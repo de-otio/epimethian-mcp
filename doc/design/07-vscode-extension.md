@@ -10,11 +10,11 @@ Key `contributes` fields:
     "commands": [
       {
         "command": "epimethian-mcp.configure",
-        "title": "Confluence MCP: Configure"
+        "title": "Epimethian MCP: Configure"
       },
       {
         "command": "epimethian-mcp.testConnection",
-        "title": "Confluence MCP: Test Connection"
+        "title": "Epimethian MCP: Test Connection"
       }
     ],
     "mcpServers": {
@@ -108,7 +108,7 @@ The configuration webview is a single panel with:
 
 ### Multi-Client MCP Registration
 
-The extension can register the Confluence MCP server with multiple AI clients, not just VS Code. Each client stores its MCP config in a different file:
+The extension can register the Epimethian MCP server with multiple AI clients, not just VS Code. Each client stores its MCP config in a different file:
 
 | Client | Config Path |
 |--------|------------|

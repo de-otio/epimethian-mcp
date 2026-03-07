@@ -10,6 +10,18 @@ vi.mock('node:fs/promises', () => ({
   mkdir: (...args: unknown[]) => mockMkdir(...args),
 }));
 
+const mockWorkspaceFolders: { uri: { fsPath: string } }[] | undefined = [
+  { uri: { fsPath: '/workspace/project' } },
+];
+
+vi.mock('vscode', () => ({
+  workspace: {
+    get workspaceFolders() {
+      return mockWorkspaceFolders;
+    },
+  },
+}));
+
 import {
   getSupportedClients,
   registerServer,
@@ -46,6 +58,12 @@ describe('getSupportedClients', () => {
     expect(ids).toContain('claude');
     expect(ids).toContain('claude-desktop');
   });
+
+  it('claude client uses project-level .mcp.json when workspace is open', () => {
+    const claude = getSupportedClients().find((c) => c.id === 'claude')!;
+    expect(claude.configPath).toBe('/workspace/project/.mcp.json');
+    expect(claude.pathDescription).toBe('<workspace>/.mcp.json');
+  });
 });
 
 describe('registerServer', () => {
@@ -59,7 +77,7 @@ describe('registerServer', () => {
     mockReadFile.mockRejectedValue(new Error('ENOENT'));
 
     const client = makeClient();
-    await registerServer(client, '/ext/path', { CONFLUENCE_URL: 'https://x.atlassian.net' });
+    await registerServer(client, '/ext/path');
 
     expect(mockWriteFile).toHaveBeenCalledTimes(1);
     const [path, content] = mockWriteFile.mock.calls[0];
@@ -68,8 +86,17 @@ describe('registerServer', () => {
     expect(written.mcpServers.confluence).toEqual({
       command: 'node',
       args: ['/ext/path/dist/server.js'],
-      env: { CONFLUENCE_URL: 'https://x.atlassian.net' },
     });
+  });
+
+  it('does not include env vars in the config (credentials read from keychain)', async () => {
+    mockReadFile.mockRejectedValue(new Error('ENOENT'));
+
+    const client = makeClient();
+    await registerServer(client, '/ext/path');
+
+    const written = JSON.parse(mockWriteFile.mock.calls[0][1]);
+    expect(written.mcpServers.confluence.env).toBeUndefined();
   });
 
   it('preserves existing servers when adding confluence', async () => {
@@ -81,7 +108,7 @@ describe('registerServer', () => {
     mockReadFile.mockResolvedValue(JSON.stringify(existing));
 
     const client = makeClient();
-    await registerServer(client, '/ext', { KEY: 'VAL' });
+    await registerServer(client, '/ext');
 
     const written = JSON.parse(mockWriteFile.mock.calls[0][1]);
     expect(written.mcpServers['other-server']).toEqual(existing.mcpServers['other-server']);
@@ -99,7 +126,7 @@ describe('registerServer', () => {
     mockReadFile.mockResolvedValue(JSON.stringify(existing));
 
     const client = makeClient();
-    await registerServer(client, '/new/path', { A: 'B' });
+    await registerServer(client, '/new/path');
 
     const written = JSON.parse(mockWriteFile.mock.calls[0][1]);
     expect(written.mcpServers.confluence.command).toBe('node');
@@ -115,7 +142,7 @@ describe('registerServer', () => {
     mockReadFile.mockResolvedValue(JSON.stringify(existing));
 
     const client = makeClient();
-    await registerServer(client, '/ext', {});
+    await registerServer(client, '/ext');
 
     const written = JSON.parse(mockWriteFile.mock.calls[0][1]);
     expect(written.someOtherKey).toBe('important');
@@ -184,5 +211,56 @@ describe('isServerRegistered', () => {
     mockReadFile.mockRejectedValue(new Error('ENOENT'));
     const result = await isServerRegistered(makeClient());
     expect(result).toBe(false);
+  });
+});
+
+describe('registerServer gitignore handling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockWriteFile.mockResolvedValue(undefined);
+    mockMkdir.mockResolvedValue(undefined);
+  });
+
+  it('adds .mcp.json to .gitignore for claude client with workspace config', async () => {
+    // First call reads the mcp config (ENOENT), second reads .gitignore
+    mockReadFile
+      .mockRejectedValueOnce(new Error('ENOENT'))
+      .mockResolvedValueOnce('node_modules/\ndist/\n');
+
+    const client = makeClient({
+      id: 'claude',
+      configPath: '/workspace/project/.mcp.json',
+    });
+    await registerServer(client, '/ext');
+
+    // writeFile called twice: once for .mcp.json, once for .gitignore
+    expect(mockWriteFile).toHaveBeenCalledTimes(2);
+    const gitignoreCall = mockWriteFile.mock.calls[1];
+    expect(gitignoreCall[0]).toBe('/workspace/project/.gitignore');
+    expect(gitignoreCall[1]).toContain('.mcp.json');
+  });
+
+  it('does not duplicate .mcp.json if already in .gitignore', async () => {
+    mockReadFile
+      .mockRejectedValueOnce(new Error('ENOENT'))
+      .mockResolvedValueOnce('node_modules/\n.mcp.json\ndist/\n');
+
+    const client = makeClient({
+      id: 'claude',
+      configPath: '/workspace/project/.mcp.json',
+    });
+    await registerServer(client, '/ext');
+
+    // Only one writeFile call (for .mcp.json config, not .gitignore)
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not modify .gitignore for non-claude clients', async () => {
+    mockReadFile.mockRejectedValue(new Error('ENOENT'));
+
+    const client = makeClient({ id: 'chatgpt' });
+    await registerServer(client, '/ext');
+
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
   });
 });

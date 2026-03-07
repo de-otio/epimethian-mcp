@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ConfigPanel } from './webview.js';
+import { ConfigPanel, ConfigViewProvider } from './webview.js';
 
 // The MCP environment provider API is available at runtime in VS Code 1.96+
 // but not yet in @types/vscode. We declare the shape we need here.
@@ -16,7 +16,15 @@ declare module 'vscode' {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
-  // Register the configuration webview command
+  // Register sidebar webview view provider (Activity Bar icon)
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      ConfigViewProvider.viewType,
+      new ConfigViewProvider(context)
+    )
+  );
+
+  // Register the configuration webview command (opens in editor area)
   context.subscriptions.push(
     vscode.commands.registerCommand('epimethian-mcp.configure', () => {
       ConfigPanel.createOrShow(context);

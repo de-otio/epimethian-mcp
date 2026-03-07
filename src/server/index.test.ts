@@ -7,6 +7,11 @@ vi.hoisted(() => {
   process.env.CONFLUENCE_API_TOKEN = "test-token";
 });
 
+// Mock keychain to prevent actual OS keychain access
+vi.mock("../shared/keychain.js", () => ({
+  readFromKeychain: vi.fn().mockResolvedValue(null),
+}));
+
 // Mock the MCP SDK so the module doesn't try to connect to stdio
 const mockConnect = vi.fn().mockResolvedValue(undefined);
 const mockRegisterTool = vi.fn();

@@ -1,6 +1,6 @@
 # Tools Reference
 
-The Confluence MCP server provides 12 tools for managing Confluence pages, spaces, attachments, and diagrams. All tools return plain text output suitable for AI consumption.
+The Epimethian MCP server provides 12 tools for managing Confluence pages, spaces, attachments, and diagrams. All tools return plain text output suitable for AI consumption.
 
 ## Spaces
 

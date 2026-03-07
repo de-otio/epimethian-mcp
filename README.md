@@ -52,7 +52,7 @@ code --install-extension epimethian-mcp-*.vsix
 
 ## Setup
 
-1. Open the Command Palette and run **Confluence MCP: Configure**
+1. Open the Command Palette and run **Epimethian MCP: Configure**
 2. Enter your Confluence URL (e.g., `https://yourcompany.atlassian.net`)
 3. Enter your Atlassian email address
 4. Enter your [API token](https://id.atlassian.com/manage-profile/security/api-tokens)

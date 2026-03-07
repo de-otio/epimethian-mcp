@@ -8,17 +8,30 @@ const { mockRegisterCommand, mockGet, mockGetConfiguration, mockRegisterMCPServe
   return { mockRegisterCommand, mockGet, mockGetConfiguration, mockRegisterMCPServerEnvironmentProvider };
 });
 
+const mockRegisterWebviewViewProvider = vi.hoisted(() => vi.fn());
+
 vi.mock('vscode', () => ({
   workspace: { getConfiguration: mockGetConfiguration },
   commands: { registerCommand: mockRegisterCommand },
-  window: { activeTextEditor: undefined },
+  window: {
+    activeTextEditor: undefined,
+    registerWebviewViewProvider: mockRegisterWebviewViewProvider,
+  },
   lm: { registerMCPServerEnvironmentProvider: mockRegisterMCPServerEnvironmentProvider },
   ConfigurationTarget: { Global: 1 },
   ViewColumn: { One: 1 },
 }));
 
+const MockConfigViewProvider = vi.hoisted(() => {
+  const ctor = vi.fn();
+  ctor.prototype = {};
+  Object.defineProperty(ctor, 'viewType', { value: 'epimethian-mcp.configView' });
+  return ctor;
+});
+
 vi.mock('./webview.js', () => ({
   ConfigPanel: { createOrShow: vi.fn() },
+  ConfigViewProvider: MockConfigViewProvider,
 }));
 
 import { activate, deactivate } from './extension.js';
@@ -46,7 +59,17 @@ describe('activate', () => {
       'epimethian-mcp.configure',
       expect.any(Function)
     );
-    expect(ctx.subscriptions.length).toBe(2);
+    expect(ctx.subscriptions.length).toBe(3);
+  });
+
+  it('registers sidebar webview view provider', async () => {
+    const ctx = makeContext();
+    await activate(ctx);
+
+    expect(mockRegisterWebviewViewProvider).toHaveBeenCalledWith(
+      'epimethian-mcp.configView',
+      expect.any(Object)
+    );
   });
 
   it('registers MCP environment provider', async () => {

@@ -67,7 +67,7 @@ server.registerTool(
     try {
       const spaceId = await resolveSpaceId(space_key);
       const page = await createPage(spaceId, title, body, parent_id);
-      return toolResult(formatPage(page, false));
+      return toolResult(await formatPage(page, false));
     } catch (err) {
       return toolError(err);
     }
@@ -91,7 +91,7 @@ server.registerTool(
   async ({ page_id, include_body }) => {
     try {
       const page = await getPage(page_id, include_body);
-      return toolResult(formatPage(page, include_body));
+      return toolResult(await formatPage(page, include_body));
     } catch (err) {
       return toolError(err);
     }
@@ -323,7 +323,7 @@ server.registerTool(
           `No page found with title "${title}" in space ${space_key}.`
         );
       }
-      return toolResult(formatPage(page, include_body));
+      return toolResult(await formatPage(page, include_body));
     } catch (err) {
       return toolError(err);
     }

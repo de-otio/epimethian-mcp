@@ -1,6 +1,6 @@
 {
   "name": "epimethian-mcp",
-  "displayName": "Confluence MCP",
+  "displayName": "Epimethian MCP",
   "description": "Confluence Cloud tools for AI assistants via the Model Context Protocol",
   "version": "1.0.0",
   "publisher": "rmyers",
@@ -17,18 +17,36 @@
   "main": "dist/extension.js",
   "activationEvents": ["onStartupFinished"],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "confluence-mcp",
+          "title": "Epimethian MCP",
+          "icon": "media/confluence.svg"
+        }
+      ]
+    },
+    "views": {
+      "confluence-mcp": [
+        {
+          "type": "webview",
+          "id": "epimethian-mcp.configView",
+          "name": "Configuration"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "epimethian-mcp.configure",
-        "title": "Confluence MCP: Configure"
+        "title": "Epimethian MCP: Configure"
       },
       {
         "command": "epimethian-mcp.testConnection",
-        "title": "Confluence MCP: Test Connection"
+        "title": "Epimethian MCP: Test Connection"
       }
     ],
     "configuration": {
-      "title": "Confluence MCP",
+      "title": "Epimethian MCP",
       "properties": {
         "epimethian-mcp.url": {
           "type": "string",

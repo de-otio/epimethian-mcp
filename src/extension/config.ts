@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { saveToKeychain } from '../shared/keychain.js';
 
 export async function saveCredentials(
   context: vscode.ExtensionContext,
@@ -10,6 +11,14 @@ export async function saveCredentials(
   await config.update('url', url, vscode.ConfigurationTarget.Global);
   await config.update('email', email, vscode.ConfigurationTarget.Global);
   await context.secrets.store('epimethian-mcp.apiToken', apiToken);
+
+  // Also write to OS keychain so the MCP server can read credentials
+  // without needing them in .mcp.json env vars
+  try {
+    await saveToKeychain({ url, email, apiToken });
+  } catch {
+    // Keychain write failed — credentials still saved in VS Code SecretStorage
+  }
 }
 
 export async function loadCredentials(

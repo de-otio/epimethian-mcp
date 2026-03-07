@@ -1,32 +1,61 @@
 import { z } from "zod";
+import { readFromKeychain } from "../shared/keychain.js";
 
 // --- Configuration ---
 
-const CONFLUENCE_URL = process.env.CONFLUENCE_URL?.replace(/\/$/, "");
-const CONFLUENCE_EMAIL = process.env.CONFLUENCE_EMAIL;
-const CONFLUENCE_API_TOKEN = process.env.CONFLUENCE_API_TOKEN;
-
-if (!CONFLUENCE_URL || !CONFLUENCE_EMAIL || !CONFLUENCE_API_TOKEN) {
-  console.error(
-    "Missing required environment variables: CONFLUENCE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN"
-  );
-  process.exit(1);
+// Credentials are resolved lazily: env vars take priority, then OS keychain.
+interface Config {
+  url: string;
+  apiV2: string;
+  apiV1: string;
+  authHeader: string;
+  jsonHeaders: Record<string, string>;
 }
 
-// Confluence exposes two API generations:
-//   - v2 (REST): /wiki/api/v2  — used for page CRUD, spaces, children
-//   - v1 (REST): /wiki/rest/api — used for CQL search and attachments (no v2 equivalent)
-const API_V2 = `${CONFLUENCE_URL}/wiki/api/v2`;
-const API_V1 = `${CONFLUENCE_URL}/wiki/rest/api`;
+let _config: Config | null = null;
 
-const AUTH_HEADER =
-  "Basic " +
-  Buffer.from(`${CONFLUENCE_EMAIL}:${CONFLUENCE_API_TOKEN}`).toString("base64");
+async function getConfig(): Promise<Config> {
+  if (_config) return _config;
 
-const JSON_HEADERS = {
-  Authorization: AUTH_HEADER,
-  "Content-Type": "application/json",
-};
+  let url = process.env.CONFLUENCE_URL?.replace(/\/$/, "") || "";
+  let email = process.env.CONFLUENCE_EMAIL || "";
+  let apiToken = process.env.CONFLUENCE_API_TOKEN || "";
+
+  // Fall back to OS keychain if any credential is missing
+  if (!url || !email || !apiToken) {
+    const keychainCreds = await readFromKeychain();
+    if (keychainCreds) {
+      url = url || keychainCreds.url.replace(/\/$/, "");
+      email = email || keychainCreds.email;
+      apiToken = apiToken || keychainCreds.apiToken;
+    }
+  }
+
+  if (!url || !email || !apiToken) {
+    console.error(
+      "Missing Confluence credentials. Set CONFLUENCE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN environment variables, or save credentials via the VS Code extension."
+    );
+    process.exit(1);
+  }
+
+  // Confluence exposes two API generations:
+  //   - v2 (REST): /wiki/api/v2  — used for page CRUD, spaces, children
+  //   - v1 (REST): /wiki/rest/api — used for CQL search and attachments (no v2 equivalent)
+  const authHeader =
+    "Basic " + Buffer.from(`${email}:${apiToken}`).toString("base64");
+
+  _config = {
+    url,
+    apiV2: `${url}/wiki/api/v2`,
+    apiV1: `${url}/wiki/rest/api`,
+    authHeader,
+    jsonHeaders: {
+      Authorization: authHeader,
+      "Content-Type": "application/json",
+    },
+  };
+  return _config;
+}
 
 // --- Zod response schemas (runtime validation) ---
 
@@ -105,7 +134,8 @@ async function confluenceRequest(
   url: string,
   options: RequestInit = {}
 ): Promise<Response> {
-  const res = await fetch(url, { headers: JSON_HEADERS, ...options });
+  const cfg = await getConfig();
+  const res = await fetch(url, { headers: cfg.jsonHeaders, ...options });
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Confluence API error (${res.status}): ${body}`);
@@ -117,7 +147,8 @@ async function v2Get(
   path: string,
   params?: Record<string, string | number>
 ): Promise<unknown> {
-  const url = new URL(`${API_V2}${path}`);
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV2}${path}`);
   if (params) {
     for (const [k, v] of Object.entries(params)) {
       url.searchParams.set(k, String(v));
@@ -128,7 +159,8 @@ async function v2Get(
 }
 
 async function v2Post(path: string, body: unknown): Promise<unknown> {
-  const res = await confluenceRequest(`${API_V2}${path}`, {
+  const cfg = await getConfig();
+  const res = await confluenceRequest(`${cfg.apiV2}${path}`, {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -136,7 +168,8 @@ async function v2Post(path: string, body: unknown): Promise<unknown> {
 }
 
 async function v2Put(path: string, body: unknown): Promise<unknown> {
-  const res = await confluenceRequest(`${API_V2}${path}`, {
+  const cfg = await getConfig();
+  const res = await confluenceRequest(`${cfg.apiV2}${path}`, {
     method: "PUT",
     body: JSON.stringify(body),
   });
@@ -144,7 +177,8 @@ async function v2Put(path: string, body: unknown): Promise<unknown> {
 }
 
 async function v2Delete(path: string): Promise<void> {
-  await confluenceRequest(`${API_V2}${path}`, { method: "DELETE" });
+  const cfg = await getConfig();
+  await confluenceRequest(`${cfg.apiV2}${path}`, { method: "DELETE" });
 }
 
 // --- Public API ---
@@ -222,7 +256,8 @@ export async function searchPages(
   limit: number
 ): Promise<PageData[]> {
   // CQL search only available via v1 REST API
-  const url = new URL(`${API_V1}/content/search`);
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/content/search`);
   url.searchParams.set("cql", cql);
   url.searchParams.set("limit", String(limit));
   const res = await confluenceRequest(url.toString());
@@ -281,7 +316,8 @@ export async function getAttachments(
   limit: number
 ): Promise<AttachmentData[]> {
   // Attachments only available via v1 REST API
-  const url = new URL(`${API_V1}/content/${pageId}/child/attachment`);
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/content/${pageId}/child/attachment`);
   url.searchParams.set("limit", String(limit));
   const res = await confluenceRequest(url.toString());
   const raw = await res.json();
@@ -295,15 +331,16 @@ export async function uploadAttachment(
   comment?: string
 ): Promise<{ title: string; id: string; fileSize?: number }> {
   // Attachments only available via v1 REST API
+  const cfg = await getConfig();
   const form = new FormData();
   form.append("file", new Blob([new Uint8Array(fileData)]), filename);
   if (comment) form.append("comment", comment);
 
-  const attachUrl = `${API_V1}/content/${pageId}/child/attachment`;
+  const attachUrl = `${cfg.apiV1}/content/${pageId}/child/attachment`;
   const res = await fetch(attachUrl, {
     method: "POST",
     headers: {
-      Authorization: AUTH_HEADER,
+      Authorization: cfg.authHeader,
       "X-Atlassian-Token": "nocheck",
     },
     body: form,
@@ -326,14 +363,15 @@ export function toStorageFormat(body: string): string {
   return HTML_TAG_RE.test(body) ? body : `<p>${body}</p>`;
 }
 
-export function formatPage(page: PageData, includeBody: boolean): string {
+export async function formatPage(page: PageData, includeBody: boolean): Promise<string> {
+  const cfg = await getConfig();
   const spaceKey = page.spaceId ?? page.space?.key ?? "N/A";
   const version = page.version?.number ?? 0;
   const webui = page._links?.webui ?? "";
-  const base = page._links?.base ?? `${CONFLUENCE_URL}/wiki`;
+  const base = page._links?.base ?? `${cfg.url}/wiki`;
   const url = webui
     ? `${base}${webui}`
-    : `${CONFLUENCE_URL}/wiki/pages/${page.id}`;
+    : `${cfg.url}/wiki/pages/${page.id}`;
 
   const lines = [
     `Title: ${page.title}`,

@@ -24,26 +24,32 @@ export interface McpClientInfo {
 interface ServerEntry {
   command: string;
   args: string[];
-  env: Record<string, string>;
 }
 
-function buildServerEntry(extensionPath: string, env: Record<string, string>): ServerEntry {
+function buildServerEntry(extensionPath: string): ServerEntry {
   return {
     command: 'node',
     args: [join(extensionPath, 'dist', 'server.js')],
-    env,
   };
 }
 
 const home = homedir();
+
+function getWorkspaceRoot(): string | undefined {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
 
 export function getSupportedClients(): McpClientInfo[] {
   return [
     {
       name: 'Claude Code',
       id: 'claude',
-      configPath: join(home, '.claude', 'mcp.json'),
-      pathDescription: '~/.claude/mcp.json',
+      configPath: getWorkspaceRoot()
+        ? join(getWorkspaceRoot()!, '.mcp.json')
+        : join(home, '.claude', 'mcp.json'),
+      pathDescription: getWorkspaceRoot()
+        ? '<workspace>/.mcp.json'
+        : '~/.claude/mcp.json',
     },
     {
       name: 'Claude Desktop',
@@ -98,19 +104,45 @@ async function writeJsonFile(path: string, data: Record<string, unknown>): Promi
 }
 
 /**
+ * Ensure `.mcp.json` is listed in the workspace .gitignore.
+ */
+async function ensureGitignore(workspaceRoot: string): Promise<void> {
+  const gitignorePath = join(workspaceRoot, '.gitignore');
+  let content = '';
+  try {
+    content = await readFile(gitignorePath, 'utf-8');
+  } catch {
+    // .gitignore doesn't exist yet — we'll create it
+  }
+  const lines = content.split('\n');
+  if (lines.some((line) => line.trim() === '.mcp.json')) {
+    return;
+  }
+  const newline = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
+  await writeFile(gitignorePath, content + newline + '.mcp.json\n', 'utf-8');
+}
+
+/**
  * Register the confluence MCP server in a client's config file.
  * Merges into the existing file — never overwrites other servers.
  */
 export async function registerServer(
   client: McpClientInfo,
   extensionPath: string,
-  env: Record<string, string>,
 ): Promise<void> {
   const existing = await readJsonFile(client.configPath);
   const servers = (existing.mcpServers ?? {}) as Record<string, unknown>;
-  servers.confluence = buildServerEntry(extensionPath, env);
+  servers.confluence = buildServerEntry(extensionPath);
   existing.mcpServers = servers;
   await writeJsonFile(client.configPath, existing);
+
+  // For Claude Code with project-level config, ensure .mcp.json is gitignored
+  if (client.id === 'claude') {
+    const workspaceRoot = getWorkspaceRoot();
+    if (workspaceRoot && client.configPath.startsWith(workspaceRoot)) {
+      await ensureGitignore(workspaceRoot);
+    }
+  }
 }
 
 /**

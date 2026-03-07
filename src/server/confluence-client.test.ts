@@ -7,6 +7,11 @@ vi.hoisted(() => {
   process.env.CONFLUENCE_API_TOKEN = "test-token";
 });
 
+// Mock keychain to prevent actual OS keychain access
+vi.mock("../shared/keychain.js", () => ({
+  readFromKeychain: vi.fn().mockResolvedValue(null),
+}));
+
 import {
   PageSchema,
   toStorageFormat,
@@ -131,7 +136,7 @@ describe("toStorageFormat", () => {
 });
 
 describe("formatPage", () => {
-  it("formats a page without body", () => {
+  it("formats a page without body", async () => {
     const page = {
       id: "42",
       title: "Test",
@@ -139,7 +144,7 @@ describe("formatPage", () => {
       version: { number: 5 },
       _links: { base: "https://x.atlassian.net/wiki", webui: "/spaces/SP1/pages/42" },
     };
-    const result = formatPage(page, false);
+    const result = await formatPage(page, false);
     expect(result).toContain("Title: Test");
     expect(result).toContain("ID: 42");
     expect(result).toContain("Space: SP1");
@@ -148,49 +153,49 @@ describe("formatPage", () => {
     expect(result).not.toContain("Content:");
   });
 
-  it("formats a page with body (storage format)", () => {
+  it("formats a page with body (storage format)", async () => {
     const page = {
       id: "42",
       title: "Test",
       body: { storage: { value: "<p>Hello</p>" } },
     };
-    const result = formatPage(page, true);
+    const result = await formatPage(page, true);
     expect(result).toContain("Content:");
     expect(result).toContain("<p>Hello</p>");
   });
 
-  it("uses body.value when storage is missing", () => {
+  it("uses body.value when storage is missing", async () => {
     const page = {
       id: "42",
       title: "Test",
       body: { value: "fallback content" },
     };
-    const result = formatPage(page, true);
+    const result = await formatPage(page, true);
     expect(result).toContain("fallback content");
   });
 
-  it("handles missing _links gracefully", () => {
+  it("handles missing _links gracefully", async () => {
     const page = { id: "42", title: "Test" };
-    const result = formatPage(page, false);
+    const result = await formatPage(page, false);
     // Falls back to constructed URL
     expect(result).toContain("URL: https://test.atlassian.net/wiki/pages/42");
   });
 
-  it("handles missing version gracefully", () => {
+  it("handles missing version gracefully", async () => {
     const page = { id: "42", title: "Test" };
-    const result = formatPage(page, false);
+    const result = await formatPage(page, false);
     expect(result).toContain("Version: 0");
   });
 
-  it("uses space.key when spaceId is missing", () => {
+  it("uses space.key when spaceId is missing", async () => {
     const page = { id: "42", title: "Test", space: { key: "FOO" } };
-    const result = formatPage(page, false);
+    const result = await formatPage(page, false);
     expect(result).toContain("Space: FOO");
   });
 
-  it("shows N/A when no space info available", () => {
+  it("shows N/A when no space info available", async () => {
     const page = { id: "42", title: "Test" };
-    const result = formatPage(page, false);
+    const result = await formatPage(page, false);
     expect(result).toContain("Space: N/A");
   });
 });

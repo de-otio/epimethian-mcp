@@ -12,6 +12,11 @@ vi.mock('vscode', () => ({
   ConfigurationTarget: { Global: 1 },
 }));
 
+const mockSaveToKeychain = vi.fn().mockResolvedValue(undefined);
+vi.mock('../shared/keychain.js', () => ({
+  saveToKeychain: (...args: unknown[]) => mockSaveToKeychain(...args),
+}));
+
 import { saveCredentials, loadCredentials, testConnection } from './config.js';
 
 function makeContext(overrides: Record<string, unknown> = {}) {

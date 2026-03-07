@@ -5,7 +5,7 @@
 1. Download the `.vsix` from the latest CI build (see [08-ci.md](08-ci.md)) or build from source (see "For Developers" below)
 2. Install it: `code --install-extension epimethian-mcp-*.vsix`
 3. Open VS Code
-3. Open the configuration panel: Command Palette > **Confluence MCP: Configure**
+3. Open the configuration panel: Command Palette > **Epimethian MCP: Configure**
 4. Enter your Confluence URL, email, and API token
 5. Click **Test Connection** to verify
 6. Done -- the MCP server is now available to AI tools in VS Code

@@ -1,6 +1,6 @@
-# Installing and Configuring the Confluence MCP Server
+# Installing and Configuring the Epimethian MCP Server
 
-The Confluence MCP server runs locally on your machine and connects your AI coding assistant (Claude Code, Cursor, etc.) to Confluence Cloud. All changes you make through the AI are attributed to your Confluence user.
+The Epimethian MCP server runs locally on your machine and connects your AI coding assistant (Claude Code, Cursor, etc.) to Confluence Cloud. All changes you make through the AI are attributed to your Confluence user.
 
 ## Prerequisites
 

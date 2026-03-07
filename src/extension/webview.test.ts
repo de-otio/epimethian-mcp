@@ -61,7 +61,7 @@ vi.mock('./mcp-clients.js', () => ({
   isServerRegistered: (...args: unknown[]) => mockIsServerRegistered(...args),
 }));
 
-import { ConfigPanel } from './webview.js';
+import { ConfigPanel, ConfigViewProvider } from './webview.js';
 
 function makeContext() {
   return {
@@ -109,7 +109,7 @@ describe('ConfigPanel.createOrShow', () => {
     expect(mockCreateWebviewPanel).toHaveBeenCalledTimes(1);
     expect(mockCreateWebviewPanel).toHaveBeenCalledWith(
       'epimethianMcpConfig',
-      'Confluence MCP: Configure',
+      'Epimethian MCP: Configure',
       1,
       expect.objectContaining({ enableScripts: true })
     );
@@ -210,17 +210,12 @@ describe('handleMessage', () => {
     );
   });
 
-  it('registerClient: calls registerServer, posts clientUpdated', async () => {
+  it('registerClient: calls registerServer without env, posts clientUpdated', async () => {
     await onDidReceiveMessageCallback!({ type: 'registerClient', clientId: 'claude' });
 
     expect(mockRegisterServer).toHaveBeenCalledWith(
       defaultClients[0],
       '/ext/path',
-      expect.objectContaining({
-        CONFLUENCE_URL: 'https://x.atlassian.net',
-        CONFLUENCE_EMAIL: 'a@b.com',
-        CONFLUENCE_API_TOKEN: 'tok',
-      })
     );
     expect(mockPostMessage).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'clientUpdated', clients: expect.any(Array) })
@@ -234,5 +229,37 @@ describe('handleMessage', () => {
     expect(mockPostMessage).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'clientUpdated', clients: expect.any(Array) })
     );
+  });
+});
+
+describe('ConfigViewProvider', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setupClientMocks();
+    mockLoadCredentials.mockResolvedValue({ url: '', email: '', apiToken: '' });
+  });
+
+  it('resolveWebviewView sets HTML and wires up message handler', () => {
+    const ctx = makeContext();
+    const provider = new ConfigViewProvider(ctx);
+
+    let sidebarMessageCallback: ((msg: any) => void) | undefined;
+    const sidebarWebview = {
+      options: {} as any,
+      html: '',
+      postMessage: vi.fn().mockResolvedValue(true),
+      onDidReceiveMessage: vi.fn((cb: any) => {
+        sidebarMessageCallback = cb;
+        return { dispose: vi.fn() };
+      }),
+    };
+    const webviewView = { webview: sidebarWebview } as any;
+
+    provider.resolveWebviewView(webviewView, {} as any, {} as any);
+
+    expect(sidebarWebview.options.enableScripts).toBe(true);
+    expect(sidebarWebview.html).toContain('Confluence URL');
+    expect(sidebarWebview.onDidReceiveMessage).toHaveBeenCalled();
+    expect(sidebarMessageCallback).toBeDefined();
   });
 });
