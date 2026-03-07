@@ -52,11 +52,12 @@ code --install-extension epimethian-mcp-*.vsix
 
 ## Setup
 
-1. Open the Command Palette and run **Epimethian MCP: Configure**
+1. Click the **Epimethian MCP** icon in the Activity Bar (left sidebar) to open the configuration panel
 2. Enter your Confluence URL (e.g., `https://yourcompany.atlassian.net`)
 3. Enter your Atlassian email address
 4. Enter your [API token](https://id.atlassian.com/manage-profile/security/api-tokens)
 5. Click **Test Connection** to verify
+6. Register the MCP server with your AI clients using the **AI Clients** section at the bottom of the panel
 
 Your API token is stored in the OS keychain and never written to disk in plaintext.
 

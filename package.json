@@ -45,21 +45,6 @@
         "title": "Epimethian MCP: Test Connection"
       }
     ],
-    "configuration": {
-      "title": "Epimethian MCP",
-      "properties": {
-        "epimethian-mcp.url": {
-          "type": "string",
-          "default": "",
-          "description": "Confluence instance URL (e.g., https://yourcompany.atlassian.net)"
-        },
-        "epimethian-mcp.email": {
-          "type": "string",
-          "default": "",
-          "description": "Atlassian account email address"
-        }
-      }
-    },
     "mcpServers": {
       "confluence": {
         "command": "node",
