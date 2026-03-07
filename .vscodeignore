@@ -1,0 +1,8 @@
+**/*
+!dist/extension.js
+!dist/extension.js.map
+!dist/server.js
+!dist/server.js.map
+!package.json
+!LICENSE
+!README.md

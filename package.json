@@ -1,0 +1,73 @@
+{
+  "name": "epimethian-mcp",
+  "displayName": "Confluence MCP",
+  "description": "Confluence Cloud tools for AI assistants via the Model Context Protocol",
+  "version": "1.0.0",
+  "publisher": "rmyers",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rmyers/epimethian-mcp.git"
+  },
+  "engines": {
+    "vscode": "^1.96.0",
+    "node": ">=18"
+  },
+  "categories": ["Other"],
+  "main": "dist/extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "epimethian-mcp.configure",
+        "title": "Confluence MCP: Configure"
+      },
+      {
+        "command": "epimethian-mcp.testConnection",
+        "title": "Confluence MCP: Test Connection"
+      }
+    ],
+    "configuration": {
+      "title": "Confluence MCP",
+      "properties": {
+        "epimethian-mcp.url": {
+          "type": "string",
+          "default": "",
+          "description": "Confluence instance URL (e.g., https://yourcompany.atlassian.net)"
+        },
+        "epimethian-mcp.email": {
+          "type": "string",
+          "default": "",
+          "description": "Atlassian account email address"
+        }
+      }
+    },
+    "mcpServers": {
+      "confluence": {
+        "command": "node",
+        "args": ["${extensionPath}/dist/server.js"],
+        "env": {}
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch",
+    "package": "vsce package --no-dependencies",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.96.0",
+    "@vitest/coverage-v8": "^3.0.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}
