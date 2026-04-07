@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, rm, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -20,6 +20,17 @@ import {
   uploadAttachment,
   formatPage,
 } from "./confluence-client.js";
+
+// --- Utilities ---
+
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
 
 // --- Error-safe tool helpers ---
 
@@ -358,9 +369,9 @@ server.registerTool(
   },
   async ({ page_id, file_path, filename, comment }) => {
     try {
-      // Security: restrict file reads to the current working directory
-      const resolved = resolve(file_path);
-      const cwd = process.cwd();
+      // Security: restrict file reads to the current working directory (resolve symlinks)
+      const resolved = await realpath(resolve(file_path));
+      const cwd = await realpath(process.cwd());
       if (!resolved.startsWith(cwd + "/") && resolved !== cwd) {
         return toolError(
           new Error(
@@ -398,6 +409,10 @@ server.registerTool(
         ),
       diagram_name: z
         .string()
+        .regex(
+          /^[a-zA-Z0-9_\-. ]+$/,
+          "Diagram name may only contain letters, numbers, spaces, hyphens, underscores, and dots"
+        )
         .describe(
           "Name for the diagram file (e.g., 'architecture.drawio'). Will have .drawio appended if not present."
         ),
@@ -430,8 +445,8 @@ server.registerTool(
       // Build the draw.io macro
       const macro = [
         `<ac:structured-macro ac:name="drawio" ac:schema-version="1">`,
-        `  <ac:parameter ac:name="diagramName">${filename}</ac:parameter>`,
-        `  <ac:parameter ac:name="attachment">${filename}</ac:parameter>`,
+        `  <ac:parameter ac:name="diagramName">${escapeXml(filename)}</ac:parameter>`,
+        `  <ac:parameter ac:name="attachment">${escapeXml(filename)}</ac:parameter>`,
         `</ac:structured-macro>`,
       ].join("\n");
 

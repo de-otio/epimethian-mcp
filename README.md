@@ -1,5 +1,7 @@
 # epimethian-mcp
 
+> **Note:** For most Confluence use cases, we recommend the official [Atlassian Rovo MCP server](https://github.com/atlassian/mcp-server-atlassian) instead. It covers standard page and space operations and is maintained by Atlassian. Use this extension if you need features it doesn't provide, such as draw.io diagram support, OS keychain credential storage, or the VS Code graphical configuration panel.
+
 A VS Code extension that provides Confluence Cloud tools to AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). Build from source, install the `.vsix` locally, configure your credentials through a graphical panel, and your AI assistant can create, read, update, search, and manage Confluence pages.
 
 ## Features

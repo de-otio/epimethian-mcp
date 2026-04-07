@@ -49,12 +49,14 @@ const mockReadFile = vi.fn();
 const mockWriteFile = vi.fn();
 const mockMkdtemp = vi.fn();
 const mockRm = vi.fn();
+const mockRealpath = vi.fn((p: string) => Promise.resolve(p));
 
 vi.mock("node:fs/promises", () => ({
   readFile: (...args: unknown[]) => mockReadFile(...args),
   writeFile: (...args: unknown[]) => mockWriteFile(...args),
   mkdtemp: (...args: unknown[]) => mockMkdtemp(...args),
   rm: (...args: unknown[]) => mockRm(...args),
+  realpath: (...args: unknown[]) => mockRealpath(...(args as [string])),
 }));
 
 // We need to dynamically import AFTER mocks are set up

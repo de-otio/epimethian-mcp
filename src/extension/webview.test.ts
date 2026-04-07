@@ -30,7 +30,7 @@ const mockCreateWebviewPanel = vi.fn(() => mockPanel);
 vi.mock('vscode', () => ({
   workspace: { getConfiguration: vi.fn(() => ({ get: vi.fn(), update: vi.fn() })) },
   window: {
-    createWebviewPanel: (...args: unknown[]) => mockCreateWebviewPanel(...args),
+    createWebviewPanel: (...args: unknown[]) => mockCreateWebviewPanel(...(args as Parameters<typeof mockCreateWebviewPanel>)),
     activeTextEditor: undefined,
   },
   commands: { registerCommand: vi.fn() },
@@ -89,15 +89,8 @@ function setupClientMocks() {
 describe('ConfigPanel.createOrShow', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Reset the static currentPanel by disposing if needed
     onDidReceiveMessageCallback = undefined;
     onDidDisposeCallback = undefined;
-    // Reset the static state by triggering dispose
-    if (onDidDisposeCallback) {
-      onDidDisposeCallback();
-    }
-    // Force reset static state by accessing internal — we simulate fresh state
-    // by calling createOrShow, disposing, then testing again
     (ConfigPanel as any).currentPanel = undefined;
     setupClientMocks();
   });
