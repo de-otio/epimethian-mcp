@@ -10,6 +10,7 @@ vi.hoisted(() => {
 // Mock keychain to prevent actual OS keychain access
 vi.mock("../shared/keychain.js", () => ({
   readFromKeychain: vi.fn().mockResolvedValue(null),
+  PROFILE_NAME_RE: /^[a-z0-9][a-z0-9-]{0,62}$/,
 }));
 
 // Mock the MCP SDK so the module doesn't try to connect to stdio
@@ -42,6 +43,17 @@ vi.mock("./confluence-client.js", () => ({
   getAttachments: vi.fn(),
   uploadAttachment: vi.fn(),
   formatPage: vi.fn().mockReturnValue("formatted page"),
+  sanitizeError: (msg: string) => msg.slice(0, 500),
+  getConfig: vi.fn().mockResolvedValue({
+    url: "https://test.atlassian.net",
+    email: "user@test.com",
+    profile: null,
+    apiV2: "https://test.atlassian.net/wiki/api/v2",
+    apiV1: "https://test.atlassian.net/wiki/rest/api",
+    authHeader: "Basic dGVzdA==",
+    jsonHeaders: {},
+  }),
+  validateStartup: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock node:fs/promises for add_attachment and add_drawio_diagram tests

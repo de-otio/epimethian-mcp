@@ -11,6 +11,7 @@ vi.hoisted(() => {
 
 vi.mock("../shared/keychain.js", () => ({
   readFromKeychain: vi.fn().mockResolvedValue(null),
+  PROFILE_NAME_RE: /^[a-z0-9][a-z0-9-]{0,62}$/,
 }));
 
 const mockConnect = vi.fn().mockResolvedValue(undefined);
@@ -41,6 +42,17 @@ vi.mock("../server/confluence-client.js", () => ({
   getAttachments: vi.fn(),
   uploadAttachment: vi.fn(),
   formatPage: vi.fn().mockReturnValue("formatted"),
+  sanitizeError: (msg: string) => msg,
+  getConfig: vi.fn().mockResolvedValue({
+    url: "https://test.atlassian.net",
+    email: "user@test.com",
+    profile: null,
+    apiV2: "https://test.atlassian.net/wiki/api/v2",
+    apiV1: "https://test.atlassian.net/wiki/rest/api",
+    authHeader: "Basic dGVzdA==",
+    jsonHeaders: {},
+  }),
+  validateStartup: vi.fn().mockResolvedValue(undefined),
 }));
 
 let guideContent: string;
@@ -107,8 +119,12 @@ describe("install-agent.md consistency", () => {
     );
   });
 
-  it("tells the user to run the setup command", () => {
-    expect(guideContent).toContain("epimethian-mcp setup");
+  it("tells the user to run the setup command with --profile", () => {
+    expect(guideContent).toContain("epimethian-mcp setup --profile");
+  });
+
+  it("uses CONFLUENCE_PROFILE in the MCP config", () => {
+    expect(guideContent).toContain("CONFLUENCE_PROFILE");
   });
 
   it("requires the user to restart the MCP client", () => {

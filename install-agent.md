@@ -35,13 +35,12 @@ which epimethian-mcp
 
 Use the output as the `command` value in the MCP config below.
 
-## Step 3: Collect non-secret configuration
+## Step 3: Collect configuration
 
 Ask the user for:
-1. **Confluence Cloud URL** — e.g., `https://yoursite.atlassian.net`
-2. **Email address** — the email associated with their Atlassian account
-
-These are NOT secrets and can be stored in configuration files.
+1. **Profile name** — a short identifier for this Confluence instance (e.g., `jambit`, `acme-corp`). Lowercase alphanumeric and hyphens only.
+2. **Confluence Cloud URL** — e.g., `https://yoursite.atlassian.net`
+3. **Email address** — the email associated with their Atlassian account
 
 ## Step 4: Write MCP configuration
 
@@ -53,28 +52,27 @@ Add the server to `.mcp.json` (or the equivalent config file for the user's MCP 
     "confluence": {
       "command": "<absolute path from Step 2>",
       "env": {
-        "CONFLUENCE_URL": "<url from Step 3>",
-        "CONFLUENCE_EMAIL": "<email from Step 3>"
+        "CONFLUENCE_PROFILE": "<profile name from Step 3>"
       }
     }
   }
 }
 ```
 
-**IMPORTANT: Do NOT put the API token in the config file.** The server reads it from the OS keychain at startup.
+**IMPORTANT:** The only env var needed is `CONFLUENCE_PROFILE`. The URL, email, and API token are stored securely in the OS keychain — they should NOT appear in config files.
 
 ## Step 5: Credential setup
 
 Tell the user to run this command in their terminal:
 
 ```
-epimethian-mcp setup
+epimethian-mcp setup --profile <profile name from Step 3>
 ```
 
 This interactive command will:
-1. Prompt for the Confluence API token (masked input)
+1. Prompt for the Confluence URL, email, and API token (masked input)
 2. Test the connection
-3. Store the token securely in the OS keychain (macOS Keychain / Linux libsecret)
+3. Store all credentials securely in the OS keychain under the named profile
 
 The API token is generated at: https://id.atlassian.com/manage-profile/security/api-tokens
 
@@ -90,6 +88,44 @@ Tell the user:
 ## Step 7: Validation
 
 After the user restarts, verify the server is working by listing available Confluence tools or running a simple operation like listing spaces.
+
+## Adding Additional Tenants
+
+To add a second Confluence instance (e.g., for a different customer):
+
+1. Run `epimethian-mcp setup --profile <new-profile-name>` with the new credentials
+2. In the project that uses the new tenant, update `.mcp.json` to set `CONFLUENCE_PROFILE` to the new profile name
+3. Restart the MCP client
+
+Each VS Code window / Claude Code session uses the profile specified in its `.mcp.json`. Profiles are fully isolated — different OS keychain entries, different Confluence instances.
+
+## Managing Profiles
+
+- List all profiles: `epimethian-mcp profiles`
+- Show details: `epimethian-mcp profiles --verbose`
+- Check connection: `CONFLUENCE_PROFILE=<name> epimethian-mcp status`
+- Remove a profile: `epimethian-mcp profiles --remove <name>`
+
+## CI/CD (No Keychain)
+
+For environments where the OS keychain is unavailable (Docker, CI), set all three env vars directly:
+
+```json
+{
+  "mcpServers": {
+    "confluence": {
+      "command": "<absolute path>",
+      "env": {
+        "CONFLUENCE_URL": "<url>",
+        "CONFLUENCE_EMAIL": "<email>",
+        "CONFLUENCE_API_TOKEN": "<token>"
+      }
+    }
+  }
+}
+```
+
+**Warning:** This exposes the API token in the process environment. Use profile-based auth whenever possible.
 
 ## Troubleshooting
 

@@ -10,7 +10,15 @@ vi.mock("../shared/test-connection.js", () => ({
 
 vi.mock("../shared/keychain.js", () => ({
   saveToKeychain: (...args: unknown[]) => mockSaveToKeychain(...args),
-  readFromKeychain: () => mockReadFromKeychain(),
+  readFromKeychain: (...args: unknown[]) => mockReadFromKeychain(...args),
+  PROFILE_NAME_RE: /^[a-z0-9][a-z0-9-]{0,62}$/,
+}));
+
+const mockAddToProfileRegistry = vi.fn().mockResolvedValue(undefined);
+
+vi.mock("../shared/profiles.js", () => ({
+  addToProfileRegistry: (...args: unknown[]) =>
+    mockAddToProfileRegistry(...args),
 }));
 
 // Mock readline
@@ -165,11 +173,14 @@ describe("runSetup", () => {
       "old@test.com",
       "new"
     );
-    expect(mockSaveToKeychain).toHaveBeenCalledWith({
-      url: "https://existing.atlassian.net",
-      email: "old@test.com",
-      apiToken: "new",
-    });
+    expect(mockSaveToKeychain).toHaveBeenCalledWith(
+      {
+        url: "https://existing.atlassian.net",
+        email: "old@test.com",
+        apiToken: "new",
+      },
+      undefined
+    );
 
     process.stdin.on = originalOn;
   });
@@ -245,11 +256,14 @@ describe("runSetup", () => {
       "user@test.com",
       "tok"
     );
-    expect(mockSaveToKeychain).toHaveBeenCalledWith({
-      url: "https://test.atlassian.net",
-      email: "user@test.com",
-      apiToken: "tok",
-    });
+    expect(mockSaveToKeychain).toHaveBeenCalledWith(
+      {
+        url: "https://test.atlassian.net",
+        email: "user@test.com",
+        apiToken: "tok",
+      },
+      undefined
+    );
 
     process.stdin.on = originalOn;
   });
@@ -284,5 +298,51 @@ describe("runSetup", () => {
     expect(mockSaveToKeychain).not.toHaveBeenCalled();
 
     process.stdin.on = originalOn;
+  });
+
+  it("passes profile to saveToKeychain and addToProfileRegistry", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net")
+      .mockResolvedValueOnce("user@test.com");
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => {
+          cb("t");
+          cb("o");
+          cb("k");
+          cb("\n");
+        }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("jambit");
+
+    expect(mockSaveToKeychain).toHaveBeenCalledWith(
+      {
+        url: "https://test.atlassian.net",
+        email: "user@test.com",
+        apiToken: "tok",
+      },
+      "jambit"
+    );
+    expect(mockAddToProfileRegistry).toHaveBeenCalledWith("jambit");
+
+    process.stdin.on = originalOn;
+  });
+
+  it("exits on invalid profile name", async () => {
+    await expect(runSetup("-bad")).rejects.toThrow("process.exit(1)");
+    expect(exitCode).toBe(1);
   });
 });

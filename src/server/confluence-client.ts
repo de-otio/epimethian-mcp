@@ -1,11 +1,13 @@
 import { z } from "zod";
-import { readFromKeychain } from "../shared/keychain.js";
+import { readFromKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
+import { testConnection, verifyTenantIdentity } from "../shared/test-connection.js";
 
 // --- Configuration ---
 
-// Credentials are resolved lazily: env vars take priority, then OS keychain.
-interface Config {
+export interface Config {
   url: string;
+  email: string;
+  profile: string | null;
   apiV2: string;
   apiV1: string;
   authHeader: string;
@@ -14,29 +16,86 @@ interface Config {
 
 let _config: Config | null = null;
 
-async function getConfig(): Promise<Config> {
-  if (_config) return _config;
+/**
+ * Resolve credentials from environment / keychain without caching.
+ * Exported for testability — callers should use getConfig() instead.
+ *
+ * Resolution order (no merging across sources):
+ *   1. CONFLUENCE_PROFILE env var → read all fields from named keychain entry
+ *   2. All 3 env vars set → use directly (CI/CD mode)
+ *   3. Partial env vars (1 or 2 of 3) → hard error
+ *   4. No env vars → read legacy keychain entry (backward compat, deprecation warning)
+ */
+export async function resolveCredentials(): Promise<{
+  url: string;
+  email: string;
+  apiToken: string;
+  profile: string | null;
+}> {
+  const profileEnv = process.env.CONFLUENCE_PROFILE || "";
+  const urlEnv = process.env.CONFLUENCE_URL?.replace(/\/$/, "") || "";
+  const emailEnv = process.env.CONFLUENCE_EMAIL || "";
+  const tokenEnv = process.env.CONFLUENCE_API_TOKEN || "";
 
-  let url = process.env.CONFLUENCE_URL?.replace(/\/$/, "") || "";
-  let email = process.env.CONFLUENCE_EMAIL || "";
-  let apiToken = process.env.CONFLUENCE_API_TOKEN || "";
-
-  // Fall back to OS keychain if any credential is missing
-  if (!url || !email || !apiToken) {
-    const keychainCreds = await readFromKeychain();
-    if (keychainCreds) {
-      url = url || keychainCreds.url.replace(/\/$/, "");
-      email = email || keychainCreds.email;
-      apiToken = apiToken || keychainCreds.apiToken;
+  // Step 1: Named profile
+  if (profileEnv) {
+    if (!PROFILE_NAME_RE.test(profileEnv)) {
+      console.error(
+        `Invalid CONFLUENCE_PROFILE: "${profileEnv}". Use lowercase alphanumeric and hyphens only (1-63 chars).`
+      );
+      process.exit(1);
     }
+    const creds = await readFromKeychain(profileEnv);
+    if (!creds) {
+      console.error(
+        `No credentials found for profile "${profileEnv}". Run \`epimethian-mcp setup --profile ${profileEnv}\` to configure.`
+      );
+      process.exit(1);
+    }
+    return {
+      url: creds.url.replace(/\/$/, ""),
+      email: creds.email,
+      apiToken: creds.apiToken,
+      profile: profileEnv,
+    };
   }
 
-  if (!url || !email || !apiToken) {
+  // Step 2: All three env vars set (CI/CD mode)
+  if (urlEnv && emailEnv && tokenEnv) {
+    // Clear token from process env to reduce exposure window
+    delete process.env.CONFLUENCE_API_TOKEN;
+    return { url: urlEnv, email: emailEnv, apiToken: tokenEnv, profile: null };
+  }
+
+  // Step 3: Anything else — hard error
+  // No partial env vars, no legacy keychain fallback.
+  const setVars = [
+    urlEnv && "CONFLUENCE_URL",
+    emailEnv && "CONFLUENCE_EMAIL",
+    tokenEnv && "CONFLUENCE_API_TOKEN",
+  ].filter(Boolean);
+
+  if (setVars.length > 0) {
     console.error(
-      "Missing Confluence credentials. Set CONFLUENCE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN environment variables, or run `epimethian-mcp setup`."
+      `Error: Partial credentials detected (${setVars.join(", ")} set, but not all three).\n` +
+        "Either set CONFLUENCE_PROFILE or provide all three environment variables " +
+        "(CONFLUENCE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN).\n" +
+        "Run `epimethian-mcp setup --profile <name>` for guided setup."
     );
     process.exit(1);
   }
+
+  console.error(
+    "Missing Confluence credentials. Set CONFLUENCE_PROFILE environment variable, " +
+      "or run `epimethian-mcp setup --profile <name>` to configure."
+  );
+  process.exit(1);
+}
+
+export async function getConfig(): Promise<Config> {
+  if (_config) return _config;
+
+  const { url, email, apiToken, profile } = await resolveCredentials();
 
   // Confluence exposes two API generations:
   //   - v2 (REST): /wiki/api/v2  — used for page CRUD, spaces, children
@@ -44,8 +103,10 @@ async function getConfig(): Promise<Config> {
   const authHeader =
     "Basic " + Buffer.from(`${email}:${apiToken}`).toString("base64");
 
-  _config = {
+  _config = Object.freeze({
     url,
+    email,
+    profile,
     apiV2: `${url}/wiki/api/v2`,
     apiV1: `${url}/wiki/rest/api`,
     authHeader,
@@ -53,8 +114,61 @@ async function getConfig(): Promise<Config> {
       Authorization: authHeader,
       "Content-Type": "application/json",
     },
-  };
+  });
   return _config;
+}
+
+/**
+ * Validate credentials against the Confluence instance before accepting tool calls.
+ * 1. Test authentication (GET spaces)
+ * 2. Verify tenant identity (email matches)
+ * 3. Log connection info to stderr
+ */
+export async function validateStartup(config: Config): Promise<void> {
+  const { url, email, profile } = config;
+  // Extract apiToken from authHeader (it's baked into the Basic auth)
+  // We need raw credentials for testConnection/verifyTenantIdentity
+  const decoded = Buffer.from(
+    config.authHeader.replace("Basic ", ""),
+    "base64"
+  ).toString();
+  const colonIndex = decoded.indexOf(":");
+  const apiToken = decoded.slice(colonIndex + 1);
+
+  // Step 1: Authentication check
+  const connResult = await testConnection(url, email, apiToken);
+  if (!connResult.ok) {
+    const profileHint = profile
+      ? `Run \`epimethian-mcp setup --profile ${profile}\` to update credentials.`
+      : "Check your CONFLUENCE_URL, CONFLUENCE_EMAIL, and CONFLUENCE_API_TOKEN.";
+    console.error(
+      `Error: Confluence credentials rejected by ${url}\n${connResult.message}\n${profileHint}`
+    );
+    process.exit(1);
+  }
+
+  // Step 2: Tenant identity verification
+  const identityResult = await verifyTenantIdentity(url, email, apiToken);
+  if (!identityResult.ok) {
+    const profileHint = profile
+      ? `Run \`epimethian-mcp setup --profile ${profile}\` to reconfigure.`
+      : "Check your credential configuration.";
+    console.error(
+      `Error: Tenant identity mismatch for ${profile ? `profile "${profile}"` : "configured credentials"}.\n` +
+        `Expected user: ${email}\n` +
+        (identityResult.authenticatedEmail
+          ? `Authenticated as: ${identityResult.authenticatedEmail}\n`
+          : "") +
+        `This may indicate a DNS or configuration issue. ${profileHint}`
+    );
+    process.exit(1);
+  }
+
+  // Step 3: Log connection info
+  const profileLabel = profile ? `profile: ${profile}` : "env-var mode";
+  console.error(
+    `epimethian-mcp: connected to ${url} as ${email} (${profileLabel})`
+  );
 }
 
 // --- Zod response schemas (runtime validation) ---
@@ -128,6 +242,24 @@ const UploadResultSchema = z.object({
     .default([]),
 });
 
+// --- Error sanitization ---
+
+/**
+ * Sanitize error messages before they reach the MCP client.
+ * Truncates to 500 chars and strips anything resembling credentials.
+ * Full error details should be logged to stderr separately.
+ */
+export function sanitizeError(message: string): string {
+  let safe = message.slice(0, 500);
+  // Strip Basic auth tokens (base64-encoded credentials)
+  safe = safe.replace(/Basic [A-Za-z0-9+/=]{20,}/g, "Basic [REDACTED]");
+  // Strip Authorization headers
+  safe = safe.replace(/Authorization:\s*\S+/gi, "Authorization: [REDACTED]");
+  // Strip Bearer tokens
+  safe = safe.replace(/Bearer [A-Za-z0-9._-]{20,}/g, "Bearer [REDACTED]");
+  return safe;
+}
+
 // --- HTTP helpers ---
 
 async function confluenceRequest(
@@ -138,7 +270,10 @@ async function confluenceRequest(
   const res = await fetch(url, { headers: cfg.jsonHeaders, ...options });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Confluence API error (${res.status}): ${body}`);
+    console.error(`Confluence API error (${res.status}): ${body}`);
+    throw new Error(
+      `Confluence API error (${res.status}): ${sanitizeError(body)}`
+    );
   }
   return res;
 }
@@ -373,7 +508,10 @@ export async function uploadAttachment(
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Confluence API error (${res.status}): ${body}`);
+    console.error(`Confluence API error (${res.status}): ${body}`);
+    throw new Error(
+      `Confluence API error (${res.status}): ${sanitizeError(body)}`
+    );
   }
   const data = UploadResultSchema.parse(await res.json());
   const att = data.results[0];

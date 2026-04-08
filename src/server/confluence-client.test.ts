@@ -10,12 +10,20 @@ vi.hoisted(() => {
 // Mock keychain to prevent actual OS keychain access
 vi.mock("../shared/keychain.js", () => ({
   readFromKeychain: vi.fn().mockResolvedValue(null),
+  PROFILE_NAME_RE: /^[a-z0-9][a-z0-9-]{0,62}$/,
+}));
+
+// Mock test-connection to prevent real HTTP during tests
+vi.mock("../shared/test-connection.js", () => ({
+  testConnection: vi.fn().mockResolvedValue({ ok: true, message: "Connected" }),
+  verifyTenantIdentity: vi.fn().mockResolvedValue({ ok: true, authenticatedEmail: "user@test.com", message: "Verified" }),
 }));
 
 import {
   PageSchema,
   toStorageFormat,
   formatPage,
+  sanitizeError,
   resolveSpaceId,
   getPage,
   createPage,
@@ -64,7 +72,53 @@ beforeEach(() => {
 });
 
 // =============================================================================
-// D3 — Zod schemas
+// D3 — Error sanitization
+// =============================================================================
+
+describe("sanitizeError", () => {
+  it("passes through short safe messages unchanged", () => {
+    expect(sanitizeError("Not found")).toBe("Not found");
+  });
+
+  it("truncates messages longer than 500 characters", () => {
+    const long = "x".repeat(600);
+    expect(sanitizeError(long)).toBe("x".repeat(500));
+  });
+
+  it("strips Basic auth tokens", () => {
+    const msg = "Error with Basic dXNlckBleGFtcGxlLmNvbTp0b2tlbjEyMw== in header";
+    const result = sanitizeError(msg);
+    expect(result).toContain("Basic [REDACTED]");
+    expect(result).not.toContain("dXNlckBleGFtcGxlLmNvbTp0b2tlbjEyMw==");
+  });
+
+  it("strips Authorization header values", () => {
+    const msg = 'Failed: Authorization: Bearer abc123def456ghi789jkl012mno';
+    const result = sanitizeError(msg);
+    expect(result).toContain("Authorization: [REDACTED]");
+  });
+
+  it("strips Bearer tokens", () => {
+    const msg = "Token Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature was rejected";
+    const result = sanitizeError(msg);
+    expect(result).toContain("Bearer [REDACTED]");
+    expect(result).not.toContain("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
+  });
+
+  it("handles messages with multiple credential patterns", () => {
+    const msg = "Basic dXNlcjp0b2tlbjEyMzQ1Njc4OTA= and Authorization: SecretValue";
+    const result = sanitizeError(msg);
+    expect(result).not.toContain("dXNlcjp0b2tlbjEyMzQ1Njc4OTA=");
+    expect(result).not.toContain("SecretValue");
+  });
+
+  it("does not strip short non-credential strings", () => {
+    const msg = "Basic error occurred";
+    expect(sanitizeError(msg)).toBe("Basic error occurred");
+  });
+});
+
+// D4 — Zod schemas
 // =============================================================================
 
 describe("Zod schemas", () => {

@@ -1,3 +1,47 @@
+export async function verifyTenantIdentity(
+  url: string,
+  email: string,
+  apiToken: string
+): Promise<{ ok: boolean; authenticatedEmail?: string; message: string }> {
+  const endpoint = `${url.replace(/\/+$/, '')}/wiki/rest/api/user/current`;
+  const auth = Buffer.from(`${email}:${apiToken}`).toString('base64');
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'GET',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return { ok: false, message: `HTTP ${response.status}: ${response.statusText}` };
+    }
+
+    const body = (await response.json()) as {
+      email?: string;
+      displayName?: string;
+    };
+    const authenticatedEmail = body.email ?? '';
+
+    if (authenticatedEmail.toLowerCase() !== email.toLowerCase()) {
+      return {
+        ok: false,
+        authenticatedEmail,
+        message:
+          `Tenant identity mismatch. Expected: ${email}, authenticated as: ${authenticatedEmail}. ` +
+          'This may indicate a DNS or configuration issue.',
+      };
+    }
+
+    return { ok: true, authenticatedEmail, message: `Verified identity: ${authenticatedEmail}` };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `Identity verification failed: ${message}` };
+  }
+}
+
 export async function testConnection(
   url: string,
   email: string,
