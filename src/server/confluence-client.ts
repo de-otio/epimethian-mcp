@@ -521,7 +521,7 @@ export async function uploadAttachment(
 
 // --- Attribution ---
 
-const GITHUB_URL = "https://github.com/rmyers/epimethian-mcp";
+const GITHUB_URL = "https://github.com/de-otio/epimethian-mcp";
 const ATTRIBUTION_LABEL = "epimethian-managed";
 const ATTRIBUTION_START = "<!-- epimethian-attribution-start -->";
 const ATTRIBUTION_END = "<!-- epimethian-attribution-end -->";
