@@ -70,6 +70,148 @@ describe("runSetup", () => {
     expect(exitCode).toBe(1);
   });
 
+  it("exits with error when email is empty", async () => {
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net") // url
+      .mockResolvedValueOnce(""); // email
+
+    await expect(runSetup()).rejects.toThrow("process.exit(1)");
+    expect(exitCode).toBe(1);
+  });
+
+  it("exits with error when API token is empty", async () => {
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net")
+      .mockResolvedValueOnce("user@test.com");
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => cb("\n"), 0); // Enter with no input
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await expect(runSetup()).rejects.toThrow("process.exit(1)");
+    expect(exitCode).toBe(1);
+
+    process.stdin.on = originalOn;
+  });
+
+  it("strips trailing slashes from URL", async () => {
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net///")
+      .mockResolvedValueOnce("user@test.com");
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup();
+
+    expect(mockTestConnection).toHaveBeenCalledWith(
+      "https://test.atlassian.net",
+      "user@test.com",
+      "t"
+    );
+
+    process.stdin.on = originalOn;
+  });
+
+  it("uses existing keychain credentials as defaults", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce({
+      url: "https://existing.atlassian.net",
+      email: "old@test.com",
+      apiToken: "old-token",
+    });
+
+    // User presses Enter for both prompts (accepts defaults)
+    mockQuestion
+      .mockResolvedValueOnce("") // accept default URL
+      .mockResolvedValueOnce(""); // accept default email
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("n"); cb("e"); cb("w"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup();
+
+    expect(mockTestConnection).toHaveBeenCalledWith(
+      "https://existing.atlassian.net",
+      "old@test.com",
+      "new"
+    );
+    expect(mockSaveToKeychain).toHaveBeenCalledWith({
+      url: "https://existing.atlassian.net",
+      email: "old@test.com",
+      apiToken: "new",
+    });
+
+    process.stdin.on = originalOn;
+  });
+
+  it("handles backspace in password input", async () => {
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net")
+      .mockResolvedValueOnce("user@test.com");
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => {
+          cb("a");
+          cb("b");
+          cb("x");
+          cb("\u007f"); // backspace - removes "x"
+          cb("c");
+          cb("\n");
+        }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup();
+
+    expect(mockTestConnection).toHaveBeenCalledWith(
+      "https://test.atlassian.net",
+      "user@test.com",
+      "abc"
+    );
+
+    process.stdin.on = originalOn;
+  });
+
   it("saves to keychain on successful connection", async () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net") // url

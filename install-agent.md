@@ -80,9 +80,33 @@ The API token is generated at: https://id.atlassian.com/manage-profile/security/
 
 **Do NOT ask the user for the API token yourself.** The token must go directly from the user into the interactive setup command to avoid appearing in conversation logs.
 
-## Step 6: Validation
+## Step 6: User must restart the MCP client
 
-After the user completes setup and restarts the MCP client, verify by listing available Confluence tools or running a simple operation like listing spaces.
+**IMPORTANT:** The user must restart their MCP client (e.g., restart Claude Code, reload VS Code, restart Claude Desktop) for the new server configuration to take effect. The MCP client reads `.mcp.json` at startup and does not detect changes while running.
+
+Tell the user:
+> Please restart your MCP client now to activate the Confluence tools.
+
+## Step 7: Validation
+
+After the user restarts, verify the server is working by listing available Confluence tools or running a simple operation like listing spaces.
+
+## Troubleshooting
+
+If **npm install fails**:
+- Verify Node.js 18+ is installed: `node --version`
+- Verify npm is on PATH: `npm --version`
+- If permission errors occur, the user may need to fix their npm prefix or use a Node version manager (nvm, fnm)
+
+If **`epimethian-mcp setup` fails**:
+- "Connection failed": Verify the Confluence URL is correct and accessible
+- "Token is invalid or expired": The user needs to generate a new API token at https://id.atlassian.com/manage-profile/security/api-tokens
+- Keychain errors on Linux: The user may need to install `libsecret` / `gnome-keyring` (`apt install libsecret-tools` or equivalent)
+
+If **the server doesn't appear after restart**:
+- Verify the `.mcp.json` path is correct for the user's MCP client
+- Verify the `command` value is an absolute path (run `which epimethian-mcp` to confirm)
+- Check that `.mcp.json` contains valid JSON (no trailing commas, correct quoting)
 
 ## Available Tools (12)
 
