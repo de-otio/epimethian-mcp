@@ -2,7 +2,21 @@
 
 Confluence Cloud tools for AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). (not associated with or endorsed by Atlassian)
 
-> **Note:** For most Confluence use cases, the official [Atlassian MCP server](https://github.com/atlassian/atlassian-mcp-server) may be sufficient. Use Epimethian if you need draw.io diagram support, OS keychain credential storage, multi-tenant profile isolation, or attribution tracking on managed pages.
+## Why use this?
+
+The official [Atlassian MCP server](https://github.com/atlassian/atlassian-mcp-server) covers basic Confluence and Jira access. Epimethian targets gaps that matter for consultants, power users, and teams with strict security requirements:
+
+- **OS keychain credential storage** — API tokens are stored in macOS Keychain or Linux libsecret, never in plaintext config files. Setup uses masked input so tokens don't leak into terminal scrollback.
+- **Multi-tenant profile isolation** — Each Atlassian tenant gets its own named profile with fully separate credentials and keychain entries. No risk of cross-tenant writes when switching between clients.
+- **Tenant-aware write safety** — Write operations echo the target tenant so the AI agent (and you) always see where changes are going before they land.
+- **draw.io diagram support** — Create and embed draw.io diagrams directly in Confluence pages, something the official server doesn't expose.
+- **Attribution tracking** — Managed pages carry metadata so you can trace which AI-assisted edits touched which content.
+
+If you don't need any of the above, the official Atlassian server is a fine choice.
+
+## How it works
+
+Epimethian runs as a local MCP server that your AI agent (Claude Code, Cursor, etc.) talks to over stdio. On startup it reads a profile name from the environment, pulls the matching credentials from your OS keychain, validates the connection against Confluence Cloud, and then exposes a set of tools the agent can call. All Confluence API calls go directly from your machine to Atlassian — there is no intermediate service.
 
 ## Quick Start
 
