@@ -2,7 +2,7 @@
 
 Confluence Cloud tools for AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). (not associated with or endorsed by Atlassian)
 
-> **Note:** For most Confluence use cases, the official [Atlassian Rovo MCP server](https://github.com/atlassian/mcp-server-atlassian) may be sufficient. Use Epimethian if you need draw.io diagram support, OS keychain credential storage, multi-tenant profile isolation, or attribution tracking on managed pages.
+> **Note:** For most Confluence use cases, the official [Atlassian MCP server](https://github.com/atlassian/atlassian-mcp-server) may be sufficient. Use Epimethian if you need draw.io diagram support, OS keychain credential storage, multi-tenant profile isolation, or attribution tracking on managed pages.
 
 ## Quick Start
 
