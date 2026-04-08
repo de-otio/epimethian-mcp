@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import { main as startServer } from "../server/index.js";
 
 async function run(): Promise<void> {
