@@ -1,22 +1,52 @@
 # Setup
 
-## For Users (Local Extension Install)
+## For Users
 
-1. Download the `.vsix` from the latest CI build (see [08-ci.md](08-ci.md)) or build from source (see "For Developers" below)
-2. Install it: `code --install-extension epimethian-mcp-*.vsix`
-3. Open VS Code
-3. Open the configuration panel: Command Palette > **Epimethian MCP: Configure**
-4. Enter your Confluence URL, email, and API token
-5. Click **Test Connection** to verify
-6. Done -- the MCP server is now available to AI tools in VS Code
+### Via AI Agent (Recommended)
+
+Tell your AI agent:
+
+> Install and configure the Epimethian MCP server. See https://github.com/de-otio/epimethian-mcp
+
+The agent will read `install-agent.md` from the repository and handle the installation and configuration.
+
+### Manual Installation
+
+```bash
+npm install -g @de-otio/epimethian-mcp
+epimethian-mcp setup
+```
+
+The `setup` command prompts for:
+1. Confluence URL (e.g., `https://yoursite.atlassian.net`)
+2. Email address
+3. API token (masked input)
+
+It tests the connection and stores credentials in the OS keychain.
+
+Then add to your `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "confluence": {
+      "command": "epimethian-mcp",
+      "env": {
+        "CONFLUENCE_URL": "https://yoursite.atlassian.net",
+        "CONFLUENCE_EMAIL": "user@example.com"
+      }
+    }
+  }
+}
+```
 
 ## Generate an API Token
 
-1. Go to id.atlassian.com/manage-profile/security/api-tokens
+1. Go to https://id.atlassian.com/manage-profile/security/api-tokens
 2. Click **Create API token**
-3. Give it a label (e.g., "VS Code MCP") and click **Create**
+3. Give it a label (e.g., "Epimethian MCP") and click **Create**
 4. Copy the token (shown only once)
-5. Paste it into the extension's configuration webview
+5. Paste it into the `epimethian-mcp setup` prompt
 
 No admin access required. Any Confluence user can generate their own token.
 
@@ -24,19 +54,18 @@ No admin access required. Any Confluence user can generate their own token.
 
 | Setting | Storage | Location |
 |---------|---------|----------|
-| Confluence URL | VS Code settings | `settings.json` (not secret) |
-| Email | VS Code settings | `settings.json` (not secret) |
-| API token | VS Code SecretStorage | OS keychain (macOS Keychain, libsecret, Windows Credential Vault) |
+| Confluence URL | MCP config (`.mcp.json`) | env var, not secret |
+| Email | MCP config (`.mcp.json`) | env var, not secret |
+| API token | OS keychain | macOS Keychain / Linux libsecret |
 
 The API token never appears in plaintext config files. It is encrypted at rest by the OS credential store.
 
 ## For Developers (Building from Source)
 
 ```bash
-git clone https://github.com/rmyers/epimethian-mcp.git
+git clone https://github.com/de-otio/epimethian-mcp.git
 cd epimethian-mcp
 npm install
-npm run build          # esbuild bundles extension + server
-npm run package        # produces .vsix file
-code --install-extension epimethian-mcp-*.vsix
+npm run build
+npm test
 ```

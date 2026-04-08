@@ -1,191 +1,111 @@
-# VS Code Extension
+# CLI and npm Package
 
-## Extension Manifest (`package.json`)
+> **Note:** This file previously documented the VS Code extension, which was removed in v2.0.0 in favor of a standalone npm package.
 
-Key `contributes` fields:
+## Package Manifest (`package.json`)
+
+Key fields:
 
 ```jsonc
 {
-  "contributes": {
-    "commands": [
-      {
-        "command": "epimethian-mcp.configure",
-        "title": "Epimethian MCP: Configure"
-      },
-      {
-        "command": "epimethian-mcp.testConnection",
-        "title": "Epimethian MCP: Test Connection"
-      }
-    ],
-    "mcpServers": {
-      "confluence": {
-        "command": "node",
-        "args": ["${extensionPath}/dist/server.js"],
-        "env": {}
-      }
-    }
+  "name": "@de-otio/epimethian-mcp",
+  "bin": {
+    "epimethian-mcp": "./dist/cli/index.js"
   },
-  "activationEvents": [
-    "onStartupFinished"
-  ]
+  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  }
 }
 ```
 
-The `mcpServers` contribution registers the bundled MCP server with VS Code. The extension injects credentials into the server's environment at launch time by reading them from settings and SecretStorage.
+The `bin` field exposes the `epimethian-mcp` command globally after `npm install -g`.
 
-## Extension Host
+## CLI Entry Point (`src/cli/index.ts`)
 
-### Activation (`extension.ts`)
+The entry point routes based on `process.argv[2]`:
 
 ```typescript
-export async function activate(context: vscode.ExtensionContext) {
-  // Register the configuration webview command
-  context.subscriptions.push(
-    vscode.commands.registerCommand('epimethian-mcp.configure', () => {
-      ConfigPanel.createOrShow(context);
-    })
-  );
+#!/usr/bin/env node
+import { main as startServer } from '../server/index.js';
 
-  // Register MCP server environment provider
-  // Injects credentials from SecretStorage + settings into the server process
-  context.subscriptions.push(
-    vscode.lm.registerMCPServerEnvironmentProvider('confluence', {
-      async resolveEnvironment(env) {
-        const config = vscode.workspace.getConfiguration('epimethian-mcp');
-        const token = await context.secrets.get('epimethian-mcp.apiToken');
-        return {
-          ...env,
-          CONFLUENCE_URL: config.get<string>('url') ?? '',
-          CONFLUENCE_EMAIL: config.get<string>('email') ?? '',
-          CONFLUENCE_API_TOKEN: token ?? '',
-        };
-      }
-    })
-  );
+const command = process.argv[2];
+if (command === 'setup') {
+  const { runSetup } = await import('./setup.js');
+  await runSetup();
+} else {
+  await startServer();
 }
 ```
 
-### Configuration Helpers (`config.ts`)
+- **Default (no args):** Start the MCP server via stdio transport. This is how MCP clients launch it.
+- **`setup`:** Run the interactive credential setup command.
 
-```typescript
-export async function saveCredentials(
-  context: vscode.ExtensionContext,
-  url: string,
-  email: string,
-  apiToken: string
-): Promise<void> {
-  const config = vscode.workspace.getConfiguration('epimethian-mcp');
-  await config.update('url', url, vscode.ConfigurationTarget.Global);
-  await config.update('email', email, vscode.ConfigurationTarget.Global);
-  await context.secrets.store('epimethian-mcp.apiToken', apiToken);
-}
+## Setup Command (`src/cli/setup.ts`)
 
-export async function testConnection(
-  url: string,
-  email: string,
-  apiToken: string
-): Promise<{ ok: boolean; message: string }> {
-  // Makes a lightweight GET /wiki/api/v2/spaces?limit=1 call
-  // Returns success with user display name, or error details
-}
-```
+Interactive credential configuration:
 
-## Webview
+1. Prompts for Confluence URL (validates `https://`, strips trailing slash)
+2. Prompts for email
+3. Prompts for API token with **masked input** (`process.stdin.setRawMode(true)`, echoes `*`)
+4. Tests the connection via `testConnection()` (GET `/wiki/api/v2/spaces?limit=1`)
+5. On success: saves to OS keychain via `saveToKeychain()`
+6. Prints confirmation with list of available tools
 
-### Layout
+If existing credentials are found in the keychain, they are offered as defaults.
 
-The configuration webview is a single panel with:
+Requires an interactive terminal (`process.stdin.isTTY`). For headless environments, credentials are set via environment variables.
 
-1. **Confluence URL** -- text input, placeholder: `https://yourcompany.atlassian.net`
-2. **Email** -- text input, placeholder: `you@company.com`
-3. **API Token** -- password input (masked), with a link to the Atlassian token generation page
-4. **Test Connection** button -- calls the Confluence API to verify credentials
-5. **Save** button -- stores credentials via the extension host
-6. **Status area** -- shows connection test results:
-   - Last verified: timestamp of the most recent successful test
-   - Status: "Connected as [display name]" or error message
-7. **AI Clients** section -- lists supported AI tools with Register/Remove buttons for each
+## Agent Installation Guide (`install-agent.md`)
 
-### Multi-Client MCP Registration
+A markdown file at the repository root, written for AI agents, not humans. When a user says "Install Epimethian MCP", the agent fetches this file and follows it:
 
-The extension can register the Epimethian MCP server with multiple AI clients, not just VS Code. Each client stores its MCP config in a different file:
+1. Install: `npm install -g @de-otio/epimethian-mcp`
+2. Resolve path: `which epimethian-mcp`
+3. Collect non-secret config (URL, email) from user
+4. Write `.mcp.json` with command + env (no token)
+5. Direct user to run `epimethian-mcp setup` for credential storage
+6. Validate
 
-| Client | Config Path |
-|--------|------------|
-| Claude Code | `~/.claude/mcp.json` |
-| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| ChatGPT | `~/.chatgpt/mcp.json` |
-| Continue | `~/.continue/mcp.json` |
-| Kilo Code | `~/.kilo/mcp.json` |
+The agent must NOT handle the API token directly -- it would appear in conversation logs.
 
-Registration **merges** into the existing config file — it never overwrites. Only the `mcpServers.confluence` entry is added or updated; all other servers and top-level keys are preserved. Unregistration removes only the `confluence` entry.
+## Credential Resolution
 
-This logic lives in `src/extension/mcp-clients.ts`.
+At server startup, credentials are resolved in order:
 
-### Message Protocol
+1. **Environment variables:** `CONFLUENCE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`
+2. **OS keychain:** via `readFromKeychain()` in `src/shared/keychain.ts`
 
-The webview and extension host communicate via `postMessage`:
-
-```typescript
-// Webview -> Extension
-type WebviewMessage =
-  | { type: 'save'; url: string; email: string; apiToken: string }
-  | { type: 'testConnection'; url: string; email: string; apiToken: string }
-  | { type: 'requestConfig' }
-  | { type: 'registerClient'; clientId: string }
-  | { type: 'unregisterClient'; clientId: string };
-
-// Extension -> Webview
-type ExtensionMessage =
-  | { type: 'configLoaded'; url: string; email: string; hasToken: boolean; clients: ClientStatus[] }
-  | { type: 'testResult'; ok: boolean; message: string }
-  | { type: 'saved' }
-  | { type: 'clientUpdated'; clients: ClientStatus[] };
-
-interface ClientStatus {
-  id: string;
-  name: string;
-  pathDescription: string;
-  registered: boolean;
-}
-```
-
-### API Token Expiry
-
-Atlassian API tokens are opaque strings -- there is no API to query their expiration date. Tokens last until revoked (or until an org admin's expiration policy takes effect). The webview handles this by:
-
-- Displaying a **"Test Connection"** button that verifies the token works right now
-- Showing **"Last verified: [timestamp]"** after a successful test (persisted in global state)
-- If the test fails with 401, displaying **"Token is invalid or expired. Generate a new one."** with a link to the Atlassian token page
-
-This gives the user confidence their token is working without relying on expiry metadata that doesn't exist.
+The env var path is for CI/Docker where a secret manager injects credentials. For interactive use, the keychain is the primary store.
 
 ## Bundling
 
-esbuild produces two bundles:
+esbuild produces a single bundle:
 
 | Bundle | Entry | Output | Target |
 |--------|-------|--------|--------|
-| Extension | `src/extension/extension.ts` | `dist/extension.js` | `node` (VS Code extension host) |
-| Server | `src/server/index.ts` | `dist/server.js` | `node` (child process) |
+| CLI + Server | `src/cli/index.ts` | `dist/cli/index.js` | `node18` |
 
-Both are CommonJS bundles with external `vscode` module (extension only). The server bundle has no dependency on the `vscode` module -- it is a standalone Node.js process.
+The output includes a `#!/usr/bin/env node` shebang via esbuild's `banner` option.
 
 ```javascript
 // esbuild.config.mjs
 import { build } from 'esbuild';
 
-const shared = { bundle: true, platform: 'node', format: 'cjs', sourcemap: true };
+const shared = { bundle: true, platform: 'node', format: 'cjs', sourcemap: true, target: 'node18' };
 
-await Promise.all([
-  build({ ...shared, entryPoints: ['src/extension/extension.ts'], outfile: 'dist/extension.js', external: ['vscode'] }),
-  build({ ...shared, entryPoints: ['src/server/index.ts'], outfile: 'dist/server.js' }),
-]);
+await build({
+  ...shared,
+  entryPoints: ['src/cli/index.ts'],
+  outfile: 'dist/cli/index.js',
+  banner: { js: '#!/usr/bin/env node' },
+});
 ```
 
 ## Security Considerations
 
-- The API token is stored in SecretStorage, backed by the OS keychain. It is never written to `settings.json`, `.env`, or any file on disk.
-- The token is passed to the server process via environment variables at spawn time. Environment variables are process-scoped and not visible to other users on the system.
-- The webview uses a Content Security Policy that restricts scripts to the extension's own resources.
-- The webview password input masks the token by default.
+- The API token is stored in the OS keychain (macOS Keychain / Linux libsecret). It is never written to `.mcp.json`, `.env`, or any config file on disk.
+- The `setup` command uses masked input so the token doesn't appear in terminal scrollback.
+- URL and email (non-secrets) can be stored in `.mcp.json` as environment variables.
+- The server reads the token from the keychain at startup, keeping it in process memory only.
+- For CI environments, `CONFLUENCE_API_TOKEN` can be set via a secret manager -- it exists only in the process environment, not on disk.

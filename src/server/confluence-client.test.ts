@@ -113,10 +113,14 @@ describe("toStorageFormat", () => {
     expect(toStorageFormat("hello world")).toBe("<p>hello world</p>");
   });
 
-  it("wraps HTML that does not match the tag regex (e.g. <div>)", () => {
-    // The regex /<[a-z][\s>\/]/i requires a single letter then whitespace/>/slash
-    // <div> has <d then i, which doesn't match — so it gets wrapped
-    expect(toStorageFormat("<div>content</div>")).toBe("<p><div>content</div></p>");
+  it("passes through multi-letter HTML tags like <div>", () => {
+    expect(toStorageFormat("<div>content</div>")).toBe("<div>content</div>");
+  });
+
+  it("passes through other multi-letter tags", () => {
+    expect(toStorageFormat("<table><tr><td>data</td></tr></table>")).toBe("<table><tr><td>data</td></tr></table>");
+    expect(toStorageFormat("<h1>Title</h1>")).toBe("<h1>Title</h1>");
+    expect(toStorageFormat("<img src='x' />")).toBe("<img src='x' />");
   });
 
   it("passes through tags matching the regex like <p>", () => {
@@ -263,7 +267,8 @@ describe("createPage", () => {
     const body = JSON.parse(opts.body as string);
     expect(body.title).toBe("New Page");
     expect(body.spaceId).toBe("spaceA");
-    expect(body.body.value).toBe("<p>body text</p>");
+    expect(body.body.value).toContain("<p>body text</p>");
+    expect(body.body.value).toContain("epimethian-attribution");
     expect(body.parentId).toBeUndefined();
   });
 
@@ -294,7 +299,19 @@ describe("updatePage", () => {
     ]);
     await updatePage("30", { body: "new body" });
     const putBody = JSON.parse((global.fetch as any).mock.calls[1][1].body as string);
-    expect(putBody.body.value).toBe("<p>new body</p>");
+    expect(putBody.body.value).toContain("<p>new body</p>");
+    expect(putBody.body.value).toContain("epimethian-attribution");
+  });
+
+  it("includes custom versionMessage when provided", async () => {
+    global.fetch = mockFetchSequence([
+      { body: { id: "30", title: "T", version: { number: 1 } } },
+      { body: { id: "30", title: "T" } },
+    ]);
+    await updatePage("30", { body: "text", versionMessage: "Fixed typo" });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[1][1].body as string);
+    expect(putBody.version.message).toContain("Fixed typo");
+    expect(putBody.version.message).toContain("via Epimethian");
   });
 
   it("omits body from payload when not provided", async () => {

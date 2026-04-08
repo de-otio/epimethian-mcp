@@ -1,36 +1,3 @@
-import * as vscode from 'vscode';
-import { saveToKeychain } from '../shared/keychain.js';
-
-export async function saveCredentials(
-  context: vscode.ExtensionContext,
-  url: string,
-  email: string,
-  apiToken: string
-): Promise<void> {
-  const config = vscode.workspace.getConfiguration('epimethian-mcp');
-  await config.update('url', url, vscode.ConfigurationTarget.Global);
-  await config.update('email', email, vscode.ConfigurationTarget.Global);
-  await context.secrets.store('epimethian-mcp.apiToken', apiToken);
-
-  // Also write to OS keychain so the MCP server can read credentials
-  // without needing them in .mcp.json env vars
-  try {
-    await saveToKeychain({ url, email, apiToken });
-  } catch {
-    // Keychain write failed — credentials still saved in VS Code SecretStorage
-  }
-}
-
-export async function loadCredentials(
-  context: vscode.ExtensionContext
-): Promise<{ url: string; email: string; apiToken: string }> {
-  const config = vscode.workspace.getConfiguration('epimethian-mcp');
-  const url = config.get<string>('url') ?? '';
-  const email = config.get<string>('email') ?? '';
-  const apiToken = (await context.secrets.get('epimethian-mcp.apiToken')) ?? '';
-  return { url, email, apiToken };
-}
-
 export async function testConnection(
   url: string,
   email: string,

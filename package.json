@@ -1,62 +1,29 @@
 {
-  "name": "epimethian-mcp",
-  "displayName": "Epimethian MCP",
+  "name": "@de-otio/epimethian-mcp",
   "description": "Confluence Cloud tools for AI assistants via the Model Context Protocol",
-  "version": "1.0.0",
-  "publisher": "rmyers",
+  "version": "2.0.0",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rmyers/epimethian-mcp.git"
+    "url": "https://github.com/de-otio/epimethian-mcp.git"
   },
   "engines": {
-    "vscode": "^1.96.0",
     "node": ">=18"
   },
-  "categories": ["Other"],
-  "main": "dist/extension.js",
-  "activationEvents": ["onStartupFinished"],
-  "contributes": {
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "confluence-mcp",
-          "title": "Epimethian MCP",
-          "icon": "media/confluence.svg"
-        }
-      ]
-    },
-    "views": {
-      "confluence-mcp": [
-        {
-          "type": "webview",
-          "id": "epimethian-mcp.configView",
-          "name": "Configuration"
-        }
-      ]
-    },
-    "commands": [
-      {
-        "command": "epimethian-mcp.configure",
-        "title": "Epimethian MCP: Configure"
-      },
-      {
-        "command": "epimethian-mcp.testConnection",
-        "title": "Epimethian MCP: Test Connection"
-      }
-    ],
-    "mcpServers": {
-      "confluence": {
-        "command": "node",
-        "args": ["${extensionPath}/dist/server.js"],
-        "env": {}
-      }
-    }
+  "main": "./dist/cli/index.js",
+  "bin": {
+    "epimethian-mcp": "./dist/cli/index.js"
   },
+  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": ["confluence", "mcp", "model-context-protocol", "atlassian", "cli"],
   "scripts": {
     "build": "node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
-    "package": "vsce package --no-dependencies",
+    "prepublishOnly": "npm run build",
+    "prepack": "chmod +x dist/cli/index.js 2>/dev/null || true",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage"
   },
@@ -66,9 +33,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/vscode": "^1.96.0",
     "@vitest/coverage-v8": "^3.0.0",
-    "@vscode/vsce": "^3.0.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.0.0",
     "vitest": "^3.0.0"

@@ -1,69 +1,71 @@
 # Architecture
 
 ```
-  ┌───────────────────────────────────────────────────────────┐
-  │  VS Code                                                  │
-  │                                                           │
-  │  ┌─────────────────┐         ┌──────────────────────┐    │
-  │  │  Extension Host  │         │  Webview Panel       │    │
-  │  │                  │ <────> │  (Configuration UI)  │    │
-  │  │  - Activates     │  msg    │  - URL / email       │    │
-  │  │  - Reads secrets │  pass   │  - API token         │    │
-  │  │  - Registers MCP │         │  - Test connection   │    │
-  │  │  - Spawns server │         │  - Status display    │    │
-  │  └───────┬──────────┘         └──────────────────────┘    │
-  │          │                                                 │
-  │          │ stdio (JSON-RPC)                                │
-  │          ▼                                                 │
-  │  ┌──────────────────┐                                     │
-  │  │  MCP Server       │                                     │
-  │  │  (bundled child   │                                     │
-  │  │   process)        │                                     │
-  │  └───────┬──────────┘                                     │
-  │          │                                                 │
-  └──────────│─────────────────────────────────────────────────┘
-             │ HTTPS
-             │ Basic Auth
-             ▼
-     ┌────────────────┐
-     │  Confluence    │
-     │  Cloud API     │
-     │  (v2 REST)     │
-     └────────────────┘
+  ┌──────────────────────┐
+  │  MCP Client           │
+  │  (Claude Code,        │
+  │   Claude Desktop,     │
+  │   Cursor, etc.)       │
+  └───────┬──────────────┘
+          │ stdio (JSON-RPC)
+          ▼
+  ┌──────────────────────┐
+  │  epimethian-mcp       │
+  │  (npm global binary)  │
+  │                       │
+  │  - CLI entry point    │
+  │  - MCP server (12     │
+  │    Confluence tools)  │
+  │  - Reads credentials  │
+  │    from OS keychain   │
+  └───────┬──────────────┘
+          │ HTTPS
+          │ Basic Auth
+          ▼
+  ┌──────────────────────┐
+  │  Confluence           │
+  │  Cloud API            │
+  │  (v2 + v1 REST)      │
+  └──────────────────────┘
 ```
 
 ## How It Works
 
-1. User builds and installs the extension locally (`.vsix`)
-2. On first activation, the extension opens the configuration webview
-3. User enters Confluence URL, email, and API token in the webview
-4. The extension stores URL and email in VS Code settings; the API token goes to SecretStorage (OS keychain)
-5. The extension registers an MCP server that spawns the bundled server as a child process, passing credentials via environment variables
-6. AI features in VS Code (Copilot Chat, etc.) discover the MCP server and can call Confluence tools
+1. User installs globally: `npm install -g @de-otio/epimethian-mcp`
+2. User runs `epimethian-mcp setup` to enter credentials interactively (masked input)
+3. The setup command tests the connection and stores credentials in the OS keychain
+4. User (or AI agent) configures `.mcp.json` with the server command and non-secret env vars
+5. The MCP client launches `epimethian-mcp` as a child process via stdio
+6. On startup, the server reads credentials from env vars (URL, email) and the OS keychain (API token)
 7. All Confluence API calls use Basic Auth with the user's personal token
 
 ## Project Structure
 
 ```
 epimethian-mcp/
-├── package.json                  # Extension manifest + MCP server deps
+├── package.json                  # npm package manifest with bin entry
 ├── tsconfig.json
-├── esbuild.config.mjs            # Bundles extension + server separately
+├── esbuild.config.mjs            # Bundles CLI + server into single file
+├── install-agent.md              # Agent-readable installation guide
 ├── src/
-│   ├── extension/
-│   │   ├── extension.ts          # activate / deactivate entry point
-│   │   ├── config.ts             # SecretStorage + settings helpers
-│   │   ├── webview.ts            # Webview panel provider
-│   │   └── mcp-clients.ts       # Multi-client MCP config registration
+│   ├── cli/
+│   │   ├── index.ts              # Entry point: routes to server or setup
+│   │   └── setup.ts              # Interactive credential setup command
 │   ├── server/
 │   │   ├── index.ts              # MCP server setup + tool registrations
 │   │   └── confluence-client.ts  # HTTP helpers, Zod response schemas, formatting
 │   └── shared/
-│       └── types.ts              # Message types shared between extension & webview
+│       ├── keychain.ts           # OS keychain abstraction (macOS, Linux)
+│       └── test-connection.ts    # Connection test (used by setup command)
 ├── doc/
 │   └── design/
-├── prompts/
-└── .vscodeignore
+├── .github/
+│   └── workflows/
+│       ├── build.yml             # CI: build + test on push/PR
+│       └── publish.yml           # Publish to npm on GitHub release
+└── dist/
+    └── cli/
+        └── index.js              # Single bundled binary with shebang
 ```
 
-The extension and server are bundled into two separate files (`dist/extension.js` and `dist/server.js`) by esbuild. The server bundle is self-contained and launched as a child process.
+Everything is bundled by esbuild into a single file (`dist/cli/index.js`) with a `#!/usr/bin/env node` shebang. The binary is exposed as `epimethian-mcp` via the `bin` field in `package.json`.

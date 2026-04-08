@@ -1,11 +1,11 @@
 # Contributing
 
-Thanks for your interest in contributing to epimethian-mcp.
+Thanks for your interest in contributing to Epimethian MCP.
 
 ## Development Setup
 
 ```bash
-git clone https://github.com/rmyers/epimethian-mcp.git
+git clone https://github.com/de-otio/epimethian-mcp.git
 cd epimethian-mcp
 npm install
 npm run build
@@ -15,28 +15,26 @@ npm run build
 
 ```
 src/
-  extension/
-    extension.ts         # VS Code extension activate / deactivate
-    config.ts            # SecretStorage + settings helpers
-    webview.ts           # Configuration webview panel
-    mcp-clients.ts       # Multi-client MCP config registration
+  cli/
+    index.ts             # Entry point: routes to server or setup
+    setup.ts             # Interactive credential setup command
   server/
     index.ts             # MCP server setup + tool registrations
     confluence-client.ts # HTTP helpers, Zod response schemas, formatting
   shared/
-    types.ts             # Message types shared between extension & webview
+    keychain.ts          # OS keychain abstraction (macOS, Linux)
+    test-connection.ts   # Connection test for setup command
 doc/
   design/                # Design documents
   user-doc/              # End-user documentation
-prompts/                 # Prompt history
 ```
 
 ## Making Changes
 
-1. Fork the repo and create a branch from `main`
+1. Fork the repo and create a branch from `master`
 2. Make your changes
 3. Run `npm run build` to verify the build passes
-4. Run `npm test` if tests exist for the area you changed
+4. Run `npm test` to verify all tests pass
 5. Open a pull request
 
 ## Guidelines
@@ -52,4 +50,4 @@ Open an issue on GitHub with:
 - What you expected to happen
 - What actually happened
 - Steps to reproduce
-- Your VS Code version and OS
+- Your Node.js version and OS

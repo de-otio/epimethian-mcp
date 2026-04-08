@@ -1,67 +1,79 @@
-# epimethian-mcp
+# Epimethian MCP
 
-> **Note:** For most Confluence use cases, we recommend the official [Atlassian Rovo MCP server](https://github.com/atlassian/mcp-server-atlassian) instead. It covers standard page and space operations and is maintained by Atlassian. Use this extension if you need features it doesn't provide, such as draw.io diagram support, OS keychain credential storage, or the VS Code graphical configuration panel.
+Confluence Cloud tools for AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). (not associated with or endorsed by Atlassian)
 
-A VS Code extension that provides Confluence Cloud tools to AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). Build from source, install the `.vsix` locally, configure your credentials through a graphical panel, and your AI assistant can create, read, update, search, and manage Confluence pages.
+> **Note:** For most Confluence use cases, the official [Atlassian Rovo MCP server](https://github.com/atlassian/mcp-server-atlassian) may be sufficient. Use Epimethian if you need draw.io diagram support, OS keychain credential storage, or attribution tracking on managed pages.
 
-## Features
+## Quick Start
 
-- 12 Confluence tools: pages, spaces, search, attachments, draw.io diagrams
-- Graphical configuration via a VS Code webview -- no JSON editing
-- API token stored securely in your OS keychain (macOS Keychain, libsecret, Windows Credential Vault)
-- All changes attributed to your Confluence user identity
+Tell your AI agent:
+
+> Install and configure the Epimethian MCP server. See https://github.com/de-otio/epimethian-mcp
+
+Or install manually:
+
+```bash
+npm install -g @de-otio/epimethian-mcp
+epimethian-mcp setup
+```
+
+The `setup` command prompts for your Confluence URL, email, and API token (masked input), tests the connection, and stores credentials securely in your OS keychain.
+
+## MCP Configuration
+
+Add to your `.mcp.json` (or equivalent MCP client config):
+
+```json
+{
+  "mcpServers": {
+    "confluence": {
+      "command": "epimethian-mcp",
+      "env": {
+        "CONFLUENCE_URL": "https://yoursite.atlassian.net",
+        "CONFLUENCE_EMAIL": "user@example.com"
+      }
+    }
+  }
+}
+```
+
+The API token is read from the OS keychain at startup. **Do not put it in config files.**
+
+For IDE-hosted agents, use the absolute path from `which epimethian-mcp` as the `command` value.
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `create_page` | Create a new page |
-| `get_page` | Read a page by ID |
-| `get_page_by_title` | Look up a page by title |
-| `update_page` | Update an existing page |
-| `delete_page` | Delete a page |
-| `list_pages` | List pages in a space |
-| `get_page_children` | Get child pages |
-| `search_pages` | Search via CQL |
-| `get_spaces` | List available spaces |
-| `add_attachment` | Upload a file attachment |
-| `get_attachments` | List attachments on a page |
-| `add_drawio_diagram` | Add a draw.io diagram (all-in-one) |
+| Tool                 | Description                |
+| -------------------- | -------------------------- |
+| `create_page`        | Create a new page          |
+| `get_page`           | Read a page by ID          |
+| `get_page_by_title`  | Look up a page by title    |
+| `update_page`        | Update an existing page    |
+| `delete_page`        | Delete a page              |
+| `list_pages`         | List pages in a space      |
+| `get_page_children`  | Get child pages            |
+| `search_pages`       | Search via CQL             |
+| `get_spaces`         | List available spaces      |
+| `add_attachment`     | Upload a file attachment   |
+| `get_attachments`    | List attachments on a page |
+| `add_drawio_diagram` | Add a draw.io diagram      |
 
-## Installation
+## Credential Security
 
-### From CI Artifact
+- API tokens are stored in the OS keychain (macOS Keychain / Linux libsecret)
+- Tokens are never written to disk in plaintext
+- The `setup` command uses masked input so tokens don't appear in terminal scrollback
+- For CI/headless environments, set `CONFLUENCE_API_TOKEN` as an environment variable injected by your secret manager
 
-1. Go to the repository's **Actions** tab on GitHub
-2. Click the latest successful **Build Extension** run
-3. Download the **epimethian-mcp-vsix** artifact
-4. Extract and install:
-
-```bash
-code --install-extension epimethian-mcp-*.vsix
-```
-
-### From Source
+## Development
 
 ```bash
-git clone https://github.com/rmyers/epimethian-mcp.git
+git clone https://github.com/de-otio/epimethian-mcp.git
 cd epimethian-mcp
 npm install
 npm run build
-npm run package
-code --install-extension epimethian-mcp-*.vsix
+npm test
 ```
-
-## Setup
-
-1. Click the **Epimethian MCP** icon in the Activity Bar (left sidebar) to open the configuration panel
-2. Enter your Confluence URL (e.g., `https://yourcompany.atlassian.net`)
-3. Enter your Atlassian email address
-4. Enter your [API token](https://id.atlassian.com/manage-profile/security/api-tokens)
-5. Click **Test Connection** to verify
-6. Register the MCP server with your AI clients using the **AI Clients** section at the bottom of the panel
-
-Your API token is stored in the OS keychain and never written to disk in plaintext.
 
 ## License
 

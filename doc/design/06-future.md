@@ -9,12 +9,12 @@
 - Markdown-to-storage-format conversion
 - Cursor-based pagination for large result sets
 - In-memory caching for `resolveSpaceId` (space keys rarely change)
+- Windows keychain support (Credential Manager via PowerShell)
 
-## Extension Enhancements
-- Status bar item showing connection status
-- Auto-test connection on activation (non-blocking)
-- "Open in Confluence" command for page IDs in the editor
-- Support for multiple Confluence instances (workspace-scoped profiles)
+## CLI Enhancements
+- `epimethian-mcp status` -- Show current connection info and credential status
+- `epimethian-mcp update` -- Self-update to latest npm version
+- Support for multiple Confluence instances (named profiles in keychain)
 
 ## Cloud Deployment (Future)
 If centralized deployment is ever needed (e.g., for Bedrock agents), the server can be adapted to run on AWS AgentCore by:

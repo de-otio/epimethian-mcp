@@ -33,7 +33,7 @@ async function getConfig(): Promise<Config> {
 
   if (!url || !email || !apiToken) {
     console.error(
-      "Missing Confluence credentials. Set CONFLUENCE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN environment variables, or save credentials via the VS Code extension."
+      "Missing Confluence credentials. Set CONFLUENCE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN environment variables, or run `epimethian-mcp setup`."
     );
     process.exit(1);
   }
@@ -207,15 +207,28 @@ export async function createPage(
   body: string,
   parentId?: string
 ): Promise<PageData> {
+  const cleanBody = stripAttributionFooter(toStorageFormat(body));
   const payload: Record<string, unknown> = {
     title,
     spaceId,
     status: "current",
-    body: { representation: "storage", value: toStorageFormat(body) },
+    body: {
+      representation: "storage",
+      value: cleanBody + "\n" + buildAttributionFooter("created"),
+    },
+    version: { message: "Created by Epimethian" },
   };
   if (parentId) payload.parentId = parentId;
   const raw = await v2Post("/pages", payload);
-  return PageSchema.parse(raw);
+  const page = PageSchema.parse(raw);
+
+  try {
+    await addLabel(page.id, ATTRIBUTION_LABEL);
+  } catch {
+    // Label addition is non-critical
+  }
+
+  return page;
 }
 
 export async function updatePage(
@@ -230,21 +243,34 @@ export async function updatePage(
   const newVersion = (current.version?.number ?? 0) + 1;
   const newTitle = opts.title ?? current.title;
 
+  const versionMessage = opts.versionMessage
+    ? `${opts.versionMessage} (via Epimethian)`
+    : "Updated by Epimethian";
+
   const payload: Record<string, unknown> = {
     id: pageId,
     status: "current",
     title: newTitle,
-    version: { number: newVersion, message: opts.versionMessage },
+    version: { number: newVersion, message: versionMessage },
   };
   if (opts.body) {
+    const cleanBody = stripAttributionFooter(toStorageFormat(opts.body));
     payload.body = {
       representation: "storage",
-      value: toStorageFormat(opts.body),
+      value: cleanBody + "\n" + buildAttributionFooter("updated"),
     };
   }
 
   const raw = await v2Put(`/pages/${pageId}`, payload);
-  return { page: PageSchema.parse(raw), newVersion };
+  const page = PageSchema.parse(raw);
+
+  try {
+    await addLabel(page.id, ATTRIBUTION_LABEL);
+  } catch {
+    // Label addition is non-critical
+  }
+
+  return { page, newVersion };
 }
 
 export async function deletePage(pageId: string): Promise<void> {
@@ -355,9 +381,43 @@ export async function uploadAttachment(
   return { title: att.title, id: att.id, fileSize: att.extensions?.fileSize };
 }
 
+// --- Attribution ---
+
+const GITHUB_URL = "https://github.com/rmyers/epimethian-mcp";
+const ATTRIBUTION_LABEL = "epimethian-managed";
+const ATTRIBUTION_START = "<!-- epimethian-attribution-start -->";
+const ATTRIBUTION_END = "<!-- epimethian-attribution-end -->";
+
+function buildAttributionFooter(action: "created" | "updated"): string {
+  return (
+    ATTRIBUTION_START +
+    '<p style="font-size:11px;color:#999;margin-top:2em;">' +
+    `<em>This page was ${action} with ` +
+    `<a href="${GITHUB_URL}">Epimethian</a>.</em></p>` +
+    ATTRIBUTION_END
+  );
+}
+
+function stripAttributionFooter(body: string): string {
+  return body
+    .replace(
+      /<!-- epimethian-attribution-start -->[\s\S]*?<!-- epimethian-attribution-end -->/g,
+      ""
+    )
+    .trimEnd();
+}
+
+async function addLabel(pageId: string, label: string): Promise<void> {
+  const cfg = await getConfig();
+  await confluenceRequest(`${cfg.apiV1}/content/${pageId}/label`, {
+    method: "POST",
+    body: JSON.stringify([{ prefix: "global", name: label }]),
+  });
+}
+
 // --- Formatting helpers ---
 
-const HTML_TAG_RE = /<[a-z][\s>\/]/i;
+const HTML_TAG_RE = /<[a-z][a-z0-9]*[\s>\/]/i;
 
 export function toStorageFormat(body: string): string {
   return HTML_TAG_RE.test(body) ? body : `<p>${body}</p>`;

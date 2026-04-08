@@ -1,9 +1,0 @@
-**/*
-!dist/extension.js
-!dist/extension.js.map
-!dist/server.js
-!dist/server.js.map
-!media/confluence.svg
-!package.json
-!LICENSE
-!README.md

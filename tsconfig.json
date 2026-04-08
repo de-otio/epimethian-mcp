@@ -7,5 +7,5 @@
     "esModuleInterop": true,
     "noEmit": true
   },
-  "include": ["src/extension", "src/server", "src/shared"]
+  "include": ["src/cli", "src/server", "src/shared"]
 }

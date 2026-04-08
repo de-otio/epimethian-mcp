@@ -512,9 +512,7 @@ server.registerTool(
 
 // --- Start ---
 
-async function main() {
+export async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
-
-main();

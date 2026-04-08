@@ -63,7 +63,8 @@ vi.mock("node:fs/promises", () => ({
 let registeredTools: Map<string, { handler: Function; schema: any }>;
 
 beforeAll(async () => {
-  await import("./index.js");
+  const { main } = await import("./index.js");
+  await main();
   // Collect registered tools from mockRegisterTool calls
   registeredTools = new Map();
   for (const call of mockRegisterTool.mock.calls) {
@@ -303,6 +304,32 @@ describe("get_attachments tool", () => {
     expect(result.content[0].text).toContain("image.png");
     expect(result.content[0].text).toContain("2KB");
     expect(result.content[0].text).toContain("image/png");
+  });
+
+  it("handles attachments with missing extensions", async () => {
+    const { getAttachments } = await import("./confluence-client.js");
+    (getAttachments as any).mockResolvedValueOnce([
+      {
+        id: "att-2",
+        title: "doc.pdf",
+        extensions: {},
+      },
+    ]);
+
+    const handler = registeredTools.get("get_attachments")!.handler;
+    const result = await handler({ page_id: "1", limit: 25 });
+    expect(result.content[0].text).toContain("doc.pdf");
+    expect(result.content[0].text).toContain("unknown size");
+  });
+
+  it("returns error on failure", async () => {
+    const { getAttachments } = await import("./confluence-client.js");
+    (getAttachments as any).mockRejectedValueOnce(new Error("API error"));
+
+    const handler = registeredTools.get("get_attachments")!.handler;
+    const result = await handler({ page_id: "1", limit: 25 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error: API error");
   });
 
   it("returns message when no attachments", async () => {

@@ -13,14 +13,11 @@ const isWatch = process.argv.includes("--watch");
 const configs = [
   {
     ...shared,
-    entryPoints: ["src/extension/extension.ts"],
-    outfile: "dist/extension.js",
-    external: ["vscode"],
-  },
-  {
-    ...shared,
-    entryPoints: ["src/server/index.ts"],
-    outfile: "dist/server.js",
+    entryPoints: ["src/cli/index.ts"],
+    outfile: "dist/cli/index.js",
+    banner: {
+      js: "#!/usr/bin/env node",
+    },
   },
 ];
 
