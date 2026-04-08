@@ -14,15 +14,15 @@ The agent will read `install-agent.md` from the repository and handle the instal
 
 ```bash
 npm install -g @de-otio/epimethian-mcp
-epimethian-mcp setup
+epimethian-mcp setup --profile <name>
 ```
 
-The `setup` command prompts for:
+The `setup --profile` command prompts for:
 1. Confluence URL (e.g., `https://yoursite.atlassian.net`)
 2. Email address
 3. API token (masked input)
 
-It tests the connection and stores credentials in the OS keychain.
+It tests the connection and stores all three credentials in the OS keychain under the named profile.
 
 Then add to your `.mcp.json`:
 
@@ -32,8 +32,7 @@ Then add to your `.mcp.json`:
     "confluence": {
       "command": "epimethian-mcp",
       "env": {
-        "CONFLUENCE_URL": "https://yoursite.atlassian.net",
-        "CONFLUENCE_EMAIL": "user@example.com"
+        "CONFLUENCE_PROFILE": "<profile-name>"
       }
     }
   }
@@ -46,7 +45,7 @@ Then add to your `.mcp.json`:
 2. Click **Create API token**
 3. Give it a label (e.g., "Epimethian MCP") and click **Create**
 4. Copy the token (shown only once)
-5. Paste it into the `epimethian-mcp setup` prompt
+5. Paste it into the `epimethian-mcp setup --profile <name>` prompt
 
 No admin access required. Any Confluence user can generate their own token.
 
@@ -54,11 +53,14 @@ No admin access required. Any Confluence user can generate their own token.
 
 | Setting | Storage | Location |
 |---------|---------|----------|
-| Confluence URL | MCP config (`.mcp.json`) | env var, not secret |
-| Email | MCP config (`.mcp.json`) | env var, not secret |
-| API token | OS keychain | macOS Keychain / Linux libsecret |
+| Profile name | MCP config (`.mcp.json`) | `CONFLUENCE_PROFILE` env var, not secret |
+| Confluence URL | OS keychain | Stored per-profile, never in config files |
+| Email | OS keychain | Stored per-profile, never in config files |
+| API token | OS keychain | Stored per-profile, never in config files |
 
-The API token never appears in plaintext config files. It is encrypted at rest by the OS credential store.
+All credentials are stored as an atomic unit per profile. The API token never appears in plaintext config files. Credentials are encrypted at rest by the OS credential store.
+
+For CI/CD environments without a keychain, all three env vars (`CONFLUENCE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`) can be set directly. Partial combinations are rejected.
 
 ## For Developers (Building from Source)
 

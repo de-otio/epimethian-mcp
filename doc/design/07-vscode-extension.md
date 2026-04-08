@@ -62,21 +62,24 @@ A markdown file at the repository root, written for AI agents, not humans. When 
 
 1. Install: `npm install -g @de-otio/epimethian-mcp`
 2. Resolve path: `which epimethian-mcp`
-3. Collect non-secret config (URL, email) from user
-4. Write `.mcp.json` with command + env (no token)
-5. Direct user to run `epimethian-mcp setup` for credential storage
+3. Collect profile name from user
+4. Write `.mcp.json` with command + `CONFLUENCE_PROFILE` env var
+5. Direct user to run `epimethian-mcp setup --profile <name>` for credential storage
 6. Validate
 
 The agent must NOT handle the API token directly -- it would appear in conversation logs.
 
 ## Credential Resolution
 
+> **Updated in v3.0.0.** See `doc/design/10-multi-tenant.md` for the full design.
+
 At server startup, credentials are resolved in order:
 
-1. **Environment variables:** `CONFLUENCE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`
-2. **OS keychain:** via `readFromKeychain()` in `src/shared/keychain.ts`
+1. **Named profile:** `CONFLUENCE_PROFILE` env var → read all credentials from OS keychain
+2. **All three env vars:** `CONFLUENCE_URL` + `CONFLUENCE_EMAIL` + `CONFLUENCE_API_TOKEN` (CI/CD only)
+3. **Partial env vars or nothing:** hard error
 
-The env var path is for CI/Docker where a secret manager injects credentials. For interactive use, the keychain is the primary store.
+Credential merging across sources is never performed. The env var path is for CI/Docker where a secret manager injects all three credentials. For interactive use, named profiles are the primary store.
 
 ## Bundling
 

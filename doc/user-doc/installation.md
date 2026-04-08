@@ -24,18 +24,20 @@ npm install -g @de-otio/epimethian-mcp
 
 ### Step 2: Set Up Credentials
 
-Run the interactive setup command:
+Run the interactive setup command with a profile name:
 
 ```bash
-epimethian-mcp setup
+epimethian-mcp setup --profile <name>
 ```
+
+Choose a short, descriptive profile name (e.g., `jambit`, `acme-corp`). If you only work with one Confluence instance, any name works (e.g., `main`).
 
 This will prompt for:
 1. Your Confluence URL (e.g., `https://yourcompany.atlassian.net`)
 2. Your email address
 3. Your API token (masked input)
 
-It tests the connection and stores the API token securely in your OS keychain.
+It tests the connection and stores all credentials securely in your OS keychain under the named profile.
 
 To generate an API token:
 1. Go to [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
@@ -55,8 +57,7 @@ Add to your MCP client configuration (`.mcp.json` or equivalent):
     "confluence": {
       "command": "epimethian-mcp",
       "env": {
-        "CONFLUENCE_URL": "https://yourcompany.atlassian.net",
-        "CONFLUENCE_EMAIL": "you@company.com"
+        "CONFLUENCE_PROFILE": "<profile name from Step 2>"
       }
     }
   }
@@ -71,7 +72,7 @@ which epimethian-mcp
 
 Then use the output as the `command` value.
 
-**Important:** The API token is NOT in the config file. The server reads it from the OS keychain at startup.
+**Important:** Only `CONFLUENCE_PROFILE` goes in the config file. URL, email, and API token are read from the OS keychain at startup.
 
 ### Client-Specific Config Locations
 
@@ -82,15 +83,27 @@ Then use the output as the `command` value.
 | Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Cursor | `~/.cursor/mcp.json` |
 
+## Multi-Tenant Setup
+
+If you work with multiple Confluence instances (e.g., as a consultant), create a profile for each:
+
+```bash
+epimethian-mcp setup --profile jambit
+epimethian-mcp setup --profile acme-corp
+```
+
+Each project's `.mcp.json` specifies which profile to use. Profiles are fully isolated — different keychain entries, different Confluence instances.
+
 ## Environment Variables
 
-For CI/headless environments where OS keychain is not available:
+| Variable | Description |
+|----------|-------------|
+| `CONFLUENCE_PROFILE` | **Recommended.** Name of the credential profile in the OS keychain. |
+| `CONFLUENCE_URL` | Atlassian instance URL (CI/CD only — requires all three env vars) |
+| `CONFLUENCE_EMAIL` | Atlassian account email (CI/CD only) |
+| `CONFLUENCE_API_TOKEN` | API token (CI/CD only — use OS keychain for interactive use) |
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `CONFLUENCE_URL` | Yes | Your Atlassian instance URL |
-| `CONFLUENCE_EMAIL` | Yes | Your Atlassian account email |
-| `CONFLUENCE_API_TOKEN` | For CI only | Your API token (use OS keychain for interactive use) |
+For CI/headless environments where the OS keychain is not available, set all three `CONFLUENCE_*` env vars. Partial combinations are rejected.
 
 ## Verifying the Setup
 
@@ -100,14 +113,20 @@ After configuring, restart your AI client and ask:
 
 If configured correctly, your AI assistant will use the `get_spaces` tool and return your Confluence spaces.
 
+You can also test from the terminal:
+
+```bash
+CONFLUENCE_PROFILE=<name> epimethian-mcp status
+```
+
 ## Troubleshooting
 
 **Server fails to start**
-- Run `epimethian-mcp setup` to verify credentials are stored correctly.
-- Ensure `CONFLUENCE_URL` and `CONFLUENCE_EMAIL` are set in your MCP config.
+- Run `epimethian-mcp status` (with `CONFLUENCE_PROFILE` set) to verify credentials.
+- Ensure `CONFLUENCE_PROFILE` is set in your `.mcp.json`.
 
 **Authentication errors (401)**
-- Run `epimethian-mcp setup` to re-enter your API token.
+- Run `epimethian-mcp setup --profile <name>` to re-enter your API token.
 - Verify your token has not been revoked at id.atlassian.com.
 
 **Forbidden errors (403)**

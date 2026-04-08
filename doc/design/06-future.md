@@ -12,9 +12,11 @@
 - Windows keychain support (Credential Manager via PowerShell)
 
 ## CLI Enhancements
-- `epimethian-mcp status` -- Show current connection info and credential status
 - `epimethian-mcp update` -- Self-update to latest npm version
-- Support for multiple Confluence instances (named profiles in keychain)
+
+### Completed in v3.0.0
+- ~~`epimethian-mcp status` -- Show current connection info and credential status~~ → See `10-multi-tenant.md`
+- ~~Support for multiple Confluence instances (named profiles in keychain)~~ → See `10-multi-tenant.md`
 
 ## Cloud Deployment (Future)
 If centralized deployment is ever needed (e.g., for Bedrock agents), the server can be adapted to run on AWS AgentCore by:

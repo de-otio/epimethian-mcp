@@ -2,7 +2,7 @@
 
 Confluence Cloud tools for AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). (not associated with or endorsed by Atlassian)
 
-> **Note:** For most Confluence use cases, the official [Atlassian Rovo MCP server](https://github.com/atlassian/mcp-server-atlassian) may be sufficient. Use Epimethian if you need draw.io diagram support, OS keychain credential storage, or attribution tracking on managed pages.
+> **Note:** For most Confluence use cases, the official [Atlassian Rovo MCP server](https://github.com/atlassian/mcp-server-atlassian) may be sufficient. Use Epimethian if you need draw.io diagram support, OS keychain credential storage, multi-tenant profile isolation, or attribution tracking on managed pages.
 
 ## Quick Start
 
@@ -14,10 +14,10 @@ Or install manually:
 
 ```bash
 npm install -g @de-otio/epimethian-mcp
-epimethian-mcp setup
+epimethian-mcp setup --profile <name>
 ```
 
-The `setup` command prompts for your Confluence URL, email, and API token (masked input), tests the connection, and stores credentials securely in your OS keychain.
+The `setup` command prompts for your Confluence URL, email, and API token (masked input), tests the connection, and stores all credentials securely in your OS keychain under the named profile.
 
 ## MCP Configuration
 
@@ -29,17 +29,35 @@ Add to your `.mcp.json` (or equivalent MCP client config):
     "confluence": {
       "command": "epimethian-mcp",
       "env": {
-        "CONFLUENCE_URL": "https://yoursite.atlassian.net",
-        "CONFLUENCE_EMAIL": "user@example.com"
+        "CONFLUENCE_PROFILE": "my-profile"
       }
     }
   }
 }
 ```
 
-The API token is read from the OS keychain at startup. **Do not put it in config files.**
+All credentials (URL, email, token) are read from the OS keychain at startup. **Only the profile name goes in config files.**
 
 For IDE-hosted agents, use the absolute path from `which epimethian-mcp` as the `command` value.
+
+## Multi-Tenant Support
+
+Consultants and developers working across multiple Atlassian tenants can create a profile per tenant:
+
+```bash
+epimethian-mcp setup --profile jambit
+epimethian-mcp setup --profile acme-corp
+```
+
+Each project's `.mcp.json` specifies which profile to use. Profiles are fully isolated — separate keychain entries, separate Confluence instances, separate MCP server names (`confluence-jambit`, `confluence-acme-corp`).
+
+Manage profiles:
+
+```bash
+epimethian-mcp profiles              # list all
+epimethian-mcp profiles --verbose    # show URLs and emails
+CONFLUENCE_PROFILE=jambit epimethian-mcp status   # test connection
+```
 
 ## Tools
 
@@ -60,10 +78,13 @@ For IDE-hosted agents, use the absolute path from `which epimethian-mcp` as the 
 
 ## Credential Security
 
-- API tokens are stored in the OS keychain (macOS Keychain / Linux libsecret)
+- Credentials are stored per-profile in the OS keychain (macOS Keychain / Linux libsecret)
+- URL, email, and API token are stored as an atomic unit — no mixing across profiles
 - Tokens are never written to disk in plaintext
 - The `setup` command uses masked input so tokens don't appear in terminal scrollback
-- For CI/headless environments, set `CONFLUENCE_API_TOKEN` as an environment variable injected by your secret manager
+- Startup validation verifies credentials and tenant identity before accepting tool calls
+- Write operations include a tenant echo so the target is always visible
+- For CI/headless environments, set all three env vars (`CONFLUENCE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`) — partial combinations are rejected
 
 ## Development
 
