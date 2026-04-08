@@ -1,11 +1,11 @@
 {
   "name": "@de-otio/epimethian-mcp",
   "description": "Confluence Cloud tools for AI assistants via the Model Context Protocol",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/de-otio/epimethian-mcp.git"
+    "url": "git+https://github.com/de-otio/epimethian-mcp.git"
   },
   "engines": {
     "node": ">=18"
@@ -14,11 +14,19 @@
   "bin": {
     "epimethian-mcp": "./dist/cli/index.js"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },
-  "keywords": ["confluence", "mcp", "model-context-protocol", "atlassian", "cli"],
+  "keywords": [
+    "confluence",
+    "mcp",
+    "model-context-protocol",
+    "atlassian",
+    "cli"
+  ],
   "scripts": {
     "build": "node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
