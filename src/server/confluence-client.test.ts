@@ -23,6 +23,7 @@ import {
   PageSchema,
   toStorageFormat,
   formatPage,
+  extractHeadings,
   sanitizeError,
   resolveSpaceId,
   getPage,
@@ -36,9 +37,15 @@ import {
   getPageByTitle,
   getAttachments,
   uploadAttachment,
+  extractSection,
+  replaceSection,
+  truncateStorageFormat,
+  toMarkdownView,
+  looksLikeMarkdown,
   ConfluenceApiError,
   ConfluenceConflictError,
 } from "./confluence-client.js";
+import { pageCache } from "./page-cache.js";
 
 // --- Helpers ---
 
@@ -71,6 +78,7 @@ function mockFetchSequence(responses: Array<{ body: unknown; status?: number }>)
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  pageCache.clear();
 });
 
 // =============================================================================
@@ -148,6 +156,12 @@ describe("Zod schemas", () => {
       expect(result.version).toBeUndefined();
       expect(result.body).toBeUndefined();
       expect(result._links).toBeUndefined();
+      expect(result.excerpt).toBeUndefined();
+    });
+
+    it("parses a page with excerpt field", () => {
+      const result = PageSchema.parse({ id: "1", title: "T", excerpt: "Preview text" });
+      expect(result.excerpt).toBe("Preview text");
     });
 
     it("rejects data missing required id", () => {
@@ -258,6 +272,305 @@ describe("formatPage", () => {
     const result = await formatPage(page, false);
     expect(result).toContain("Space: N/A");
   });
+
+  it("returns heading outline when headingsOnly is true", async () => {
+    const page = {
+      id: "42",
+      title: "Test",
+      body: {
+        storage: {
+          value: "<h1>Introduction</h1><p>text</p><h2>Background</h2><p>more</p><h2>Goals</h2><h1>Architecture</h1>",
+        },
+      },
+    };
+    const result = await formatPage(page, { headingsOnly: true });
+    expect(result).toContain("Headings:");
+    expect(result).toContain("1. Introduction");
+    expect(result).toContain("  1.1. Background");
+    expect(result).toContain("  1.2. Goals");
+    expect(result).toContain("2. Architecture");
+    expect(result).not.toContain("Content:");
+    expect(result).not.toContain("<p>");
+  });
+
+  it("headingsOnly takes precedence over includeBody", async () => {
+    const page = {
+      id: "42",
+      title: "Test",
+      body: { storage: { value: "<h1>Title</h1><p>body text</p>" } },
+    };
+    const result = await formatPage(page, { includeBody: true, headingsOnly: true });
+    expect(result).toContain("Headings:");
+    expect(result).not.toContain("Content:");
+    expect(result).not.toContain("body text");
+  });
+
+  it("headingsOnly with no headings shows fallback message", async () => {
+    const page = {
+      id: "42",
+      title: "Test",
+      body: { storage: { value: "<p>Just a paragraph</p>" } },
+    };
+    const result = await formatPage(page, { headingsOnly: true });
+    expect(result).toContain("(no headings found)");
+  });
+
+  it("options object with includeBody works like boolean overload", async () => {
+    const page = {
+      id: "42",
+      title: "Test",
+      body: { storage: { value: "<p>Hello</p>" } },
+    };
+    const withBool = await formatPage(page, true);
+    const withObj = await formatPage(page, { includeBody: true });
+    expect(withBool).toBe(withObj);
+  });
+});
+
+describe("extractHeadings", () => {
+  it("extracts nested headings with numbering", () => {
+    const html = "<h1>A</h1><h2>B</h2><h2>C</h2><h3>D</h3><h1>E</h1>";
+    const result = extractHeadings(html);
+    expect(result).toBe(
+      "1. A\n  1.1. B\n  1.2. C\n    1.2.1. D\n2. E"
+    );
+  });
+
+  it("strips inline HTML tags from heading text", () => {
+    const html = '<h1><strong>Bold</strong> and <em>italic</em></h1>';
+    const result = extractHeadings(html);
+    expect(result).toBe("1. Bold and italic");
+  });
+
+  it("returns fallback for content with no headings", () => {
+    const html = "<p>No headings here</p>";
+    expect(extractHeadings(html)).toBe("(no headings found)");
+  });
+
+  it("returns fallback for empty string", () => {
+    expect(extractHeadings("")).toBe("(no headings found)");
+  });
+});
+
+describe("extractSection", () => {
+  const html = "<h1>Intro</h1><p>Intro text</p><h2>Background</h2><p>Background text</p><h2>Goals</h2><p>Goals text</p><h1>Architecture</h1><p>Arch text</p>";
+
+  it("extracts correct section from multi-section document", () => {
+    const result = extractSection(html, "Background");
+    expect(result).toBe("<h2>Background</h2><p>Background text</p>");
+  });
+
+  it("includes content up to next heading of same level", () => {
+    const result = extractSection(html, "Intro");
+    // h1 Intro should include h2 subsections until the next h1
+    expect(result).toContain("<h1>Intro</h1>");
+    expect(result).toContain("<p>Intro text</p>");
+    expect(result).toContain("<h2>Background</h2>");
+    expect(result).toContain("<h2>Goals</h2>");
+    expect(result).not.toContain("Architecture");
+  });
+
+  it("includes content through end of document when section is last", () => {
+    const result = extractSection(html, "Architecture");
+    expect(result).toBe("<h1>Architecture</h1><p>Arch text</p>");
+  });
+
+  it("preserves ac:structured-macro blocks within the section", () => {
+    const macroHtml = '<h1>Code</h1><ac:structured-macro ac:name="code"><ac:plain-text-body>print("hi")</ac:plain-text-body></ac:structured-macro><h1>End</h1>';
+    const result = extractSection(macroHtml, "Code");
+    expect(result).toContain("ac:structured-macro");
+    expect(result).not.toContain("End");
+  });
+
+  it("matches headings case-insensitively", () => {
+    const result = extractSection(html, "background");
+    expect(result).toContain("<h2>Background</h2>");
+  });
+
+  it("returns null for non-existent section", () => {
+    expect(extractSection(html, "Nonexistent")).toBeNull();
+  });
+
+  it("includes nested headings in extracted section", () => {
+    const nested = "<h1>Top</h1><h2>Sub</h2><h3>SubSub</h3><p>text</p><h1>Other</h1>";
+    const result = extractSection(nested, "Top");
+    expect(result).toContain("<h2>Sub</h2>");
+    expect(result).toContain("<h3>SubSub</h3>");
+    expect(result).not.toContain("Other");
+  });
+});
+
+describe("replaceSection", () => {
+  const html = "<h1>Intro</h1><p>Old intro</p><h1>Details</h1><p>Old details</p><h1>End</h1><p>Ending</p>";
+
+  it("replaces content under target heading", () => {
+    const result = replaceSection(html, "Details", "<p>New details</p>");
+    expect(result).toContain("<h1>Details</h1><p>New details</p>");
+    expect(result).not.toContain("Old details");
+  });
+
+  it("preserves content before and after the section", () => {
+    const result = replaceSection(html, "Details", "<p>New</p>");
+    expect(result).toContain("<h1>Intro</h1><p>Old intro</p>");
+    expect(result).toContain("<h1>End</h1><p>Ending</p>");
+  });
+
+  it("handles last section in document", () => {
+    const result = replaceSection(html, "End", "<p>New ending</p>");
+    expect(result).toContain("<h1>End</h1><p>New ending</p>");
+    expect(result).not.toContain("Ending");
+  });
+
+  it("preserves macros in other sections", () => {
+    const macroHtml = '<h1>A</h1><ac:structured-macro ac:name="code"><ac:plain-text-body>x</ac:plain-text-body></ac:structured-macro><h1>B</h1><p>old</p>';
+    const result = replaceSection(macroHtml, "B", "<p>new</p>");
+    expect(result).toContain("ac:structured-macro");
+    expect(result).toContain("<h1>B</h1><p>new</p>");
+  });
+
+  it("returns null when heading not found", () => {
+    expect(replaceSection(html, "Missing", "<p>x</p>")).toBeNull();
+  });
+
+  it("handles nested headings correctly", () => {
+    const nested = "<h1>A</h1><h2>A1</h2><p>a1 text</p><h2>A2</h2><p>a2 text</p><h1>B</h1><p>b text</p>";
+    // Replacing A should replace everything until B
+    const result = replaceSection(nested, "A", "<p>whole new A</p>");
+    expect(result).toBe("<h1>A</h1><p>whole new A</p><h1>B</h1><p>b text</p>");
+  });
+});
+
+describe("truncateStorageFormat", () => {
+  it("returns unchanged when content is shorter than maxLength", () => {
+    const html = "<p>short</p>";
+    expect(truncateStorageFormat(html, 100)).toBe(html);
+  });
+
+  it("truncates at element boundary", () => {
+    const html = "<p>first</p><p>second</p><p>third</p>";
+    const result = truncateStorageFormat(html, 20);
+    expect(result).toContain("<p>first</p>");
+    expect(result).toContain("[truncated at");
+    expect(result).not.toContain("third");
+  });
+
+  it("appends truncation marker with correct lengths", () => {
+    const html = "<p>aaa</p><p>bbb</p>";
+    const result = truncateStorageFormat(html, 12);
+    expect(result).toContain(`[truncated at 10 of ${html.length} characters]`);
+  });
+
+  it("does not split mid-tag", () => {
+    const html = "<p>hello</p><p>world</p>";
+    const result = truncateStorageFormat(html, 13);
+    // Should cut at </p> boundary (10), not mid-tag
+    expect(result).toContain("<p>hello</p>");
+    expect(result).not.toContain("<p>wor");
+  });
+
+  it("handles content with no HTML tags", () => {
+    const text = "Just plain text without any tags at all";
+    const result = truncateStorageFormat(text, 10);
+    // No closing tags found, falls back to maxLength
+    expect(result).toContain("[truncated at 10 of");
+  });
+
+  it("handles single large element gracefully", () => {
+    const html = "<p>" + "x".repeat(100) + "</p>";
+    const result = truncateStorageFormat(html, 10);
+    // No complete closing tag before maxLength, falls back to maxLength
+    expect(result).toContain("[truncated at");
+  });
+});
+
+describe("toMarkdownView", () => {
+  it("converts basic HTML to markdown", () => {
+    const html = "<h1>Title</h1><p>Hello <strong>world</strong></p>";
+    const result = toMarkdownView(html);
+    expect(result).toContain("# Title");
+    expect(result).toContain("**world**");
+  });
+
+  it("replaces ac:structured-macro with placeholder", () => {
+    const html = '<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">python</ac:parameter><ac:plain-text-body>print("hi")</ac:plain-text-body></ac:structured-macro>';
+    const result = toMarkdownView(html);
+    expect(result).toContain("[macro: code");
+    expect(result).toContain("language=python");
+  });
+
+  it("shows whitelisted parameters but redacts sensitive ones", () => {
+    const html = '<ac:structured-macro ac:name="widget"><ac:parameter ac:name="title">My Widget</ac:parameter><ac:parameter ac:name="url">https://secret.com/api</ac:parameter></ac:structured-macro>';
+    const result = toMarkdownView(html);
+    expect(result).toContain("title=My Widget");
+    expect(result).not.toContain("secret.com");
+  });
+
+  it("shows unknown macros with name only", () => {
+    const html = '<ac:structured-macro ac:name="custom-thing"><ac:parameter ac:name="apiKey">secret123</ac:parameter></ac:structured-macro>';
+    const result = toMarkdownView(html);
+    expect(result).toContain("[macro: custom-thing]");
+    expect(result).not.toContain("secret123");
+  });
+
+  it("replaces ac:layout with column count", () => {
+    const html = "<ac:layout><ac:layout-section><ac:layout-cell><p>A</p></ac:layout-cell><ac:layout-cell><p>B</p></ac:layout-cell></ac:layout-section></ac:layout>";
+    const result = toMarkdownView(html);
+    expect(result).toContain("[layout: 2-column]");
+  });
+
+  it("replaces ac:image with filename", () => {
+    const html = '<ac:image><ri:attachment ri:filename="diagram.png" /></ac:image>';
+    const result = toMarkdownView(html);
+    expect(result).toContain("[image: diagram.png]");
+  });
+
+  it("appends element count footer", () => {
+    const html = '<p>text</p><ac:structured-macro ac:name="toc"></ac:structured-macro><ac:structured-macro ac:name="code"><ac:plain-text-body>x</ac:plain-text-body></ac:structured-macro>';
+    const result = toMarkdownView(html);
+    expect(result).toContain("[Page contains 2 Confluence elements");
+  });
+
+  it("no footer when no Confluence elements", () => {
+    const html = "<p>Just a paragraph</p>";
+    const result = toMarkdownView(html);
+    expect(result).not.toContain("Confluence element");
+  });
+
+  it("handles empty string", () => {
+    const result = toMarkdownView("");
+    expect(result).toBe("");
+  });
+});
+
+describe("looksLikeMarkdown", () => {
+  it("detects markdown headings without HTML", () => {
+    expect(looksLikeMarkdown("# Title\n\nSome text")).toBe(true);
+  });
+
+  it("detects markdown links without HTML", () => {
+    expect(looksLikeMarkdown("See [this page](https://example.com)")).toBe(true);
+  });
+
+  it("detects markdown bold without HTML", () => {
+    expect(looksLikeMarkdown("This is **important**")).toBe(true);
+  });
+
+  it("returns false for storage format HTML", () => {
+    expect(looksLikeMarkdown("<p>Hello <strong>world</strong></p>")).toBe(false);
+  });
+
+  it("returns false for plain text with no markdown patterns", () => {
+    expect(looksLikeMarkdown("Just plain text")).toBe(false);
+  });
+
+  it("returns false for content with both markdown and HTML", () => {
+    // Storage format might contain # in text content
+    expect(looksLikeMarkdown("<p># Not a heading</p>")).toBe(false);
+  });
+
+  it("returns false for Confluence macros", () => {
+    expect(looksLikeMarkdown('# Title\n<ac:structured-macro ac:name="code"></ac:structured-macro>')).toBe(false);
+  });
 });
 
 // =============================================================================
@@ -305,6 +618,106 @@ describe("getPage", () => {
     const page = await getPage("10", false);
     expect(page.id).toBe("10");
     expect(page.title).toBe("P");
+  });
+
+  it("serves body from cache on version match", async () => {
+    // Pre-populate cache
+    pageCache.set("10", 3, "<p>cached</p>");
+    // Mock returns metadata-only (no body) with matching version
+    const metadataPage = { id: "10", title: "P", spaceId: "s1", version: { number: 3 } };
+    global.fetch = mockFetchResponse(metadataPage);
+    const page = await getPage("10", true);
+    // Only one API call (metadata-only, no body-format)
+    expect(global.fetch).toHaveBeenCalledOnce();
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).not.toContain("body-format");
+    // Body comes from cache
+    expect(page.body?.storage?.value).toBe("<p>cached</p>");
+  });
+
+  it("fetches full body on cache version mismatch", async () => {
+    // Pre-populate cache with old version
+    pageCache.set("10", 2, "<p>old</p>");
+    // First call: metadata-only (version 3 — mismatch)
+    const metadataPage = { id: "10", title: "P", spaceId: "s1", version: { number: 3 } };
+    // Second call: full fetch with body
+    const fullPage = { id: "10", title: "P", spaceId: "s1", version: { number: 3 }, body: { storage: { value: "<p>new</p>" } } };
+    let callCount = 0;
+    global.fetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      const data = callCount === 1 ? metadataPage : fullPage;
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(data) });
+    }) as any;
+    const page = await getPage("10", true);
+    expect(callCount).toBe(2);
+    expect(page.body?.storage?.value).toBe("<p>new</p>");
+  });
+
+  it("fetches full body directly when page is not in cache", async () => {
+    const fullPage = { id: "10", title: "P", spaceId: "s1", version: { number: 1 }, body: { storage: { value: "<p>body</p>" } } };
+    global.fetch = mockFetchResponse(fullPage);
+    const page = await getPage("10", true);
+    expect(global.fetch).toHaveBeenCalledOnce();
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).toContain("body-format=storage");
+    expect(page.body?.storage?.value).toBe("<p>body</p>");
+    // Now cached
+    expect(pageCache.has("10")).toEqual({ version: 1 });
+  });
+
+  it("includeBody false does not interact with cache", async () => {
+    pageCache.set("10", 3, "<p>cached</p>");
+    global.fetch = mockFetchResponse(samplePage);
+    await getPage("10", false);
+    // Cache should still be there, untouched
+    expect(pageCache.has("10")).toEqual({ version: 3 });
+  });
+});
+
+describe("page cache integration", () => {
+  it("createPage caches the body", async () => {
+    const createdPage = { id: "99", title: "New", version: { number: 1 } };
+    // createPage makes a POST then tries to add a label (2 fetches)
+    let callCount = 0;
+    global.fetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(createdPage) });
+    }) as any;
+    await createPage("space1", "New", "hello");
+    expect(pageCache.has("99")).toEqual({ version: 1 });
+  });
+
+  it("updatePage caches the body", async () => {
+    const updatedPage = { id: "10", title: "T", version: { number: 6 } };
+    let callCount = 0;
+    global.fetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(updatedPage) });
+    }) as any;
+    await updatePage("10", { title: "T", body: "<p>updated</p>", version: 5 });
+    expect(pageCache.has("10")).toEqual({ version: 6 });
+  });
+
+  it("deletePage evicts from cache", async () => {
+    pageCache.set("10", 5, "<p>body</p>");
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }) as any;
+    await deletePage("10");
+    expect(pageCache.has("10")).toBeUndefined();
+  });
+
+  it("getPage after updatePage serves from cache", async () => {
+    // Simulate update
+    const updatedPage = { id: "10", title: "T", version: { number: 6 } };
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(updatedPage) }) as any;
+    await updatePage("10", { title: "T", body: "<p>new content</p>", version: 5 });
+
+    // Now getPage — should use cache
+    const metadataPage = { id: "10", title: "T", spaceId: "s1", version: { number: 6 } };
+    global.fetch = mockFetchResponse(metadataPage);
+    const page = await getPage("10", true);
+    // Body from cache, only 1 API call (metadata-only)
+    expect(global.fetch).toHaveBeenCalledOnce();
+    expect(page.body?.storage?.value).toContain("new content");
   });
 });
 

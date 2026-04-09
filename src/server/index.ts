@@ -19,6 +19,11 @@ import {
   getAttachments,
   uploadAttachment,
   formatPage,
+  extractSection,
+  replaceSection,
+  truncateStorageFormat,
+  toMarkdownView,
+  looksLikeMarkdown,
   sanitizeError,
   getConfig,
   validateStartup,
@@ -100,20 +105,94 @@ function registerTools(server: McpServer, config: Config): void {
   server.registerTool(
     "get_page",
     {
-      description: "Read a Confluence page by ID",
+      description:
+        "Read a Confluence page by ID. For large pages, use headings_only to get the page outline first, then use section to read a specific section, or max_length to limit the response size.",
       inputSchema: {
         page_id: z.string().describe("The Confluence page ID"),
         include_body: z
           .boolean()
           .default(true)
           .describe("Whether to include the page body content"),
+        headings_only: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Return only the heading outline of the page (takes precedence over all other body options). Use this to preview page structure before fetching full content."
+          ),
+        section: z
+          .string()
+          .optional()
+          .describe(
+            "Return only the content under this heading (case-insensitive). Use headings_only first to see available sections."
+          ),
+        max_length: z
+          .number()
+          .optional()
+          .describe(
+            "Truncate the page body after this many characters."
+          ),
+        format: z
+          .enum(["storage", "markdown"])
+          .default("storage")
+          .describe(
+            "Response format. 'storage' (default) returns Confluence storage format, safe for editing. 'markdown' returns a read-only summary — macros and rich elements are summarized, not preserved."
+          ),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ page_id, include_body }) => {
+    async ({ page_id, include_body, headings_only, section, max_length, format }) => {
       try {
-        const page = await getPage(page_id, include_body);
-        return toolResult(await formatPage(page, include_body));
+        const needBody = include_body || headings_only || !!section;
+        const page = await getPage(page_id, needBody);
+
+        if (headings_only) {
+          return toolResult(
+            await formatPage(page, { headingsOnly: true })
+          );
+        }
+
+        if (section) {
+          const body = page.body?.storage?.value ?? page.body?.value ?? "";
+          const sectionContent = extractSection(body, section);
+          if (sectionContent === null) {
+            return toolResult(
+              `Section "${section}" not found. Use headings_only to see available sections.`
+            );
+          }
+          let content = sectionContent;
+          if (max_length && content.length > max_length) {
+            content = truncateStorageFormat(content, max_length);
+          }
+          if (format === "markdown") {
+            content = toMarkdownView(content);
+          }
+          const header = await formatPage(page, { includeBody: false });
+          return toolResult(`${header}\n\nSection: ${section}\n${content}`);
+        }
+
+        if (include_body && format === "markdown") {
+          const body = page.body?.storage?.value ?? page.body?.value ?? "";
+          let content = body;
+          if (max_length && content.length > max_length) {
+            content = truncateStorageFormat(content, max_length);
+          }
+          const md = toMarkdownView(content);
+          const header = await formatPage(page, { includeBody: false });
+          return toolResult(
+            `${header}\n\n⚠ Read-only markdown rendering. Macros and rich elements are summarized. To edit this page, use format: storage.\n\n${md}`
+          );
+        }
+
+        if (include_body && max_length) {
+          const body = page.body?.storage?.value ?? page.body?.value ?? "";
+          const truncated = truncateStorageFormat(body, max_length);
+          const header = await formatPage(page, { includeBody: false });
+          return toolResult(`${header}\n\nContent:\n${truncated}`);
+        }
+
+        return toolResult(
+          await formatPage(page, { includeBody: include_body })
+        );
       } catch (err) {
         return toolError(err);
       }
@@ -149,6 +228,11 @@ function registerTools(server: McpServer, config: Config): void {
     },
     async ({ page_id, title, version, body, version_message }) => {
       try {
+        if (body && looksLikeMarkdown(body)) {
+          return toolResult(
+            "Error: Body appears to be markdown, not Confluence storage format. The update_page tool requires storage format. Use get_page with format: storage to retrieve the editable content."
+          );
+        }
         const { page, newVersion } = await updatePage(page_id, {
           title,
           body,
@@ -184,6 +268,60 @@ function registerTools(server: McpServer, config: Config): void {
     }
   );
 
+  // update_page_section
+  server.registerTool(
+    "update_page_section",
+    {
+      description:
+        "Update a single section of a Confluence page by heading name. Only the content under the specified heading is replaced; the rest of the page is untouched. Use headings_only to find section names first.",
+      inputSchema: {
+        page_id: z.string().describe("The Confluence page ID"),
+        section: z
+          .string()
+          .describe("Heading text identifying the section to replace (case-insensitive)"),
+        body: z
+          .string()
+          .describe("New content for this section in Confluence storage format. The heading itself is preserved; only content under it is replaced."),
+        version: z
+          .number()
+          .int()
+          .positive()
+          .describe("The page version number from your most recent get_page call"),
+        version_message: z
+          .string()
+          .optional()
+          .describe("Optional version comment"),
+      },
+      annotations: { destructiveHint: false, idempotentHint: false },
+    },
+    async ({ page_id, section, body, version, version_message }) => {
+      try {
+        // Fetch the full page body
+        const page = await getPage(page_id, true);
+        const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
+
+        const newFullBody = replaceSection(fullBody, section, body);
+        if (newFullBody === null) {
+          return toolResult(
+            `Section "${section}" not found. Use headings_only to see available sections.`
+          );
+        }
+
+        const { page: updated, newVersion } = await updatePage(page_id, {
+          title: page.title,
+          body: newFullBody,
+          version,
+          versionMessage: version_message,
+        });
+        return toolResult(
+          `Updated section "${section}" in: ${updated.title} (ID: ${updated.id}, version: ${newVersion})` + echo
+        );
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
   // search_pages
   server.registerTool(
     "search_pages",
@@ -213,6 +351,9 @@ function registerTools(server: McpServer, config: Config): void {
         for (const p of results) {
           const spaceKey = p.spaceId ?? p.space?.key ?? "N/A";
           lines.push(`- ${p.title} (ID: ${p.id}, space: ${spaceKey})`);
+          if (p.excerpt) {
+            lines.push(`  ${p.excerpt}`);
+          }
         }
         return toolResult(lines.join("\n"));
       } catch (err) {
@@ -328,7 +469,8 @@ function registerTools(server: McpServer, config: Config): void {
   server.registerTool(
     "get_page_by_title",
     {
-      description: "Look up a Confluence page by its title within a space",
+      description:
+        "Look up a Confluence page by its title within a space. For large pages, use headings_only to get the page outline first, then use section to read a specific section.",
       inputSchema: {
         title: z.string().describe("Page title to search for"),
         space_key: z
@@ -338,19 +480,92 @@ function registerTools(server: McpServer, config: Config): void {
           .boolean()
           .default(false)
           .describe("Whether to include the page body content"),
+        headings_only: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Return only the heading outline of the page (takes precedence over all other body options). Use this to preview page structure before fetching full content."
+          ),
+        section: z
+          .string()
+          .optional()
+          .describe(
+            "Return only the content under this heading (case-insensitive). Use headings_only first to see available sections."
+          ),
+        max_length: z
+          .number()
+          .optional()
+          .describe(
+            "Truncate the page body after this many characters."
+          ),
+        format: z
+          .enum(["storage", "markdown"])
+          .default("storage")
+          .describe(
+            "Response format. 'storage' (default) returns Confluence storage format, safe for editing. 'markdown' returns a read-only summary — macros and rich elements are summarized, not preserved."
+          ),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ title, space_key, include_body }) => {
+    async ({ title, space_key, include_body, headings_only, section, max_length, format }) => {
       try {
         const spaceId = await resolveSpaceId(space_key);
-        const page = await getPageByTitle(spaceId, title, include_body);
+        const needBody = include_body || headings_only || !!section;
+        const page = await getPageByTitle(spaceId, title, needBody);
         if (!page) {
           return toolResult(
             `No page found with title "${title}" in space ${space_key}.`
           );
         }
-        return toolResult(await formatPage(page, include_body));
+
+        if (headings_only) {
+          return toolResult(
+            await formatPage(page, { headingsOnly: true })
+          );
+        }
+
+        if (section) {
+          const body = page.body?.storage?.value ?? page.body?.value ?? "";
+          const sectionContent = extractSection(body, section);
+          if (sectionContent === null) {
+            return toolResult(
+              `Section "${section}" not found. Use headings_only to see available sections.`
+            );
+          }
+          let content = sectionContent;
+          if (max_length && content.length > max_length) {
+            content = truncateStorageFormat(content, max_length);
+          }
+          if (format === "markdown") {
+            content = toMarkdownView(content);
+          }
+          const header = await formatPage(page, { includeBody: false });
+          return toolResult(`${header}\n\nSection: ${section}\n${content}`);
+        }
+
+        if (include_body && format === "markdown") {
+          const body = page.body?.storage?.value ?? page.body?.value ?? "";
+          let content = body;
+          if (max_length && content.length > max_length) {
+            content = truncateStorageFormat(content, max_length);
+          }
+          const md = toMarkdownView(content);
+          const header = await formatPage(page, { includeBody: false });
+          return toolResult(
+            `${header}\n\n⚠ Read-only markdown rendering. Macros and rich elements are summarized. To edit this page, use format: storage.\n\n${md}`
+          );
+        }
+
+        if (include_body && max_length) {
+          const body = page.body?.storage?.value ?? page.body?.value ?? "";
+          const truncated = truncateStorageFormat(body, max_length);
+          const header = await formatPage(page, { includeBody: false });
+          return toolResult(`${header}\n\nContent:\n${truncated}`);
+        }
+
+        return toolResult(
+          await formatPage(page, { includeBody: include_body, headingsOnly: headings_only })
+        );
       } catch (err) {
         return toolError(err);
       }

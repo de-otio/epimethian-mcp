@@ -13,6 +13,7 @@ const TOOLS = [
   "get_page",
   "get_page_by_title",
   "update_page",
+  "update_page_section",
   "delete_page",
   "list_pages",
   "get_page_children",

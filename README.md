@@ -87,9 +87,10 @@ The `--remove` command deletes the profile's keychain entry and registry record 
 | Tool                 | Description                |
 | -------------------- | -------------------------- |
 | `create_page`        | Create a new page          |
-| `get_page`           | Read a page by ID          |
-| `get_page_by_title`  | Look up a page by title    |
+| `get_page`           | Read a page by ID (supports `headings_only` outline) |
+| `get_page_by_title`  | Look up a page by title (supports `headings_only` outline) |
 | `update_page`        | Update an existing page    |
+| `update_page_section`| Update a single section by heading name |
 | `delete_page`        | Delete a page              |
 | `list_pages`         | List pages in a space      |
 | `get_page_children`  | Get child pages            |

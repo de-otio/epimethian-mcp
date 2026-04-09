@@ -1,6 +1,8 @@
 import { z } from "zod";
+import TurndownService from "turndown";
 import { readFromKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
 import { testConnection, verifyTenantIdentity } from "../shared/test-connection.js";
+import { pageCache } from "./page-cache.js";
 
 // --- Configuration ---
 
@@ -179,6 +181,7 @@ export const PageSchema = z.object({
   spaceId: z.string().optional(),
   space: z.object({ key: z.string() }).optional(),
   version: z.object({ number: z.number() }).optional(),
+  excerpt: z.string().optional(),
   body: z
     .object({
       storage: z.object({ value: z.string() }).optional(),
@@ -349,10 +352,33 @@ export async function getPage(
   pageId: string,
   includeBody: boolean
 ): Promise<PageData> {
-  const params: Record<string, string> = {};
-  if (includeBody) params["body-format"] = "storage";
-  const raw = await v2Get(`/pages/${pageId}`, params);
-  return PageSchema.parse(raw);
+  if (!includeBody) {
+    const raw = await v2Get(`/pages/${pageId}`, {});
+    return PageSchema.parse(raw);
+  }
+
+  // Check if this page is in the cache
+  const cached = pageCache.has(pageId);
+  if (cached) {
+    // Fetch metadata only (no body) to check version
+    const raw = await v2Get(`/pages/${pageId}`, {});
+    const page = PageSchema.parse(raw);
+    const version = page.version?.number ?? 0;
+    const body = pageCache.get(pageId, version);
+    if (body !== undefined) {
+      // Cache hit — inject the cached body into the page data
+      return { ...page, body: { storage: { value: body } } };
+    }
+  }
+
+  // Cache miss or never seen — full fetch
+  const raw = await v2Get(`/pages/${pageId}`, { "body-format": "storage" });
+  const page = PageSchema.parse(raw);
+  const body = page.body?.storage?.value ?? page.body?.value;
+  if (body !== undefined) {
+    pageCache.set(pageId, page.version?.number ?? 0, body);
+  }
+  return page;
 }
 
 export async function createPage(
@@ -375,6 +401,9 @@ export async function createPage(
   if (parentId) payload.parentId = parentId;
   const raw = await v2Post("/pages", payload);
   const page = PageSchema.parse(raw);
+
+  // Cache the body we just sent (new pages start at version 1)
+  pageCache.set(page.id, page.version?.number ?? 1, cleanBody + "\n" + buildAttributionFooter("created"));
 
   try {
     await addLabel(page.id, ATTRIBUTION_LABEL);
@@ -425,6 +454,12 @@ export async function updatePage(
   }
   const page = PageSchema.parse(raw);
 
+  // Cache the body we just sent
+  if (opts.body) {
+    const cachedBody = stripAttributionFooter(toStorageFormat(opts.body));
+    pageCache.set(pageId, newVersion, cachedBody + "\n" + buildAttributionFooter("updated"));
+  }
+
   try {
     await addLabel(page.id, ATTRIBUTION_LABEL);
   } catch {
@@ -436,6 +471,7 @@ export async function updatePage(
 
 export async function deletePage(pageId: string): Promise<void> {
   await v2Delete(`/pages/${pageId}`);
+  pageCache.delete(pageId);
 }
 
 export async function searchPages(
@@ -585,7 +621,290 @@ export function toStorageFormat(body: string): string {
   return HTML_TAG_RE.test(body) ? body : `<p>${body}</p>`;
 }
 
-export async function formatPage(page: PageData, includeBody: boolean): Promise<string> {
+/**
+ * Extract headings from Confluence storage format HTML.
+ * Returns a numbered outline string, e.g.:
+ *   1. Introduction
+ *   1.1. Background
+ *   1.2. Goals
+ *   2. Architecture
+ */
+export function extractHeadings(storageHtml: string): string {
+  const headingRe = /<h([1-6])[^>]*>(.*?)<\/h\1>/gi;
+  const counters = [0, 0, 0, 0, 0, 0]; // h1–h6
+  const lines: string[] = [];
+  let match;
+
+  while ((match = headingRe.exec(storageHtml)) !== null) {
+    const level = parseInt(match[1], 10);
+    // Reset all deeper counters
+    for (let i = level; i < 6; i++) counters[i] = 0;
+    counters[level - 1]++;
+    const number = counters.slice(0, level).filter(n => n > 0).join(".");
+    // Strip HTML tags from heading text
+    const text = match[2].replace(/<[^>]+>/g, "").trim();
+    lines.push(`${"  ".repeat(level - 1)}${number}. ${text}`);
+  }
+
+  return lines.length > 0 ? lines.join("\n") : "(no headings found)";
+}
+
+/**
+ * Extract the content under a specific heading from storage format HTML.
+ * Returns the heading element + all sibling content until the next heading
+ * of equal or higher level. Returns null if the heading is not found.
+ *
+ * Only matches top-level headings — headings inside <ac:structured-macro>
+ * or <ac:rich-text-body> are ignored.
+ */
+export function extractSection(storageHtml: string, headingText: string): string | null {
+  const { parse } = require("node-html-parser") as typeof import("node-html-parser");
+  const root = parse(storageHtml);
+  const topLevelNodes = root.childNodes;
+
+  // Find the target heading among top-level elements only
+  let startIdx = -1;
+  let headingLevel = 0;
+
+  for (let i = 0; i < topLevelNodes.length; i++) {
+    const node = topLevelNodes[i];
+    if (node.nodeType !== 1) continue; // skip text nodes
+    const el = node as import("node-html-parser").HTMLElement;
+    const tagMatch = el.tagName?.match(/^H([1-6])$/i);
+    if (tagMatch && el.text.trim().toLowerCase() === headingText.toLowerCase()) {
+      startIdx = i;
+      headingLevel = parseInt(tagMatch[1], 10);
+      break;
+    }
+  }
+
+  if (startIdx === -1) return null;
+
+  // Collect content until next heading of equal or higher level
+  let endIdx = topLevelNodes.length;
+  for (let i = startIdx + 1; i < topLevelNodes.length; i++) {
+    const node = topLevelNodes[i];
+    if (node.nodeType !== 1) continue;
+    const el = node as import("node-html-parser").HTMLElement;
+    const tagMatch = el.tagName?.match(/^H([1-6])$/i);
+    if (tagMatch && parseInt(tagMatch[1], 10) <= headingLevel) {
+      endIdx = i;
+      break;
+    }
+  }
+
+  const sectionNodes = topLevelNodes.slice(startIdx, endIdx);
+  return sectionNodes.map(n => n.toString()).join("");
+}
+
+/**
+ * Replace the content under a specific heading in storage format HTML.
+ * The heading itself is preserved; content between it and the next heading
+ * of equal or higher level is replaced with newContent.
+ * Returns the full HTML with the section replaced, or null if heading not found.
+ */
+export function replaceSection(
+  storageHtml: string,
+  headingText: string,
+  newContent: string
+): string | null {
+  const { parse } = require("node-html-parser") as typeof import("node-html-parser");
+  const root = parse(storageHtml);
+  const topLevelNodes = root.childNodes;
+
+  let startIdx = -1;
+  let headingLevel = 0;
+
+  for (let i = 0; i < topLevelNodes.length; i++) {
+    const node = topLevelNodes[i];
+    if (node.nodeType !== 1) continue;
+    const el = node as import("node-html-parser").HTMLElement;
+    const tagMatch = el.tagName?.match(/^H([1-6])$/i);
+    if (tagMatch && el.text.trim().toLowerCase() === headingText.toLowerCase()) {
+      startIdx = i;
+      headingLevel = parseInt(tagMatch[1], 10);
+      break;
+    }
+  }
+
+  if (startIdx === -1) return null;
+
+  let endIdx = topLevelNodes.length;
+  for (let i = startIdx + 1; i < topLevelNodes.length; i++) {
+    const node = topLevelNodes[i];
+    if (node.nodeType !== 1) continue;
+    const el = node as import("node-html-parser").HTMLElement;
+    const tagMatch = el.tagName?.match(/^H([1-6])$/i);
+    if (tagMatch && parseInt(tagMatch[1], 10) <= headingLevel) {
+      endIdx = i;
+      break;
+    }
+  }
+
+  // Reconstruct: before + heading + newContent + after
+  const before = topLevelNodes.slice(0, startIdx);
+  const heading = topLevelNodes[startIdx];
+  const after = topLevelNodes.slice(endIdx);
+
+  return (
+    before.map(n => n.toString()).join("") +
+    heading.toString() +
+    newContent +
+    after.map(n => n.toString()).join("")
+  );
+}
+
+/**
+ * Truncate storage format HTML at the nearest element boundary.
+ * Appends a truncation marker showing how much was cut.
+ */
+export function truncateStorageFormat(storageHtml: string, maxLength: number): string {
+  if (storageHtml.length <= maxLength) return storageHtml;
+
+  // Find the last complete element boundary (closing tag) before maxLength
+  let cutoff = maxLength;
+  // Look backward for the end of a complete tag
+  const closingTagRe = /<\/[a-z][a-z0-9]*>/gi;
+  let lastClose = 0;
+  let match;
+  while ((match = closingTagRe.exec(storageHtml)) !== null) {
+    const tagEnd = match.index + match[0].length;
+    if (tagEnd <= maxLength) {
+      lastClose = tagEnd;
+    } else {
+      break;
+    }
+  }
+
+  // Use the last complete element boundary, or maxLength if no tags found
+  cutoff = lastClose > 0 ? lastClose : maxLength;
+  const truncated = storageHtml.slice(0, cutoff);
+  return `${truncated}\n\n[truncated at ${cutoff} of ${storageHtml.length} characters]`;
+}
+
+/** Parameters that are safe to show in macro placeholders. */
+const SAFE_MACRO_PARAMS = new Set([
+  "language", "title", "linenumbers", "theme", "collapse",
+  "appearance", "color", "type", "name", "width", "height",
+]);
+
+/**
+ * Convert Confluence storage format HTML to a read-only markdown rendering.
+ * Confluence-specific elements (macros, layouts, images) are replaced with
+ * human-readable placeholders. This is a one-way, lossy conversion — the
+ * output must never be written back to Confluence.
+ */
+export function toMarkdownView(storageHtml: string): string {
+  let confluenceElementCount = 0;
+  let processed = storageHtml;
+
+  // Replace <ac:structured-macro> blocks with placeholders
+  processed = processed.replace(
+    /<ac:structured-macro[^>]*ac:name="([^"]*)"[^>]*>[\s\S]*?<\/ac:structured-macro>/gi,
+    (_match, name) => {
+      confluenceElementCount++;
+      // Extract safe parameters from the match
+      const paramRe = /<ac:parameter ac:name="([^"]*)"[^>]*>([^<]*)<\/ac:parameter>/gi;
+      const params: string[] = [];
+      let pm;
+      while ((pm = paramRe.exec(_match)) !== null) {
+        if (SAFE_MACRO_PARAMS.has(pm[1])) {
+          params.push(`${pm[1]}=${pm[2]}`);
+        }
+      }
+      const paramStr = params.length > 0 ? ` (${params.join(", ")})` : "";
+      return `\n\n[macro: ${name}${paramStr}]\n\n`;
+    }
+  );
+
+  // Replace <ac:layout> blocks with column count placeholders
+  processed = processed.replace(
+    /<ac:layout>[\s\S]*?<\/ac:layout>/gi,
+    (match) => {
+      confluenceElementCount++;
+      const cellCount = (match.match(/<ac:layout-cell/gi) || []).length;
+      return `\n\n[layout: ${cellCount}-column]\n\n`;
+    }
+  );
+
+  // Replace <ac:image> and <ri:attachment> references
+  processed = processed.replace(
+    /<ac:image[^>]*>[\s\S]*?<\/ac:image>/gi,
+    (match) => {
+      confluenceElementCount++;
+      const filenameMatch = match.match(/ri:filename="([^"]*)"/);
+      const name = filenameMatch ? filenameMatch[1] : "unknown";
+      return `[image: ${name}]`;
+    }
+  );
+
+  // Replace standalone <ri:attachment> refs outside of ac:image
+  processed = processed.replace(
+    /<ri:attachment ri:filename="([^"]*)"[^>]*\/>/gi,
+    (_match, filename) => {
+      confluenceElementCount++;
+      return `[attachment: ${filename}]`;
+    }
+  );
+
+  // Replace <ac:emoticon> with placeholder
+  processed = processed.replace(
+    /<ac:emoticon[^>]*ac:name="([^"]*)"[^>]*\/>/gi,
+    (_match, name) => {
+      confluenceElementCount++;
+      return `[emoticon: ${name}]`;
+    }
+  );
+
+  // Convert remaining HTML to markdown
+  const turndown = new TurndownService({
+    headingStyle: "atx",
+    codeBlockStyle: "fenced",
+  });
+  let markdown = turndown.turndown(processed);
+
+  // Unescape brackets in our placeholders that turndown escaped
+  markdown = markdown.replace(/\\\[([^\]]*)\\\]/g, "[$1]");
+
+  // Append element count footer
+  if (confluenceElementCount > 0) {
+    markdown += `\n\n---\n[Page contains ${confluenceElementCount} Confluence element${confluenceElementCount === 1 ? "" : "s"} not shown in this view. Use format: storage to see full content.]`;
+  }
+
+  return markdown;
+}
+
+/** Pattern that strongly suggests content is markdown, not storage format. */
+const MARKDOWN_PATTERN_RE = /(?:^#{1,6}\s|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\)|^```)/m;
+const STORAGE_FORMAT_RE = /<(?:ac:|ri:|p |p>|h[1-6][ >]|div[ >]|table[ >])/i;
+
+/**
+ * Detect if a body string is likely markdown rather than storage format.
+ * Returns true only when the content matches markdown patterns AND
+ * contains no storage format markers. Errs on the side of permissiveness.
+ */
+export function looksLikeMarkdown(body: string): boolean {
+  return MARKDOWN_PATTERN_RE.test(body) && !STORAGE_FORMAT_RE.test(body);
+}
+
+export type FormatPageOptions = {
+  includeBody?: boolean;
+  headingsOnly?: boolean;
+};
+
+export async function formatPage(page: PageData, includeBody: boolean): Promise<string>;
+export async function formatPage(page: PageData, options: FormatPageOptions): Promise<string>;
+export async function formatPage(
+  page: PageData,
+  optionsOrIncludeBody: boolean | FormatPageOptions
+): Promise<string> {
+  const options: FormatPageOptions =
+    typeof optionsOrIncludeBody === "boolean"
+      ? { includeBody: optionsOrIncludeBody }
+      : optionsOrIncludeBody;
+
+  const { includeBody = false, headingsOnly = false } = options;
+
   const cfg = await getConfig();
   const spaceKey = page.spaceId ?? page.space?.key ?? "N/A";
   const version = page.version?.number ?? 0;
@@ -603,7 +922,10 @@ export async function formatPage(page: PageData, includeBody: boolean): Promise<
     `URL: ${url}`,
   ];
 
-  if (includeBody) {
+  if (headingsOnly) {
+    const body = page.body?.storage?.value ?? page.body?.value ?? "";
+    lines.push("", "Headings:", extractHeadings(body));
+  } else if (includeBody) {
     const body = page.body?.storage?.value ?? page.body?.value ?? "";
     if (body) {
       lines.push("", `Content:`, body);

@@ -8,7 +8,7 @@ All tools return plain text (not JSON) for LLM consumption. Tools are registered
 |------|:---:|:---:|:---:|
 | `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments` | yes | — | — |
 | `create_page`, `add_attachment`, `add_drawio_diagram` | — | no | no |
-| `update_page` | — | no | no |
+| `update_page`, `update_page_section` | — | no | no |
 | `delete_page` | — | yes | yes |
 
 ## Tool Summary
@@ -16,14 +16,15 @@ All tools return plain text (not JSON) for LLM consumption. Tools are registered
 | Tool | Parameters | Description |
 |------|-----------|-------------|
 | `create_page` | title, space_key, body, parent_id? | Create a new Confluence page |
-| `get_page` | page_id, include_body? | Read a page by ID |
+| `get_page` | page_id, include_body?, headings_only?, section?, max_length?, format? | Read a page by ID |
 | `update_page` | page_id, title, version, body?, version_message? | Update an existing page (optimistic concurrency via version) |
+| `update_page_section` | page_id, section, body, version, version_message? | Update a single section by heading name |
 | `delete_page` | page_id | Delete a page by ID |
 | `search_pages` | cql, limit? | Search using CQL |
 | `list_pages` | space_key, limit?, status? | List pages in a space |
 | `get_page_children` | page_id, limit? | Get child pages |
 | `get_spaces` | limit?, type? | List available spaces |
-| `get_page_by_title` | title, space_key, include_body? | Look up a page by title within a space |
+| `get_page_by_title` | title, space_key, include_body?, headings_only?, section?, max_length?, format? | Look up a page by title within a space |
 | `add_attachment` | page_id, file_path, filename?, comment? | Upload a file attachment to a page |
 | `get_attachments` | page_id, limit? | List attachments on a page |
 | `add_drawio_diagram` | page_id, diagram_xml, diagram_name, append? | Add a draw.io diagram to a page (all-in-one) |
@@ -34,10 +35,13 @@ All tools return plain text (not JSON) for LLM consumption. Tools are registered
 Creates a new page in a Confluence space. Resolves the human-readable `space_key` (e.g., "DEV") to a numeric space ID internally. Plain text body content is auto-wrapped in `<p>` tags; HTML/storage format is passed through as-is.
 
 ### get_page
-Reads a page by its numeric ID. By default includes the page body in Confluence storage format. Returns title, ID, space, version, URL, and optionally the content.
+Reads a page by its numeric ID. By default includes the page body in Confluence storage format. Returns title, ID, space, version, URL, and optionally the content. For large pages, use `headings_only: true` to get the page outline first (a numbered heading hierarchy), then use `section` to read a specific section, or `max_length` to limit the response size. The `format: "markdown"` option returns a read-only markdown rendering (macros and rich elements are summarized as placeholders, not preserved). Page bodies are cached in memory to avoid redundant API calls during iterative editing sessions.
 
 ### update_page
-Updates an existing page using optimistic concurrency control. The caller must provide the `version` number from their most recent `get_page` call. The server sends `version + 1` to the Confluence API. If the page has been modified since the caller's read (version mismatch), Confluence returns a 409 and the tool returns a `ConfluenceConflictError` instructing the agent to re-read the page. Both `title` and `version` are required; `body` is optional (omit to update only the title).
+Updates an existing page using optimistic concurrency control. The caller must provide the `version` number from their most recent `get_page` call. The server sends `version + 1` to the Confluence API. If the page has been modified since the caller's read (version mismatch), Confluence returns a 409 and the tool returns a `ConfluenceConflictError` instructing the agent to re-read the page. Both `title` and `version` are required; `body` is optional (omit to update only the title). Bodies that appear to be markdown (rather than storage format) are rejected with an error.
+
+### update_page_section
+Updates a single section of a page by heading name. The rest of the page is untouched. Fetches the full page body, replaces the content under the specified heading (case-insensitive match), and calls `update_page` with the reconstructed body. Uses the same optimistic concurrency pattern as `update_page`. This reduces the blast radius of edits — untouched sections are never re-serialized.
 
 ### delete_page
 Deletes a page by ID. Returns confirmation text.
@@ -55,7 +59,7 @@ Returns child pages of a given parent page ID.
 Lists available Confluence spaces. Supports filtering by type (`global`, `personal`) and limiting result count. Useful for discovering space keys before using other tools.
 
 ### get_page_by_title
-Looks up a page by its exact title within a space. Returns the same formatted output as `get_page`. Useful when you know the page name but not its numeric ID.
+Looks up a page by its exact title within a space. Returns the same formatted output as `get_page`. Useful when you know the page name but not its numeric ID. Supports the same `headings_only` drill-down pattern as `get_page`.
 
 ### add_attachment
 Uploads a local file as an attachment to a Confluence page. Reads the file from the local filesystem and uploads via the v1 attachment API with `X-Atlassian-Token: nocheck` header. **Security:** The file path is resolved and validated to be under `process.cwd()` to prevent exfiltration of files outside the working directory.

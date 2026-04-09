@@ -29,7 +29,8 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 }));
 
 // Mock the confluence-client so we don't need real HTTP
-vi.mock("./confluence-client.js", () => {
+vi.mock("./confluence-client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./confluence-client.js")>();
   class ConfluenceConflictError extends Error {
     constructor(pageId: string) {
       super(`Version conflict: page ${pageId} has been modified since you last read it. Call get_page to fetch the latest version, then retry your update with the new version number.`);
@@ -50,6 +51,11 @@ vi.mock("./confluence-client.js", () => {
     getAttachments: vi.fn(),
     uploadAttachment: vi.fn(),
     formatPage: vi.fn().mockReturnValue("formatted page"),
+    extractSection: actual.extractSection,
+    replaceSection: actual.replaceSection,
+    truncateStorageFormat: actual.truncateStorageFormat,
+    toMarkdownView: actual.toMarkdownView,
+    looksLikeMarkdown: actual.looksLikeMarkdown,
     sanitizeError: (msg: string) => msg.slice(0, 500),
     ConfluenceConflictError,
     getConfig: vi.fn().mockResolvedValue({
@@ -104,6 +110,7 @@ describe("MCP server index", () => {
       "create_page",
       "get_page",
       "update_page",
+      "update_page_section",
       "delete_page",
       "search_pages",
       "list_pages",
@@ -294,6 +301,43 @@ describe("search_pages tool", () => {
     const result = await handler({ cql: "nothing", limit: 25 });
     expect(result.content[0].text).toContain("No pages found");
   });
+
+  it("includes excerpt when present", async () => {
+    const { searchPages } = await import("./confluence-client.js");
+    (searchPages as any).mockResolvedValueOnce([
+      { id: "1", title: "Page A", spaceId: "SP", excerpt: "This is a preview of the page" },
+    ]);
+
+    const handler = registeredTools.get("search_pages")!.handler;
+    const result = await handler({ cql: "test", limit: 25 });
+    expect(result.content[0].text).toContain("This is a preview of the page");
+  });
+
+  it("omits excerpt line when excerpt is missing", async () => {
+    const { searchPages } = await import("./confluence-client.js");
+    (searchPages as any).mockResolvedValueOnce([
+      { id: "1", title: "Page A", spaceId: "SP" },
+    ]);
+
+    const handler = registeredTools.get("search_pages")!.handler;
+    const result = await handler({ cql: "test", limit: 25 });
+    const text = result.content[0].text;
+    const lines = text.split("\n").filter((l: string) => l.startsWith("  "));
+    expect(lines).toHaveLength(0);
+  });
+
+  it("omits excerpt line when excerpt is empty string", async () => {
+    const { searchPages } = await import("./confluence-client.js");
+    (searchPages as any).mockResolvedValueOnce([
+      { id: "1", title: "Page A", spaceId: "SP", excerpt: "" },
+    ]);
+
+    const handler = registeredTools.get("search_pages")!.handler;
+    const result = await handler({ cql: "test", limit: 25 });
+    const text = result.content[0].text;
+    const lines = text.split("\n").filter((l: string) => l.startsWith("  "));
+    expect(lines).toHaveLength(0);
+  });
 });
 
 describe("get_spaces tool", () => {
@@ -370,5 +414,241 @@ describe("get_attachments tool", () => {
     const handler = registeredTools.get("get_attachments")!.handler;
     const result = await handler({ page_id: "1", limit: 25 });
     expect(result.content[0].text).toContain("No attachments found");
+  });
+});
+
+describe("get_page section/max_length params", () => {
+  const pageWithBody = {
+    id: "1",
+    title: "T",
+    body: { storage: { value: "<h1>Intro</h1><p>Intro text</p><h1>Details</h1><p>Details text</p>" } },
+  };
+
+  it("section parameter returns only matching section", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce(pageWithBody);
+    (formatPage as any).mockResolvedValueOnce("Title: T\nID: 1");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({ page_id: "1", include_body: true, headings_only: false, section: "Details" });
+    expect(result.content[0].text).toContain("Section: Details");
+    expect(result.content[0].text).toContain("<h1>Details</h1>");
+    expect(result.content[0].text).toContain("Details text");
+  });
+
+  it("section returns error when not found", async () => {
+    const { getPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce(pageWithBody);
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({ page_id: "1", include_body: true, headings_only: false, section: "Missing" });
+    expect(result.content[0].text).toContain('Section "Missing" not found');
+  });
+
+  it("max_length truncates body", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce(pageWithBody);
+    (formatPage as any).mockResolvedValueOnce("Title: T\nID: 1");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({ page_id: "1", include_body: true, headings_only: false, max_length: 30 });
+    expect(result.content[0].text).toContain("[truncated at");
+  });
+
+  it("headings_only takes precedence over section", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce(pageWithBody);
+    (formatPage as any).mockImplementationOnce(() => "Title: T\nHeadings:\n1. Intro\n2. Details");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({ page_id: "1", include_body: true, headings_only: true, section: "Intro" });
+    expect(result.content[0].text).toContain("Headings:");
+    expect(result.content[0].text).not.toContain("Section:");
+  });
+});
+
+describe("update_page_section tool", () => {
+  it("replaces section content and updates page", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    const fullPage = {
+      id: "1",
+      title: "T",
+      body: { storage: { value: "<h1>A</h1><p>old</p><h1>B</h1><p>keep</p>" } },
+    };
+    (getPage as any).mockResolvedValueOnce(fullPage);
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "1",
+      section: "A",
+      body: "<p>new</p>",
+      version: 5,
+    });
+    expect(result.content[0].text).toContain('Updated section "A"');
+    expect(result.content[0].text).toContain("version: 6");
+
+    // Verify updatePage was called with reconstructed body
+    const updateCall = (updatePage as any).mock.calls[0];
+    expect(updateCall[1].body).toContain("<p>new</p>");
+    expect(updateCall[1].body).toContain("<h1>B</h1><p>keep</p>");
+  });
+
+  it("returns error when section not found", async () => {
+    const { getPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      body: { storage: { value: "<h1>A</h1><p>text</p>" } },
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "1",
+      section: "Missing",
+      body: "<p>x</p>",
+      version: 5,
+    });
+    expect(result.content[0].text).toContain('Section "Missing" not found');
+  });
+
+  it("passes version_message to updatePage", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      body: { storage: { value: "<h1>A</h1><p>old</p>" } },
+    });
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 3,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    await handler({
+      page_id: "1",
+      section: "A",
+      body: "<p>new</p>",
+      version: 2,
+      version_message: "Updated intro",
+    });
+    const updateCall = (updatePage as any).mock.calls[0];
+    expect(updateCall[1].versionMessage).toBe("Updated intro");
+  });
+});
+
+describe("get_page format: markdown", () => {
+  const pageWithBody = {
+    id: "1",
+    title: "T",
+    body: { storage: { value: '<h1>Title</h1><p>Hello <strong>world</strong></p><ac:structured-macro ac:name="toc"></ac:structured-macro>' } },
+  };
+
+  it("returns markdown with warning when format is markdown", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce(pageWithBody);
+    (formatPage as any).mockResolvedValueOnce("Title: T\nID: 1");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({ page_id: "1", include_body: true, headings_only: false, format: "markdown" });
+    const text = result.content[0].text;
+    expect(text).toContain("Read-only markdown rendering");
+    expect(text).toContain("# Title");
+    expect(text).toContain("**world**");
+  });
+
+  it("returns storage format by default", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce(pageWithBody);
+    (formatPage as any).mockResolvedValueOnce("Title: T\nContent:\n<h1>Title</h1>");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({ page_id: "1", include_body: true, headings_only: false, format: "storage" });
+    expect(result.content[0].text).not.toContain("Read-only markdown");
+  });
+
+  it("format markdown + section returns markdown for section", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce(pageWithBody);
+    (formatPage as any).mockResolvedValueOnce("Title: T\nID: 1");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({ page_id: "1", include_body: true, headings_only: false, section: "Title", format: "markdown" });
+    const text = result.content[0].text;
+    expect(text).toContain("Section: Title");
+    // Should contain markdown, not raw HTML
+    expect(text).toContain("**world**");
+  });
+});
+
+describe("update_page markdown guard", () => {
+  it("rejects body that is clearly markdown", async () => {
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: "# Heading\n\nSome **bold** text and a [link](https://example.com)",
+    });
+    expect(result.content[0].text).toContain("appears to be markdown");
+  });
+
+  it("accepts storage format HTML", async () => {
+    const { updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: "<p>Hello <strong>world</strong></p>",
+    });
+    expect(result.content[0].text).toContain("Updated:");
+  });
+
+  it("accepts plain text without markdown patterns", async () => {
+    const { updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: "Just some plain text",
+    });
+    expect(result.content[0].text).toContain("Updated:");
+  });
+
+  it("accepts body with markdown-like patterns AND HTML tags", async () => {
+    const { updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: "<p># Not actually a heading, just a hash in HTML</p>",
+    });
+    expect(result.content[0].text).toContain("Updated:");
   });
 });

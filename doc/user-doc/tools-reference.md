@@ -36,26 +36,34 @@ Plain text body content is automatically wrapped in `<p>` tags. HTML in Confluen
 
 ### `get_page`
 
-Reads a page by its numeric ID.
+Reads a page by its numeric ID. For large pages, use `headings_only` to get the page outline first, then use `section` to read a specific section, or `max_length` to limit the response size.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `page_id` | string | Yes | Numeric page ID |
 | `include_body` | boolean | No | Whether to include page content (default: true) |
+| `headings_only` | boolean | No | Return only the heading outline (default: false). Takes precedence over all other body options. |
+| `section` | string | No | Return only the content under this heading (case-insensitive). Use `headings_only` first to see available sections. |
+| `max_length` | number | No | Truncate the page body after this many characters. |
+| `format` | string | No | `"storage"` (default) or `"markdown"`. Markdown is a read-only rendering — macros and rich elements are summarized, not preserved. |
 
-Returns title, ID, space, version, URL, and optionally the page content in Confluence storage format.
+Returns title, ID, space, version, URL, and optionally the page content. Page bodies are cached in memory — repeated reads of the same page version avoid redundant API calls.
 
 ---
 
 ### `get_page_by_title`
 
-Looks up a page by its exact title within a space.
+Looks up a page by its exact title within a space. Supports the same parameters as `get_page` (`headings_only`, `section`, `max_length`, `format`).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `title` | string | Yes | Exact page title |
 | `space_key` | string | Yes | Space key (e.g., `DEV`) |
 | `include_body` | boolean | No | Whether to include page content (default: false) |
+| `headings_only` | boolean | No | Return only the heading outline (default: false). Takes precedence over all other body options. |
+| `section` | string | No | Return only the content under this heading (case-insensitive). |
+| `max_length` | number | No | Truncate the page body after this many characters. |
+| `format` | string | No | `"storage"` (default) or `"markdown"`. |
 
 Returns the same output as `get_page`. Use this when you know the page name but not its numeric ID.
 
@@ -72,6 +80,24 @@ Updates an existing page using optimistic concurrency control. You must provide 
 | `version` | number | Yes | Page version number from your most recent `get_page` call |
 | `body` | string | No | New page content (omit to leave body unchanged) |
 | `version_message` | string | No | Version comment visible in page history |
+
+Bodies that appear to be markdown (rather than Confluence storage format) are rejected with an error to prevent accidental data loss.
+
+---
+
+### `update_page_section`
+
+Updates a single section of a page by heading name. Only the content under the specified heading is replaced; the rest of the page is untouched.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page_id` | string | Yes | Numeric page ID |
+| `section` | string | Yes | Heading text identifying the section to replace (case-insensitive) |
+| `body` | string | Yes | New content for this section in Confluence storage format |
+| `version` | number | Yes | Page version number from your most recent `get_page` call |
+| `version_message` | string | No | Version comment visible in page history |
+
+Use `headings_only` on `get_page` first to find section names. This reduces the blast radius of edits — the LLM never needs to handle the full page body.
 
 ---
 

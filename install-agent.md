@@ -218,14 +218,15 @@ If **the server doesn't appear after restart**:
 - Verify the `command` value is an absolute path (run `which epimethian-mcp` to confirm)
 - Check that `.mcp.json` contains valid JSON (no trailing commas, correct quoting)
 
-## Available Tools (12)
+## Available Tools (13)
 
 | Tool | Description |
 |------|-------------|
 | `create_page` | Create a new Confluence page |
-| `get_page` | Read a page by ID |
-| `get_page_by_title` | Look up a page by title in a space |
+| `get_page` | Read a page by ID (use `headings_only` to preview structure first) |
+| `get_page_by_title` | Look up a page by title (use `headings_only` to preview structure first) |
 | `update_page` | Update an existing page |
+| `update_page_section` | Update a single section by heading name |
 | `delete_page` | Delete a page |
 | `list_pages` | List pages in a space |
 | `get_page_children` | Get child pages of a page |
