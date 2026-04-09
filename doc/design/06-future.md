@@ -1,16 +1,22 @@
 # Phase 2 Considerations
 
 ## Additional Tools
-- `get_page_comments` / `add_comment` -- Comment operations
-- `get_page_history` -- Version history
+- (none remaining — all planned tools have been implemented)
 
 ## Enhancements
 - Cursor-based pagination for large result sets
 - Windows keychain support (Credential Manager via PowerShell)
 - Advisory file locking on profile registry (proper-lockfile) for concurrent CLI safety
 
+### Completed in v4.5.0
+- ~~Content status badges~~ → `get_page_status`, `set_page_status`, `remove_page_status` tools
+- ~~Page version history / diff~~ → `get_page_versions`, `get_page_version`, `diff_page_versions` tools. See `investigations/investigate-version-history.md`
+
+### Completed in v4.4.0
+- ~~Comment operations~~ → `get_comments`, `create_comment`, `resolve_comment`, `delete_comment` tools. See `investigations/investigate-comments.md`
+
 ### Completed in v4.3.0
-- ~~Page label management~~ → `get_labels`, `add_label`, `remove_label` tools
+- ~~Page label management~~ → `get_labels`, `add_label`, `remove_label` tools. See `investigations/investigate-labels.md`
 
 ### Completed in v4.2.0
 - ~~Per-profile read-only mode~~ → Whitelist-based write guard, strict-mode OR merge, `[READ-ONLY]` tool prefix, default read-only for new profiles. See `investigations/investigate-write-locks.md`

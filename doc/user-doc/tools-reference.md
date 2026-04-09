@@ -266,3 +266,87 @@ Deletes a comment. Blocked in read-only mode.
 | `type` | string | Yes | Comment type: `footer` or `inline` |
 
 Deleting a parent comment also deletes all replies to that comment.
+
+---
+
+## Content Status
+
+### `get_page_status`
+
+Gets the content status badge (e.g., "Draft", "In Progress", "Ready for Review") on a page. Works in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page_id` | string | Yes | Confluence page ID |
+
+Returns the status name and color, or indicates that no status is set.
+
+---
+
+### `set_page_status`
+
+Sets the content status badge on a page. Blocked in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page_id` | string | Yes | Confluence page ID |
+| `name` | string | Yes | Status name (max 20 characters, no control characters) |
+| `color` | string | Yes | Status color: `#FFC400` (yellow), `#2684FF` (blue), `#57D9A3` (green), `#FF7452` (red), or `#8777D9` (purple) |
+
+Setting a status creates a new page version. This is a Confluence Cloud behavior — the tool warns about it in the response.
+
+---
+
+### `remove_page_status`
+
+Removes the content status badge from a page. Blocked in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page_id` | string | Yes | Confluence page ID |
+
+Idempotent — removing a status that doesn't exist succeeds silently.
+
+---
+
+## Version History
+
+### `get_page_versions`
+
+Lists the version history for a page. Works in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page_id` | string | Yes | Confluence page ID |
+| `limit` | number | No | Maximum number of versions to return (1–200, default: 25) |
+
+Returns version number, author, date, and optional version message for each version. Results are ordered from newest to oldest.
+
+---
+
+### `get_page_version`
+
+Gets the content of a page at a specific historical version. Works in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page_id` | string | Yes | Confluence page ID |
+| `version` | number | Yes | Version number (must be ≥ 1) |
+
+Returns the page content as sanitized markdown at the requested version. Historical version bodies are cached separately from current versions.
+
+---
+
+### `diff_page_versions`
+
+Compares two versions of a page with a section-aware summary or unified diff. Works in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page_id` | string | Yes | Confluence page ID |
+| `from_version` | number | Yes | Starting version number |
+| `to_version` | number | No | Ending version number (defaults to current version) |
+| `max_length` | number | No | Truncate output after this many characters |
+| `format` | string | No | `"summary"` (default) or `"unified"`. Summary shows section-level changes; unified shows a standard diff. |
+
+The summary format groups changes by heading — added sections, removed sections, and modified sections with per-section diffs. Useful for answering "what changed since version X?"

@@ -14,7 +14,7 @@
   │  (npm global binary)  │
   │                       │
   │  - CLI entry point    │
-  │  - MCP server (13     │
+  │  - MCP server (26     │
   │    Confluence tools)  │
   │  - Reads credentials  │
   │    from OS keychain   │
@@ -58,7 +58,8 @@ epimethian-mcp/
 │   ├── server/
 │   │   ├── index.ts              # MCP server setup + tool registrations
 │   │   ├── confluence-client.ts  # HTTP helpers, Zod schemas, formatting, section ops
-│   │   └── page-cache.ts         # In-memory version-keyed page cache (LRU)
+│   │   ├── page-cache.ts         # In-memory version-keyed page cache (LRU)
+│   │   └── diff.ts               # Section-aware summary and unified diff for version comparison
 │   └── shared/
 │       ├── keychain.ts           # OS keychain abstraction (macOS, Linux)
 │       ├── profiles.ts           # Profile registry (JSON file alongside keychain)

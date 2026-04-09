@@ -10,10 +10,10 @@ When a profile is configured as read-only (`readOnly: true` in profile settings 
 
 | Tool | readOnlyHint | destructiveHint | idempotentHint |
 |------|:---:|:---:|:---:|
-| `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments`, `get_labels` | yes | — | — |
-| `create_page`, `add_attachment`, `add_drawio_diagram`, `add_label` | — | no | no |
-| `update_page`, `update_page_section` | — | no | no |
-| `delete_page`, `remove_label` | — | yes | yes |
+| `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments`, `get_labels`, `get_comments`, `get_page_status`, `get_page_versions`, `get_page_version`, `diff_page_versions` | yes | — | — |
+| `create_page`, `add_attachment`, `add_drawio_diagram`, `add_label`, `create_comment` | — | no | no |
+| `update_page`, `update_page_section`, `resolve_comment` | — | no | no |
+| `delete_page`, `remove_label`, `delete_comment`, `set_page_status`, `remove_page_status` | — | yes | yes |
 
 ## Tool Summary
 
@@ -35,6 +35,16 @@ When a profile is configured as read-only (`readOnly: true` in profile settings 
 | `get_labels` | page_id | Get all labels on a page |
 | `add_label` | page_id, labels | Add one or more labels to a page |
 | `remove_label` | page_id, label | Remove a label from a page |
+| `get_comments` | page_id, type?, resolution_status?, include_replies? | Get footer/inline comments on a page |
+| `create_comment` | page_id, body, type?, parent_comment_id?, text_selection?, text_selection_match_index? | Create a footer or inline comment |
+| `resolve_comment` | comment_id, resolved? | Resolve or reopen an inline comment |
+| `delete_comment` | comment_id, type | Permanently delete a comment |
+| `get_page_status` | page_id | Get the content status badge on a page |
+| `set_page_status` | page_id, name, color | Set the content status badge on a page |
+| `remove_page_status` | page_id | Remove the content status badge from a page |
+| `get_page_versions` | page_id, limit? | List version history for a page |
+| `get_page_version` | page_id, version | Get page content at a specific historical version |
+| `diff_page_versions` | page_id, from_version, to_version?, max_length?, format? | Compare two versions of a page |
 
 ## Tool Details
 
@@ -91,3 +101,33 @@ Adds one or more labels to a page. The `labels` parameter accepts either a singl
 
 ### remove_label
 Removes a single label from a page. The `label` parameter is the name of the label to remove. Removal is case-insensitive. If the label is not present on the page, the operation succeeds silently (idempotent). Requires edit permission on the page.
+
+### get_comments
+Retrieves footer and/or inline comments on a page. Supports filtering by type (`footer`, `inline`, `all`) and resolution status (`open`, `resolved`, `all`). Optionally fetches reply threads for each top-level comment. Comment bodies are sanitized HTML.
+
+### create_comment
+Creates a footer or inline comment on a page. All comments are auto-prefixed with `[AI-generated via Epimethian]` for attribution. Footer comments appear at the bottom of the page; inline comments are anchored to a specific text selection. The `text_selection` parameter is required for top-level inline comments; `text_selection_match_index` disambiguates when the same text appears multiple times. Supports replies via `parent_comment_id`.
+
+### resolve_comment
+Resolves or reopens an inline comment. Only inline comments have resolution status — footer comments do not.
+
+### delete_comment
+Permanently deletes a comment. The `type` parameter (`footer` or `inline`) is required because Confluence uses separate API endpoints for each. Deleting a parent comment also deletes all replies. Idempotent — deleting a non-existent comment succeeds silently.
+
+### get_page_status
+Returns the content status badge on a page (name and color). If no status is set, indicates that. This is a read-only operation.
+
+### set_page_status
+Sets the content status badge on a page. The `name` parameter is validated (max 20 chars, no control characters). The `color` parameter must be one of five predefined hex values. **Warning:** Setting a status creates a new page version in Confluence.
+
+### remove_page_status
+Removes the content status badge from a page. Idempotent — succeeds silently if no status is set.
+
+### get_page_versions
+Lists version history metadata for a page (version number, author, date, version message). Results are ordered from newest to oldest. The `limit` parameter caps at 200.
+
+### get_page_version
+Fetches the content of a page at a specific historical version. Returns the body as sanitized markdown. Historical version bodies are cached separately from current versions in the page cache (using composite keys).
+
+### diff_page_versions
+Compares two versions of a page. The `summary` format (default) uses section-aware diffing — it splits both versions by heading and reports added, removed, and modified sections with per-section change details. The `unified` format returns a standard unified diff. Both formats support `max_length` truncation. Uses the `diff` npm package internally. Size-limited to 500 KB per version.
