@@ -563,7 +563,7 @@ function buildAttributionFooter(action: "created" | "updated"): string {
 function stripAttributionFooter(body: string): string {
   return body
     .replace(
-      /<!-- epimethian-attribution-start -->[\s\S]*?<!-- epimethian-attribution-end -->/g,
+      /<!--\s*epimethian-attribution-start\s*-->[\s\S]*?<!--\s*epimethian-attribution-end\s*-->/g,
       ""
     )
     .trimEnd();

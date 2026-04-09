@@ -393,6 +393,47 @@ describe("updatePage", () => {
   });
 });
 
+describe("attribution footer deduplication", () => {
+  it("strips exact attribution markers from body before adding new one", async () => {
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    const bodyWithFooter =
+      "<p>content</p>\n" +
+      "<!-- epimethian-attribution-start -->" +
+      '<p style="font-size:11px;color:#999;margin-top:2em;"><em>This page was created with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a>.</em></p>' +
+      "<!-- epimethian-attribution-end -->";
+    await updatePage("30", { title: "T", version: 1, body: bodyWithFooter });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
+    expect(occurrences).toHaveLength(1);
+  });
+
+  it("strips attribution markers normalized by Confluence (no spaces)", async () => {
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    const bodyWithNormalizedFooter =
+      "<p>content</p>\n" +
+      "<!--epimethian-attribution-start-->" +
+      '<p style="font-size:11px;color:#999;margin-top:2em;"><em>This page was updated with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a>.</em></p>' +
+      "<!--epimethian-attribution-end-->";
+    await updatePage("30", { title: "T", version: 1, body: bodyWithNormalizedFooter });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
+    expect(occurrences).toHaveLength(1);
+  });
+
+  it("strips attribution markers with extra whitespace", async () => {
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    const bodyWithExtraSpaces =
+      "<p>content</p>\n" +
+      "<!--  epimethian-attribution-start  -->" +
+      "<p>old footer</p>" +
+      "<!--  epimethian-attribution-end  -->";
+    await updatePage("30", { title: "T", version: 1, body: bodyWithExtraSpaces });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
+    expect(occurrences).toHaveLength(1);
+  });
+});
+
 describe("deletePage", () => {
   it("sends DELETE request", async () => {
     global.fetch = mockFetchResponse(undefined, 204);
