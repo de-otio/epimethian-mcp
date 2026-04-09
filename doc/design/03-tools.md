@@ -8,7 +8,7 @@ All tools return plain text (not JSON) for LLM consumption. Tools are registered
 |------|:---:|:---:|:---:|
 | `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments` | yes | — | — |
 | `create_page`, `add_attachment`, `add_drawio_diagram` | — | no | no |
-| `update_page` | — | no | yes |
+| `update_page` | — | no | no |
 | `delete_page` | — | yes | yes |
 
 ## Tool Summary
@@ -17,7 +17,7 @@ All tools return plain text (not JSON) for LLM consumption. Tools are registered
 |------|-----------|-------------|
 | `create_page` | title, space_key, body, parent_id? | Create a new Confluence page |
 | `get_page` | page_id, include_body? | Read a page by ID |
-| `update_page` | page_id, title?, body?, version_message? | Update an existing page (auto-increments version) |
+| `update_page` | page_id, title, version, body?, version_message? | Update an existing page (optimistic concurrency via version) |
 | `delete_page` | page_id | Delete a page by ID |
 | `search_pages` | cql, limit? | Search using CQL |
 | `list_pages` | space_key, limit?, status? | List pages in a space |
@@ -37,7 +37,7 @@ Creates a new page in a Confluence space. Resolves the human-readable `space_key
 Reads a page by its numeric ID. By default includes the page body in Confluence storage format. Returns title, ID, space, version, URL, and optionally the content.
 
 ### update_page
-Updates an existing page. Fetches the current page first to determine the version number, then auto-increments it. Only the fields provided (title, body) are changed; omitted fields keep their current values.
+Updates an existing page using optimistic concurrency control. The caller must provide the `version` number from their most recent `get_page` call. The server sends `version + 1` to the Confluence API. If the page has been modified since the caller's read (version mismatch), Confluence returns a 409 and the tool returns a `ConfluenceConflictError` instructing the agent to re-read the page. Both `title` and `version` are required; `body` is optional (omit to update only the title).
 
 ### delete_page
 Deletes a page by ID. Returns confirmation text.

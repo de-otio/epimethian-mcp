@@ -63,12 +63,13 @@ Returns the same output as `get_page`. Use this when you know the page name but 
 
 ### `update_page`
 
-Updates an existing page. Automatically fetches the current version and increments it.
+Updates an existing page using optimistic concurrency control. You must provide the `version` number from your most recent `get_page` call. If the page was modified by someone else since then, the tool returns an error asking you to re-read the page and retry.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `page_id` | string | Yes | Numeric page ID |
-| `title` | string | No | New page title (keeps current if omitted) |
+| `title` | string | Yes | Page title (use the title from `get_page` if unchanged) |
+| `version` | number | Yes | Page version number from your most recent `get_page` call |
 | `body` | string | No | New page content (keeps current if omitted) |
 | `version_message` | string | No | Version comment visible in page history |
 

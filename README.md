@@ -24,6 +24,8 @@ Tell your AI agent:
 
 > Install and configure the Epimethian MCP server. See https://github.com/de-otio/epimethian-mcp
 
+For a detailed agent-facing guide (installation, configuration, profile management, uninstallation), see [install-agent.md](install-agent.md) or run `epimethian-mcp agent-guide` after installation.
+
 Or install manually:
 
 ```bash
@@ -71,7 +73,10 @@ Manage profiles:
 epimethian-mcp profiles              # list all
 epimethian-mcp profiles --verbose    # show URLs and emails
 CONFLUENCE_PROFILE=jambit epimethian-mcp status   # test connection
+epimethian-mcp profiles --remove <name>           # delete profile and credentials
 ```
+
+The `--remove` command deletes the profile's keychain entry and registry record after interactive confirmation. For non-interactive environments (CI, agent shell sessions), pass `--force` to skip the prompt.
 
 ## Tools
 

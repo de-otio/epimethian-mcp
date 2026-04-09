@@ -36,6 +36,8 @@ import {
   getPageByTitle,
   getAttachments,
   uploadAttachment,
+  ConfluenceApiError,
+  ConfluenceConflictError,
 } from "./confluence-client.js";
 
 // --- Helpers ---
@@ -335,47 +337,59 @@ describe("createPage", () => {
 });
 
 describe("updatePage", () => {
-  it("auto-increments version number", async () => {
-    // First call: getPage (current page), second call: v2Put (update)
-    global.fetch = mockFetchSequence([
-      { body: { id: "30", title: "Old Title", version: { number: 5 }, body: { storage: { value: "<p>old</p>" } } } },
-      { body: { id: "30", title: "New Title" } },
-    ]);
-    const { page, newVersion } = await updatePage("30", { title: "New Title" });
+  it("sends version + 1 to Confluence", async () => {
+    global.fetch = mockFetchResponse({ id: "30", title: "New Title" });
+    const { page, newVersion } = await updatePage("30", {
+      title: "New Title",
+      version: 5,
+    });
     expect(newVersion).toBe(6);
     expect(page.title).toBe("New Title");
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.version.number).toBe(6);
   });
 
   it("sends body when provided", async () => {
-    global.fetch = mockFetchSequence([
-      { body: { id: "30", title: "T", version: { number: 1 } } },
-      { body: { id: "30", title: "T" } },
-    ]);
-    await updatePage("30", { body: "new body" });
-    const putBody = JSON.parse((global.fetch as any).mock.calls[1][1].body as string);
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    await updatePage("30", { title: "T", version: 1, body: "new body" });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).toContain("<p>new body</p>");
     expect(putBody.body.value).toContain("epimethian-attribution");
   });
 
   it("includes custom versionMessage when provided", async () => {
-    global.fetch = mockFetchSequence([
-      { body: { id: "30", title: "T", version: { number: 1 } } },
-      { body: { id: "30", title: "T" } },
-    ]);
-    await updatePage("30", { body: "text", versionMessage: "Fixed typo" });
-    const putBody = JSON.parse((global.fetch as any).mock.calls[1][1].body as string);
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    await updatePage("30", { title: "T", version: 1, body: "text", versionMessage: "Fixed typo" });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message).toContain("Fixed typo");
     expect(putBody.version.message).toContain("via Epimethian");
   });
 
   it("omits body from payload when not provided", async () => {
-    global.fetch = mockFetchSequence([
-      { body: { id: "30", title: "T", version: { number: 1 } } },
-      { body: { id: "30", title: "Updated" } },
-    ]);
-    await updatePage("30", { title: "Updated" });
-    const putBody = JSON.parse((global.fetch as any).mock.calls[1][1].body as string);
+    global.fetch = mockFetchResponse({ id: "30", title: "Updated" });
+    await updatePage("30", { title: "Updated", version: 1 });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body).toBeUndefined();
+  });
+
+  it("throws ConfluenceConflictError on 409 response", async () => {
+    global.fetch = mockFetchResponse({ message: "Version conflict" }, 409);
+    await expect(
+      updatePage("30", { title: "T", version: 5 })
+    ).rejects.toThrow(ConfluenceConflictError);
+    await expect(
+      updatePage("30", { title: "T", version: 5 })
+    ).rejects.toThrow(/get_page/);
+  });
+
+  it("rethrows non-409 errors unchanged", async () => {
+    global.fetch = mockFetchResponse("Server Error", 500);
+    await expect(
+      updatePage("30", { title: "T", version: 5 })
+    ).rejects.toThrow(ConfluenceApiError);
+    await expect(
+      updatePage("30", { title: "T", version: 5 })
+    ).rejects.toThrow("Confluence API error (500)");
   });
 });
 
@@ -548,8 +562,9 @@ describe("uploadAttachment", () => {
 // =============================================================================
 
 describe("HTTP error handling", () => {
-  it("throws on 400 response", async () => {
+  it("throws ConfluenceApiError on 400 response", async () => {
     global.fetch = mockFetchResponse("Bad Request", 400);
+    await expect(getPage("1", false)).rejects.toThrow(ConfluenceApiError);
     await expect(getPage("1", false)).rejects.toThrow("Confluence API error (400)");
   });
 
@@ -561,6 +576,13 @@ describe("HTTP error handling", () => {
   it("throws on 404 response", async () => {
     global.fetch = mockFetchResponse("Not Found", 404);
     await expect(deletePage("999")).rejects.toThrow("Confluence API error (404)");
+  });
+
+  it("throws ConfluenceApiError with status on 409 response", async () => {
+    global.fetch = mockFetchResponse("Conflict", 409);
+    const err = await getPage("1", false).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect((err as ConfluenceApiError).status).toBe(409);
   });
 
   it("throws on 500 response", async () => {

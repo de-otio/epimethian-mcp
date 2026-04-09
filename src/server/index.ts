@@ -125,13 +125,17 @@ function registerTools(server: McpServer, config: Config): void {
     "update_page",
     {
       description:
-        "Update an existing Confluence page. Auto-increments version number.",
+        "Update an existing Confluence page. You must provide the version number from your most recent get_page call. If the page was modified by someone else since then, this will return a conflict error — re-read the page and retry.",
       inputSchema: {
         page_id: z.string().describe("The Confluence page ID"),
         title: z
           .string()
-          .optional()
-          .describe("New title (omit to keep current)"),
+          .describe("Page title (use the title from get_page if unchanged)"),
+        version: z
+          .number()
+          .int()
+          .positive()
+          .describe("The page version number from your most recent get_page call"),
         body: z
           .string()
           .optional()
@@ -141,13 +145,14 @@ function registerTools(server: McpServer, config: Config): void {
           .optional()
           .describe("Optional version comment"),
       },
-      annotations: { destructiveHint: false, idempotentHint: true },
+      annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, title, body, version_message }) => {
+    async ({ page_id, title, version, body, version_message }) => {
       try {
         const { page, newVersion } = await updatePage(page_id, {
           title,
           body,
+          version,
           versionMessage: version_message,
         });
         return toolResult(
@@ -463,14 +468,15 @@ function registerTools(server: McpServer, config: Config): void {
 
         // Fetch current page to get version and existing body
         const current = await getPage(page_id, true);
-        const newVersion = (current.version?.number ?? 0) + 1;
         const existingBody =
           current.body?.storage?.value ?? current.body?.value ?? "";
 
         const newBody = append ? `${existingBody}\n${macro}` : macro;
 
-        const { page } = await updatePage(page_id, {
+        const { page, newVersion } = await updatePage(page_id, {
+          title: current.title,
           body: newBody,
+          version: current.version?.number ?? 0,
           versionMessage: `Added diagram: ${filename}`,
         });
 

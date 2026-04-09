@@ -260,6 +260,27 @@ export function sanitizeError(message: string): string {
   return safe;
 }
 
+// --- Error classes ---
+
+export class ConfluenceApiError extends Error {
+  status: number;
+  constructor(status: number, body: string) {
+    super(`Confluence API error (${status}): ${sanitizeError(body)}`);
+    this.name = "ConfluenceApiError";
+    this.status = status;
+  }
+}
+
+export class ConfluenceConflictError extends Error {
+  constructor(pageId: string) {
+    super(
+      `Version conflict: page ${pageId} has been modified since you last read it. ` +
+      `Call get_page to fetch the latest version, then retry your update with the new version number.`
+    );
+    this.name = "ConfluenceConflictError";
+  }
+}
+
 // --- HTTP helpers ---
 
 async function confluenceRequest(
@@ -270,10 +291,8 @@ async function confluenceRequest(
   const res = await fetch(url, { headers: cfg.jsonHeaders, ...options });
   if (!res.ok) {
     const body = await res.text();
-    console.error(`Confluence API error (${res.status}): ${body}`);
-    throw new Error(
-      `Confluence API error (${res.status}): ${sanitizeError(body)}`
-    );
+    console.error(`Confluence API error (${res.status}): ${sanitizeError(body)}`);
+    throw new ConfluenceApiError(res.status, body);
   }
   return res;
 }
@@ -369,14 +388,13 @@ export async function createPage(
 export async function updatePage(
   pageId: string,
   opts: {
-    title?: string;
+    title: string;
     body?: string;
+    version: number;
     versionMessage?: string;
   }
 ): Promise<{ page: PageData; newVersion: number }> {
-  const current = await getPage(pageId, true);
-  const newVersion = (current.version?.number ?? 0) + 1;
-  const newTitle = opts.title ?? current.title;
+  const newVersion = opts.version + 1;
 
   const versionMessage = opts.versionMessage
     ? `${opts.versionMessage} (via Epimethian)`
@@ -385,7 +403,7 @@ export async function updatePage(
   const payload: Record<string, unknown> = {
     id: pageId,
     status: "current",
-    title: newTitle,
+    title: opts.title,
     version: { number: newVersion, message: versionMessage },
   };
   if (opts.body) {
@@ -396,7 +414,15 @@ export async function updatePage(
     };
   }
 
-  const raw = await v2Put(`/pages/${pageId}`, payload);
+  let raw: unknown;
+  try {
+    raw = await v2Put(`/pages/${pageId}`, payload);
+  } catch (err) {
+    if (err instanceof ConfluenceApiError && err.status === 409) {
+      throw new ConfluenceConflictError(pageId);
+    }
+    throw err;
+  }
   const page = PageSchema.parse(raw);
 
   try {
@@ -508,10 +534,8 @@ export async function uploadAttachment(
   });
   if (!res.ok) {
     const body = await res.text();
-    console.error(`Confluence API error (${res.status}): ${body}`);
-    throw new Error(
-      `Confluence API error (${res.status}): ${sanitizeError(body)}`
-    );
+    console.error(`Confluence API error (${res.status}): ${sanitizeError(body)}`);
+    throw new ConfluenceApiError(res.status, body);
   }
   const data = UploadResultSchema.parse(await res.json());
   const att = data.results[0];

@@ -23,6 +23,7 @@ API responses are validated at runtime using Zod schemas (`PageSchema`, `SpacesR
 | Auth invalid | 401 | `isError: true` with API message |
 | Forbidden | 403 | `isError: true` with API message |
 | Not found | 404 | `isError: true` with API message |
+| Version conflict | 409 | `isError: true` with message instructing agent to re-read the page via `get_page` |
 | Rate limited | 429 | `isError: true` with API message |
 | Server error | 5xx | `isError: true` with API message |
 | File path outside CWD | N/A | `isError: true` with path restriction message |

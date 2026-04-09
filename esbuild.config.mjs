@@ -6,6 +6,7 @@ const shared = {
   format: "cjs",
   sourcemap: true,
   target: "node18",
+  loader: { ".md": "text" },
 };
 
 const isWatch = process.argv.includes("--watch");

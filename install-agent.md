@@ -104,7 +104,81 @@ Each VS Code window / Claude Code session uses the profile specified in its `.mc
 - List all profiles: `epimethian-mcp profiles`
 - Show details: `epimethian-mcp profiles --verbose`
 - Check connection: `CONFLUENCE_PROFILE=<name> epimethian-mcp status`
-- Remove a profile: `epimethian-mcp profiles --remove <name>`
+
+### Removing a Profile
+
+To delete a profile and its credentials, run:
+
+```bash
+epimethian-mcp profiles --remove <name> --force
+```
+
+**Agents must pass `--force`** because the command normally prompts for interactive confirmation (`Remove profile "<name>" and delete its credentials? [y/N]`), which will fail in non-TTY environments like agent shell sessions. The `--force` flag skips the confirmation prompt when stdin is not a TTY.
+
+This command:
+1. Deletes the credential entry (URL, email, API token) from the OS keychain
+2. Removes the profile from the registry at `~/.config/epimethian-mcp/profiles.json`
+3. Writes an entry to the audit log at `~/.config/epimethian-mcp/audit.log`
+
+After removing a profile, also remove or update any `.mcp.json` files that reference it — otherwise the MCP server will fail to start with a missing-profile error.
+
+**Errors:**
+- If the profile name is invalid (not matching lowercase alphanumeric/hyphens, 1–63 chars), the command exits with code 1
+- If the profile does not exist in the keychain, the keychain deletion is silently skipped — the registry entry is still removed
+
+## Accessing This Guide Post-Install
+
+Once installed, this guide is available locally via:
+
+```bash
+epimethian-mcp agent-guide
+```
+
+This prints the full agent guide to stdout — no web fetch required.
+
+## Uninstallation
+
+When a user asks to uninstall Epimethian MCP, follow these steps:
+
+### Step 1: Check for existing profiles
+
+```bash
+epimethian-mcp profiles
+```
+
+### Step 2: Ask the user about credential cleanup
+
+If profiles exist, ask the user:
+
+> You have Epimethian profiles configured: [list the profile names]. Would you like to delete all stored credentials before uninstalling? (This removes API tokens from your OS keychain.)
+
+### Step 3: Delete credentials (if the user agrees)
+
+For each profile the user wants removed:
+
+```bash
+epimethian-mcp profiles --remove <name> --force
+```
+
+Or to remove all profiles:
+
+```bash
+for name in $(epimethian-mcp profiles | grep '^ '); do epimethian-mcp profiles --remove "$name" --force; done
+```
+
+### Step 4: Remove MCP configuration
+
+Delete the `confluence` entry (or the tenant-specific entry like `confluence-jambit`) from the project's `.mcp.json`.
+
+### Step 5: Uninstall the package
+
+```bash
+npm uninstall -g @de-otio/epimethian-mcp
+```
+
+### Step 6: Restart the MCP client
+
+Tell the user to restart their MCP client so it stops trying to launch the removed server.
 
 ## CI/CD (No Keychain)
 

@@ -29,32 +29,41 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 }));
 
 // Mock the confluence-client so we don't need real HTTP
-vi.mock("./confluence-client.js", () => ({
-  resolveSpaceId: vi.fn(),
-  getPage: vi.fn(),
-  createPage: vi.fn(),
-  updatePage: vi.fn(),
-  deletePage: vi.fn(),
-  searchPages: vi.fn(),
-  listPages: vi.fn(),
-  getPageChildren: vi.fn(),
-  getSpaces: vi.fn(),
-  getPageByTitle: vi.fn(),
-  getAttachments: vi.fn(),
-  uploadAttachment: vi.fn(),
-  formatPage: vi.fn().mockReturnValue("formatted page"),
-  sanitizeError: (msg: string) => msg.slice(0, 500),
-  getConfig: vi.fn().mockResolvedValue({
-    url: "https://test.atlassian.net",
-    email: "user@test.com",
-    profile: null,
-    apiV2: "https://test.atlassian.net/wiki/api/v2",
-    apiV1: "https://test.atlassian.net/wiki/rest/api",
-    authHeader: "Basic dGVzdA==",
-    jsonHeaders: {},
-  }),
-  validateStartup: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock("./confluence-client.js", () => {
+  class ConfluenceConflictError extends Error {
+    constructor(pageId: string) {
+      super(`Version conflict: page ${pageId} has been modified since you last read it. Call get_page to fetch the latest version, then retry your update with the new version number.`);
+      this.name = "ConfluenceConflictError";
+    }
+  }
+  return {
+    resolveSpaceId: vi.fn(),
+    getPage: vi.fn(),
+    createPage: vi.fn(),
+    updatePage: vi.fn(),
+    deletePage: vi.fn(),
+    searchPages: vi.fn(),
+    listPages: vi.fn(),
+    getPageChildren: vi.fn(),
+    getSpaces: vi.fn(),
+    getPageByTitle: vi.fn(),
+    getAttachments: vi.fn(),
+    uploadAttachment: vi.fn(),
+    formatPage: vi.fn().mockReturnValue("formatted page"),
+    sanitizeError: (msg: string) => msg.slice(0, 500),
+    ConfluenceConflictError,
+    getConfig: vi.fn().mockResolvedValue({
+      url: "https://test.atlassian.net",
+      email: "user@test.com",
+      profile: null,
+      apiV2: "https://test.atlassian.net/wiki/api/v2",
+      apiV1: "https://test.atlassian.net/wiki/rest/api",
+      authHeader: "Basic dGVzdA==",
+      jsonHeaders: {},
+    }),
+    validateStartup: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 // Mock node:fs/promises for add_attachment and add_drawio_diagram tests
 const mockReadFile = vi.fn();
@@ -214,6 +223,11 @@ describe("add_drawio_diagram filename normalization", () => {
     // Check that uploadAttachment was called with .drawio extension
     expect((uploadAttachment as any).mock.lastCall[2]).toBe("arch.drawio");
     expect(result.content[0].text).toContain("arch.drawio");
+
+    // Verify updatePage received version and title from getPage
+    const updateCall = (updatePage as any).mock.lastCall;
+    expect(updateCall[1].version).toBe(3);
+    expect(updateCall[1].title).toBe("T");
   });
 
   it("does not double-append .drawio", async () => {
@@ -249,6 +263,11 @@ describe("add_drawio_diagram filename normalization", () => {
     });
 
     expect((uploadAttachment as any).mock.lastCall[2]).toBe("arch.drawio");
+
+    // Verify updatePage received version and title from getPage
+    const updateCall = (updatePage as any).mock.lastCall;
+    expect(updateCall[1].version).toBe(1);
+    expect(updateCall[1].title).toBe("T");
   });
 });
 

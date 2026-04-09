@@ -4,6 +4,7 @@ const mockStartServer = vi.fn().mockResolvedValue(undefined);
 const mockRunSetup = vi.fn().mockResolvedValue(undefined);
 const mockRunProfiles = vi.fn().mockResolvedValue(undefined);
 const mockRunStatus = vi.fn().mockResolvedValue(undefined);
+const mockRunAgentGuide = vi.fn();
 
 vi.mock("../server/index.js", () => ({
   main: mockStartServer,
@@ -19,6 +20,10 @@ vi.mock("./profiles.js", () => ({
 
 vi.mock("./status.js", () => ({
   runStatus: mockRunStatus,
+}));
+
+vi.mock("./agent-guide.js", () => ({
+  runAgentGuide: mockRunAgentGuide,
 }));
 
 describe("CLI entry point", () => {
@@ -97,6 +102,22 @@ describe("CLI entry point", () => {
 
     await new Promise((r) => setTimeout(r, 10));
     expect(mockRunStatus).toHaveBeenCalledOnce();
+    expect(mockStartServer).not.toHaveBeenCalled();
+  });
+
+  it("calls runAgentGuide when 'agent-guide' argument is provided", async () => {
+    process.argv = ["node", "index.js", "agent-guide"];
+    vi.resetModules();
+    vi.doMock("../server/index.js", () => ({ main: mockStartServer }));
+    vi.doMock("./setup.js", () => ({ runSetup: mockRunSetup }));
+    vi.doMock("./profiles.js", () => ({ runProfiles: mockRunProfiles }));
+    vi.doMock("./status.js", () => ({ runStatus: mockRunStatus }));
+    vi.doMock("./agent-guide.js", () => ({ runAgentGuide: mockRunAgentGuide }));
+
+    await import("./index.js");
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(mockRunAgentGuide).toHaveBeenCalledOnce();
     expect(mockStartServer).not.toHaveBeenCalled();
   });
 });
