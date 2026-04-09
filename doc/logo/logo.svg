@@ -2,6 +2,6 @@
   <!-- Background -->
   <circle cx="32" cy="32" r="30" fill="#1A1A2E"/>
 
-  <!-- Greek letter Epsilon (Ε/ε) — uppercase -->
-  <text x="32" y="46" text-anchor="middle" font-family="serif" font-size="44" font-weight="bold" fill="#C0A040">&#917;</text>
+  <!-- Greek uppercase Epsilon as path — no font dependency -->
+  <path d="M22,16 L42,16 L42,20 L26,20 L26,30 L40,30 L40,34 L26,34 L26,44 L42,44 L42,48 L22,48 Z" fill="#C0A040"/>
 </svg>
