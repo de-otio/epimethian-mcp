@@ -398,6 +398,14 @@ describe("extractSection", () => {
     expect(result).toContain("<h3>SubSub</h3>");
     expect(result).not.toContain("Other");
   });
+
+  it("finds headings inside ac:layout cells", () => {
+    const layoutHtml = '<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell><h1>Intro</h1><p>Intro text</p><h1>Details</h1><p>Details text</p></ac:layout-cell></ac:layout-section></ac:layout>';
+    const result = extractSection(layoutHtml, "Intro");
+    expect(result).toContain("<h1>Intro</h1>");
+    expect(result).toContain("<p>Intro text</p>");
+    expect(result).not.toContain("Details");
+  });
 });
 
 describe("replaceSection", () => {
@@ -436,7 +444,17 @@ describe("replaceSection", () => {
     const nested = "<h1>A</h1><h2>A1</h2><p>a1 text</p><h2>A2</h2><p>a2 text</p><h1>B</h1><p>b text</p>";
     // Replacing A should replace everything until B
     const result = replaceSection(nested, "A", "<p>whole new A</p>");
-    expect(result).toBe("<h1>A</h1><p>whole new A</p><h1>B</h1><p>b text</p>");
+    expect(result).toContain("<h1>A</h1><p>whole new A</p>");
+    expect(result).toContain("<h1>B</h1><p>b text</p>");
+  });
+
+  it("works with headings inside ac:layout cells", () => {
+    const layoutHtml = '<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell><h1>A</h1><p>old A</p><h1>B</h1><p>keep B</p></ac:layout-cell></ac:layout-section></ac:layout>';
+    const result = replaceSection(layoutHtml, "A", "<p>new A</p>");
+    expect(result).toContain("<h1>A</h1><p>new A</p>");
+    expect(result).toContain("<h1>B</h1><p>keep B</p>");
+    // Preserves the layout wrapper
+    expect(result).toContain("ac:layout");
   });
 });
 

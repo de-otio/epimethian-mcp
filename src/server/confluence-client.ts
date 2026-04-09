@@ -650,40 +650,56 @@ export function extractHeadings(storageHtml: string): string {
 }
 
 /**
+ * Find a heading element anywhere in the DOM tree (including inside
+ * ac:layout cells) whose text matches the target. Returns the heading
+ * element and its sibling list within the parent container, or null.
+ */
+function findHeadingInTree(
+  root: import("node-html-parser").HTMLElement,
+  headingText: string
+): { siblings: import("node-html-parser").Node[]; startIdx: number; headingLevel: number } | null {
+  type HTMLElement = import("node-html-parser").HTMLElement;
+
+  // Depth-first search for all heading elements
+  const allHeadings = root.querySelectorAll("h1, h2, h3, h4, h5, h6") as HTMLElement[];
+
+  for (const heading of allHeadings) {
+    if (heading.text.trim().toLowerCase() !== headingText.toLowerCase()) continue;
+
+    const tagMatch = heading.tagName.match(/^H([1-6])$/i);
+    if (!tagMatch) continue;
+
+    // Found it — get sibling list from the heading's parent
+    const parent = heading.parentNode as HTMLElement;
+    const siblings = parent.childNodes;
+    const startIdx = siblings.indexOf(heading);
+    if (startIdx === -1) continue;
+
+    return { siblings, startIdx, headingLevel: parseInt(tagMatch[1], 10) };
+  }
+  return null;
+}
+
+/**
  * Extract the content under a specific heading from storage format HTML.
  * Returns the heading element + all sibling content until the next heading
  * of equal or higher level. Returns null if the heading is not found.
  *
- * Only matches top-level headings — headings inside <ac:structured-macro>
- * or <ac:rich-text-body> are ignored.
+ * Searches the entire DOM tree, including inside ac:layout cells.
  */
 export function extractSection(storageHtml: string, headingText: string): string | null {
   const { parse } = require("node-html-parser") as typeof import("node-html-parser");
   const root = parse(storageHtml);
-  const topLevelNodes = root.childNodes;
 
-  // Find the target heading among top-level elements only
-  let startIdx = -1;
-  let headingLevel = 0;
+  const found = findHeadingInTree(root, headingText);
+  if (!found) return null;
 
-  for (let i = 0; i < topLevelNodes.length; i++) {
-    const node = topLevelNodes[i];
-    if (node.nodeType !== 1) continue; // skip text nodes
-    const el = node as import("node-html-parser").HTMLElement;
-    const tagMatch = el.tagName?.match(/^H([1-6])$/i);
-    if (tagMatch && el.text.trim().toLowerCase() === headingText.toLowerCase()) {
-      startIdx = i;
-      headingLevel = parseInt(tagMatch[1], 10);
-      break;
-    }
-  }
-
-  if (startIdx === -1) return null;
+  const { siblings, startIdx, headingLevel } = found;
 
   // Collect content until next heading of equal or higher level
-  let endIdx = topLevelNodes.length;
-  for (let i = startIdx + 1; i < topLevelNodes.length; i++) {
-    const node = topLevelNodes[i];
+  let endIdx = siblings.length;
+  for (let i = startIdx + 1; i < siblings.length; i++) {
+    const node = siblings[i];
     if (node.nodeType !== 1) continue;
     const el = node as import("node-html-parser").HTMLElement;
     const tagMatch = el.tagName?.match(/^H([1-6])$/i);
@@ -693,7 +709,7 @@ export function extractSection(storageHtml: string, headingText: string): string
     }
   }
 
-  const sectionNodes = topLevelNodes.slice(startIdx, endIdx);
+  const sectionNodes = siblings.slice(startIdx, endIdx);
   return sectionNodes.map(n => n.toString()).join("");
 }
 
@@ -702,6 +718,8 @@ export function extractSection(storageHtml: string, headingText: string): string
  * The heading itself is preserved; content between it and the next heading
  * of equal or higher level is replaced with newContent.
  * Returns the full HTML with the section replaced, or null if heading not found.
+ *
+ * Searches the entire DOM tree, including inside ac:layout cells.
  */
 export function replaceSection(
   storageHtml: string,
@@ -710,28 +728,15 @@ export function replaceSection(
 ): string | null {
   const { parse } = require("node-html-parser") as typeof import("node-html-parser");
   const root = parse(storageHtml);
-  const topLevelNodes = root.childNodes;
 
-  let startIdx = -1;
-  let headingLevel = 0;
+  const found = findHeadingInTree(root, headingText);
+  if (!found) return null;
 
-  for (let i = 0; i < topLevelNodes.length; i++) {
-    const node = topLevelNodes[i];
-    if (node.nodeType !== 1) continue;
-    const el = node as import("node-html-parser").HTMLElement;
-    const tagMatch = el.tagName?.match(/^H([1-6])$/i);
-    if (tagMatch && el.text.trim().toLowerCase() === headingText.toLowerCase()) {
-      startIdx = i;
-      headingLevel = parseInt(tagMatch[1], 10);
-      break;
-    }
-  }
+  const { siblings, startIdx, headingLevel } = found;
 
-  if (startIdx === -1) return null;
-
-  let endIdx = topLevelNodes.length;
-  for (let i = startIdx + 1; i < topLevelNodes.length; i++) {
-    const node = topLevelNodes[i];
+  let endIdx = siblings.length;
+  for (let i = startIdx + 1; i < siblings.length; i++) {
+    const node = siblings[i];
     if (node.nodeType !== 1) continue;
     const el = node as import("node-html-parser").HTMLElement;
     const tagMatch = el.tagName?.match(/^H([1-6])$/i);
@@ -742,16 +747,19 @@ export function replaceSection(
   }
 
   // Reconstruct: before + heading + newContent + after
-  const before = topLevelNodes.slice(0, startIdx);
-  const heading = topLevelNodes[startIdx];
-  const after = topLevelNodes.slice(endIdx);
+  const before = siblings.slice(0, startIdx);
+  const heading = siblings[startIdx];
+  const after = siblings.slice(endIdx);
 
-  return (
+  // Replace within the parent container, then return the full document
+  const parent = heading.parentNode as import("node-html-parser").HTMLElement;
+  parent.innerHTML =
     before.map(n => n.toString()).join("") +
     heading.toString() +
     newContent +
-    after.map(n => n.toString()).join("")
-  );
+    after.map(n => n.toString()).join("");
+
+  return root.toString();
 }
 
 /**
