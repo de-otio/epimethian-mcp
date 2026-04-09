@@ -478,14 +478,26 @@ export async function searchPages(
   cql: string,
   limit: number
 ): Promise<PageData[]> {
-  // CQL search only available via v1 REST API
+  // Use /rest/api/search (not /content/search) to get excerpts
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/search`);
+  const url = new URL(`${cfg.url}/wiki/rest/api/search`);
   url.searchParams.set("cql", cql);
   url.searchParams.set("limit", String(limit));
   const res = await confluenceRequest(url.toString());
-  const raw = await res.json();
-  return PagesResultSchema.parse(raw).results;
+  const raw = await res.json() as any;
+  // /rest/api/search nests page data under `content` with excerpt at result level
+  // Flatten into PageSchema-compatible shape
+  const results: PageData[] = [];
+  for (const r of raw.results ?? []) {
+    const page = r.content ?? r;
+    if (r.excerpt) page.excerpt = r.excerpt;
+    try {
+      results.push(PageSchema.parse(page));
+    } catch {
+      // Skip unparseable results (e.g., attachments, comments)
+    }
+  }
+  return results;
 }
 
 export async function listPages(

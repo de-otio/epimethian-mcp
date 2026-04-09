@@ -876,21 +876,31 @@ describe("deletePage", () => {
 });
 
 describe("searchPages", () => {
-  it("returns results from CQL search", async () => {
+  it("returns results from search API with excerpts", async () => {
     global.fetch = mockFetchResponse({
-      results: [{ id: "1", title: "Found" }],
+      results: [{ content: { id: "1", title: "Found" }, excerpt: "Preview text" }],
     });
     const pages = await searchPages('title ~ "Found"', 10);
     expect(pages).toHaveLength(1);
     expect(pages[0].title).toBe("Found");
+    expect(pages[0].excerpt).toBe("Preview text");
     const url = (global.fetch as any).mock.calls[0][0] as string;
-    expect(url).toContain(`${API_V1}/content/search`);
+    expect(url).toContain("/rest/api/search");
   });
 
   it("returns empty array when no results", async () => {
     global.fetch = mockFetchResponse({ results: [] });
     const pages = await searchPages("nothing", 10);
     expect(pages).toHaveLength(0);
+  });
+
+  it("handles results without excerpt", async () => {
+    global.fetch = mockFetchResponse({
+      results: [{ content: { id: "1", title: "NoExcerpt" } }],
+    });
+    const pages = await searchPages("test", 10);
+    expect(pages).toHaveLength(1);
+    expect(pages[0].excerpt).toBeUndefined();
   });
 });
 
