@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="doc/logo/logo.svg" alt="Epimethian MCP logo" width="64" height="64">
+  <img src="doc/logo/logo.svg?v=2" alt="Epimethian MCP logo" width="64" height="64">
 </p>
 
 # Epimethian MCP
