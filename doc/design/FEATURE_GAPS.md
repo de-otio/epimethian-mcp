@@ -4,17 +4,17 @@ Features not available in the official Atlassian Rovo MCP server or popular comm
 
 ## High Value — No One Does Well
 
-### 1. Per-Tenant Write Locks
+### 1. ~~Per-Tenant Write Locks~~ ✅ Implemented in v4.2.0
 
-No server offers "read-write for tenant A, read-only for tenant B." Add a `read_only` flag per profile so consultants can protect client tenants from accidental writes while keeping full access to their own.
+Per-profile `readOnly` flag in profile settings with whitelist-based write guard, strict-mode OR merge (env var can only tighten), `[READ-ONLY]` tool description prefix, and default read-only for new profiles. See `investigations/investigate-write-locks.md`.
 
-### 2. Comments (Inline + Footer)
+### 2. ~~Comments (Inline + Footer)~~ ✅ Implemented in v4.4.0
 
-The official server has `getConfluencePageInlineComments`, `getConfluencePageFooterComments`, `createConfluenceFooterComment`, and `createConfluenceInlineComment`. No local MCP server handles inline comments well. This is a big workflow gap for review and collaboration.
+`get_comments`, `create_comment`, `resolve_comment`, and `delete_comment` tools. The official server has read-only comment access; epimethian adds full comment lifecycle management including resolve/reopen and deletion. See `investigations/investigate-comments.md`.
 
-### 3. Labels (Get + Add + Remove)
+### 3. ~~Labels (Get + Add + Remove)~~ ✅ Implemented in v4.3.0
 
-sooperset has get/add but no remove. The official server has nothing. Labels are heavily used for organizing content. The `epimethian-managed` label already shows we're touching this API — expand it into full user-facing tools.
+`get_labels`, `add_label`, and `remove_label` tools. sooperset has get/add but no remove. The official server has nothing. Labels are heavily used for organizing content.
 
 ### 4. Page Version History / Diff
 

@@ -1,5 +1,7 @@
 # Investigation: Labels (Get + Add + Remove)
 
+**STATUS: ✅ IMPLEMENTED** (get_labels, add_label, remove_label tools)
+
 ## Problem
 
 Labels are heavily used in Confluence for organizing content, driving macros (e.g., content-by-label), and filtering searches. The official Rovo MCP server has zero label tools. sooperset has get/add but no remove. Epimethian already uses labels internally for the `epimethian-managed` attribution stamp but doesn't expose label management to users.
@@ -64,7 +66,7 @@ space = "DEV" AND label = "approved"
 
 **File:** `src/server/confluence-client.ts`
 
-The server already has a working `addLabel` function (line 572-578):
+The server already has a working `addLabel` function:
 
 ```typescript
 async function addLabel(pageId: string, label: string): Promise<void> {
@@ -93,44 +95,119 @@ The `confluenceRequest` helper, `getConfig()`, error handling patterns, and `too
 | Remove label | No | No | No |
 | Search by label | Via CQL | Via CQL | Via CQL |
 
+## Input Validation
+
+### Label Name Schema
+
+```typescript
+const labelNameSchema = z.string()
+  .min(1).max(255)
+  .regex(/^[a-z0-9][a-z0-9_-]*$/, "Label must be lowercase alphanumeric, hyphens, underscores only");
+```
+
+### Page ID Schema
+
+```typescript
+const pageIdSchema = z.string()
+  .regex(/^\d+$/, "Page ID must be numeric");
+```
+
+Note: `pageIdSchema` is a defense-in-depth improvement applicable project-wide, not just labels.
+
+### Reserved Label Namespace
+
+The `epimethian-` prefix is reserved for system-managed labels. User-facing tools must reject labels matching this prefix:
+
+```typescript
+const userLabelSchema = labelNameSchema.refine(
+  (name) => !name.startsWith("epimethian-"),
+  "Labels with the 'epimethian-' prefix are system-managed and cannot be modified directly"
+);
+```
+
 ## Proposed Tools
 
 ### `get_labels`
 
-```
-Inputs:
-  page_id: string (required)
+```typescript
+inputSchema: z.object({
+  page_id: pageIdSchema.describe("Confluence page ID"),
+})
 
-Output: list of labels with name and prefix
+annotations: { readOnlyHint: true }
 ```
 
-Read-only. Use `GET {apiV1}/content/{pageId}/label`.
+Output: list of labels with name and prefix.
+
+Read-only. Use `GET {apiV1}/content/{pageId}/label`. Add to `READ_ONLY_TOOLS` set.
 
 ### `add_label`
 
-```
-Inputs:
-  page_id: string (required)
-  labels: string[] (required, 1-20 labels)
+```typescript
+inputSchema: z.object({
+  page_id: pageIdSchema.describe("Confluence page ID"),
+  labels: z.array(userLabelSchema).min(1).max(20).describe("Labels to add"),
+})
 
-Output: confirmation with list of added labels + tenant echo
+annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true }
 ```
 
-Write operation. The v1 POST body accepts an array, so multiple labels go in a single request. Must respect write locks.
+Output: confirmation with list of added labels + tenant echo.
+
+Write operation. The v1 POST body accepts an array, so multiple labels go in a single request.
 
 Implementation: extend the existing `addLabel` function to accept an array, export it, and add proper error handling (don't swallow errors for user-facing calls).
 
 ### `remove_label`
 
-```
-Inputs:
-  page_id: string (required)
-  label: string (required)
+```typescript
+inputSchema: z.object({
+  page_id: pageIdSchema.describe("Confluence page ID"),
+  label: userLabelSchema.describe("Label to remove"),
+})
 
-Output: confirmation + tenant echo
+annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true }
 ```
 
-Write operation. Use `DELETE {apiV1}/content/{pageId}/label?name={labelName}` (query param variant — safe with `/` characters).
+Output: confirmation + tenant echo.
+
+Write operation. Use `DELETE {apiV1}/content/{pageId}/label` with URL-safe encoding:
+
+```typescript
+const url = new URL(`${cfg.apiV1}/content/${pageId}/label`);
+url.searchParams.set("name", labelName);
+```
+
+Do NOT use string concatenation for the query parameter — this prevents injection of additional query params via crafted label names. The `URL.searchParams.set()` pattern is already established in `v2Get` and `searchPages`.
+
+## Write Guard Integration
+
+All three tools must follow the established write-lock pattern:
+
+1. **`get_labels`** — add to `READ_ONLY_TOOLS` set in `index.ts`. No `writeGuard()` call needed.
+2. **`add_label`** — first line of handler must call `writeGuard()`:
+   ```typescript
+   const blocked = writeGuard("add_label", config);
+   if (blocked) return blocked;
+   ```
+   Wrap description with `describeWithLock()`.
+3. **`remove_label`** — same pattern as `add_label`:
+   ```typescript
+   const blocked = writeGuard("remove_label", config);
+   if (blocked) return blocked;
+   ```
+   Wrap description with `describeWithLock()`.
+
+If `writeGuard()` is omitted, label writes will bypass read-only mode — this violates the multi-tenant safety guarantee.
+
+## Error Messages
+
+| Scenario | Message |
+|---|---|
+| Write-locked tenant | `"Write operation 'add_label' blocked — profile is read-only. Switch to a writable profile to modify labels."` |
+| Reserved label prefix | `"Label 'epimethian-foo' uses the reserved 'epimethian-' prefix. This namespace is system-managed."` |
+| Label not found on remove | `"Label 'foo' not found on page {id}."` (non-fatal — idempotent) |
+| Archived page | `"Cannot modify labels on archived page {id}."` |
 
 ## Implementation Notes
 
@@ -139,6 +216,7 @@ Write operation. Use `DELETE {apiV1}/content/{pageId}/label?name={labelName}` (q
 - Add a Zod schema for label responses.
 - Document that `search_pages` already supports label-based CQL queries — no new search tool needed.
 - The `epimethian-managed` label is added automatically on create/update. The user-facing `get_labels` tool should show it (transparency), but document its purpose.
+- Use `URL.searchParams.set()` for the DELETE endpoint — never string-concatenate user input into query parameters.
 
 ## Effort Estimate
 
@@ -148,8 +226,8 @@ This is the lowest-effort feature in the gap list. The internal `addLabel` funct
 - Zod schema for label response
 - Tests
 
-## Open Questions
+## Resolved Questions
 
-1. Should `add_label` prevent adding the `epimethian-managed` label manually (it's system-managed)?
-2. Should `remove_label` warn when removing `epimethian-managed`?
-3. Should there be a `bulk_add_label` tool that accepts multiple page IDs? (See bulk operations investigation.)
+1. **Should `add_label` prevent adding the `epimethian-managed` label manually?** Yes — block the entire `epimethian-` prefix. This prevents false attribution (pages appearing AI-managed when they are not). Enforced via `userLabelSchema` validation.
+2. **Should `remove_label` block removing `epimethian-managed`?** Yes — same `userLabelSchema` rejects `epimethian-` prefixed labels. Removing the attribution label would hide evidence of AI-authored content, which may violate organizational policies. The internal `addLabel` call in `createPage`/`updatePage` bypasses this restriction since it uses the private function directly.
+3. **Should there be a `bulk_add_label` tool that accepts multiple page IDs?** Deferred to the bulk operations investigation.

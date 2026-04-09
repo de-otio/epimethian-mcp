@@ -9,6 +9,8 @@ import {
   readProfileRegistry,
   removeFromProfileRegistry,
   appendAuditLog,
+  getProfileSettings,
+  setProfileSettings,
 } from "../shared/profiles.js";
 
 export async function runProfiles(): Promise<void> {
@@ -28,6 +30,30 @@ export async function runProfiles(): Promise<void> {
     return;
   }
 
+  // Handle --set-read-only <name>
+  const setRoIdx = args.indexOf("--set-read-only");
+  if (setRoIdx > -1) {
+    const name = args[setRoIdx + 1];
+    if (!name || !PROFILE_NAME_RE.test(name)) {
+      console.error("Error: --set-read-only requires a valid profile name.");
+      process.exit(1);
+    }
+    await setReadOnlyFlag(name, true);
+    return;
+  }
+
+  // Handle --set-read-write <name>
+  const setRwIdx = args.indexOf("--set-read-write");
+  if (setRwIdx > -1) {
+    const name = args[setRwIdx + 1];
+    if (!name || !PROFILE_NAME_RE.test(name)) {
+      console.error("Error: --set-read-write requires a valid profile name.");
+      process.exit(1);
+    }
+    await setReadOnlyFlag(name, false);
+    return;
+  }
+
   const verbose = args.includes("--verbose");
   const profiles = await readProfileRegistry();
 
@@ -38,18 +64,20 @@ export async function runProfiles(): Promise<void> {
 
   if (verbose) {
     console.log(
-      `  ${"Profile".padEnd(20)} ${"URL".padEnd(40)} Email`
+      `  ${"Profile".padEnd(20)} ${"URL".padEnd(40)} ${"Read-Only".padEnd(12)} Email`
     );
     console.log(
-      `  ${"─".repeat(20)} ${"─".repeat(40)} ${"─".repeat(30)}`
+      `  ${"─".repeat(20)} ${"─".repeat(40)} ${"─".repeat(12)} ${"─".repeat(30)}`
     );
 
     for (const name of profiles) {
       try {
         const creds = await readFromKeychain(name);
+        const settings = await getProfileSettings(name);
+        const roLabel = settings?.readOnly ? "YES" : "no";
         if (creds) {
           console.log(
-            `  ${name.padEnd(20)} ${creds.url.padEnd(40)} ${creds.email}`
+            `  ${name.padEnd(20)} ${creds.url.padEnd(40)} ${roLabel.padEnd(12)} ${creds.email}`
           );
         } else {
           console.log(
@@ -65,10 +93,24 @@ export async function runProfiles(): Promise<void> {
   } else {
     console.log("Configured profiles:");
     for (const name of profiles) {
-      console.log(`  ${name}`);
+      const settings = await getProfileSettings(name);
+      const roSuffix = settings?.readOnly ? " (read-only)" : "";
+      console.log(`  ${name}${roSuffix}`);
     }
     console.log("\nUse --verbose to show URLs and emails.");
   }
+}
+
+async function setReadOnlyFlag(name: string, readOnly: boolean): Promise<void> {
+  const profiles = await readProfileRegistry();
+  if (!profiles.includes(name)) {
+    console.error(`Error: Profile "${name}" does not exist.`);
+    process.exit(1);
+  }
+  await setProfileSettings(name, { readOnly });
+  const label = readOnly ? "read-only" : "read-write";
+  console.log(`Profile "${name}" is now ${label}.`);
+  console.log("Note: Restart any running MCP servers for this change to take effect.");
 }
 
 async function removeProfile(name: string, force: boolean): Promise<void> {

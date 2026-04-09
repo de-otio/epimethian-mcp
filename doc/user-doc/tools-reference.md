@@ -1,6 +1,6 @@
 # Tools Reference
 
-The Epimethian MCP server provides 13 tools for managing Confluence pages, spaces, attachments, and diagrams. All tools return plain text output suitable for AI consumption.
+The Epimethian MCP server provides 26 tools for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
 
 ## Spaces
 
@@ -206,3 +206,63 @@ Adds a draw.io diagram to a Confluence page in a single step. Uploads the diagra
 **Requires the draw.io app to be installed on your Confluence instance.** If draw.io is not installed, the attachment will upload successfully but the diagram macro will display as an unknown macro on the page.
 
 Example usage: ask your AI assistant to "create a draw.io architecture diagram on page 12345" and it will generate the mxGraph XML and call this tool to handle the rest.
+
+---
+
+## Comments
+
+### `get_comments`
+
+Retrieves comments on a page. Works in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page_id` | string | Yes | Confluence page ID |
+| `type` | string | No | Comment type: `footer`, `inline`, or `all` (default: `all`) |
+| `resolution_status` | string | No | Filter inline comments by status: `open`, `resolved`, or `all` (default: `all`). Ignored for footer comments. |
+| `include_replies` | boolean | No | If true, fetches replies for each top-level comment (default: false) |
+
+Returns all comments of the specified type with author, creation date, and content.
+
+---
+
+### `create_comment`
+
+Adds a new comment to a page. Blocked in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `page_id` | string | Yes | Confluence page ID |
+| `body` | string | Yes | Comment body (plain text or simple HTML) |
+| `type` | string | No | Comment type: `footer` or `inline` (default: `footer`) |
+| `parent_comment_id` | string | No | Parent comment ID to reply to (creates a nested reply) |
+| `text_selection` | string | No | Exact text to highlight for inline comments (required for top-level inline comments) |
+| `text_selection_match_index` | number | No | Zero-based index of which occurrence to highlight (default: 0). Use this if the same text appears multiple times on the page. |
+
+Footer comments appear at the bottom of the page. Inline comments are anchored to specific text on the page.
+
+---
+
+### `resolve_comment`
+
+Resolves or reopens an inline comment. Blocked in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `comment_id` | string | Yes | Inline comment ID |
+| `resolved` | boolean | No | `true` to resolve the comment, `false` to reopen (default: true) |
+
+Only inline comments can be resolved. Footer comments have no resolution status.
+
+---
+
+### `delete_comment`
+
+Deletes a comment. Blocked in read-only mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `comment_id` | string | Yes | Comment ID to delete |
+| `type` | string | Yes | Comment type: `footer` or `inline` |
+
+Deleting a parent comment also deletes all replies to that comment.

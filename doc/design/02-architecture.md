@@ -37,7 +37,8 @@
 4. User (or AI agent) configures `.mcp.json` with the server command and non-secret env vars
 5. The MCP client launches `epimethian-mcp` as a child process via stdio
 6. On startup, the server reads credentials from env vars (URL, email) and the OS keychain (API token)
-7. All Confluence API calls use Basic Auth with the user's personal token
+7. The server resolves the per-profile read-only flag (strict-mode OR: registry OR env var) and freezes it into the config
+8. All Confluence API calls use Basic Auth with the user's personal token
 
 ## Project Structure
 

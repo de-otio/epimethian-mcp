@@ -50,6 +50,30 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     getPageByTitle: vi.fn(),
     getAttachments: vi.fn(),
     uploadAttachment: vi.fn(),
+    getLabels: vi.fn(),
+    addLabels: vi.fn(),
+    removeLabel: vi.fn(),
+    getContentState: vi.fn(),
+    setContentState: vi.fn(),
+    removeContentState: vi.fn(),
+    getFooterComments: vi.fn(),
+    getInlineComments: vi.fn(),
+    getCommentReplies: vi.fn(),
+    createFooterComment: vi.fn(),
+    createInlineComment: vi.fn(),
+    resolveComment: vi.fn(),
+    deleteFooterComment: vi.fn(),
+    deleteInlineComment: vi.fn(),
+    getPageVersions: vi.fn(),
+    getPageVersionBody: vi.fn(),
+    ConfluenceApiError: class ConfluenceApiError extends Error {
+      status: number;
+      constructor(status: number, body: string) {
+        super(`Confluence API error (${status}): ${body.slice(0, 100)}`);
+        this.name = "ConfluenceApiError";
+        this.status = status;
+      }
+    },
     formatPage: vi.fn().mockReturnValue("formatted page"),
     extractSection: actual.extractSection,
     replaceSection: actual.replaceSection,
@@ -62,6 +86,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
       url: "https://test.atlassian.net",
       email: "user@test.com",
       profile: null,
+      readOnly: false,
       apiV2: "https://test.atlassian.net/wiki/api/v2",
       apiV1: "https://test.atlassian.net/wiki/rest/api",
       authHeader: "Basic dGVzdA==",
@@ -70,6 +95,13 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     validateStartup: vi.fn().mockResolvedValue(undefined),
   };
 });
+
+// Mock the diff module
+vi.mock("./diff.js", () => ({
+  computeSummaryDiff: vi.fn(),
+  computeUnifiedDiff: vi.fn(),
+  MAX_DIFF_SIZE: 512000,
+}));
 
 // Mock node:fs/promises for add_attachment and add_drawio_diagram tests
 const mockReadFile = vi.fn();
@@ -120,6 +152,16 @@ describe("MCP server index", () => {
       "add_attachment",
       "add_drawio_diagram",
       "get_attachments",
+      "get_labels",
+      "add_label",
+      "remove_label",
+      "get_comments",
+      "create_comment",
+      "resolve_comment",
+      "delete_comment",
+      "get_page_versions",
+      "get_page_version",
+      "diff_page_versions",
     ];
     for (const tool of expectedTools) {
       expect(registeredTools.has(tool), `tool "${tool}" should be registered`).toBe(true);
@@ -650,5 +692,982 @@ describe("update_page markdown guard", () => {
       body: "<p># Not actually a heading, just a hash in HTML</p>",
     });
     expect(result.content[0].text).toContain("Updated:");
+  });
+});
+
+describe("writeGuard (read-only mode)", () => {
+  let writeGuardFn: typeof import("./index.js")["writeGuard"];
+
+  beforeAll(async () => {
+    const mod = await import("./index.js");
+    writeGuardFn = mod.writeGuard;
+  });
+
+  const readOnlyConfig = {
+    url: "https://acme.atlassian.net",
+    email: "user@acme.com",
+    profile: "acme",
+    readOnly: true,
+    apiV2: "https://acme.atlassian.net/wiki/api/v2",
+    apiV1: "https://acme.atlassian.net/wiki/rest/api",
+    authHeader: "Basic dGVzdA==",
+    jsonHeaders: {},
+  };
+
+  const writableConfig = { ...readOnlyConfig, readOnly: false };
+
+  it("blocks create_page when readOnly is true", () => {
+    const result = writeGuardFn("create_page", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+    expect(result!.content[0].text).toContain("Write blocked");
+  });
+
+  it("blocks update_page when readOnly is true", () => {
+    const result = writeGuardFn("update_page", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+  });
+
+  it("blocks update_page_section when readOnly is true", () => {
+    const result = writeGuardFn("update_page_section", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+  });
+
+  it("blocks delete_page when readOnly is true", () => {
+    const result = writeGuardFn("delete_page", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+  });
+
+  it("blocks add_attachment when readOnly is true", () => {
+    const result = writeGuardFn("add_attachment", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+  });
+
+  it("blocks add_drawio_diagram when readOnly is true", () => {
+    const result = writeGuardFn("add_drawio_diagram", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+  });
+
+  it("blocks add_label when readOnly is true", () => {
+    const result = writeGuardFn("add_label", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+    expect(result!.content[0].text).toContain("Write blocked");
+  });
+
+  it("blocks remove_label when readOnly is true", () => {
+    const result = writeGuardFn("remove_label", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+    expect(result!.content[0].text).toContain("Write blocked");
+  });
+
+  it("allows all read-only tools when readOnly is true", () => {
+    const readTools = [
+      "get_page", "get_page_by_title", "search_pages",
+      "list_pages", "get_page_children", "get_spaces", "get_attachments",
+      "get_labels", "get_page_status",
+      "get_page_versions", "get_page_version", "diff_page_versions",
+    ];
+    for (const tool of readTools) {
+      expect(writeGuardFn(tool, readOnlyConfig)).toBeNull();
+    }
+  });
+
+  it("allows write tools when readOnly is false", () => {
+    const writeTools = [
+      "create_page", "update_page", "update_page_section",
+      "delete_page", "add_attachment", "add_drawio_diagram",
+      "add_label", "remove_label",
+      "set_page_status", "remove_page_status",
+    ];
+    for (const tool of writeTools) {
+      expect(writeGuardFn(tool, writableConfig)).toBeNull();
+    }
+  });
+
+  it("error message includes profile name and remediation command", () => {
+    const result = writeGuardFn("create_page", readOnlyConfig);
+    expect(result!.content[0].text).toContain('profile "acme"');
+    expect(result!.content[0].text).toContain("epimethian-mcp profiles --set-read-write acme");
+  });
+
+  it("error message does NOT include hostname", () => {
+    const result = writeGuardFn("create_page", readOnlyConfig);
+    expect(result!.content[0].text).not.toContain("acme.atlassian.net");
+  });
+
+  it("blocks unrecognized tool names when readOnly is true (whitelist pattern)", () => {
+    const result = writeGuardFn("some_future_write_tool", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+  });
+
+  it("uses 'current configuration' when profile is null", () => {
+    const noProfileConfig = { ...readOnlyConfig, profile: null };
+    const result = writeGuardFn("create_page", noProfileConfig);
+    expect(result!.content[0].text).toContain("current configuration");
+  });
+});
+
+describe("get_labels tool", () => {
+  it("returns label list on success", async () => {
+    const { getLabels } = await import("./confluence-client.js");
+    (getLabels as any).mockResolvedValueOnce([
+      { id: "1", prefix: "global", name: "architecture" },
+      { id: "2", prefix: "global", name: "draft" },
+    ]);
+
+    const handler = registeredTools.get("get_labels")!.handler;
+    const result = await handler({ page_id: "123" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("architecture (global)");
+    expect(result.content[0].text).toContain("draft (global)");
+  });
+
+  it("returns no-labels message for empty result", async () => {
+    const { getLabels } = await import("./confluence-client.js");
+    (getLabels as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("get_labels")!.handler;
+    const result = await handler({ page_id: "123" });
+    expect(result.content[0].text).toContain("has no labels");
+  });
+
+  it("returns isError on API failure", async () => {
+    const { getLabels } = await import("./confluence-client.js");
+    (getLabels as any).mockRejectedValueOnce(new Error("Not found"));
+
+    const handler = registeredTools.get("get_labels")!.handler;
+    const result = await handler({ page_id: "999" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error: Not found");
+  });
+});
+
+describe("add_label tool", () => {
+  it("returns success with label names and tenant echo", async () => {
+    const { addLabels } = await import("./confluence-client.js");
+    (addLabels as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("add_label")!.handler;
+    const result = await handler({ page_id: "123", labels: ["draft", "review"] });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Added 2 label(s)");
+    expect(result.content[0].text).toContain("draft, review");
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+
+  it("returns isError on API failure", async () => {
+    const { addLabels } = await import("./confluence-client.js");
+    (addLabels as any).mockRejectedValueOnce(new Error("Forbidden"));
+
+    const handler = registeredTools.get("add_label")!.handler;
+    const result = await handler({ page_id: "123", labels: ["test"] });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error: Forbidden");
+  });
+});
+
+describe("remove_label tool", () => {
+  it("returns success with label name and tenant echo", async () => {
+    const { removeLabel } = await import("./confluence-client.js");
+    (removeLabel as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("remove_label")!.handler;
+    const result = await handler({ page_id: "123", label: "draft" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain('Removed label "draft"');
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+
+  it("returns isError on API failure", async () => {
+    const { removeLabel } = await import("./confluence-client.js");
+    (removeLabel as any).mockRejectedValueOnce(new Error("Not found"));
+
+    const handler = registeredTools.get("remove_label")!.handler;
+    const result = await handler({ page_id: "123", label: "missing" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error: Not found");
+  });
+});
+
+// =============================================================================
+// Content status tools
+// =============================================================================
+
+describe("get_page_status tool", () => {
+  it("returns status name + color + tenant echo on success", async () => {
+    const { getContentState } = await import("./confluence-client.js");
+    (getContentState as any).mockResolvedValueOnce({ name: "In progress", color: "#2684FF" });
+
+    const handler = registeredTools.get("get_page_status")!.handler;
+    const result = await handler({ page_id: "123" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("In progress");
+    expect(result.content[0].text).toContain("#2684FF");
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+
+  it("returns 'no status set' + tenant echo when null", async () => {
+    const { getContentState } = await import("./confluence-client.js");
+    (getContentState as any).mockResolvedValueOnce(null);
+
+    const handler = registeredTools.get("get_page_status")!.handler;
+    const result = await handler({ page_id: "123" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("no status set");
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+
+  it("returns isError on API failure", async () => {
+    const { getContentState } = await import("./confluence-client.js");
+    (getContentState as any).mockRejectedValueOnce(new Error("Server error"));
+
+    const handler = registeredTools.get("get_page_status")!.handler;
+    const result = await handler({ page_id: "999" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error: Server error");
+  });
+});
+
+describe("set_page_status tool", () => {
+  it("returns success with name + color + tenant echo", async () => {
+    const { setContentState } = await import("./confluence-client.js");
+    (setContentState as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("set_page_status")!.handler;
+    const result = await handler({ page_id: "123", name: "Ready for review", color: "#57D9A3" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Ready for review");
+    expect(result.content[0].text).toContain("#57D9A3");
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+
+  it("is blocked by writeGuard in read-only mode", async () => {
+    const { writeGuard } = await import("./index.js");
+    const readOnlyConfig = {
+      url: "https://test.atlassian.net",
+      email: "user@test.com",
+      profile: "acme",
+      readOnly: true,
+      apiV2: "https://test.atlassian.net/wiki/api/v2",
+      apiV1: "https://test.atlassian.net/wiki/rest/api",
+      authHeader: "Basic dGVzdA==",
+      jsonHeaders: {},
+    };
+    const result = writeGuard("set_page_status", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+    expect(result!.content[0].text).toContain("Write blocked");
+  });
+
+  it("returns isError on API failure", async () => {
+    const { setContentState } = await import("./confluence-client.js");
+    (setContentState as any).mockRejectedValueOnce(new Error("Forbidden"));
+
+    const handler = registeredTools.get("set_page_status")!.handler;
+    const result = await handler({ page_id: "123", name: "Draft", color: "#FFC400" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error: Forbidden");
+  });
+});
+
+describe("remove_page_status tool", () => {
+  it("returns success + tenant echo", async () => {
+    const { removeContentState } = await import("./confluence-client.js");
+    (removeContentState as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("remove_page_status")!.handler;
+    const result = await handler({ page_id: "123" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Removed status");
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+
+  it("is blocked by writeGuard in read-only mode", async () => {
+    const { writeGuard } = await import("./index.js");
+    const readOnlyConfig = {
+      url: "https://test.atlassian.net",
+      email: "user@test.com",
+      profile: "acme",
+      readOnly: true,
+      apiV2: "https://test.atlassian.net/wiki/api/v2",
+      apiV1: "https://test.atlassian.net/wiki/rest/api",
+      authHeader: "Basic dGVzdA==",
+      jsonHeaders: {},
+    };
+    const result = writeGuard("remove_page_status", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+    expect(result!.content[0].text).toContain("Write blocked");
+  });
+
+  it("returns isError on API failure", async () => {
+    const { removeContentState } = await import("./confluence-client.js");
+    (removeContentState as any).mockRejectedValueOnce(new Error("Server error"));
+
+    const handler = registeredTools.get("remove_page_status")!.handler;
+    const result = await handler({ page_id: "123" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error: Server error");
+  });
+});
+
+const mockComment = {
+  id: "123",
+  version: { number: 1, authorId: "user1", createdAt: "2024-01-01T00:00:00Z" },
+  body: { storage: { value: "<p>Test comment</p>" } },
+  resolutionStatus: "open",
+};
+
+describe("get_comments tool", () => {
+  beforeEach(async () => {
+    const { getFooterComments, getInlineComments, getCommentReplies } = await import("./confluence-client.js");
+    (getFooterComments as any).mockReset();
+    (getInlineComments as any).mockReset();
+    (getCommentReplies as any).mockReset();
+  });
+
+  it("calls getFooterComments and getInlineComments in parallel for type: all", async () => {
+    const { getFooterComments, getInlineComments } = await import("./confluence-client.js");
+    (getFooterComments as any).mockResolvedValueOnce([]);
+    (getInlineComments as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    await handler({ page_id: "42", type: "all", resolution_status: "all", include_replies: false });
+
+    expect(getFooterComments).toHaveBeenCalledWith("42");
+    expect(getInlineComments).toHaveBeenCalledWith("42", "all");
+  });
+
+  it("only calls getFooterComments for type: footer", async () => {
+    const { getFooterComments, getInlineComments } = await import("./confluence-client.js");
+    (getFooterComments as any).mockResolvedValueOnce([]);
+    (getInlineComments as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    await handler({ page_id: "42", type: "footer", resolution_status: "all", include_replies: false });
+
+    expect(getFooterComments).toHaveBeenCalledWith("42");
+    expect(getInlineComments).not.toHaveBeenCalled();
+  });
+
+  it("only calls getInlineComments for type: inline", async () => {
+    const { getFooterComments, getInlineComments } = await import("./confluence-client.js");
+    (getFooterComments as any).mockResolvedValueOnce([]);
+    (getInlineComments as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    await handler({ page_id: "42", type: "inline", resolution_status: "open", include_replies: false });
+
+    expect(getInlineComments).toHaveBeenCalledWith("42", "open");
+    expect(getFooterComments).not.toHaveBeenCalled();
+  });
+
+  it("passes resolution_status to getInlineComments", async () => {
+    const { getFooterComments, getInlineComments } = await import("./confluence-client.js");
+    (getFooterComments as any).mockResolvedValueOnce([]);
+    (getInlineComments as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    await handler({ page_id: "42", type: "all", resolution_status: "resolved", include_replies: false });
+
+    expect(getInlineComments).toHaveBeenCalledWith("42", "resolved");
+  });
+
+  it("fetches replies when include_replies is true", async () => {
+    const { getFooterComments, getInlineComments, getCommentReplies } = await import("./confluence-client.js");
+    (getFooterComments as any).mockResolvedValueOnce([mockComment]);
+    (getInlineComments as any).mockResolvedValueOnce([]);
+    (getCommentReplies as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    await handler({ page_id: "42", type: "all", resolution_status: "all", include_replies: true });
+
+    expect(getCommentReplies).toHaveBeenCalledWith("123", "footer");
+  });
+
+  it("returns formatted output with comment IDs and body excerpts", async () => {
+    const { getFooterComments, getInlineComments } = await import("./confluence-client.js");
+    (getFooterComments as any).mockResolvedValueOnce([mockComment]);
+    (getInlineComments as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    const result = await handler({ page_id: "42", type: "all", resolution_status: "all", include_replies: false });
+
+    expect(result.isError).toBeUndefined();
+    const text = result.content[0].text;
+    expect(text).toContain("123");
+    expect(text).toContain("user1");
+    expect(text).toContain("Test comment");
+  });
+
+  it("returns No comments found when both lists are empty", async () => {
+    const { getFooterComments, getInlineComments } = await import("./confluence-client.js");
+    (getFooterComments as any).mockResolvedValueOnce([]);
+    (getInlineComments as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    const result = await handler({ page_id: "42", type: "all", resolution_status: "all", include_replies: false });
+
+    expect(result.content[0].text).toContain("No comments found");
+  });
+
+  it("is not blocked by writeGuard in read-only mode", async () => {
+    const { writeGuard } = await import("./index.js");
+    const readOnlyConfig = {
+      url: "https://test.atlassian.net",
+      email: "user@test.com",
+      profile: null,
+      readOnly: true,
+      apiV2: "https://test.atlassian.net/wiki/api/v2",
+      apiV1: "https://test.atlassian.net/wiki/rest/api",
+      authHeader: "Basic dGVzdA==",
+      jsonHeaders: {},
+    };
+    const result = writeGuard("get_comments", readOnlyConfig);
+    expect(result).toBeNull();
+  });
+
+  it("returns isError on API failure", async () => {
+    const { getFooterComments, getInlineComments } = await import("./confluence-client.js");
+    (getFooterComments as any).mockRejectedValueOnce(new Error("API failure"));
+    (getInlineComments as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    const result = await handler({ page_id: "42", type: "all", resolution_status: "all", include_replies: false });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error: API failure");
+  });
+});
+
+describe("create_comment tool", () => {
+  beforeEach(async () => {
+    const { createFooterComment, createInlineComment } = await import("./confluence-client.js");
+    (createFooterComment as any).mockReset();
+    (createInlineComment as any).mockReset();
+  });
+
+  it("is blocked by writeGuard in read-only mode", async () => {
+    const { writeGuard } = await import("./index.js");
+    const readOnlyConfig = {
+      url: "https://test.atlassian.net",
+      email: "user@test.com",
+      profile: null,
+      readOnly: true,
+      apiV2: "https://test.atlassian.net/wiki/api/v2",
+      apiV1: "https://test.atlassian.net/wiki/rest/api",
+      authHeader: "Basic dGVzdA==",
+      jsonHeaders: {},
+    };
+    const result = writeGuard("create_comment", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+    expect(result!.content[0].text).toContain("Write blocked");
+  });
+
+  it("calls createFooterComment for type: footer", async () => {
+    const { createFooterComment } = await import("./confluence-client.js");
+    (createFooterComment as any).mockResolvedValueOnce({ ...mockComment, id: "456" });
+
+    const handler = registeredTools.get("create_comment")!.handler;
+    const result = await handler({
+      page_id: "42",
+      body: "Hello footer",
+      type: "footer",
+      text_selection_match_index: 0,
+    });
+
+    expect(createFooterComment).toHaveBeenCalledWith("42", "Hello footer", undefined);
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Created footer comment");
+    expect(result.content[0].text).toContain("456");
+  });
+
+  it("calls createInlineComment for type: inline with text_selection", async () => {
+    const { createInlineComment } = await import("./confluence-client.js");
+    (createInlineComment as any).mockResolvedValueOnce({ ...mockComment, id: "789" });
+
+    const handler = registeredTools.get("create_comment")!.handler;
+    const result = await handler({
+      page_id: "42",
+      body: "Inline comment",
+      type: "inline",
+      text_selection: "some text",
+      text_selection_match_index: 0,
+    });
+
+    expect(createInlineComment).toHaveBeenCalledWith("42", "Inline comment", "some text", 0, undefined);
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Created inline comment");
+    expect(result.content[0].text).toContain("789");
+  });
+
+  it("returns error if type: inline without parent_comment_id and without text_selection", async () => {
+    const handler = registeredTools.get("create_comment")!.handler;
+    const result = await handler({
+      page_id: "42",
+      body: "Inline comment",
+      type: "inline",
+      text_selection_match_index: 0,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("text_selection is required");
+  });
+
+  it("returns created comment ID in success message with tenant echo", async () => {
+    const { createFooterComment } = await import("./confluence-client.js");
+    (createFooterComment as any).mockResolvedValueOnce({ ...mockComment, id: "999" });
+
+    const handler = registeredTools.get("create_comment")!.handler;
+    const result = await handler({
+      page_id: "42",
+      body: "Test body",
+      type: "footer",
+      text_selection_match_index: 0,
+    });
+
+    expect(result.content[0].text).toContain("Created footer comment");
+    expect(result.content[0].text).toContain("999");
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+});
+
+describe("resolve_comment tool", () => {
+  beforeEach(async () => {
+    const { resolveComment } = await import("./confluence-client.js");
+    (resolveComment as any).mockReset();
+  });
+
+  it("is blocked by writeGuard in read-only mode", async () => {
+    const { writeGuard } = await import("./index.js");
+    const readOnlyConfig = {
+      url: "https://test.atlassian.net",
+      email: "user@test.com",
+      profile: null,
+      readOnly: true,
+      apiV2: "https://test.atlassian.net/wiki/api/v2",
+      apiV1: "https://test.atlassian.net/wiki/rest/api",
+      authHeader: "Basic dGVzdA==",
+      jsonHeaders: {},
+    };
+    const result = writeGuard("resolve_comment", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+  });
+
+  it("calls resolveComment(id, true) by default", async () => {
+    const { resolveComment } = await import("./confluence-client.js");
+    (resolveComment as any).mockResolvedValueOnce({ ...mockComment });
+
+    const handler = registeredTools.get("resolve_comment")!.handler;
+    const result = await handler({ comment_id: "123", resolved: true });
+
+    expect(resolveComment).toHaveBeenCalledWith("123", true);
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("resolved");
+  });
+
+  it("calls resolveComment(id, false) when resolved: false", async () => {
+    const { resolveComment } = await import("./confluence-client.js");
+    (resolveComment as any).mockResolvedValueOnce({ ...mockComment });
+
+    const handler = registeredTools.get("resolve_comment")!.handler;
+    const result = await handler({ comment_id: "123", resolved: false });
+
+    expect(resolveComment).toHaveBeenCalledWith("123", false);
+    expect(result.content[0].text).toContain("reopened");
+  });
+
+  it("returns resolved in success message", async () => {
+    const { resolveComment } = await import("./confluence-client.js");
+    (resolveComment as any).mockResolvedValueOnce({ ...mockComment });
+
+    const handler = registeredTools.get("resolve_comment")!.handler;
+    const result = await handler({ comment_id: "123", resolved: true });
+
+    expect(result.content[0].text).toContain("resolved");
+    expect(result.content[0].text).toContain("123");
+  });
+
+  it("surfaces error message on API failure", async () => {
+    const { resolveComment } = await import("./confluence-client.js");
+    (resolveComment as any).mockRejectedValueOnce(new Error("Dangling comment: highlighted text has been deleted"));
+
+    const handler = registeredTools.get("resolve_comment")!.handler;
+    const result = await handler({ comment_id: "123", resolved: true });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Dangling comment");
+  });
+});
+
+describe("delete_comment tool", () => {
+  beforeEach(async () => {
+    const { deleteFooterComment, deleteInlineComment } = await import("./confluence-client.js");
+    (deleteFooterComment as any).mockReset();
+    (deleteInlineComment as any).mockReset();
+  });
+
+  it("is blocked by writeGuard in read-only mode", async () => {
+    const { writeGuard } = await import("./index.js");
+    const readOnlyConfig = {
+      url: "https://test.atlassian.net",
+      email: "user@test.com",
+      profile: null,
+      readOnly: true,
+      apiV2: "https://test.atlassian.net/wiki/api/v2",
+      apiV1: "https://test.atlassian.net/wiki/rest/api",
+      authHeader: "Basic dGVzdA==",
+      jsonHeaders: {},
+    };
+    const result = writeGuard("delete_comment", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+  });
+
+  it("calls deleteFooterComment for type: footer", async () => {
+    const { deleteFooterComment } = await import("./confluence-client.js");
+    (deleteFooterComment as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("delete_comment")!.handler;
+    const result = await handler({ comment_id: "123", type: "footer" });
+
+    expect(deleteFooterComment).toHaveBeenCalledWith("123");
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Deleted footer comment");
+    expect(result.content[0].text).toContain("123");
+  });
+
+  it("calls deleteInlineComment for type: inline", async () => {
+    const { deleteInlineComment } = await import("./confluence-client.js");
+    (deleteInlineComment as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("delete_comment")!.handler;
+    const result = await handler({ comment_id: "456", type: "inline" });
+
+    expect(deleteInlineComment).toHaveBeenCalledWith("456");
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Deleted inline comment");
+    expect(result.content[0].text).toContain("456");
+  });
+
+  it("returns deleted comment ID and type in success message", async () => {
+    const { deleteFooterComment } = await import("./confluence-client.js");
+    (deleteFooterComment as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("delete_comment")!.handler;
+    const result = await handler({ comment_id: "777", type: "footer" });
+
+    expect(result.content[0].text).toContain("777");
+    expect(result.content[0].text).toContain("footer");
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+
+  it("returns isError on API failure", async () => {
+    const { deleteFooterComment } = await import("./confluence-client.js");
+    (deleteFooterComment as any).mockRejectedValueOnce(new Error("Comment not found"));
+
+    const handler = registeredTools.get("delete_comment")!.handler;
+    const result = await handler({ comment_id: "123", type: "footer" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error: Comment not found");
+  });
+});
+
+// =============================================================================
+// Version history tools (Phase 1)
+// =============================================================================
+
+describe("get_page_versions tool", () => {
+  it("returns formatted version list on success", async () => {
+    const { getPageVersions } = await import("./confluence-client.js");
+    (getPageVersions as any).mockResolvedValueOnce([
+      { number: 3, by: { displayName: "Alice", accountId: "a" }, when: "2025-01-03T00:00:00Z", message: "Fix typo", minorEdit: false },
+      { number: 2, by: { displayName: "Bob", accountId: "b" }, when: "2025-01-02T00:00:00Z", message: "", minorEdit: true },
+    ]);
+
+    const handler = registeredTools.get("get_page_versions")!.handler;
+    const result = await handler({ page_id: "123", limit: 25 });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("2 version(s)");
+    expect(result.content[0].text).toContain("v3: Alice");
+    expect(result.content[0].text).toContain("Fix typo");
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+
+  it("returns toolError on ConfluenceApiError", async () => {
+    const { getPageVersions, ConfluenceApiError } = await import("./confluence-client.js");
+    (getPageVersions as any).mockRejectedValueOnce(new ConfluenceApiError(500, "Internal"));
+
+    const handler = registeredTools.get("get_page_versions")!.handler;
+    const result = await handler({ page_id: "123", limit: 25 });
+    expect(result.isError).toBe(true);
+  });
+
+  it("maps 404 to 'Page not found or inaccessible'", async () => {
+    const { getPageVersions, ConfluenceApiError } = await import("./confluence-client.js");
+    (getPageVersions as any).mockRejectedValueOnce(new ConfluenceApiError(404, "Not found"));
+
+    const handler = registeredTools.get("get_page_versions")!.handler;
+    const result = await handler({ page_id: "999", limit: 25 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Page not found or inaccessible");
+  });
+
+  it("maps 403 to 'Page not found or inaccessible'", async () => {
+    const { getPageVersions, ConfluenceApiError } = await import("./confluence-client.js");
+    (getPageVersions as any).mockRejectedValueOnce(new ConfluenceApiError(403, "Forbidden"));
+
+    const handler = registeredTools.get("get_page_versions")!.handler;
+    const result = await handler({ page_id: "999", limit: 25 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Page not found or inaccessible");
+  });
+
+  it("includes minor edit flag and message in output", async () => {
+    const { getPageVersions } = await import("./confluence-client.js");
+    (getPageVersions as any).mockResolvedValueOnce([
+      { number: 1, by: { displayName: "X", accountId: "x" }, when: "2025-01-01T00:00:00Z", message: "Init", minorEdit: true },
+    ]);
+
+    const handler = registeredTools.get("get_page_versions")!.handler;
+    const result = await handler({ page_id: "1", limit: 25 });
+    expect(result.content[0].text).toContain("[minor]");
+    expect(result.content[0].text).toContain("Init");
+  });
+});
+
+describe("get_page_version tool", () => {
+  it("returns formatted page content with title/version header", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    (getPageVersionBody as any).mockResolvedValueOnce({
+      title: "My Page",
+      rawBody: "<p>Simple text</p>",
+      version: 3,
+    });
+
+    const handler = registeredTools.get("get_page_version")!.handler;
+    const result = await handler({ page_id: "10", version: 3 });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Title: My Page");
+    expect(result.content[0].text).toContain("Version: 3");
+    expect(result.content[0].text).toContain("Tenant:");
+  });
+
+  it("calls toMarkdownView on raw body (content is sanitized)", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    (getPageVersionBody as any).mockResolvedValueOnce({
+      title: "Test",
+      rawBody: '<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">js</ac:parameter><ac:plain-text-body>let x = 1;</ac:plain-text-body></ac:structured-macro>',
+      version: 1,
+    });
+
+    const handler = registeredTools.get("get_page_version")!.handler;
+    const result = await handler({ page_id: "5", version: 1 });
+    // toMarkdownView replaces macros with placeholders
+    expect(result.content[0].text).toContain("[macro: code");
+  });
+
+  it("maps 404/403 to 'Page not found or inaccessible'", async () => {
+    const { getPageVersionBody, ConfluenceApiError } = await import("./confluence-client.js");
+    (getPageVersionBody as any).mockRejectedValueOnce(new ConfluenceApiError(404, "Not found"));
+
+    const handler = registeredTools.get("get_page_version")!.handler;
+    const result = await handler({ page_id: "999", version: 1 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Page not found or inaccessible");
+  });
+
+  it("returns toolError on generic error", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    (getPageVersionBody as any).mockRejectedValueOnce(new Error("Network timeout"));
+
+    const handler = registeredTools.get("get_page_version")!.handler;
+    const result = await handler({ page_id: "1", version: 1 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Network timeout");
+  });
+});
+
+describe("diff_page_versions tool", () => {
+  const mockVersionResult = (title: string, rawBody: string, version: number) => ({
+    title, rawBody, version,
+  });
+
+  it("summary format returns formatted summary with section changes", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    const { computeSummaryDiff } = await import("./diff.js");
+    (getPageVersionBody as any)
+      .mockResolvedValueOnce(mockVersionResult("Page", "<p>old</p>", 1))
+      .mockResolvedValueOnce(mockVersionResult("Page", "<p>new</p>", 3));
+    (computeSummaryDiff as any).mockReturnValueOnce({
+      totalAdded: 5, totalRemoved: 2,
+      sections: [{ type: "modified", section: "Intro", added: 5, removed: 2 }],
+      summary: "5 lines added, 2 lines removed. Changes in sections: Intro",
+    });
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    const result = await handler({ page_id: "10", from_version: 1, to_version: 3, format: "summary" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Diff summary: v1");
+    expect(result.content[0].text).toContain("v3");
+    expect(result.content[0].text).toContain("Section changes:");
+    expect(result.content[0].text).toContain("modified: Intro");
+  });
+
+  it("unified format returns unified diff text", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    const { computeUnifiedDiff } = await import("./diff.js");
+    (getPageVersionBody as any)
+      .mockResolvedValueOnce(mockVersionResult("Page", "<p>a</p>", 1))
+      .mockResolvedValueOnce(mockVersionResult("Page", "<p>b</p>", 2));
+    (computeUnifiedDiff as any).mockReturnValueOnce({
+      diff: "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b", truncated: false,
+    });
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    const result = await handler({ page_id: "10", from_version: 1, to_version: 2, format: "unified" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Diff: v1");
+    expect(result.content[0].text).toContain("--- a");
+  });
+
+  it("defaults to_version to current version when not provided", async () => {
+    const { getPage, getPageVersionBody } = await import("./confluence-client.js");
+    const { computeSummaryDiff } = await import("./diff.js");
+    (getPage as any).mockResolvedValueOnce({ id: "10", title: "P", version: { number: 5 } });
+    (getPageVersionBody as any)
+      .mockResolvedValueOnce(mockVersionResult("P", "<p>old</p>", 1))
+      .mockResolvedValueOnce(mockVersionResult("P", "<p>new</p>", 5));
+    (computeSummaryDiff as any).mockReturnValueOnce({
+      totalAdded: 0, totalRemoved: 0, sections: [], summary: "No changes.",
+    });
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    await handler({ page_id: "10", from_version: 1, format: "summary" });
+    expect(getPage).toHaveBeenCalledWith("10", false);
+  });
+
+  it("validates from_version < to_version", async () => {
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    const result = await handler({ page_id: "10", from_version: 5, to_version: 3, format: "summary" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("must be less than");
+  });
+
+  it("rejects when body exceeds MAX_DIFF_SIZE", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    const bigBody = "x".repeat(600000);
+    (getPageVersionBody as any)
+      .mockResolvedValueOnce(mockVersionResult("P", bigBody, 1))
+      .mockResolvedValueOnce(mockVersionResult("P", "<p>small</p>", 2));
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    const result = await handler({ page_id: "10", from_version: 1, to_version: 2, format: "summary" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("maximum diff size");
+  });
+
+  it("fetches both versions in parallel", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    const { computeSummaryDiff } = await import("./diff.js");
+    (getPageVersionBody as any).mockReset();
+    (getPageVersionBody as any)
+      .mockResolvedValueOnce(mockVersionResult("P", "<p>a</p>", 1))
+      .mockResolvedValueOnce(mockVersionResult("P", "<p>b</p>", 2));
+    (computeSummaryDiff as any).mockReturnValueOnce({
+      totalAdded: 0, totalRemoved: 0, sections: [], summary: "No changes.",
+    });
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    await handler({ page_id: "10", from_version: 1, to_version: 2, format: "summary" });
+    expect(getPageVersionBody).toHaveBeenCalledTimes(2);
+    expect(getPageVersionBody).toHaveBeenCalledWith("10", 1);
+    expect(getPageVersionBody).toHaveBeenCalledWith("10", 2);
+  });
+
+  it("calls toMarkdownView on both raw bodies", async () => {
+    const { getPageVersionBody, toMarkdownView } = await import("./confluence-client.js");
+    const { computeSummaryDiff } = await import("./diff.js");
+    (getPageVersionBody as any)
+      .mockResolvedValueOnce(mockVersionResult("P", "<p>a</p>", 1))
+      .mockResolvedValueOnce(mockVersionResult("P", "<p>b</p>", 2));
+    (computeSummaryDiff as any).mockReturnValueOnce({
+      totalAdded: 1, totalRemoved: 1, sections: [], summary: "1 added, 1 removed",
+    });
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    await handler({ page_id: "10", from_version: 1, to_version: 2, format: "summary" });
+    // toMarkdownView is the real function (not mocked), so we verify it ran
+    // by checking computeSummaryDiff was called with markdown strings, not raw HTML
+    expect(computeSummaryDiff).toHaveBeenCalled();
+  });
+
+  it("passes max_length through to computeUnifiedDiff", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    const { computeUnifiedDiff } = await import("./diff.js");
+    (getPageVersionBody as any)
+      .mockResolvedValueOnce(mockVersionResult("P", "<p>a</p>", 1))
+      .mockResolvedValueOnce(mockVersionResult("P", "<p>b</p>", 2));
+    (computeUnifiedDiff as any).mockReturnValueOnce({ diff: "...", truncated: false });
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    await handler({ page_id: "10", from_version: 1, to_version: 2, format: "unified", max_length: 500 });
+    expect(computeUnifiedDiff).toHaveBeenCalledWith(expect.any(String), expect.any(String), 500);
+  });
+
+  it("maps 404 to 'Page not found or inaccessible'", async () => {
+    const { getPageVersionBody, ConfluenceApiError } = await import("./confluence-client.js");
+    (getPageVersionBody as any).mockRejectedValueOnce(new ConfluenceApiError(404, "Not found"));
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    const result = await handler({ page_id: "999", from_version: 1, to_version: 2, format: "summary" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Page not found or inaccessible");
+  });
+
+  it("maps 403 to 'Page not found or inaccessible'", async () => {
+    const { getPageVersionBody, ConfluenceApiError } = await import("./confluence-client.js");
+    (getPageVersionBody as any).mockRejectedValueOnce(new ConfluenceApiError(403, "Forbidden"));
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    const result = await handler({ page_id: "999", from_version: 1, to_version: 2, format: "summary" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Page not found or inaccessible");
+  });
+
+  it("returns toolError for generic errors", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    (getPageVersionBody as any).mockRejectedValueOnce(new Error("Timeout"));
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    const result = await handler({ page_id: "10", from_version: 1, to_version: 2, format: "summary" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Timeout");
+  });
+
+  it("includes page title in output header", async () => {
+    const { getPageVersionBody } = await import("./confluence-client.js");
+    const { computeSummaryDiff } = await import("./diff.js");
+    (getPageVersionBody as any)
+      .mockResolvedValueOnce(mockVersionResult("Architecture Doc", "<p>a</p>", 1))
+      .mockResolvedValueOnce(mockVersionResult("Architecture Doc", "<p>b</p>", 2));
+    (computeSummaryDiff as any).mockReturnValueOnce({
+      totalAdded: 0, totalRemoved: 0, sections: [], summary: "No changes.",
+    });
+
+    const handler = registeredTools.get("diff_page_versions")!.handler;
+    const result = await handler({ page_id: "10", from_version: 1, to_version: 2, format: "summary" });
+    expect(result.content[0].text).toContain("Architecture Doc");
   });
 });

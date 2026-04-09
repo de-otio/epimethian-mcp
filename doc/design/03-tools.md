@@ -2,14 +2,18 @@
 
 All tools return plain text (not JSON) for LLM consumption. Tools are registered using `server.registerTool()` with annotations that hint at their behavior (e.g., `readOnlyHint`, `destructiveHint`, `idempotentHint`). All API responses are validated at runtime using Zod schemas defined in `confluence-client.ts`.
 
+## Read-Only Mode
+
+When a profile is configured as read-only (`readOnly: true` in profile settings or `CONFLUENCE_READ_ONLY=true` env var), write tools are blocked at call time using a whitelist pattern: only tools in the `READ_ONLY_TOOLS` set are permitted, all others return an error. Write tool descriptions are prefixed with `[READ-ONLY]` during registration. New tools are blocked by default unless explicitly added to the whitelist.
+
 ## Tool Annotations
 
 | Tool | readOnlyHint | destructiveHint | idempotentHint |
 |------|:---:|:---:|:---:|
-| `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments` | yes | — | — |
-| `create_page`, `add_attachment`, `add_drawio_diagram` | — | no | no |
+| `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments`, `get_labels` | yes | — | — |
+| `create_page`, `add_attachment`, `add_drawio_diagram`, `add_label` | — | no | no |
 | `update_page`, `update_page_section` | — | no | no |
-| `delete_page` | — | yes | yes |
+| `delete_page`, `remove_label` | — | yes | yes |
 
 ## Tool Summary
 
@@ -28,6 +32,9 @@ All tools return plain text (not JSON) for LLM consumption. Tools are registered
 | `add_attachment` | page_id, file_path, filename?, comment? | Upload a file attachment to a page |
 | `get_attachments` | page_id, limit? | List attachments on a page |
 | `add_drawio_diagram` | page_id, diagram_xml, diagram_name, append? | Add a draw.io diagram to a page (all-in-one) |
+| `get_labels` | page_id | Get all labels on a page |
+| `add_label` | page_id, labels | Add one or more labels to a page |
+| `remove_label` | page_id, label | Remove a label from a page |
 
 ## Tool Details
 
@@ -75,3 +82,12 @@ All-in-one tool for adding draw.io diagrams. The LLM provides the diagram XML (m
 4. Cleans up the temp file
 
 By default appends the diagram to existing page content (`append: true`). Set `append: false` to replace the page body entirely. Requires the draw.io app to be installed on the Confluence instance.
+
+### get_labels
+Returns all labels on a page. Labels are returned as an array of strings. This is a read-only operation and does not require edit permissions.
+
+### add_label
+Adds one or more labels to a page. The `labels` parameter accepts either a single label name (string) or an array of label names. Labels are case-insensitive when matching existing labels, but the server preserves the case of the label as provided. This operation does not remove existing labels; it only adds new ones. Duplicate label additions are idempotent (duplicate additions have no effect). Requires edit permission on the page.
+
+### remove_label
+Removes a single label from a page. The `label` parameter is the name of the label to remove. Removal is case-insensitive. If the label is not present on the page, the operation succeeds silently (idempotent). Requires edit permission on the page.

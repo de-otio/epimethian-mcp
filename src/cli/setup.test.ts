@@ -15,10 +15,13 @@ vi.mock("../shared/keychain.js", () => ({
 }));
 
 const mockAddToProfileRegistry = vi.fn().mockResolvedValue(undefined);
+const mockSetProfileSettings = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("../shared/profiles.js", () => ({
   addToProfileRegistry: (...args: unknown[]) =>
     mockAddToProfileRegistry(...args),
+  setProfileSettings: (...args: unknown[]) =>
+    mockSetProfileSettings(...args),
 }));
 
 // Mock readline
@@ -304,7 +307,8 @@ describe("runSetup", () => {
     mockReadFromKeychain.mockResolvedValueOnce(null);
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net")
-      .mockResolvedValueOnce("user@test.com");
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("N"); // "Enable writes?" prompt
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -344,5 +348,97 @@ describe("runSetup", () => {
   it("exits on invalid profile name", async () => {
     await expect(runSetup("-bad")).rejects.toThrow("process.exit(1)");
     expect(exitCode).toBe(1);
+  });
+
+  it("defaults profile to read-only when user answers N to writes prompt", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net") // url
+      .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("N"); // "Enable writes?" → No
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("acme");
+
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { readOnly: true });
+
+    process.stdin.on = originalOn;
+  });
+
+  it("sets profile to read-write when --read-write flag is passed", async () => {
+    process.argv = ["node", "index.js", "setup", "--profile", "acme", "--read-write"];
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net")
+      .mockResolvedValueOnce("user@test.com");
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("acme");
+
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { readOnly: false });
+    // Should not prompt for writes when flag is explicit
+    const writesPromptCalls = mockQuestion.mock.calls.filter(
+      (c: any[]) => typeof c[0] === "string" && c[0].includes("Enable writes")
+    );
+    expect(writesPromptCalls).toHaveLength(0);
+
+    process.stdin.on = originalOn;
+  });
+
+  it("sets profile to read-only when user answers y to writes prompt", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net")
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("y"); // "Enable writes?" → Yes
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("acme");
+
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { readOnly: false });
+
+    process.stdin.on = originalOn;
   });
 });

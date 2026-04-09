@@ -1,6 +1,7 @@
 import { z } from "zod";
 import TurndownService from "turndown";
 import { readFromKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
+import { getProfileSettings } from "../shared/profiles.js";
 import { testConnection, verifyTenantIdentity } from "../shared/test-connection.js";
 import { pageCache } from "./page-cache.js";
 
@@ -10,6 +11,7 @@ export interface Config {
   url: string;
   email: string;
   profile: string | null;
+  readOnly: boolean;
   apiV2: string;
   apiV1: string;
   authHeader: string;
@@ -99,6 +101,13 @@ export async function getConfig(): Promise<Config> {
 
   const { url, email, apiToken, profile } = await resolveCredentials();
 
+  // Resolve read-only flag: strict-mode OR — either source saying read-only wins.
+  // CONFLUENCE_READ_ONLY=false does NOT override a registry-level read-only flag.
+  const registrySettings = profile ? await getProfileSettings(profile) : undefined;
+  const readOnly =
+    (registrySettings?.readOnly === true) ||
+    (process.env.CONFLUENCE_READ_ONLY === "true");
+
   // Confluence exposes two API generations:
   //   - v2 (REST): /wiki/api/v2  — used for page CRUD, spaces, children
   //   - v1 (REST): /wiki/rest/api — used for CQL search and attachments (no v2 equivalent)
@@ -109,6 +118,7 @@ export async function getConfig(): Promise<Config> {
     url,
     email,
     profile,
+    readOnly,
     apiV2: `${url}/wiki/api/v2`,
     apiV1: `${url}/wiki/rest/api`,
     authHeader,
@@ -168,8 +178,9 @@ export async function validateStartup(config: Config): Promise<void> {
 
   // Step 3: Log connection info
   const profileLabel = profile ? `profile: ${profile}` : "env-var mode";
+  const readOnlyLabel = config.readOnly ? ", READ-ONLY" : "";
   console.error(
-    `epimethian-mcp: connected to ${url} as ${email} (${profileLabel})`
+    `epimethian-mcp: connected to ${url} as ${email} (${profileLabel}${readOnlyLabel})`
   );
 }
 
@@ -233,6 +244,49 @@ const AttachmentsResultSchema = z.object({
 
 export type AttachmentData = z.infer<typeof AttachmentSchema>;
 
+export const LabelSchema = z.object({
+  id: z.string(),
+  prefix: z.enum(["global", "my", "team", "system"]),
+  name: z.string(),
+});
+
+export type LabelData = z.infer<typeof LabelSchema>;
+
+const LabelsResultSchema = z.object({
+  results: z.array(LabelSchema).default([]),
+});
+
+// Content state (page status badge) — v1 only
+export const ContentStateSchema = z.object({
+  name: z.string(),
+  color: z.string(),
+}).strict();
+
+export type ContentStateData = z.infer<typeof ContentStateSchema>;
+
+export const CommentSchema = z.object({
+  id: z.string().regex(/^\d+$/),
+  status: z.string().optional(),
+  pageId: z.string().optional(),
+  parentCommentId: z.string().nullable().optional(),
+  version: z.object({
+    number: z.number(),
+    createdAt: z.string().optional(),
+    authorId: z.string().optional(),
+  }).optional(),
+  body: z.object({
+    storage: z.object({ value: z.string() }).optional(),
+  }).optional(),
+  resolutionStatus: z.string().optional(),
+  _links: z.object({ webui: z.string().optional() }).optional(),
+});
+
+export type CommentData = z.infer<typeof CommentSchema>;
+
+const CommentsResultSchema = z.object({
+  results: z.array(CommentSchema).default([]),
+});
+
 const UploadResultSchema = z.object({
   results: z
     .array(
@@ -243,6 +297,34 @@ const UploadResultSchema = z.object({
       })
     )
     .default([]),
+});
+
+// --- Version history schemas ---
+
+const VersionMetadataSchema = z.object({
+  number: z.number(),
+  by: z.object({
+    displayName: z.string(),
+    accountId: z.string(),
+  }),
+  when: z.string(),
+  message: z.string().default(""),
+  minorEdit: z.boolean(),
+});
+
+export type VersionMetadata = z.infer<typeof VersionMetadataSchema>;
+
+const VersionsResultSchema = z.object({
+  results: z.array(VersionMetadataSchema).default([]),
+});
+
+const V1PageVersionSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  version: z.object({ number: z.number() }),
+  body: z.object({
+    storage: z.object({ value: z.string() }),
+  }),
 });
 
 // --- Error sanitization ---
@@ -406,7 +488,7 @@ export async function createPage(
   pageCache.set(page.id, page.version?.number ?? 1, cleanBody + "\n" + buildAttributionFooter("created"));
 
   try {
-    await addLabel(page.id, ATTRIBUTION_LABEL);
+    await addLabels(page.id, [ATTRIBUTION_LABEL]);
   } catch {
     // Label addition is non-critical
   }
@@ -461,7 +543,7 @@ export async function updatePage(
   }
 
   try {
-    await addLabel(page.id, ATTRIBUTION_LABEL);
+    await addLabels(page.id, [ATTRIBUTION_LABEL]);
   } catch {
     // Label addition is non-critical
   }
@@ -559,6 +641,54 @@ export async function getAttachments(
   return AttachmentsResultSchema.parse(raw).results;
 }
 
+// --- Version history ---
+
+export async function getPageVersions(
+  pageId: string,
+  limit: number
+): Promise<VersionMetadata[]> {
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/content/${pageId}/version`);
+  url.searchParams.set("limit", String(limit));
+  const res = await confluenceRequest(url.toString());
+  const raw = await res.json();
+  const data = VersionsResultSchema.parse(raw);
+  // Truncate messages (untrusted user content)
+  return data.results.map((v) => ({
+    ...v,
+    message: v.message.slice(0, 500),
+  }));
+}
+
+export async function getPageVersionBody(
+  pageId: string,
+  version: number
+): Promise<{ title: string; rawBody: string; version: number }> {
+  // Check versioned cache first
+  const cached = pageCache.getVersioned(pageId, version);
+  if (cached !== undefined) {
+    // Body is cached — lightweight metadata fetch for title
+    const raw = await v2Get(`/pages/${pageId}`, {});
+    const page = PageSchema.parse(raw);
+    return { title: page.title, rawBody: cached, version };
+  }
+
+  // Cache miss — full v1 fetch with body
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/content/${pageId}`);
+  url.searchParams.set("version", String(version));
+  url.searchParams.set("expand", "body.storage,version");
+  const res = await confluenceRequest(url.toString());
+  const raw = await res.json();
+  const data = V1PageVersionSchema.parse(raw);
+  const rawBody = data.body.storage.value;
+
+  // Cache the raw body for reuse by diff
+  pageCache.setVersioned(pageId, version, rawBody);
+
+  return { title: data.title, rawBody, version: data.version.number };
+}
+
 export async function uploadAttachment(
   pageId: string,
   fileData: Buffer | Uint8Array,
@@ -617,15 +747,256 @@ function stripAttributionFooter(body: string): string {
     .trimEnd();
 }
 
-async function addLabel(pageId: string, label: string): Promise<void> {
+export async function getLabels(pageId: string): Promise<LabelData[]> {
+  const cfg = await getConfig();
+  const res = await confluenceRequest(
+    `${cfg.apiV1}/content/${pageId}/label`
+  );
+  const data = LabelsResultSchema.parse(await res.json());
+  return data.results;
+}
+
+export async function addLabels(
+  pageId: string,
+  labels: string[]
+): Promise<void> {
   const cfg = await getConfig();
   await confluenceRequest(`${cfg.apiV1}/content/${pageId}/label`, {
     method: "POST",
-    body: JSON.stringify([{ prefix: "global", name: label }]),
+    body: JSON.stringify(labels.map((name) => ({ prefix: "global", name }))),
   });
 }
 
+export async function removeLabel(
+  pageId: string,
+  label: string
+): Promise<void> {
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/content/${pageId}/label`);
+  url.searchParams.set("name", label);
+  await confluenceRequest(url.toString(), { method: "DELETE" });
+}
+
+// --- Content State (page status badge) ---
+
+export async function getContentState(
+  pageId: string
+): Promise<ContentStateData | null> {
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
+  url.searchParams.set("status", "current");
+  try {
+    const res = await confluenceRequest(url.toString());
+    const data = await res.json();
+    // API returns contentState: null when no state is set
+    if (!data || !data.name) return null;
+    return ContentStateSchema.parse(data);
+  } catch (err) {
+    if (err instanceof ConfluenceApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+export async function setContentState(
+  pageId: string,
+  name: string,
+  color: string
+): Promise<void> {
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
+  url.searchParams.set("status", "current");
+  await confluenceRequest(url.toString(), {
+    method: "PUT",
+    body: JSON.stringify({ name, color }),
+  });
+}
+
+export async function removeContentState(pageId: string): Promise<void> {
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
+  url.searchParams.set("status", "current");
+  try {
+    await confluenceRequest(url.toString(), { method: "DELETE" });
+  } catch (err) {
+    // Idempotent — removing a status that doesn't exist is not an error
+    if (err instanceof ConfluenceApiError && (err.status === 404 || err.status === 409)) return;
+    throw err;
+  }
+}
+
+export async function getFooterComments(
+  pageId: string,
+  limit = 250
+): Promise<CommentData[]> {
+  const raw = await v2Get(`/pages/${pageId}/footer-comments`, {
+    "body-format": "storage",
+    limit,
+  });
+  return CommentsResultSchema.parse(raw).results;
+}
+
+export async function getInlineComments(
+  pageId: string,
+  resolutionStatus: "open" | "resolved" | "all",
+  limit = 250
+): Promise<CommentData[]> {
+  const params: Record<string, string | number> = {
+    "body-format": "storage",
+    limit,
+  };
+  if (resolutionStatus !== "all") {
+    params["resolution-status"] = resolutionStatus;
+  }
+  const raw = await v2Get(`/pages/${pageId}/inline-comments`, params);
+  return CommentsResultSchema.parse(raw).results;
+}
+
+export async function getCommentReplies(
+  commentId: string,
+  type: "footer" | "inline"
+): Promise<CommentData[]> {
+  const path =
+    type === "footer"
+      ? `/footer-comments/${commentId}/children`
+      : `/inline-comments/${commentId}/children`;
+  const raw = await v2Get(path, { "body-format": "storage", limit: 250 });
+  return CommentsResultSchema.parse(raw).results;
+}
+
+export async function createFooterComment(
+  pageId: string,
+  body: string,
+  parentCommentId?: string
+): Promise<CommentData> {
+  const sanitized = sanitizeCommentBody(toStorageFormat(body));
+  const attributed = `<p><em>[AI-generated via Epimethian]</em></p>${sanitized}`;
+
+  const payload: Record<string, unknown> = parentCommentId
+    ? {
+        parentCommentId,
+        body: { representation: "storage", value: attributed },
+      }
+    : {
+        pageId,
+        body: { representation: "storage", value: attributed },
+      };
+
+  const raw = await v2Post("/footer-comments", payload);
+  return CommentSchema.parse(raw);
+}
+
+export async function createInlineComment(
+  pageId: string,
+  body: string,
+  textSelection: string,
+  textSelectionMatchIndex = 0,
+  parentCommentId?: string
+): Promise<CommentData> {
+  const sanitized = sanitizeCommentBody(toStorageFormat(body));
+  const attributed = `<p><em>[AI-generated via Epimethian]</em></p>${sanitized}`;
+
+  if (parentCommentId) {
+    const raw = await v2Post("/inline-comments", {
+      parentCommentId,
+      body: { representation: "storage", value: attributed },
+    });
+    return CommentSchema.parse(raw);
+  }
+
+  const page = await getPage(pageId, true);
+  const pageBody = page.body?.storage?.value ?? page.body?.value ?? "";
+
+  let count = 0;
+  let idx = pageBody.indexOf(textSelection);
+  while (idx !== -1) {
+    count++;
+    idx = pageBody.indexOf(textSelection, idx + 1);
+  }
+
+  if (count === 0) {
+    throw new Error(
+      `Text selection "${textSelection}" not found in page body. ` +
+        `Verify the exact text to highlight (case-sensitive, whitespace-sensitive).`
+    );
+  }
+  if (textSelectionMatchIndex >= count) {
+    throw new Error(
+      `textSelectionMatchIndex ${textSelectionMatchIndex} is out of range — ` +
+        `found ${count} occurrence(s) of the selected text. Use index 0–${count - 1}.`
+    );
+  }
+
+  const raw = await v2Post("/inline-comments", {
+    pageId,
+    body: { representation: "storage", value: attributed },
+    inlineCommentProperties: {
+      textSelection,
+      textSelectionMatchCount: count,
+      textSelectionMatchIndex,
+    },
+  });
+  return CommentSchema.parse(raw);
+}
+
+export async function resolveComment(
+  commentId: string,
+  resolved: boolean,
+  attempt = 0
+): Promise<CommentData> {
+  const raw = await v2Get(`/inline-comments/${commentId}`, {
+    "body-format": "storage",
+  });
+  const comment = CommentSchema.parse(raw);
+
+  if (comment.resolutionStatus === "dangling") {
+    throw new Error(
+      `Comment ${commentId} is dangling — its highlighted text has been edited away. ` +
+        `Dangling comments cannot be resolved or reopened.`
+    );
+  }
+
+  const currentVersion = comment.version?.number ?? 1;
+
+  const putPayload: Record<string, unknown> = {
+    version: { number: currentVersion + 1 },
+    resolved,
+  };
+
+  let result: unknown;
+  try {
+    result = await v2Put(`/inline-comments/${commentId}`, putPayload);
+  } catch (err) {
+    if (err instanceof ConfluenceApiError && err.status === 409 && attempt < 2) {
+      return resolveComment(commentId, resolved, attempt + 1);
+    }
+    throw err;
+  }
+
+  return CommentSchema.parse(result);
+}
+
+export async function deleteFooterComment(commentId: string): Promise<void> {
+  await v2Delete(`/footer-comments/${commentId}`);
+}
+
+export async function deleteInlineComment(commentId: string): Promise<void> {
+  await v2Delete(`/inline-comments/${commentId}`);
+}
+
 // --- Formatting helpers ---
+
+const DANGEROUS_TAG_RE =
+  /<(ac:structured-macro|script|iframe|embed|object)[\s\S]*?<\/\1>|<(ac:structured-macro|script|iframe|embed|object)[^>]*\/>/gi;
+
+export function sanitizeCommentBody(body: string): string {
+  const stripped = body.replace(DANGEROUS_TAG_RE, "");
+  if (stripped !== body) {
+    console.error(
+      "epimethian-mcp: sanitizeCommentBody stripped dangerous tags from comment body"
+    );
+  }
+  return stripped;
+}
 
 const HTML_TAG_RE = /<[a-z][a-z0-9]*[\s>\/]/i;
 

@@ -6,6 +6,7 @@ vi.mock("node:fs/promises", () => ({
   rename: vi.fn().mockResolvedValue(undefined),
   mkdir: vi.fn().mockResolvedValue(undefined),
   chmod: vi.fn().mockResolvedValue(undefined),
+  stat: vi.fn().mockResolvedValue({ mode: 0o100600 }), // default: safe permissions
   appendFile: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -15,19 +16,22 @@ vi.mock("node:crypto", () => ({
   }),
 }));
 
-import { readFile, writeFile, rename, mkdir, appendFile } from "node:fs/promises";
+import { readFile, writeFile, rename, mkdir, appendFile, stat } from "node:fs/promises";
 import {
   readProfileRegistry,
   addToProfileRegistry,
   removeFromProfileRegistry,
   appendAuditLog,
   getProfileRegistryPath,
+  getProfileSettings,
+  setProfileSettings,
 } from "./profiles.js";
 
 const mockReadFile = vi.mocked(readFile);
 const mockWriteFile = vi.mocked(writeFile);
 const mockRename = vi.mocked(rename);
 const mockMkdir = vi.mocked(mkdir);
+const mockStat = vi.mocked(stat);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -146,6 +150,171 @@ describe("removeFromProfileRegistry", () => {
 
     expect(mockWriteFile).not.toHaveBeenCalled();
     expect(mockRename).not.toHaveBeenCalled();
+  });
+});
+
+describe("removeFromProfileRegistry", () => {
+  it("cleans up settings for removed profile", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({
+        profiles: ["keep", "remove-me"],
+        settings: { "remove-me": { readOnly: true }, keep: { readOnly: false } },
+      })
+    );
+
+    await removeFromProfileRegistry("remove-me");
+
+    const writtenData = (mockWriteFile.mock.calls[0]?.[1] as string) ?? "";
+    const parsed = JSON.parse(writtenData);
+    expect(parsed.settings).toEqual({ keep: { readOnly: false } });
+    expect(parsed.settings["remove-me"]).toBeUndefined();
+  });
+
+  it("removes settings key entirely when last profile with settings is removed", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({
+        profiles: ["only"],
+        settings: { only: { readOnly: true } },
+      })
+    );
+
+    await removeFromProfileRegistry("only");
+
+    const writtenData = (mockWriteFile.mock.calls[0]?.[1] as string) ?? "";
+    const parsed = JSON.parse(writtenData);
+    expect(parsed.settings).toBeUndefined();
+  });
+});
+
+describe("getProfileSettings", () => {
+  it("returns readOnly: true when set", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({
+        profiles: ["acme"],
+        settings: { acme: { readOnly: true } },
+      })
+    );
+    const settings = await getProfileSettings("acme");
+    expect(settings).toEqual({ readOnly: true });
+  });
+
+  it("returns undefined for unknown profile", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ profiles: ["acme"] })
+    );
+    const settings = await getProfileSettings("unknown");
+    expect(settings).toBeUndefined();
+  });
+
+  it("returns undefined when settings key is absent from registry", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ profiles: ["acme"] })
+    );
+    const settings = await getProfileSettings("acme");
+    expect(settings).toBeUndefined();
+  });
+});
+
+describe("setProfileSettings", () => {
+  it("persists and round-trips", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ profiles: ["acme"] })
+    );
+
+    await setProfileSettings("acme", { readOnly: true });
+
+    const writtenData = (mockWriteFile.mock.calls[0]?.[1] as string) ?? "";
+    const parsed = JSON.parse(writtenData);
+    expect(parsed.settings.acme).toEqual({ readOnly: true });
+    expect(parsed.profiles).toEqual(["acme"]);
+  });
+
+  it("preserves existing profiles and other settings", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({
+        profiles: ["acme", "jambit"],
+        settings: { jambit: { readOnly: false } },
+      })
+    );
+
+    await setProfileSettings("acme", { readOnly: true });
+
+    const writtenData = (mockWriteFile.mock.calls[0]?.[1] as string) ?? "";
+    const parsed = JSON.parse(writtenData);
+    expect(parsed.profiles).toEqual(["acme", "jambit"]);
+    expect(parsed.settings.jambit).toEqual({ readOnly: false });
+    expect(parsed.settings.acme).toEqual({ readOnly: true });
+  });
+
+  it("merges with existing settings for the same profile", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({
+        profiles: ["acme"],
+        settings: { acme: { readOnly: true } },
+      })
+    );
+
+    await setProfileSettings("acme", { readOnly: false });
+
+    const writtenData = (mockWriteFile.mock.calls[0]?.[1] as string) ?? "";
+    const parsed = JSON.parse(writtenData);
+    expect(parsed.settings.acme).toEqual({ readOnly: false });
+  });
+});
+
+describe("permission verification", () => {
+  it("rejects world-writable registry file", async () => {
+    mockStat.mockResolvedValue({ mode: 0o100666 } as any); // world-writable
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await readProfileRegistry();
+
+    expect(result).toEqual([]);
+    expect(spy).toHaveBeenCalledWith(
+      expect.stringContaining("unsafe permissions")
+    );
+    spy.mockRestore();
+  });
+
+  it("rejects group-writable registry file", async () => {
+    mockStat.mockResolvedValue({ mode: 0o100660 } as any); // group-writable
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await readProfileRegistry();
+
+    expect(result).toEqual([]);
+    expect(spy).toHaveBeenCalledWith(
+      expect.stringContaining("unsafe permissions")
+    );
+    spy.mockRestore();
+  });
+
+  it("accepts owner-only permissions", async () => {
+    mockStat.mockResolvedValue({ mode: 0o100600 } as any);
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ profiles: ["acme"] })
+    );
+
+    const result = await readProfileRegistry();
+    expect(result).toEqual(["acme"]);
+  });
+});
+
+describe("addToProfileRegistry preserves settings", () => {
+  it("preserves existing settings when adding a new profile", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({
+        profiles: ["existing"],
+        settings: { existing: { readOnly: true } },
+      })
+    );
+
+    await addToProfileRegistry("new-one");
+
+    const writtenData = (mockWriteFile.mock.calls[0]?.[1] as string) ?? "";
+    const parsed = JSON.parse(writtenData);
+    expect(parsed.profiles).toEqual(["existing", "new-one"]);
+    expect(parsed.settings).toEqual({ existing: { readOnly: true } });
   });
 });
 

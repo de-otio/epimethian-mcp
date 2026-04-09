@@ -74,13 +74,26 @@ Each project's `.mcp.json` specifies which profile to use. Profiles are fully is
 Manage profiles:
 
 ```bash
-epimethian-mcp profiles              # list all
-epimethian-mcp profiles --verbose    # show URLs and emails
+epimethian-mcp profiles              # list all (shows read-only status)
+epimethian-mcp profiles --verbose    # show URLs, emails, and read-only status
 CONFLUENCE_PROFILE=jambit epimethian-mcp status   # test connection
 epimethian-mcp profiles --remove <name>           # delete profile and credentials
 ```
 
 The `--remove` command deletes the profile's keychain entry and registry record after interactive confirmation. For non-interactive environments (CI, agent shell sessions), pass `--force` to skip the prompt.
+
+### Per-Profile Read-Only Mode
+
+Protect client tenants from accidental writes:
+
+```bash
+epimethian-mcp profiles --set-read-only acme-corp
+epimethian-mcp profiles --set-read-write jambit
+```
+
+New profiles default to **read-only**. The `setup` command prompts "Enable writes for this profile? [y/N]" or accepts `--read-write` for non-interactive use.
+
+When a profile is read-only, all write tools (`create_page`, `update_page`, `update_page_section`, `delete_page`, `add_attachment`, `add_drawio_diagram`, `add_label`, `remove_label`, `create_comment`, `resolve_comment`, `delete_comment`, `set_page_status`, `remove_page_status`) return an error with a remediation command. Read tools work normally. The read-only flag is resolved at server startup — restart running servers after changing it.
 
 ## Token Efficiency
 
@@ -110,6 +123,19 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `add_attachment`     | Upload a file attachment   |
 | `get_attachments`    | List attachments on a page |
 | `add_drawio_diagram` | Add a draw.io diagram      |
+| `get_labels`         | Get all labels on a page   |
+| `add_label`          | Add one or more labels to a page |
+| `remove_label`       | Remove a label from a page |
+| `get_comments`       | Read page comments (footer and inline) |
+| `create_comment`     | Add a comment to a page    |
+| `resolve_comment`    | Resolve or reopen an inline comment |
+| `delete_comment`     | Delete a comment           |
+| `get_page_status`    | Get the content status badge on a page |
+| `set_page_status`    | Set the content status badge on a page |
+| `remove_page_status` | Remove the content status badge from a page |
+| `get_page_versions`  | List version history for a page |
+| `get_page_version`   | Get page content at a specific historical version |
+| `diff_page_versions` | Compare two versions of a page |
 
 ## Credential Security
 

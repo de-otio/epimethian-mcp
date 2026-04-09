@@ -87,4 +87,44 @@ describe("PageCache", () => {
     cache.delete("1");
     expect(cache.size).toBe(1);
   });
+
+  // --- Versioned cache methods ---
+
+  describe("getVersioned / setVersioned", () => {
+    it("getVersioned returns undefined for empty cache", () => {
+      expect(cache.getVersioned("1", 3)).toBeUndefined();
+    });
+
+    it("getVersioned returns body when pageId + version match", () => {
+      cache.setVersioned("1", 3, "<p>v3</p>");
+      expect(cache.getVersioned("1", 3)).toBe("<p>v3</p>");
+    });
+
+    it("stores independently from current-version set (same pageId, both accessible)", () => {
+      cache.set("1", 5, "<p>current</p>");
+      cache.setVersioned("1", 3, "<p>historical</p>");
+      // Both accessible
+      expect(cache.get("1", 5)).toBe("<p>current</p>");
+      expect(cache.getVersioned("1", 3)).toBe("<p>historical</p>");
+      expect(cache.size).toBe(2);
+    });
+
+    it("versioned entries participate in LRU eviction alongside regular entries", () => {
+      cache.set("a", 1, "current-a");         // slot 1
+      cache.setVersioned("b", 2, "hist-b-v2"); // slot 2
+      cache.setVersioned("b", 3, "hist-b-v3"); // slot 3
+      // Cache is full (3). Adding another evicts oldest ("a" current).
+      cache.setVersioned("c", 1, "hist-c-v1");
+      expect(cache.get("a", 1)).toBeUndefined();
+      expect(cache.getVersioned("b", 2)).toBe("hist-b-v2");
+    });
+
+    it("two different versions of the same page coexist", () => {
+      cache.setVersioned("1", 2, "<p>v2</p>");
+      cache.setVersioned("1", 5, "<p>v5</p>");
+      expect(cache.getVersioned("1", 2)).toBe("<p>v2</p>");
+      expect(cache.getVersioned("1", 5)).toBe("<p>v5</p>");
+      expect(cache.size).toBe(2);
+    });
+  });
 });

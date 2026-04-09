@@ -4,10 +4,15 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Use dynamic imports with vi.resetModules().
 
 const mockReadFromKeychain = vi.fn();
+const mockGetProfileSettings = vi.fn();
 
 vi.mock("../shared/keychain.js", () => ({
   readFromKeychain: (...args: unknown[]) => mockReadFromKeychain(...args),
   PROFILE_NAME_RE: /^[a-z0-9][a-z0-9-]{0,62}$/,
+}));
+
+vi.mock("../shared/profiles.js", () => ({
+  getProfileSettings: (...args: unknown[]) => mockGetProfileSettings(...args),
 }));
 
 // Capture process.exit calls — throw to halt execution like the real exit would
@@ -32,7 +37,9 @@ beforeEach(() => {
   delete process.env.CONFLUENCE_URL;
   delete process.env.CONFLUENCE_EMAIL;
   delete process.env.CONFLUENCE_API_TOKEN;
+  delete process.env.CONFLUENCE_READ_ONLY;
   mockReadFromKeychain.mockResolvedValue(null);
+  mockGetProfileSettings.mockResolvedValue(undefined);
 });
 
 async function importResolveCredentials() {
@@ -186,5 +193,80 @@ describe("resolveCredentials", () => {
 
       expect(mockExit).toHaveBeenCalledWith(1);
     });
+  });
+});
+
+async function importGetConfig() {
+  vi.resetModules();
+  const mod = await import("./confluence-client.js");
+  return mod.getConfig;
+}
+
+describe("getConfig readOnly resolution", () => {
+  it("sets readOnly: true when registry says read-only", async () => {
+    process.env.CONFLUENCE_PROFILE = "acme";
+    mockReadFromKeychain.mockResolvedValue({
+      url: "https://acme.atlassian.net",
+      email: "u@acme.com",
+      apiToken: "tok",
+    });
+    mockGetProfileSettings.mockResolvedValue({ readOnly: true });
+
+    const getConfig = await importGetConfig();
+    const config = await getConfig();
+
+    expect(config.readOnly).toBe(true);
+    expect(mockGetProfileSettings).toHaveBeenCalledWith("acme");
+  });
+
+  it("sets readOnly: true when CONFLUENCE_READ_ONLY=true env var", async () => {
+    process.env.CONFLUENCE_URL = "https://ci.atlassian.net";
+    process.env.CONFLUENCE_EMAIL = "ci@test.com";
+    process.env.CONFLUENCE_API_TOKEN = "ci-token";
+    process.env.CONFLUENCE_READ_ONLY = "true";
+
+    const getConfig = await importGetConfig();
+    const config = await getConfig();
+
+    expect(config.readOnly).toBe(true);
+  });
+
+  it("strict-mode invariant: CONFLUENCE_READ_ONLY=false does NOT override registry readOnly", async () => {
+    process.env.CONFLUENCE_PROFILE = "acme";
+    process.env.CONFLUENCE_READ_ONLY = "false";
+    mockReadFromKeychain.mockResolvedValue({
+      url: "https://acme.atlassian.net",
+      email: "u@acme.com",
+      apiToken: "tok",
+    });
+    mockGetProfileSettings.mockResolvedValue({ readOnly: true });
+
+    const getConfig = await importGetConfig();
+    const config = await getConfig();
+
+    expect(config.readOnly).toBe(true);
+  });
+
+  it("sets readOnly: false when neither source says read-only", async () => {
+    process.env.CONFLUENCE_URL = "https://ci.atlassian.net";
+    process.env.CONFLUENCE_EMAIL = "ci@test.com";
+    process.env.CONFLUENCE_API_TOKEN = "ci-token";
+
+    const getConfig = await importGetConfig();
+    const config = await getConfig();
+
+    expect(config.readOnly).toBe(false);
+  });
+
+  it("readOnly is included in the frozen config object", async () => {
+    process.env.CONFLUENCE_URL = "https://ci.atlassian.net";
+    process.env.CONFLUENCE_EMAIL = "ci@test.com";
+    process.env.CONFLUENCE_API_TOKEN = "ci-token";
+
+    const getConfig = await importGetConfig();
+    const config = await getConfig();
+
+    expect(Object.isFrozen(config)).toBe(true);
+    expect("readOnly" in config).toBe(true);
   });
 });

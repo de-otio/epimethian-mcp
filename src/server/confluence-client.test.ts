@@ -44,6 +44,24 @@ import {
   looksLikeMarkdown,
   ConfluenceApiError,
   ConfluenceConflictError,
+  getLabels,
+  addLabels,
+  removeLabel,
+  getContentState,
+  setContentState,
+  removeContentState,
+  sanitizeCommentBody,
+  getFooterComments,
+  getInlineComments,
+  getCommentReplies,
+  createFooterComment,
+  createInlineComment,
+  resolveComment,
+  deleteFooterComment,
+  deleteInlineComment,
+  type CommentData,
+  getPageVersions,
+  getPageVersionBody,
 } from "./confluence-client.js";
 import { pageCache } from "./page-cache.js";
 
@@ -1077,5 +1095,651 @@ describe("HTTP error handling", () => {
     await expect(
       uploadAttachment("page-1", Buffer.from("data"), "f.txt")
     ).rejects.toThrow("Confluence API error (500)");
+  });
+});
+
+// =============================================================================
+// Labels API
+// =============================================================================
+
+describe("getLabels", () => {
+  it("returns parsed label array on success", async () => {
+    global.fetch = mockFetchResponse({
+      results: [
+        { prefix: "global", name: "foo", id: "1", label: "foo" },
+        { prefix: "global", name: "bar", id: "2", label: "bar" },
+      ],
+    });
+    const labels = await getLabels("page-42");
+    expect(labels).toHaveLength(2);
+    expect(labels[0].name).toBe("foo");
+    expect(labels[1].name).toBe("bar");
+  });
+
+  it("returns empty array when page has no labels", async () => {
+    global.fetch = mockFetchResponse({ results: [] });
+    const labels = await getLabels("page-42");
+    expect(labels).toHaveLength(0);
+  });
+
+  it("constructs correct URL with pageId", async () => {
+    global.fetch = mockFetchResponse({ results: [] });
+    await getLabels("page-99");
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).toBe(`${API_V1}/content/page-99/label`);
+  });
+
+  it("throws ConfluenceApiError on non-ok response", async () => {
+    global.fetch = mockFetchResponse("Not Found", 404);
+    await expect(getLabels("page-42")).rejects.toThrow(ConfluenceApiError);
+    await expect(getLabels("page-42")).rejects.toThrow("Confluence API error (404)");
+  });
+});
+
+describe("addLabels", () => {
+  it("sends correct POST body for a single label", async () => {
+    global.fetch = mockFetchResponse({}, 200);
+    await addLabels("page-42", ["foo"]);
+    const call = (global.fetch as any).mock.calls[0];
+    expect(call[0]).toBe(`${API_V1}/content/page-42/label`);
+    expect(call[1].method).toBe("POST");
+    const body = JSON.parse(call[1].body as string);
+    expect(body).toEqual([{ prefix: "global", name: "foo" }]);
+  });
+
+  it("sends correct POST body for multiple labels", async () => {
+    global.fetch = mockFetchResponse({}, 200);
+    await addLabels("page-42", ["alpha", "beta", "gamma"]);
+    const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(body).toEqual([
+      { prefix: "global", name: "alpha" },
+      { prefix: "global", name: "beta" },
+      { prefix: "global", name: "gamma" },
+    ]);
+  });
+
+  it("throws ConfluenceApiError on non-ok response", async () => {
+    global.fetch = mockFetchResponse("Forbidden", 403);
+    await expect(addLabels("page-42", ["foo"])).rejects.toThrow(ConfluenceApiError);
+    await expect(addLabels("page-42", ["foo"])).rejects.toThrow("Confluence API error (403)");
+  });
+});
+
+describe("removeLabel", () => {
+  it("sends DELETE request to correct URL", async () => {
+    global.fetch = mockFetchResponse({}, 200);
+    await removeLabel("page-42", "foo");
+    const call = (global.fetch as any).mock.calls[0];
+    expect(call[1].method).toBe("DELETE");
+    const url = call[0] as string;
+    expect(url).toContain(`${API_V1}/content/page-42/label`);
+    expect(url).toContain("name=foo");
+  });
+
+  it("encodes label with special characters safely in URL (& does not inject extra params)", async () => {
+    global.fetch = mockFetchResponse({}, 200);
+    await removeLabel("page-42", "foo&evil=1");
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    // The ampersand must be percent-encoded, not a raw & that would split params
+    expect(url).not.toContain("&evil=1");
+    expect(url).toContain("foo%26evil%3D1");
+  });
+
+  it("throws ConfluenceApiError on non-ok response", async () => {
+    global.fetch = mockFetchResponse("Not Found", 404);
+    await expect(removeLabel("page-42", "foo")).rejects.toThrow(ConfluenceApiError);
+    await expect(removeLabel("page-42", "foo")).rejects.toThrow("Confluence API error (404)");
+  });
+});
+
+// =============================================================================
+// Content State (page status badge) API
+// =============================================================================
+
+describe("getContentState", () => {
+  it("constructs correct URL with ?status=current query param", async () => {
+    global.fetch = mockFetchResponse({ name: "In progress", color: "#2684FF" });
+    await getContentState("page-42");
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).toContain(`${API_V1}/content/page-42/state`);
+    expect(url).toContain("status=current");
+  });
+
+  it("returns parsed { name, color } on success", async () => {
+    global.fetch = mockFetchResponse({ name: "Ready for review", color: "#57D9A3" });
+    const state = await getContentState("page-42");
+    expect(state).toEqual({ name: "Ready for review", color: "#57D9A3" });
+  });
+
+  it("returns null when no state is set (empty name)", async () => {
+    global.fetch = mockFetchResponse({ name: null, color: null });
+    const state = await getContentState("page-42");
+    expect(state).toBeNull();
+  });
+
+  it("returns null on 404 (page has no state)", async () => {
+    global.fetch = mockFetchResponse("Not Found", 404);
+    const state = await getContentState("page-42");
+    expect(state).toBeNull();
+  });
+
+  it("strips unexpected fields via strict schema", async () => {
+    global.fetch = mockFetchResponse({
+      name: "Draft",
+      color: "#FFC400",
+      id: 42,
+      spaceIsEnabled: true,
+      isSpaceState: false,
+    });
+    // .strict() should reject extra fields
+    await expect(getContentState("page-42")).rejects.toThrow();
+  });
+});
+
+describe("setContentState", () => {
+  it("constructs correct URL with ?status=current query param", async () => {
+    global.fetch = mockFetchResponse({}, 200);
+    await setContentState("page-42", "In progress", "#2684FF");
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).toContain(`${API_V1}/content/page-42/state`);
+    expect(url).toContain("status=current");
+  });
+
+  it("sends PUT with correct { name, color } body", async () => {
+    global.fetch = mockFetchResponse({}, 200);
+    await setContentState("page-42", "Ready for review", "#57D9A3");
+    const call = (global.fetch as any).mock.calls[0];
+    expect(call[1].method).toBe("PUT");
+    const body = JSON.parse(call[1].body as string);
+    expect(body).toEqual({ name: "Ready for review", color: "#57D9A3" });
+  });
+
+  it("throws ConfluenceApiError on non-ok response", async () => {
+    global.fetch = mockFetchResponse("Forbidden", 403);
+    await expect(setContentState("page-42", "Draft", "#FFC400")).rejects.toThrow(ConfluenceApiError);
+  });
+});
+
+describe("removeContentState", () => {
+  it("constructs correct URL with ?status=current query param", async () => {
+    global.fetch = mockFetchResponse({}, 200);
+    await removeContentState("page-42");
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).toContain(`${API_V1}/content/page-42/state`);
+    expect(url).toContain("status=current");
+  });
+
+  it("sends DELETE method", async () => {
+    global.fetch = mockFetchResponse({}, 200);
+    await removeContentState("page-42");
+    const call = (global.fetch as any).mock.calls[0];
+    expect(call[1].method).toBe("DELETE");
+  });
+
+  it("does not throw on 404 (idempotent)", async () => {
+    global.fetch = mockFetchResponse("Not Found", 404);
+    await expect(removeContentState("page-42")).resolves.toBeUndefined();
+  });
+
+  it("does not throw on 409 (idempotent)", async () => {
+    global.fetch = mockFetchResponse("Conflict", 409);
+    await expect(removeContentState("page-42")).resolves.toBeUndefined();
+  });
+
+  it("throws on other errors", async () => {
+    global.fetch = mockFetchResponse("Server Error", 500);
+    await expect(removeContentState("page-42")).rejects.toThrow(ConfluenceApiError);
+  });
+});
+
+// =============================================================================
+// Comments API
+// =============================================================================
+
+describe("Comments", () => {
+  // ---------------------------------------------------------------------------
+  // sanitizeCommentBody
+  // ---------------------------------------------------------------------------
+  describe("sanitizeCommentBody", () => {
+    it("returns body unchanged when no dangerous tags", () => {
+      const body = "<p>Hello <strong>world</strong></p>";
+      expect(sanitizeCommentBody(body)).toBe(body);
+    });
+
+    it("strips <ac:structured-macro> tags", () => {
+      const body = '<p>Before</p><ac:structured-macro ac:name="code"><ac:plain-text-body>x</ac:plain-text-body></ac:structured-macro><p>After</p>';
+      const result = sanitizeCommentBody(body);
+      expect(result).toContain("<p>Before</p>");
+      expect(result).toContain("<p>After</p>");
+      expect(result).not.toContain("ac:structured-macro");
+    });
+
+    it("strips <script> tags", () => {
+      const body = "<p>Hello</p><script>alert('xss')</script><p>World</p>";
+      const result = sanitizeCommentBody(body);
+      expect(result).not.toContain("<script>");
+      expect(result).not.toContain("alert");
+      expect(result).toContain("<p>Hello</p>");
+      expect(result).toContain("<p>World</p>");
+    });
+
+    it("strips <iframe> tags", () => {
+      const body = "<p>Start</p><iframe src='evil.com'></iframe><p>End</p>";
+      const result = sanitizeCommentBody(body);
+      expect(result).not.toContain("<iframe");
+      expect(result).toContain("<p>Start</p>");
+    });
+
+    it("does not strip safe tags like <p>, <strong>, <em>", () => {
+      const body = "<p>This is <strong>bold</strong> and <em>italic</em></p>";
+      expect(sanitizeCommentBody(body)).toBe(body);
+    });
+
+    it("logs warning to stderr when tags are stripped", () => {
+      const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const body = '<ac:structured-macro ac:name="code"><ac:plain-text-body>x</ac:plain-text-body></ac:structured-macro>';
+      sanitizeCommentBody(body);
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining("sanitizeCommentBody stripped dangerous tags")
+      );
+      stderrSpy.mockRestore();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // getFooterComments
+  // ---------------------------------------------------------------------------
+  describe("getFooterComments", () => {
+    const sampleComment = {
+      id: "101",
+      status: "current",
+      pageId: "42",
+      version: { number: 1 },
+      body: { storage: { value: "<p>A comment</p>" } },
+    };
+
+    it("calls GET /pages/{id}/footer-comments with body-format=storage&limit=250", async () => {
+      global.fetch = mockFetchResponse({ results: [sampleComment] });
+      await getFooterComments("42");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V2}/pages/42/footer-comments`);
+      expect(url).toContain("body-format=storage");
+      expect(url).toContain("limit=250");
+    });
+
+    it("returns parsed CommentData[]", async () => {
+      global.fetch = mockFetchResponse({ results: [sampleComment] });
+      const comments = await getFooterComments("42");
+      expect(comments).toHaveLength(1);
+      expect(comments[0].id).toBe("101");
+      expect(comments[0].body?.storage?.value).toBe("<p>A comment</p>");
+    });
+
+    it("returns [] when results is empty", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      const comments = await getFooterComments("42");
+      expect(comments).toHaveLength(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // getInlineComments
+  // ---------------------------------------------------------------------------
+  describe("getInlineComments", () => {
+    it("passes resolution-status param when not 'all'", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      await getInlineComments("42", "open");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain("resolution-status=open");
+    });
+
+    it("omits resolution-status param when 'all'", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      await getInlineComments("42", "all");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).not.toContain("resolution-status");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // getCommentReplies
+  // ---------------------------------------------------------------------------
+  describe("getCommentReplies", () => {
+    it("uses /footer-comments/{id}/children for type footer", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      await getCommentReplies("101", "footer");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V2}/footer-comments/101/children`);
+    });
+
+    it("uses /inline-comments/{id}/children for type inline", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      await getCommentReplies("202", "inline");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V2}/inline-comments/202/children`);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // createFooterComment
+  // ---------------------------------------------------------------------------
+  describe("createFooterComment", () => {
+    const createdComment = {
+      id: "300",
+      status: "current",
+      pageId: "42",
+      version: { number: 1 },
+    };
+
+    it("top-level: payload includes pageId, no parentCommentId", async () => {
+      global.fetch = mockFetchResponse(createdComment);
+      await createFooterComment("42", "Hello world");
+      const call = (global.fetch as any).mock.calls[0];
+      expect(call[0]).toBe(`${API_V2}/footer-comments`);
+      expect(call[1].method).toBe("POST");
+      const body = JSON.parse(call[1].body as string);
+      expect(body.pageId).toBe("42");
+      expect(body.parentCommentId).toBeUndefined();
+    });
+
+    it("reply: payload includes parentCommentId only, no pageId", async () => {
+      global.fetch = mockFetchResponse(createdComment);
+      await createFooterComment("42", "A reply", "parent-99");
+      const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+      expect(body.parentCommentId).toBe("parent-99");
+      expect(body.pageId).toBeUndefined();
+    });
+
+    it("body is sanitized and attributed", async () => {
+      global.fetch = mockFetchResponse(createdComment);
+      await createFooterComment("42", "My comment");
+      const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+      expect(body.body.value).toContain("[AI-generated via Epimethian]");
+      expect(body.body.value).toContain("My comment");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // createInlineComment
+  // ---------------------------------------------------------------------------
+  describe("createInlineComment", () => {
+    const pageWithBody = {
+      id: "42",
+      title: "Test Page",
+      version: { number: 1 },
+      body: { storage: { value: "<p>The quick brown fox jumped over the lazy dog</p>" } },
+    };
+    const createdComment = {
+      id: "400",
+      status: "current",
+      pageId: "42",
+      version: { number: 1 },
+    };
+
+    it("fetches page body and counts textSelection occurrences", async () => {
+      global.fetch = mockFetchSequence([
+        { body: pageWithBody },
+        { body: createdComment },
+      ]);
+      const comment = await createInlineComment("42", "My note", "quick brown fox");
+      expect(comment.id).toBe("400");
+      // First call fetches page with body
+      const firstUrl = (global.fetch as any).mock.calls[0][0] as string;
+      expect(firstUrl).toContain("body-format=storage");
+      // Second call posts the inline comment
+      const secondCall = (global.fetch as any).mock.calls[1];
+      const postBody = JSON.parse(secondCall[1].body as string);
+      expect(postBody.inlineCommentProperties.textSelection).toBe("quick brown fox");
+      expect(postBody.inlineCommentProperties.textSelectionMatchCount).toBe(1);
+      expect(postBody.inlineCommentProperties.textSelectionMatchIndex).toBe(0);
+    });
+
+    it("throws if textSelection not found in page body", async () => {
+      global.fetch = mockFetchResponse(pageWithBody);
+      await expect(
+        createInlineComment("42", "My note", "nonexistent text")
+      ).rejects.toThrow("not found in page body");
+    });
+
+    it("throws if textSelectionMatchIndex out of range", async () => {
+      global.fetch = mockFetchResponse(pageWithBody);
+      await expect(
+        createInlineComment("42", "My note", "quick brown fox", 5)
+      ).rejects.toThrow("out of range");
+    });
+
+    it("reply: omits inlineCommentProperties, uses parentCommentId", async () => {
+      global.fetch = mockFetchResponse(createdComment);
+      const comment = await createInlineComment("42", "Reply text", "any text", 0, "parent-100");
+      expect(comment.id).toBe("400");
+      // Only one fetch (no page body fetch needed)
+      expect((global.fetch as any).mock.calls).toHaveLength(1);
+      const postBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+      expect(postBody.parentCommentId).toBe("parent-100");
+      expect(postBody.inlineCommentProperties).toBeUndefined();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // resolveComment
+  // ---------------------------------------------------------------------------
+  describe("resolveComment", () => {
+    const commentWithVersion = {
+      id: "500",
+      status: "current",
+      resolutionStatus: "open",
+      version: { number: 3 },
+    };
+    const resolvedComment = {
+      id: "500",
+      status: "current",
+      resolutionStatus: "resolved",
+      version: { number: 4 },
+    };
+
+    it("GETs comment with body-format=storage to get version", async () => {
+      global.fetch = mockFetchSequence([
+        { body: commentWithVersion },
+        { body: resolvedComment },
+      ]);
+      await resolveComment("500", true);
+      const getUrl = (global.fetch as any).mock.calls[0][0] as string;
+      expect(getUrl).toContain(`${API_V2}/inline-comments/500`);
+      expect(getUrl).toContain("body-format=storage");
+    });
+
+    it("throws descriptive error for dangling comments", async () => {
+      const danglingComment = { id: "500", status: "current", resolutionStatus: "dangling", version: { number: 1 } };
+      global.fetch = mockFetchResponse(danglingComment);
+      await expect(resolveComment("500", true)).rejects.toThrow("dangling");
+    });
+
+    it("PUTs with resolved: true and version.number + 1", async () => {
+      global.fetch = mockFetchSequence([
+        { body: commentWithVersion },
+        { body: resolvedComment },
+      ]);
+      const result = await resolveComment("500", true);
+      expect(result.resolutionStatus).toBe("resolved");
+      const putCall = (global.fetch as any).mock.calls[1];
+      expect(putCall[1].method).toBe("PUT");
+      const putBody = JSON.parse(putCall[1].body as string);
+      expect(putBody.resolved).toBe(true);
+      expect(putBody.version.number).toBe(4); // 3 + 1
+    });
+
+    it("retries on HTTP 409 up to 2 times", async () => {
+      global.fetch = mockFetchSequence([
+        // First attempt: GET comment
+        { body: commentWithVersion },
+        // First attempt: PUT returns 409
+        { body: { message: "Conflict" }, status: 409 },
+        // Second attempt (retry 1): GET comment again
+        { body: commentWithVersion },
+        // Second attempt: PUT returns 200
+        { body: resolvedComment },
+      ]);
+      const result = await resolveComment("500", true);
+      expect(result.resolutionStatus).toBe("resolved");
+      expect((global.fetch as any).mock.calls).toHaveLength(4);
+    });
+
+    it("throws on third 409 (exhausted retries)", async () => {
+      global.fetch = mockFetchSequence([
+        // Attempt 0: GET
+        { body: commentWithVersion },
+        // Attempt 0: PUT → 409
+        { body: { message: "Conflict" }, status: 409 },
+        // Attempt 1 (retry): GET
+        { body: commentWithVersion },
+        // Attempt 1: PUT → 409
+        { body: { message: "Conflict" }, status: 409 },
+        // Attempt 2 (retry): GET
+        { body: commentWithVersion },
+        // Attempt 2: PUT → 409 (exhausted)
+        { body: { message: "Conflict" }, status: 409 },
+      ]);
+      await expect(resolveComment("500", true)).rejects.toThrow(ConfluenceApiError);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // deleteFooterComment / deleteInlineComment
+  // ---------------------------------------------------------------------------
+  describe("deleteFooterComment / deleteInlineComment", () => {
+    it("deleteFooterComment calls DELETE /footer-comments/{id}", async () => {
+      global.fetch = mockFetchResponse({}, 204);
+      await deleteFooterComment("101");
+      const call = (global.fetch as any).mock.calls[0];
+      expect(call[0]).toBe(`${API_V2}/footer-comments/101`);
+      expect(call[1].method).toBe("DELETE");
+    });
+
+    it("deleteInlineComment calls DELETE /inline-comments/{id}", async () => {
+      global.fetch = mockFetchResponse({}, 204);
+      await deleteInlineComment("202");
+      const call = (global.fetch as any).mock.calls[0];
+      expect(call[0]).toBe(`${API_V2}/inline-comments/202`);
+      expect(call[1].method).toBe("DELETE");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // getPageVersions
+  // ---------------------------------------------------------------------------
+  describe("getPageVersions", () => {
+    const sampleVersions = {
+      results: [
+        { number: 3, by: { displayName: "Alice", accountId: "abc" }, when: "2025-01-03T00:00:00Z", message: "Fixed typo", minorEdit: true },
+        { number: 2, by: { displayName: "Bob", accountId: "def" }, when: "2025-01-02T00:00:00Z", message: "", minorEdit: false },
+      ],
+    };
+
+    it("constructs correct v1 URL with limit param", async () => {
+      global.fetch = mockFetchResponse(sampleVersions);
+      await getPageVersions("123", 50);
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V1}/content/123/version`);
+      expect(url).toContain("limit=50");
+    });
+
+    it("returns parsed version metadata array", async () => {
+      global.fetch = mockFetchResponse(sampleVersions);
+      const result = await getPageVersions("123", 25);
+      expect(result).toHaveLength(2);
+      expect(result[0].number).toBe(3);
+      expect(result[0].by.displayName).toBe("Alice");
+      expect(result[0].by.accountId).toBe("abc");
+      expect(result[0].minorEdit).toBe(true);
+    });
+
+    it("truncates messages longer than 500 chars", async () => {
+      const longMsg = "x".repeat(600);
+      const versions = { results: [{ number: 1, by: { displayName: "A", accountId: "a" }, when: "2025-01-01T00:00:00Z", message: longMsg, minorEdit: false }] };
+      global.fetch = mockFetchResponse(versions);
+      const result = await getPageVersions("1", 25);
+      expect(result[0].message).toHaveLength(500);
+    });
+
+    it("returns empty array for empty results", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      const result = await getPageVersions("1", 25);
+      expect(result).toEqual([]);
+    });
+
+    it("throws ConfluenceApiError on 404", async () => {
+      global.fetch = mockFetchResponse({ message: "Not found" }, 404);
+      await expect(getPageVersions("999", 25)).rejects.toThrow(ConfluenceApiError);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // getPageVersionBody
+  // ---------------------------------------------------------------------------
+  describe("getPageVersionBody", () => {
+    const v1Response = {
+      id: "10",
+      title: "My Page",
+      version: { number: 3 },
+      body: { storage: { value: "<p>hello version 3</p>" } },
+    };
+
+    it("constructs correct v1 URL with version and expand params", async () => {
+      global.fetch = mockFetchResponse(v1Response);
+      await getPageVersionBody("10", 3);
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V1}/content/10`);
+      expect(url).toContain("version=3");
+      expect(url).toContain("expand=body.storage%2Cversion");
+    });
+
+    it("returns parsed title, rawBody, and version number", async () => {
+      global.fetch = mockFetchResponse(v1Response);
+      const result = await getPageVersionBody("10", 3);
+      expect(result.title).toBe("My Page");
+      expect(result.rawBody).toBe("<p>hello version 3</p>");
+      expect(result.version).toBe(3);
+    });
+
+    it("caches raw body via pageCache.setVersioned after fetch", async () => {
+      global.fetch = mockFetchResponse(v1Response);
+      await getPageVersionBody("10", 3);
+      expect(pageCache.getVersioned("10", 3)).toBe("<p>hello version 3</p>");
+    });
+
+    it("returns cached body on second call (only metadata fetch)", async () => {
+      // Pre-populate cache
+      pageCache.setVersioned("10", 3, "<p>cached v3</p>");
+      // Mock returns v2 metadata (no body)
+      global.fetch = mockFetchResponse({ id: "10", title: "My Page", spaceId: "s1" });
+      const result = await getPageVersionBody("10", 3);
+      expect(result.rawBody).toBe("<p>cached v3</p>");
+      // Should have made exactly one call (metadata only via v2)
+      expect(global.fetch).toHaveBeenCalledOnce();
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V2}/pages/10`);
+    });
+
+    it("throws ConfluenceApiError on 404", async () => {
+      global.fetch = mockFetchResponse({ message: "Not found" }, 404);
+      await expect(getPageVersionBody("999", 1)).rejects.toThrow(ConfluenceApiError);
+    });
+
+    it("throws ConfluenceApiError on 403", async () => {
+      global.fetch = mockFetchResponse({ message: "Forbidden" }, 403);
+      await expect(getPageVersionBody("999", 1)).rejects.toThrow(ConfluenceApiError);
+    });
+
+    it("handles v1 response shape correctly (body.storage.value path)", async () => {
+      const response = {
+        id: "5",
+        title: "Deep Page",
+        version: { number: 7 },
+        body: { storage: { value: "<h1>Title</h1><p>Content</p>" } },
+      };
+      global.fetch = mockFetchResponse(response);
+      const result = await getPageVersionBody("5", 7);
+      expect(result.rawBody).toBe("<h1>Title</h1><p>Content</p>");
+    });
   });
 });

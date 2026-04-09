@@ -1,13 +1,19 @@
 # Phase 2 Considerations
 
 ## Additional Tools
-- `add_label` / `remove_label` -- Page label management
 - `get_page_comments` / `add_comment` -- Comment operations
 - `get_page_history` -- Version history
 
 ## Enhancements
 - Cursor-based pagination for large result sets
 - Windows keychain support (Credential Manager via PowerShell)
+- Advisory file locking on profile registry (proper-lockfile) for concurrent CLI safety
+
+### Completed in v4.3.0
+- ~~Page label management~~ → `get_labels`, `add_label`, `remove_label` tools
+
+### Completed in v4.2.0
+- ~~Per-profile read-only mode~~ → Whitelist-based write guard, strict-mode OR merge, `[READ-ONLY]` tool prefix, default read-only for new profiles. See `investigations/investigate-write-locks.md`
 
 ### Completed in v4.1.0
 - ~~Token-efficient output mode (headings_only, section, max_length, format: markdown)~~ → See `investigations/investigate-token-efficiency.md`

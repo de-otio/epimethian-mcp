@@ -44,6 +44,37 @@ export class PageCache {
     return entry ? { version: entry.version } : undefined;
   }
 
+  /**
+   * Return cached body for a specific historical version.
+   * Uses composite key `${pageId}:v${version}` to coexist with current-version entries.
+   */
+  getVersioned(pageId: string, version: number): string | undefined {
+    const key = `${pageId}:v${version}`;
+    const entry = this.cache.get(key);
+    if (entry) {
+      // Promote to most-recently-used
+      this.cache.delete(key);
+      this.cache.set(key, entry);
+      return entry.body;
+    }
+    return undefined;
+  }
+
+  /**
+   * Store a historical version body.
+   * Uses composite key `${pageId}:v${version}` so multiple versions of the
+   * same page can coexist alongside the current-version entry.
+   */
+  setVersioned(pageId: string, version: number, body: string): void {
+    const key = `${pageId}:v${version}`;
+    this.cache.delete(key);
+    if (this.cache.size >= this.maxSize) {
+      const oldest = this.cache.keys().next().value!;
+      this.cache.delete(oldest);
+    }
+    this.cache.set(key, { version, body });
+  }
+
   /** Remove a specific page from the cache. */
   delete(pageId: string): void {
     this.cache.delete(pageId);

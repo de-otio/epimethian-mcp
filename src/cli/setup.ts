@@ -6,7 +6,7 @@ import {
   readFromKeychain,
   PROFILE_NAME_RE,
 } from "../shared/keychain.js";
-import { addToProfileRegistry } from "../shared/profiles.js";
+import { addToProfileRegistry, setProfileSettings } from "../shared/profiles.js";
 
 const TOOLS = [
   "create_page",
@@ -155,7 +155,27 @@ export async function runSetup(profile?: string): Promise<void> {
     await saveToKeychain({ url, email, apiToken }, profile);
     if (profile) {
       await addToProfileRegistry(profile);
-      console.log(`Credentials saved to OS keychain (profile: ${profile}).\n`);
+
+      // Determine read-only mode: --read-write opts out, otherwise default to read-only
+      const args = process.argv.slice(2);
+      const explicitReadWrite = args.includes("--read-write");
+      let enableWrites = explicitReadWrite;
+
+      if (!explicitReadWrite && !args.includes("--read-only")) {
+        // Interactive prompt — default is read-only (N)
+        const rl2 = readline.createInterface({ input: stdin, output: stdout });
+        try {
+          const answer = await rl2.question("Enable writes for this profile? [y/N] ");
+          enableWrites = answer.trim().toLowerCase() === "y";
+        } finally {
+          rl2.close();
+        }
+      }
+
+      const readOnly = !enableWrites;
+      await setProfileSettings(profile, { readOnly });
+      const modeLabel = readOnly ? "read-only" : "read-write";
+      console.log(`Credentials saved to OS keychain (profile: ${profile}, ${modeLabel}).\n`);
     } else {
       console.log("Credentials saved to OS keychain.\n");
       console.log(

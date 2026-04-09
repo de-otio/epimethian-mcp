@@ -104,6 +104,20 @@ Each VS Code window / Claude Code session uses the profile specified in its `.mc
 - List all profiles: `epimethian-mcp profiles`
 - Show details: `epimethian-mcp profiles --verbose`
 - Check connection: `CONFLUENCE_PROFILE=<name> epimethian-mcp status`
+- Set read-only: `epimethian-mcp profiles --set-read-only <name>`
+- Set read-write: `epimethian-mcp profiles --set-read-write <name>`
+
+### Read-Only Mode
+
+New profiles default to **read-only**. When read-only, all write tools are blocked and return an error. To enable writes for a profile:
+
+```bash
+epimethian-mcp profiles --set-read-write <name>
+```
+
+Or during setup: `epimethian-mcp setup --profile <name> --read-write`
+
+**Important:** Restart any running MCP servers after changing the read-only flag.
 
 ### Removing a Profile
 
@@ -218,7 +232,7 @@ If **the server doesn't appear after restart**:
 - Verify the `command` value is an absolute path (run `which epimethian-mcp` to confirm)
 - Check that `.mcp.json` contains valid JSON (no trailing commas, correct quoting)
 
-## Available Tools (13)
+## Available Tools (26)
 
 | Tool | Description |
 |------|-------------|
@@ -235,3 +249,16 @@ If **the server doesn't appear after restart**:
 | `add_attachment` | Upload a file attachment to a page |
 | `get_attachments` | List attachments on a page |
 | `add_drawio_diagram` | Add a draw.io diagram to a page |
+| `get_labels` | Get all labels on a Confluence page |
+| `add_label` | Add one or more labels to a Confluence page |
+| `remove_label` | Remove a label from a Confluence page |
+| `get_page_status` | Get the content status badge on a page |
+| `set_page_status` | Set the content status badge on a page |
+| `remove_page_status` | Remove the content status badge from a page |
+| `get_comments` | Get footer and/or inline comments on a page |
+| `create_comment` | Create a footer or inline comment on a page |
+| `resolve_comment` | Resolve or reopen an inline comment |
+| `delete_comment` | Permanently delete a comment |
+| `get_page_versions` | List version history for a page |
+| `get_page_version` | Get page content at a specific historical version |
+| `diff_page_versions` | Compare two versions of a page |

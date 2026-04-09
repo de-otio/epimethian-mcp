@@ -12,12 +12,16 @@ vi.mock("../shared/keychain.js", () => ({
 const mockReadProfileRegistry = vi.fn();
 const mockRemoveFromProfileRegistry = vi.fn().mockResolvedValue(undefined);
 const mockAppendAuditLog = vi.fn().mockResolvedValue(undefined);
+const mockGetProfileSettings = vi.fn().mockResolvedValue(undefined);
+const mockSetProfileSettings = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("../shared/profiles.js", () => ({
   readProfileRegistry: () => mockReadProfileRegistry(),
   removeFromProfileRegistry: (...args: unknown[]) =>
     mockRemoveFromProfileRegistry(...args),
   appendAuditLog: (...args: unknown[]) => mockAppendAuditLog(...args),
+  getProfileSettings: (...args: unknown[]) => mockGetProfileSettings(...args),
+  setProfileSettings: (...args: unknown[]) => mockSetProfileSettings(...args),
 }));
 
 import { runProfiles } from "./profiles.js";
@@ -79,6 +83,103 @@ describe("runProfiles", () => {
 
     const output = spy.mock.calls.map((c) => c[0]).join("\n");
     expect(output).toContain("credentials missing");
+    spy.mockRestore();
+  });
+
+  it("shows read-only status in non-verbose listing", async () => {
+    mockReadProfileRegistry.mockResolvedValue(["acme", "jambit"]);
+    mockGetProfileSettings
+      .mockResolvedValueOnce({ readOnly: true })
+      .mockResolvedValueOnce(undefined);
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runProfiles();
+
+    const output = spy.mock.calls.map((c) => c[0]).join("\n");
+    expect(output).toContain("acme (read-only)");
+    expect(output).not.toContain("jambit (read-only)");
+    spy.mockRestore();
+  });
+
+  it("shows Read-Only column in verbose listing", async () => {
+    process.argv = ["node", "index.js", "profiles", "--verbose"];
+    mockReadProfileRegistry.mockResolvedValue(["acme"]);
+    mockReadFromKeychain.mockResolvedValue({
+      url: "https://acme.atlassian.net",
+      email: "u@acme.com",
+      apiToken: "tok",
+    });
+    mockGetProfileSettings.mockResolvedValue({ readOnly: true });
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runProfiles();
+
+    const output = spy.mock.calls.map((c) => c[0]).join("\n");
+    expect(output).toContain("Read-Only");
+    expect(output).toContain("YES");
+    spy.mockRestore();
+  });
+});
+
+describe("--set-read-only / --set-read-write", () => {
+  const originalExit = process.exit;
+  let exitCode: number | undefined;
+
+  beforeEach(() => {
+    exitCode = undefined;
+    process.exit = vi.fn((code?: number) => {
+      exitCode = code ?? 0;
+      throw new Error(`process.exit(${code})`);
+    }) as any;
+  });
+
+  afterEach(() => {
+    process.exit = originalExit;
+  });
+
+  it("--set-read-only sets readOnly: true", async () => {
+    process.argv = ["node", "index.js", "profiles", "--set-read-only", "acme"];
+    mockReadProfileRegistry.mockResolvedValue(["acme"]);
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runProfiles();
+
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { readOnly: true });
+    const output = spy.mock.calls.map((c) => c[0]).join("\n");
+    expect(output).toContain("read-only");
+    expect(output).toContain("Restart any running MCP servers");
+    spy.mockRestore();
+  });
+
+  it("--set-read-write sets readOnly: false", async () => {
+    process.argv = ["node", "index.js", "profiles", "--set-read-write", "acme"];
+    mockReadProfileRegistry.mockResolvedValue(["acme"]);
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runProfiles();
+
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { readOnly: false });
+    const output = spy.mock.calls.map((c) => c[0]).join("\n");
+    expect(output).toContain("read-write");
+    spy.mockRestore();
+  });
+
+  it("--set-read-only errors on nonexistent profile", async () => {
+    process.argv = ["node", "index.js", "profiles", "--set-read-only", "nope"];
+    mockReadProfileRegistry.mockResolvedValue(["acme"]);
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(runProfiles()).rejects.toThrow("process.exit(1)");
+
+    expect(spy).toHaveBeenCalledWith(expect.stringContaining("does not exist"));
+    spy.mockRestore();
+  });
+
+  it("--set-read-only errors on invalid profile name", async () => {
+    process.argv = ["node", "index.js", "profiles", "--set-read-only", "-BAD"];
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(runProfiles()).rejects.toThrow("process.exit(1)");
     spy.mockRestore();
   });
 });
