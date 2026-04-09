@@ -6,10 +6,15 @@
 - `get_page_history` -- Version history
 
 ## Enhancements
-- Markdown-to-storage-format conversion
 - Cursor-based pagination for large result sets
-- In-memory caching for `resolveSpaceId` (space keys rarely change)
 - Windows keychain support (Credential Manager via PowerShell)
+
+### Completed in v4.1.0
+- ~~Token-efficient output mode (headings_only, section, max_length, format: markdown)~~ → See `investigations/investigate-token-efficiency.md`
+- ~~In-memory page cache (version-keyed, LRU eviction)~~ → See `page-cache.ts`
+- ~~Search excerpts~~ → Switched to `/rest/api/search` endpoint
+- ~~Section-level editing (update_page_section)~~ → New tool
+- ~~Markdown write guard on update_page~~ → Rejects markdown input
 
 ## CLI Enhancements
 - `epimethian-mcp update` -- Self-update to latest npm version

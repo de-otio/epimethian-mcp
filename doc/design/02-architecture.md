@@ -14,7 +14,7 @@
   │  (npm global binary)  │
   │                       │
   │  - CLI entry point    │
-  │  - MCP server (12     │
+  │  - MCP server (13     │
   │    Confluence tools)  │
   │  - Reads credentials  │
   │    from OS keychain   │
@@ -49,13 +49,18 @@ epimethian-mcp/
 ├── install-agent.md              # Agent-readable installation guide
 ├── src/
 │   ├── cli/
-│   │   ├── index.ts              # Entry point: routes to server or setup
-│   │   └── setup.ts              # Interactive credential setup command
+│   │   ├── index.ts              # Entry point: routes to server, setup, or subcommands
+│   │   ├── setup.ts              # Interactive credential setup command
+│   │   ├── profiles.ts           # Profile list/remove subcommand
+│   │   ├── status.ts             # Connection status subcommand
+│   │   └── agent-guide.ts        # Prints install-agent.md to stdout
 │   ├── server/
 │   │   ├── index.ts              # MCP server setup + tool registrations
-│   │   └── confluence-client.ts  # HTTP helpers, Zod response schemas, formatting
+│   │   ├── confluence-client.ts  # HTTP helpers, Zod schemas, formatting, section ops
+│   │   └── page-cache.ts         # In-memory version-keyed page cache (LRU)
 │   └── shared/
 │       ├── keychain.ts           # OS keychain abstraction (macOS, Linux)
+│       ├── profiles.ts           # Profile registry (JSON file alongside keychain)
 │       └── test-connection.ts    # Connection test (used by setup command)
 ├── doc/
 │   └── design/

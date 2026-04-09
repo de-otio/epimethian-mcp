@@ -82,19 +82,30 @@ epimethian-mcp profiles --remove <name>           # delete profile and credentia
 
 The `--remove` command deletes the profile's keychain entry and registry record after interactive confirmation. For non-interactive environments (CI, agent shell sessions), pass `--force` to skip the prompt.
 
+## Token Efficiency
+
+Confluence pages are verbose — storage format HTML with macro markup can easily reach 50,000+ tokens. Epimethian reduces token usage through several strategies, all lossless with respect to Confluence data:
+
+- **Drill-down pattern** — Use `headings_only` to get a page outline (~500 tokens), then `section` to read just the part you need in storage format. No need to fetch the full page body.
+- **Section-level editing** — `update_page_section` replaces content under a single heading. The rest of the page is never touched, eliminating the need to send the full body on updates.
+- **Page cache** — An in-memory, version-keyed cache eliminates redundant API calls during iterative editing. After updating a page, subsequent reads serve from cache (~90% fewer tokens on repeated reads).
+- **Search excerpts** — Search results include content previews so the agent can triage results without calling `get_page` on each one.
+- **Markdown view** — `format: "markdown"` returns a compact read-only rendering where macros become `[macro: name]` placeholders. The server rejects any attempt to write markdown back — storage format is the only accepted write format.
+- **Truncation** — `max_length` cuts the body at an element boundary with a `[truncated at N of M characters]` marker.
+
 ## Tools
 
 | Tool                 | Description                |
 | -------------------- | -------------------------- |
 | `create_page`        | Create a new page          |
-| `get_page`           | Read a page by ID (supports `headings_only` outline) |
-| `get_page_by_title`  | Look up a page by title (supports `headings_only` outline) |
-| `update_page`        | Update an existing page    |
+| `get_page`           | Read a page by ID (`headings_only`, `section`, `max_length`, `format`) |
+| `get_page_by_title`  | Look up a page by title (same options as `get_page`) |
+| `update_page`        | Update an existing page (rejects markdown input) |
 | `update_page_section`| Update a single section by heading name |
 | `delete_page`        | Delete a page              |
 | `list_pages`         | List pages in a space      |
 | `get_page_children`  | Get child pages            |
-| `search_pages`       | Search via CQL             |
+| `search_pages`       | Search via CQL (includes content excerpts) |
 | `get_spaces`         | List available spaces      |
 | `add_attachment`     | Upload a file attachment   |
 | `get_attachments`    | List attachments on a page |

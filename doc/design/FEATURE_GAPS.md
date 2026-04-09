@@ -40,9 +40,9 @@ Move pages, copy page trees, bulk label application. Useful for reorganization t
 
 ## Lower Priority But Differentiating
 
-### 9. Token-Efficient Output Mode
+### 9. ~~Token-Efficient Output Mode~~ ✅ Implemented in v4.1.0
 
-aashari's server has a "TOON" format that reduces token costs 30-60%. Given how verbose Confluence HTML can be, a stripped/summarized output mode could help with context window management.
+Content windowing (`headings_only`, `section`, `max_length`), read-only markdown rendering (`format: "markdown"`), in-memory page cache, search excerpts, section-level editing (`update_page_section`), and markdown write guard. See `investigations/investigate-token-efficiency.md`.
 
 ### 10. Page Tree Visualization
 

@@ -54,5 +54,5 @@
 ## Verification
 
 - [x] `npm run build` produces `dist/cli/index.js` with shebang
-- [x] `npm test` -- 74 tests pass across 5 test files
+- [x] `npm test` -- all tests pass (614 as of v4.1.2)
 - [x] `npm pack --dry-run` -- only `dist/` + metadata (375 KB)

@@ -47,7 +47,7 @@ Updates a single section of a page by heading name. The rest of the page is unto
 Deletes a page by ID. Returns confirmation text.
 
 ### search_pages
-Searches using CQL (Confluence Query Language). Uses the v1 `/rest/api/content/search` endpoint since v2 doesn't have a dedicated CQL search endpoint. Example CQL: `space = "DEV" AND title ~ "architecture"`.
+Searches using CQL (Confluence Query Language). Uses the v1 `/rest/api/search` endpoint (not `/content/search`) to include content excerpts in results. Example CQL: `space = "DEV" AND title ~ "architecture"`.
 
 ### list_pages
 Lists pages in a space by space key. Supports filtering by status (default: "current") and limiting result count.

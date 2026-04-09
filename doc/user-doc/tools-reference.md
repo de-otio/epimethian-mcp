@@ -1,6 +1,6 @@
 # Tools Reference
 
-The Epimethian MCP server provides 12 tools for managing Confluence pages, spaces, attachments, and diagrams. All tools return plain text output suitable for AI consumption.
+The Epimethian MCP server provides 13 tools for managing Confluence pages, spaces, attachments, and diagrams. All tools return plain text output suitable for AI consumption.
 
 ## Spaces
 
@@ -136,7 +136,7 @@ Returns child pages of a given parent page.
 
 ### `search_pages`
 
-Searches pages using CQL (Confluence Query Language).
+Searches pages using CQL (Confluence Query Language). Results include a content excerpt (~300 chars) so you can triage matches without fetching each page.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
