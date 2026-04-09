@@ -70,7 +70,7 @@ Updates an existing page using optimistic concurrency control. You must provide 
 | `page_id` | string | Yes | Numeric page ID |
 | `title` | string | Yes | Page title (use the title from `get_page` if unchanged) |
 | `version` | number | Yes | Page version number from your most recent `get_page` call |
-| `body` | string | No | New page content (keeps current if omitted) |
+| `body` | string | No | New page content (omit to leave body unchanged) |
 | `version_message` | string | No | Version comment visible in page history |
 
 ---
