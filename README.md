@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="doc/logo/logo.svg" alt="Epimethian MCP logo" width="64" height="64">
+</p>
+
 # Epimethian MCP
 
 Confluence Cloud tools for AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). (not associated with or endorsed by Atlassian)

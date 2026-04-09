@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Background -->
+  <circle cx="32" cy="32" r="30" fill="#1A1A2E"/>
+
+  <!-- Greek letter Epsilon (Ε/ε) — uppercase -->
+  <text x="32" y="32" text-anchor="middle" dominant-baseline="central" font-family="serif" font-size="44" font-weight="bold" fill="#C0A040">&#917;</text>
+</svg>
