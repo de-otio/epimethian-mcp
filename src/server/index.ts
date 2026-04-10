@@ -831,11 +831,21 @@ function registerTools(server: McpServer, config: Config): void {
           await rm(tmpDir, { recursive: true, force: true });
         }
 
-        // Build the draw.io macro
+        // Build the draw.io macro (must match Confluence Cloud draw.io app format)
+        const macroId = crypto.randomUUID();
+        const localId = crypto.randomUUID();
+        const baseUrl = `${config.url}/wiki`;
         const macro = [
-          `<ac:structured-macro ac:name="drawio" ac:schema-version="1">`,
+          `<ac:structured-macro ac:name="drawio" ac:schema-version="1" data-layout="default" ac:local-id="${localId}" ac:macro-id="${macroId}">`,
+          `  <ac:parameter ac:name="diagramDisplayName">${escapeXml(filename)}</ac:parameter>`,
           `  <ac:parameter ac:name="diagramName">${escapeXml(filename)}</ac:parameter>`,
-          `  <ac:parameter ac:name="attachment">${escapeXml(filename)}</ac:parameter>`,
+          `  <ac:parameter ac:name="revision">1</ac:parameter>`,
+          `  <ac:parameter ac:name="pageId">${escapeXml(page_id)}</ac:parameter>`,
+          `  <ac:parameter ac:name="baseUrl">${escapeXml(baseUrl)}</ac:parameter>`,
+          `  <ac:parameter ac:name="zoom">1</ac:parameter>`,
+          `  <ac:parameter ac:name="lbox">1</ac:parameter>`,
+          `  <ac:parameter ac:name="simple">0</ac:parameter>`,
+          `  <ac:parameter ac:name="contentVer">1</ac:parameter>`,
           `</ac:structured-macro>`,
         ].join("\n");
 
