@@ -12,6 +12,7 @@ export interface Config {
   email: string;
   profile: string | null;
   readOnly: boolean;
+  attribution: boolean;
   apiV2: string;
   apiV1: string;
   authHeader: string;
@@ -108,6 +109,11 @@ export async function getConfig(): Promise<Config> {
     (registrySettings?.readOnly === true) ||
     (process.env.CONFLUENCE_READ_ONLY === "true");
 
+  // Resolve attribution flag: disabled if registry or env var says so.
+  const attribution =
+    (registrySettings?.attribution !== false) &&
+    (process.env.CONFLUENCE_ATTRIBUTION !== "false");
+
   // Confluence exposes two API generations:
   //   - v2 (REST): /wiki/api/v2  — used for page CRUD, spaces, children
   //   - v1 (REST): /wiki/rest/api — used for CQL search and attachments (no v2 equivalent)
@@ -119,6 +125,7 @@ export async function getConfig(): Promise<Config> {
     email,
     profile,
     readOnly,
+    attribution,
     apiV2: `${url}/wiki/api/v2`,
     apiV1: `${url}/wiki/rest/api`,
     authHeader,
@@ -179,8 +186,9 @@ export async function validateStartup(config: Config): Promise<void> {
   // Step 3: Log connection info
   const profileLabel = profile ? `profile: ${profile}` : "env-var mode";
   const readOnlyLabel = config.readOnly ? ", READ-ONLY" : "";
+  const attributionLabel = config.attribution ? "" : ", NO-ATTRIBUTION";
   console.error(
-    `epimethian-mcp: connected to ${url} as ${email} (${profileLabel}${readOnlyLabel})`
+    `epimethian-mcp: connected to ${url} as ${email} (${profileLabel}${readOnlyLabel}${attributionLabel})`
   );
 }
 
@@ -469,14 +477,18 @@ export async function createPage(
   body: string,
   parentId?: string
 ): Promise<PageData> {
+  const cfg = await getConfig();
   const cleanBody = stripAttributionFooter(toStorageFormat(body));
+  const pageBody = cfg.attribution
+    ? cleanBody + "\n" + buildAttributionFooter("created")
+    : cleanBody;
   const payload: Record<string, unknown> = {
     title,
     spaceId,
     status: "current",
     body: {
       representation: "storage",
-      value: cleanBody + "\n" + buildAttributionFooter("created"),
+      value: pageBody,
     },
     version: { message: "Created by Epimethian" },
   };
@@ -485,7 +497,7 @@ export async function createPage(
   const page = PageSchema.parse(raw);
 
   // Cache the body we just sent (new pages start at version 1)
-  pageCache.set(page.id, page.version?.number ?? 1, cleanBody + "\n" + buildAttributionFooter("created"));
+  pageCache.set(page.id, page.version?.number ?? 1, pageBody);
 
   try {
     await addLabels(page.id, [ATTRIBUTION_LABEL]);
@@ -505,6 +517,7 @@ export async function updatePage(
     versionMessage?: string;
   }
 ): Promise<{ page: PageData; newVersion: number }> {
+  const cfg = await getConfig();
   const newVersion = opts.version + 1;
 
   const versionMessage = opts.versionMessage
@@ -519,9 +532,12 @@ export async function updatePage(
   };
   if (opts.body) {
     const cleanBody = stripAttributionFooter(toStorageFormat(opts.body));
+    const pageBody = cfg.attribution
+      ? cleanBody + "\n" + buildAttributionFooter("updated")
+      : cleanBody;
     payload.body = {
       representation: "storage",
-      value: cleanBody + "\n" + buildAttributionFooter("updated"),
+      value: pageBody,
     };
   }
 
@@ -538,8 +554,11 @@ export async function updatePage(
 
   // Cache the body we just sent
   if (opts.body) {
-    const cachedBody = stripAttributionFooter(toStorageFormat(opts.body));
-    pageCache.set(pageId, newVersion, cachedBody + "\n" + buildAttributionFooter("updated"));
+    const cleanBody = stripAttributionFooter(toStorageFormat(opts.body));
+    const pageBody = cfg.attribution
+      ? cleanBody + "\n" + buildAttributionFooter("updated")
+      : cleanBody;
+    pageCache.set(pageId, newVersion, pageBody);
   }
 
   try {
@@ -731,7 +750,7 @@ const ATTRIBUTION_END = "<!-- epimethian-attribution-end -->";
 function buildAttributionFooter(action: "created" | "updated"): string {
   return (
     ATTRIBUTION_START +
-    '<p style="font-size:11px;color:#999;margin-top:2em;">' +
+    '<p style="font-size:9px;color:#999;margin-top:2em;">' +
     `<em>This page was ${action} with ` +
     `<a href="${GITHUB_URL}">Epimethian</a>.</em></p>` +
     ATTRIBUTION_END

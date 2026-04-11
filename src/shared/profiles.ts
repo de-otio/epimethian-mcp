@@ -23,6 +23,7 @@ async function ensureConfigDir(): Promise<void> {
 
 export interface ProfileSettings {
   readOnly?: boolean;
+  attribution?: boolean;
 }
 
 interface ProfileRegistry {

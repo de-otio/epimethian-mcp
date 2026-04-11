@@ -54,6 +54,30 @@ export async function runProfiles(): Promise<void> {
     return;
   }
 
+  // Handle --disable-attribution <name>
+  const disableAttrIdx = args.indexOf("--disable-attribution");
+  if (disableAttrIdx > -1) {
+    const name = args[disableAttrIdx + 1];
+    if (!name || !PROFILE_NAME_RE.test(name)) {
+      console.error("Error: --disable-attribution requires a valid profile name.");
+      process.exit(1);
+    }
+    await setAttributionFlag(name, false);
+    return;
+  }
+
+  // Handle --enable-attribution <name>
+  const enableAttrIdx = args.indexOf("--enable-attribution");
+  if (enableAttrIdx > -1) {
+    const name = args[enableAttrIdx + 1];
+    if (!name || !PROFILE_NAME_RE.test(name)) {
+      console.error("Error: --enable-attribution requires a valid profile name.");
+      process.exit(1);
+    }
+    await setAttributionFlag(name, true);
+    return;
+  }
+
   const verbose = args.includes("--verbose");
   const profiles = await readProfileRegistry();
 
@@ -64,10 +88,10 @@ export async function runProfiles(): Promise<void> {
 
   if (verbose) {
     console.log(
-      `  ${"Profile".padEnd(20)} ${"URL".padEnd(40)} ${"Read-Only".padEnd(12)} Email`
+      `  ${"Profile".padEnd(20)} ${"URL".padEnd(40)} ${"Read-Only".padEnd(12)} ${"Attribution".padEnd(14)} Email`
     );
     console.log(
-      `  ${"─".repeat(20)} ${"─".repeat(40)} ${"─".repeat(12)} ${"─".repeat(30)}`
+      `  ${"─".repeat(20)} ${"─".repeat(40)} ${"─".repeat(12)} ${"─".repeat(14)} ${"─".repeat(30)}`
     );
 
     for (const name of profiles) {
@@ -75,9 +99,10 @@ export async function runProfiles(): Promise<void> {
         const creds = await readFromKeychain(name);
         const settings = await getProfileSettings(name);
         const roLabel = settings?.readOnly ? "YES" : "no";
+        const attrLabel = settings?.attribution === false ? "disabled" : "enabled";
         if (creds) {
           console.log(
-            `  ${name.padEnd(20)} ${creds.url.padEnd(40)} ${roLabel.padEnd(12)} ${creds.email}`
+            `  ${name.padEnd(20)} ${creds.url.padEnd(40)} ${roLabel.padEnd(12)} ${attrLabel.padEnd(14)} ${creds.email}`
           );
         } else {
           console.log(
@@ -95,7 +120,8 @@ export async function runProfiles(): Promise<void> {
     for (const name of profiles) {
       const settings = await getProfileSettings(name);
       const roSuffix = settings?.readOnly ? " (read-only)" : "";
-      console.log(`  ${name}${roSuffix}`);
+      const attrSuffix = settings?.attribution === false ? " (no attribution)" : "";
+      console.log(`  ${name}${roSuffix}${attrSuffix}`);
     }
     console.log("\nUse --verbose to show URLs and emails.");
   }
@@ -110,6 +136,18 @@ async function setReadOnlyFlag(name: string, readOnly: boolean): Promise<void> {
   await setProfileSettings(name, { readOnly });
   const label = readOnly ? "read-only" : "read-write";
   console.log(`Profile "${name}" is now ${label}.`);
+  console.log("Note: Restart any running MCP servers for this change to take effect.");
+}
+
+async function setAttributionFlag(name: string, attribution: boolean): Promise<void> {
+  const profiles = await readProfileRegistry();
+  if (!profiles.includes(name)) {
+    console.error(`Error: Profile "${name}" does not exist.`);
+    process.exit(1);
+  }
+  await setProfileSettings(name, { attribution });
+  const label = attribution ? "enabled" : "disabled";
+  console.log(`Attribution footer for profile "${name}" is now ${label}.`);
   console.log("Note: Restart any running MCP servers for this change to take effect.");
 }
 
