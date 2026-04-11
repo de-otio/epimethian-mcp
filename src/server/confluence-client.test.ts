@@ -881,6 +881,21 @@ describe("attribution footer deduplication", () => {
     const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
     expect(occurrences).toHaveLength(1);
   });
+
+  it("strips bare (unmarked) attribution paragraphs", async () => {
+    global.fetch = mockFetchResponse({ id: "31", title: "T" });
+    const bodyWithBareAttribution =
+      "<p>content</p>\n" +
+      '<p style="font-size: 11.0px;color: rgb(153,153,153);margin-top: 2.0em;">' +
+      '<em>This page was updated with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a>.</em></p>';
+    await updatePage("31", { title: "T", version: 1, body: bodyWithBareAttribution });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
+    expect(occurrences).toHaveLength(1);
+    // The bare copy should be gone — only the marked one remains.
+    const epimethianLinks = putBody.body.value.match(/Epimethian/g);
+    expect(epimethianLinks).toHaveLength(1);
+  });
 });
 
 describe("deletePage", () => {

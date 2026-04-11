@@ -744,6 +744,13 @@ function stripAttributionFooter(body: string): string {
       /<!--\s*epimethian-attribution-start\s*-->[\s\S]*?<!--\s*epimethian-attribution-end\s*-->/g,
       ""
     )
+    .replace(
+      // Also strip bare (unmarked) attribution paragraphs — these appear
+      // when an agent copies page content from get_page and passes it
+      // back to update_page without removing the footer.
+      /<p[^>]*>[\s\S]*?<a\s[^>]*href="https:\/\/github\.com\/de-otio\/epimethian-mcp"[^>]*>Epimethian<\/a>[\s\S]*?<\/p>/gi,
+      ""
+    )
     .trimEnd();
 }
 
