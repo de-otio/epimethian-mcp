@@ -1,4 +1,7 @@
 import { build, context } from "esbuild";
+import { readFileSync } from "node:fs";
+
+const pkg = JSON.parse(readFileSync("package.json", "utf8"));
 
 const shared = {
   bundle: true,
@@ -7,6 +10,7 @@ const shared = {
   sourcemap: true,
   target: "node18",
   loader: { ".md": "text" },
+  define: { __PKG_VERSION__: JSON.stringify(pkg.version) },
 };
 
 const isWatch = process.argv.includes("--watch");

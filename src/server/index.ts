@@ -5,6 +5,8 @@ import { readFile, writeFile, mkdtemp, rm, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+declare const __PKG_VERSION__: string;
+
 import {
   resolveSpaceId,
   getPage,
@@ -106,6 +108,7 @@ const READ_ONLY_TOOLS = new Set([
   "get_page_versions",
   "get_page_version",
   "diff_page_versions",
+  "get_version",
 ]);
 
 export function writeGuard(toolName: string, config: Config): ToolResult | null {
@@ -1455,6 +1458,16 @@ function registerTools(server: McpServer, config: Config): void {
       }
     }
   );
+
+  // get_version
+  server.registerTool(
+    "get_version",
+    {
+      description: "Return the epimethian-mcp server version.",
+      inputSchema: {},
+    },
+    async () => toolResult(`epimethian-mcp v${__PKG_VERSION__}`)
+  );
 }
 
 // --- Start ---
@@ -1471,7 +1484,7 @@ export async function main() {
 
   const server = new McpServer({
     name: serverName,
-    version: "1.0.0",
+    version: __PKG_VERSION__,
   });
 
   registerTools(server, config);

@@ -3,6 +3,8 @@ import TurndownService from "turndown";
 import { readFromKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
 import { getProfileSettings } from "../shared/profiles.js";
 import { testConnection, verifyTenantIdentity } from "../shared/test-connection.js";
+
+declare const __PKG_VERSION__: string;
 import { pageCache } from "./page-cache.js";
 
 // --- Configuration ---
@@ -490,7 +492,7 @@ export async function createPage(
       representation: "storage",
       value: pageBody,
     },
-    version: { message: "Created by Epimethian" },
+    version: { message: `Created by Epimethian v${__PKG_VERSION__}` },
   };
   if (parentId) payload.parentId = parentId;
   const raw = await v2Post("/pages", payload);
@@ -521,8 +523,8 @@ export async function updatePage(
   const newVersion = opts.version + 1;
 
   const versionMessage = opts.versionMessage
-    ? `${opts.versionMessage} (via Epimethian)`
-    : "Updated by Epimethian";
+    ? `${opts.versionMessage} (via Epimethian v${__PKG_VERSION__})`
+    : `Updated by Epimethian v${__PKG_VERSION__}`;
 
   const payload: Record<string, unknown> = {
     id: pageId,
@@ -752,7 +754,7 @@ function buildAttributionFooter(action: "created" | "updated"): string {
     ATTRIBUTION_START +
     '<p style="font-size:9px;color:#999;margin-top:2em;">' +
     `<em>This page was ${action} with ` +
-    `<a href="${GITHUB_URL}">Epimethian</a>.</em></p>` +
+    `<a href="${GITHUB_URL}">Epimethian</a> v${__PKG_VERSION__}.</em></p>` +
     ATTRIBUTION_END
   );
 }

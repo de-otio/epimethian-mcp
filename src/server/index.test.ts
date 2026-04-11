@@ -163,6 +163,7 @@ describe("MCP server index", () => {
       "get_page_versions",
       "get_page_version",
       "diff_page_versions",
+      "get_version",
     ];
     for (const tool of expectedTools) {
       expect(registeredTools.has(tool), `tool "${tool}" should be registered`).toBe(true);
@@ -775,6 +776,7 @@ describe("writeGuard (read-only mode)", () => {
       "list_pages", "get_page_children", "get_spaces", "get_attachments",
       "get_labels", "get_page_status",
       "get_page_versions", "get_page_version", "diff_page_versions",
+      "get_version",
     ];
     for (const tool of readTools) {
       expect(writeGuardFn(tool, readOnlyConfig)).toBeNull();
@@ -1677,5 +1679,13 @@ describe("diff_page_versions tool", () => {
     const handler = registeredTools.get("diff_page_versions")!.handler;
     const result = await handler({ page_id: "10", from_version: 1, to_version: 2, format: "summary" });
     expect(result.content[0].text).toContain("Architecture Doc");
+  });
+});
+
+describe("get_version tool", () => {
+  it("returns the server version", async () => {
+    const handler = registeredTools.get("get_version")!.handler;
+    const result = await handler({});
+    expect(result.content[0].text).toMatch(/^epimethian-mcp v\d+\.\d+\.\d+$/);
   });
 });

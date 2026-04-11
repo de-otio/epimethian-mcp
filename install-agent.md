@@ -232,7 +232,7 @@ If **the server doesn't appear after restart**:
 - Verify the `command` value is an absolute path (run `which epimethian-mcp` to confirm)
 - Check that `.mcp.json` contains valid JSON (no trailing commas, correct quoting)
 
-## Available Tools (26)
+## Available Tools (27)
 
 | Tool | Description |
 |------|-------------|
@@ -262,3 +262,4 @@ If **the server doesn't appear after restart**:
 | `get_page_versions` | List version history for a page |
 | `get_page_version` | Get page content at a specific historical version |
 | `diff_page_versions` | Compare two versions of a page |
+| `get_version` | Return the epimethian-mcp server version |
