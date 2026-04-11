@@ -136,6 +136,7 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `get_page_versions`  | List version history for a page |
 | `get_page_version`   | Get page content at a specific historical version |
 | `diff_page_versions` | Compare two versions of a page |
+| `get_version`        | Return the server version      |
 
 ## Credential Security
 

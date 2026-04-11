@@ -1,6 +1,6 @@
 # Investigation: Page Version History / Diff
 
-**STATUS: ⏳ PENDING** (Not yet implemented)
+**STATUS: ✅ IMPLEMENTED** (v4.5.0 — `get_page_versions`, `get_page_version`, `diff_page_versions`)
 
 ## Problem
 

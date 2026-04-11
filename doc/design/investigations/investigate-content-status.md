@@ -1,6 +1,6 @@
 # Investigation: Content Status (Get + Set + Remove)
 
-**STATUS: ⏳ PENDING** (Not yet implemented)
+**STATUS: ✅ IMPLEMENTED** (v4.5.0 — `get_page_status`, `set_page_status`, `remove_page_status`)
 
 ## Problem
 

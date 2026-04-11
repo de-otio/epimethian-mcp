@@ -1,6 +1,6 @@
 # Investigation: Comments (Inline + Footer)
 
-**STATUS: ⏳ PENDING** (Not yet implemented)
+**STATUS: ✅ IMPLEMENTED** (v4.4.0 — `get_comments`, `create_comment`, `resolve_comment`, `delete_comment`)
 
 ## Problem
 

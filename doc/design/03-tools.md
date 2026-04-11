@@ -10,7 +10,7 @@ When a profile is configured as read-only (`readOnly: true` in profile settings 
 
 | Tool | readOnlyHint | destructiveHint | idempotentHint |
 |------|:---:|:---:|:---:|
-| `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments`, `get_labels`, `get_comments`, `get_page_status`, `get_page_versions`, `get_page_version`, `diff_page_versions` | yes | — | — |
+| `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments`, `get_labels`, `get_comments`, `get_page_status`, `get_page_versions`, `get_page_version`, `diff_page_versions`, `get_version` | yes | — | — |
 | `create_page`, `add_attachment`, `add_drawio_diagram`, `add_label`, `create_comment` | — | no | no |
 | `update_page`, `update_page_section`, `resolve_comment` | — | no | no |
 | `delete_page`, `remove_label`, `delete_comment`, `set_page_status`, `remove_page_status` | — | yes | yes |
@@ -45,6 +45,7 @@ When a profile is configured as read-only (`readOnly: true` in profile settings 
 | `get_page_versions` | page_id, limit? | List version history for a page |
 | `get_page_version` | page_id, version | Get page content at a specific historical version |
 | `diff_page_versions` | page_id, from_version, to_version?, max_length?, format? | Compare two versions of a page |
+| `get_version` | *(none)* | Return the epimethian-mcp server version |
 
 ## Tool Details
 
@@ -131,3 +132,6 @@ Fetches the content of a page at a specific historical version. Returns the body
 
 ### diff_page_versions
 Compares two versions of a page. The `summary` format (default) uses section-aware diffing — it splits both versions by heading and reports added, removed, and modified sections with per-section change details. The `unified` format returns a standard unified diff. Both formats support `max_length` truncation. Uses the `diff` npm package internally. Size-limited to 500 KB per version.
+
+### get_version
+Returns the epimethian-mcp server version (e.g., `epimethian-mcp v4.3.0`). Takes no parameters. The version is injected at build time from `package.json` via esbuild's `define` and embedded in the attribution footer, page version comments, and this tool's output.

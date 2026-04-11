@@ -1,6 +1,6 @@
 # Tools Reference
 
-The Epimethian MCP server provides 26 tools for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
+The Epimethian MCP server provides 27 tools for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
 
 ## Spaces
 
@@ -350,3 +350,13 @@ Compares two versions of a page with a section-aware summary or unified diff. Wo
 | `format` | string | No | `"summary"` (default) or `"unified"`. Summary shows section-level changes; unified shows a standard diff. |
 
 The summary format groups changes by heading — added sections, removed sections, and modified sections with per-section diffs. Useful for answering "what changed since version X?"
+
+---
+
+## Server Info
+
+### `get_version`
+
+Returns the epimethian-mcp server version. Takes no parameters.
+
+Use this tool to confirm which version of the server is running, which is useful for troubleshooting or verifying that an upgrade was applied.
