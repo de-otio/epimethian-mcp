@@ -65,18 +65,18 @@ For IDE-hosted agents, use the absolute path from `which epimethian-mcp` as the 
 Consultants and developers working across multiple Atlassian tenants can create a profile per tenant:
 
 ```bash
-epimethian-mcp setup --profile jambit
+epimethian-mcp setup --profile globex
 epimethian-mcp setup --profile acme-corp
 ```
 
-Each project's `.mcp.json` specifies which profile to use. Profiles are fully isolated — separate keychain entries, separate Confluence instances, separate MCP server names (`confluence-jambit`, `confluence-acme-corp`).
+Each project's `.mcp.json` specifies which profile to use. Profiles are fully isolated — separate keychain entries, separate Confluence instances, separate MCP server names (`confluence-globex`, `confluence-acme-corp`).
 
 Manage profiles:
 
 ```bash
 epimethian-mcp profiles              # list all (shows read-only status)
 epimethian-mcp profiles --verbose    # show URLs, emails, and read-only status
-CONFLUENCE_PROFILE=jambit epimethian-mcp status   # test connection
+CONFLUENCE_PROFILE=globex epimethian-mcp status   # test connection
 epimethian-mcp profiles --remove <name>           # delete profile and credentials
 ```
 
@@ -88,7 +88,7 @@ Protect client tenants from accidental writes:
 
 ```bash
 epimethian-mcp profiles --set-read-only acme-corp
-epimethian-mcp profiles --set-read-write jambit
+epimethian-mcp profiles --set-read-write globex
 ```
 
 New profiles default to **read-only**. The `setup` command prompts "Enable writes for this profile? [y/N]" or accepts `--read-write` for non-interactive use.
