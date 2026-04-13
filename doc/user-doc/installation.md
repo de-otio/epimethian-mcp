@@ -30,7 +30,7 @@ Run the interactive setup command with a profile name:
 epimethian-mcp setup --profile <name>
 ```
 
-Choose a short, descriptive profile name (e.g., `jambit`, `acme-corp`). If you only work with one Confluence instance, any name works (e.g., `main`).
+Choose a short, descriptive profile name (e.g., `globex`, `acme-corp`). If you only work with one Confluence instance, any name works (e.g., `main`).
 
 This will prompt for:
 1. Your Confluence URL (e.g., `https://yourcompany.atlassian.net`)
@@ -88,7 +88,7 @@ Then use the output as the `command` value.
 If you work with multiple Confluence instances (e.g., as a consultant), create a profile for each:
 
 ```bash
-epimethian-mcp setup --profile jambit
+epimethian-mcp setup --profile globex
 epimethian-mcp setup --profile acme-corp
 ```
 

@@ -45,22 +45,22 @@ describe("runProfiles", () => {
   });
 
   it("lists profile names without verbose", async () => {
-    mockReadProfileRegistry.mockResolvedValue(["jambit", "acme"]);
+    mockReadProfileRegistry.mockResolvedValue(["globex", "acme"]);
     const spy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     await runProfiles();
 
-    expect(spy).toHaveBeenCalledWith(expect.stringContaining("jambit"));
+    expect(spy).toHaveBeenCalledWith(expect.stringContaining("globex"));
     expect(spy).toHaveBeenCalledWith(expect.stringContaining("acme"));
     spy.mockRestore();
   });
 
   it("shows URL and email with --verbose", async () => {
     process.argv = ["node", "index.js", "profiles", "--verbose"];
-    mockReadProfileRegistry.mockResolvedValue(["jambit"]);
+    mockReadProfileRegistry.mockResolvedValue(["globex"]);
     mockReadFromKeychain.mockResolvedValue({
-      url: "https://jambit.atlassian.net",
-      email: "user@jambit.com",
+      url: "https://globex.atlassian.net",
+      email: "user@globex.com",
       apiToken: "tok",
     });
     const spy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -68,8 +68,8 @@ describe("runProfiles", () => {
     await runProfiles();
 
     const output = spy.mock.calls.map((c) => c[0]).join("\n");
-    expect(output).toContain("jambit.atlassian.net");
-    expect(output).toContain("user@jambit.com");
+    expect(output).toContain("globex.atlassian.net");
+    expect(output).toContain("user@globex.com");
     spy.mockRestore();
   });
 
@@ -87,7 +87,7 @@ describe("runProfiles", () => {
   });
 
   it("shows read-only status in non-verbose listing", async () => {
-    mockReadProfileRegistry.mockResolvedValue(["acme", "jambit"]);
+    mockReadProfileRegistry.mockResolvedValue(["acme", "globex"]);
     mockGetProfileSettings
       .mockResolvedValueOnce({ readOnly: true })
       .mockResolvedValueOnce(undefined);
@@ -97,7 +97,7 @@ describe("runProfiles", () => {
 
     const output = spy.mock.calls.map((c) => c[0]).join("\n");
     expect(output).toContain("acme (read-only)");
-    expect(output).not.toContain("jambit (read-only)");
+    expect(output).not.toContain("globex (read-only)");
     spy.mockRestore();
   });
 

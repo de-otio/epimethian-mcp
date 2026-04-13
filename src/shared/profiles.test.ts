@@ -47,10 +47,10 @@ describe("getProfileRegistryPath", () => {
 describe("readProfileRegistry", () => {
   it("returns profile names from valid file", async () => {
     mockReadFile.mockResolvedValue(
-      JSON.stringify({ profiles: ["jambit", "acme"] })
+      JSON.stringify({ profiles: ["globex", "acme"] })
     );
     const result = await readProfileRegistry();
-    expect(result).toEqual(["jambit", "acme"]);
+    expect(result).toEqual(["globex", "acme"]);
   });
 
   it("returns empty array when file does not exist", async () => {
@@ -232,8 +232,8 @@ describe("setProfileSettings", () => {
   it("preserves existing profiles and other settings", async () => {
     mockReadFile.mockResolvedValue(
       JSON.stringify({
-        profiles: ["acme", "jambit"],
-        settings: { jambit: { readOnly: false } },
+        profiles: ["acme", "globex"],
+        settings: { globex: { readOnly: false } },
       })
     );
 
@@ -241,8 +241,8 @@ describe("setProfileSettings", () => {
 
     const writtenData = (mockWriteFile.mock.calls[0]?.[1] as string) ?? "";
     const parsed = JSON.parse(writtenData);
-    expect(parsed.profiles).toEqual(["acme", "jambit"]);
-    expect(parsed.settings.jambit).toEqual({ readOnly: false });
+    expect(parsed.profiles).toEqual(["acme", "globex"]);
+    expect(parsed.settings.globex).toEqual({ readOnly: false });
     expect(parsed.settings.acme).toEqual({ readOnly: true });
   });
 

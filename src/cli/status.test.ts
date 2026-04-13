@@ -24,10 +24,10 @@ beforeEach(() => {
 
 describe("runStatus", () => {
   it("shows profile info and connection status", async () => {
-    process.env.CONFLUENCE_PROFILE = "jambit";
+    process.env.CONFLUENCE_PROFILE = "globex";
     mockReadFromKeychain.mockResolvedValue({
-      url: "https://jambit.atlassian.net",
-      email: "user@jambit.com",
+      url: "https://globex.atlassian.net",
+      email: "user@globex.com",
       apiToken: "tok",
     });
     mockTestConnection.mockResolvedValue({
@@ -39,9 +39,9 @@ describe("runStatus", () => {
     await runStatus();
 
     const output = spy.mock.calls.map((c) => c[0]).join("\n");
-    expect(output).toContain("jambit");
-    expect(output).toContain("jambit.atlassian.net");
-    expect(output).toContain("user@jambit.com");
+    expect(output).toContain("globex");
+    expect(output).toContain("globex.atlassian.net");
+    expect(output).toContain("user@globex.com");
     expect(output).toContain("Connected");
     spy.mockRestore();
   });

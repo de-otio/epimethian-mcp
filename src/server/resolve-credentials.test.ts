@@ -52,10 +52,10 @@ async function importResolveCredentials() {
 describe("resolveCredentials", () => {
   describe("Step 1: CONFLUENCE_PROFILE", () => {
     it("resolves credentials from named keychain profile", async () => {
-      process.env.CONFLUENCE_PROFILE = "jambit";
+      process.env.CONFLUENCE_PROFILE = "globex";
       mockReadFromKeychain.mockResolvedValue({
-        url: "https://jambit.atlassian.net",
-        email: "richard@jambit.com",
+        url: "https://globex.atlassian.net",
+        email: "richard@globex.com",
         apiToken: "token-j",
       });
 
@@ -63,12 +63,12 @@ describe("resolveCredentials", () => {
       const result = await resolve();
 
       expect(result).toEqual({
-        url: "https://jambit.atlassian.net",
-        email: "richard@jambit.com",
+        url: "https://globex.atlassian.net",
+        email: "richard@globex.com",
         apiToken: "token-j",
-        profile: "jambit",
+        profile: "globex",
       });
-      expect(mockReadFromKeychain).toHaveBeenCalledWith("jambit");
+      expect(mockReadFromKeychain).toHaveBeenCalledWith("globex");
     });
 
     it("strips trailing slash from keychain URL", async () => {

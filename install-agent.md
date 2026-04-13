@@ -38,7 +38,7 @@ Use the output as the `command` value in the MCP config below.
 ## Step 3: Collect configuration
 
 Ask the user for:
-1. **Profile name** — a short identifier for this Confluence instance (e.g., `jambit`, `acme-corp`). Lowercase alphanumeric and hyphens only.
+1. **Profile name** — a short identifier for this Confluence instance (e.g., `globex`, `acme-corp`). Lowercase alphanumeric and hyphens only.
 2. **Confluence Cloud URL** — e.g., `https://yoursite.atlassian.net`
 3. **Email address** — the email associated with their Atlassian account
 
@@ -182,7 +182,7 @@ for name in $(epimethian-mcp profiles | grep '^ '); do epimethian-mcp profiles -
 
 ### Step 4: Remove MCP configuration
 
-Delete the `confluence` entry (or the tenant-specific entry like `confluence-jambit`) from the project's `.mcp.json`.
+Delete the `confluence` entry (or the tenant-specific entry like `confluence-globex`) from the project's `.mcp.json`.
 
 ### Step 5: Uninstall the package
 

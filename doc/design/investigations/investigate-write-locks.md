@@ -54,7 +54,7 @@ Store a `readOnly` flag in `~/.config/epimethian-mcp/profiles.json`:
 
 ```json
 {
-  "profiles": ["jambit", "acme-corp"],
+  "profiles": ["globex", "acme-corp"],
   "settings": {
     "acme-corp": { "readOnly": true }
   }
@@ -193,7 +193,7 @@ Any future write tool (comments, labels, move, copy, bulk operations) is automat
 - Profile listing shows read-only status:
   ```
   Profile      URL                              Read-Only
-  jambit       https://jambit.atlassian.net      no
+  globex       https://globex.atlassian.net      no
   acme-corp    https://acme.atlassian.net        YES
   ```
 
