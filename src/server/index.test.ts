@@ -66,6 +66,8 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     deleteInlineComment: vi.fn(),
     getPageVersions: vi.fn(),
     getPageVersionBody: vi.fn(),
+    searchUsers: vi.fn(),
+    searchPagesByTitle: vi.fn(),
     ConfluenceApiError: class ConfluenceApiError extends Error {
       status: number;
       constructor(status: number, body: string) {
@@ -164,6 +166,9 @@ describe("MCP server index", () => {
       "get_page_version",
       "diff_page_versions",
       "get_version",
+      // Stream 14
+      "lookup_user",
+      "resolve_page_link",
     ];
     for (const tool of expectedTools) {
       expect(registeredTools.has(tool), `tool "${tool}" should be registered`).toBe(true);
@@ -1687,5 +1692,140 @@ describe("get_version tool", () => {
     const handler = registeredTools.get("get_version")!.handler;
     const result = await handler({});
     expect(result.content[0].text).toMatch(/^epimethian-mcp v\d+\.\d+\.\d+$/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stream 14 — lookup_user tool
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("lookup_user tool", () => {
+  it("is registered", () => {
+    expect(registeredTools.has("lookup_user")).toBe(true);
+  });
+
+  it("happy path — returns formatted user list", async () => {
+    const { searchUsers } = await import("./confluence-client.js");
+    (searchUsers as any).mockResolvedValueOnce([
+      { accountId: "557058:aaa-111", displayName: "Alice Smith", email: "alice@example.com" },
+      { accountId: "557058:bbb-222", displayName: "Bob Jones", email: "bob@example.com" },
+      { accountId: "557058:ccc-333", displayName: "Carol White", email: "carol@example.com" },
+    ]);
+
+    const handler = registeredTools.get("lookup_user")!.handler;
+    const result = await handler({ query: "alice" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("3");
+    expect(result.content[0].text).toContain("557058:aaa-111");
+    expect(result.content[0].text).toContain("Alice Smith");
+    expect(result.content[0].text).toContain("alice@example.com");
+  });
+
+  it("empty result — returns informative message", async () => {
+    const { searchUsers } = await import("./confluence-client.js");
+    (searchUsers as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("lookup_user")!.handler;
+    const result = await handler({ query: "nobody" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("No users found");
+    expect(result.content[0].text).toContain("nobody");
+  });
+
+  it("API error — returns error result", async () => {
+    const { searchUsers } = await import("./confluence-client.js");
+    (searchUsers as any).mockRejectedValueOnce(new Error("User search failed"));
+
+    const handler = registeredTools.get("lookup_user")!.handler;
+    const result = await handler({ query: "error" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("User search failed");
+  });
+
+  it("shows (not disclosed) for empty email", async () => {
+    const { searchUsers } = await import("./confluence-client.js");
+    (searchUsers as any).mockResolvedValueOnce([
+      { accountId: "557058:xxx", displayName: "Private User", email: "" },
+    ]);
+
+    const handler = registeredTools.get("lookup_user")!.handler;
+    const result = await handler({ query: "private" });
+
+    expect(result.content[0].text).toContain("(not disclosed)");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stream 14 — resolve_page_link tool
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("resolve_page_link tool", () => {
+  it("is registered", () => {
+    expect(registeredTools.has("resolve_page_link")).toBe(true);
+  });
+
+  it("happy path — returns page details", async () => {
+    const { searchPagesByTitle } = await import("./confluence-client.js");
+    (searchPagesByTitle as any).mockResolvedValueOnce([
+      {
+        contentId: "123456",
+        url: "https://test.atlassian.net/wiki/spaces/ENG/pages/123456",
+        spaceKey: "ENG",
+        title: "Architecture Overview",
+      },
+    ]);
+
+    const handler = registeredTools.get("resolve_page_link")!.handler;
+    const result = await handler({ title: "Architecture Overview", space_key: "ENG" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("123456");
+    expect(result.content[0].text).toContain("https://test.atlassian.net");
+    expect(result.content[0].text).toContain("ENG");
+    expect(result.content[0].text).toContain("Architecture Overview");
+  });
+
+  it("page not found — returns error", async () => {
+    const { searchPagesByTitle } = await import("./confluence-client.js");
+    (searchPagesByTitle as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("resolve_page_link")!.handler;
+    const result = await handler({ title: "Ghost Page", space_key: "ENG" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("No page found");
+    expect(result.content[0].text).toContain("Ghost Page");
+    expect(result.content[0].text).toContain("ENG");
+  });
+
+  it("ambiguous — returns first match with notice", async () => {
+    const { searchPagesByTitle } = await import("./confluence-client.js");
+    (searchPagesByTitle as any).mockResolvedValueOnce([
+      { contentId: "100", url: "https://test.atlassian.net/wiki/spaces/ENG/pages/100", spaceKey: "ENG", title: "Home" },
+      { contentId: "200", url: "https://test.atlassian.net/wiki/spaces/ENG/pages/200", spaceKey: "ENG", title: "Home" },
+    ]);
+
+    const handler = registeredTools.get("resolve_page_link")!.handler;
+    const result = await handler({ title: "Home", space_key: "ENG" });
+
+    expect(result.isError).toBeUndefined();
+    // First match returned
+    expect(result.content[0].text).toContain("100");
+    // Ambiguity notice
+    expect(result.content[0].text).toContain("2 pages matched");
+  });
+
+  it("API error — returns error result", async () => {
+    const { searchPagesByTitle } = await import("./confluence-client.js");
+    (searchPagesByTitle as any).mockRejectedValueOnce(new Error("Search failed"));
+
+    const handler = registeredTools.get("resolve_page_link")!.handler;
+    const result = await handler({ title: "Any Page", space_key: "ENG" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Search failed");
   });
 });
