@@ -1384,17 +1384,51 @@ export function toMarkdownView(storageHtml: string): string {
   return markdown;
 }
 
-/** Pattern that strongly suggests content is markdown, not storage format. */
-const MARKDOWN_PATTERN_RE = /(?:^#{1,6}\s|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\)|^```)/m;
-const STORAGE_FORMAT_RE = /<(?:ac:|ri:|p |p>|h[1-6][ >]|div[ >]|table[ >])/i;
-
 /**
- * Detect if a body string is likely markdown rather than storage format.
- * Returns true only when the content matches markdown patterns AND
- * contains no storage format markers. Errs on the side of permissiveness.
+ * Detect if a body string is likely markdown rather than Confluence storage
+ * format (storage XHTML).
+ *
+ * Decision logic:
+ *  1. Strong storage signals → return false immediately (body is storage).
+ *     - Any `<ac:` or `<ri:` tag: these are Confluence-only storage elements
+ *       and never appear in markdown bodies.
+ *  2. Strong markdown signals → return true if at least one matches.
+ *     - GFM table separator line (`| --- |`)
+ *     - Fenced code block (``` at line start)
+ *     - ATX heading (`# Heading`)
+ *     - GitHub alert (`> [!NOTE]`)
+ *     - Pandoc container fence (`::: panel`)
+ *     - Setext heading underline (`---` or `===` alone on a line)
+ *     - Unordered list marker (`- ` or `* ` at line start)
+ *     - Ordered list marker (`1. ` at line start)
+ *     - Numbered reference (`[1]:` at line start)
+ *  3. Weak/neutral signals are ignored in isolation — a markdown body may
+ *     legitimately contain `<br/>`, `<hr/>`, `<details>`, etc.
+ *  4. Fallback: no strong storage signal AND no strong markdown signal → treat
+ *     as storage (conservative, matches prior behaviour).
  */
 export function looksLikeMarkdown(body: string): boolean {
-  return MARKDOWN_PATTERN_RE.test(body) && !STORAGE_FORMAT_RE.test(body);
+  // 1. Strong storage signals: Confluence-specific XML namespaces.
+  if (/<ac:/i.test(body) || /<ri:/i.test(body)) {
+    return false;
+  }
+
+  // 2. Strong markdown signals.
+  const STRONG_MARKDOWN_SIGNALS: RegExp[] = [
+    /^\|[\s\-:|]+\|\s*$/m,           // GFM table separator
+    /^```/m,                           // fenced code block
+    /^#{1,6}\s+/m,                     // ATX heading
+    /^>\s*\[!(INFO|NOTE|TIP|WARNING|CAUTION|IMPORTANT)\]/im, // GitHub alert
+    /^:::[ \t]/m,                      // Pandoc container fence
+    /^[-=]{2,}\s*$/m,                  // setext heading underline
+    /^[-*]\s+/m,                       // unordered list
+    /^\d+\.\s+/m,                      // ordered list
+    /^\[\d+\]:/m,                      // numbered reference
+    /\[[^\]]+\]\([^)]+\)/,            // inline link [text](url)
+    /\*\*[^*]+\*\*/,                   // inline bold **text**
+  ];
+
+  return STRONG_MARKDOWN_SIGNALS.some((re) => re.test(body));
 }
 
 export type FormatPageOptions = {

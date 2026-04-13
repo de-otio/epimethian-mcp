@@ -56,6 +56,9 @@ import {
   computeUnifiedDiff,
   MAX_DIFF_SIZE,
 } from "./diff.js";
+import { markdownToStorage } from "./converter/md-to-storage.js";
+import { planUpdate } from "./converter/update-orchestrator.js";
+import { ConverterError } from "./converter/types.js";
 
 // --- Utilities ---
 
@@ -220,7 +223,12 @@ function registerTools(server: McpServer, config: Config): void {
   server.registerTool(
     "create_page",
     {
-      description: describeWithLock("Create a new page in Confluence", config),
+      description: describeWithLock(
+        "Create a new page in Confluence. Accepts either Confluence storage format (XHTML) or GFM markdown — markdown is automatically converted to storage format before submission. " +
+        "Use allow_raw_html: true to permit raw HTML inside markdown (disabled by default for security). " +
+        "Use confluence_base_url to override the base URL used by the link rewriter (defaults to the configured Confluence URL).",
+        config
+      ),
       inputSchema: {
         title: z.string().describe("Page title"),
         space_key: z
@@ -229,20 +237,40 @@ function registerTools(server: McpServer, config: Config): void {
         body: z
           .string()
           .describe(
-            "Page content – plain text or Confluence storage format (HTML)"
+            "Page content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted."
           ),
         parent_id: z.string().optional().describe("Optional parent page ID"),
+        allow_raw_html: z
+          .boolean()
+          .default(false)
+          .describe("Allow raw HTML passthrough inside markdown bodies (disabled by default; only enable for trusted content)."),
+        confluence_base_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("Override the Confluence base URL used by the link rewriter. Defaults to the configured Confluence URL."),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ title, space_key, body, parent_id }) => {
+    async ({ title, space_key, body, parent_id, allow_raw_html, confluence_base_url }) => {
       const blocked = writeGuard("create_page", config);
       if (blocked) return blocked;
       try {
+        let finalBody = body;
+        if (looksLikeMarkdown(body)) {
+          const cfg = await getConfig();
+          finalBody = markdownToStorage(body, {
+            allowRawHtml: allow_raw_html,
+            confluenceBaseUrl: confluence_base_url ?? cfg.url,
+          });
+        }
         const spaceId = await resolveSpaceId(space_key);
-        const page = await createPage(spaceId, title, body, parent_id);
+        const page = await createPage(spaceId, title, finalBody, parent_id);
         return toolResult((await formatPage(page, false)) + echo);
       } catch (err) {
+        if (err instanceof ConverterError) {
+          return toolError(err);
+        }
         return toolError(err);
       }
     }
@@ -351,7 +379,14 @@ function registerTools(server: McpServer, config: Config): void {
     "update_page",
     {
       description: describeWithLock(
-        "Update an existing Confluence page. You must provide the version number from your most recent get_page call. If the page was modified by someone else since then, this will return a conflict error — re-read the page and retry.",
+        "Update an existing Confluence page. Accepts GFM markdown or Confluence storage format — markdown is automatically converted via the token-aware write path, which preserves all existing macros and rich elements. " +
+        "You must provide the version number from your most recent get_page call. If the page was modified by someone else since then, this will return a conflict error — re-read the page and retry.\n\n" +
+        "For narrow changes to a single section, prefer update_page_section — it leaves the rest of the page untouched and is safer for targeted edits.\n\n" +
+        "Markdown update flags:\n" +
+        "- confirm_deletions: set to true to acknowledge removing preserved macros/elements (default false — any deletion errors until confirmed).\n" +
+        "- replace_body: set to true for a wholesale rewrite that skips preservation (default false).\n" +
+        "- allow_raw_html: allow raw HTML inside markdown bodies (default false).\n" +
+        "- confluence_base_url: override the URL used by the link rewriter.",
         config
       ),
       inputSchema: {
@@ -367,23 +402,65 @@ function registerTools(server: McpServer, config: Config): void {
         body: z
           .string()
           .optional()
-          .describe("New body content in plain text or storage format"),
+          .describe("New body content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted via the token-aware write path."),
         version_message: z
           .string()
           .optional()
           .describe("Optional version comment"),
+        confirm_deletions: z
+          .boolean()
+          .default(false)
+          .describe("Set to true to acknowledge that your markdown removes preserved macros or rich elements. Required when any preserved element would be deleted."),
+        replace_body: z
+          .boolean()
+          .default(false)
+          .describe("Set to true for a wholesale page rewrite that skips token preservation. All existing macros will be lost. Use only when intentionally replacing the full body."),
+        allow_raw_html: z
+          .boolean()
+          .default(false)
+          .describe("Allow raw HTML passthrough inside markdown bodies (disabled by default)."),
+        confluence_base_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("Override the Confluence base URL used by the link rewriter. Defaults to the configured Confluence URL."),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, title, version, body, version_message }) => {
+    async ({ page_id, title, version, body, version_message, confirm_deletions, replace_body, allow_raw_html, confluence_base_url }) => {
       const blocked = writeGuard("update_page", config);
       if (blocked) return blocked;
       try {
         if (body && looksLikeMarkdown(body)) {
+          // Markdown path: token-aware write via the update orchestrator.
+          const cfg = await getConfig();
+          const currentPage = await getPage(page_id, true);
+          const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
+          const plan = planUpdate({
+            currentStorage,
+            callerMarkdown: body,
+            confirmDeletions: confirm_deletions,
+            replaceBody: replace_body,
+            converterOptions: {
+              allowRawHtml: allow_raw_html,
+              confluenceBaseUrl: confluence_base_url ?? cfg.url,
+            },
+          });
+          const effectiveVersionMessage =
+            plan.versionMessage && version_message
+              ? `${version_message}; ${plan.versionMessage}`
+              : plan.versionMessage ?? version_message;
+          const { page, newVersion } = await updatePage(page_id, {
+            title,
+            body: plan.newStorage,
+            version,
+            versionMessage: effectiveVersionMessage,
+          });
           return toolResult(
-            "Error: Body appears to be markdown, not Confluence storage format. The update_page tool requires storage format. Use get_page with format: storage to retrieve the editable content."
+            `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion})` + echo
           );
         }
+        // Storage format path: pass body through verbatim (backward compat).
         const { page, newVersion } = await updatePage(page_id, {
           title,
           body,
@@ -394,6 +471,9 @@ function registerTools(server: McpServer, config: Config): void {
           `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion})` + echo
         );
       } catch (err) {
+        if (err instanceof ConverterError) {
+          return toolError(err);
+        }
         return toolError(err);
       }
     }
