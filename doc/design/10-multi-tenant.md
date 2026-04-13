@@ -32,7 +32,7 @@ Replace the single keychain entry with **named profiles**. Each profile stores t
 | Account | `confluence-credentials` | `confluence-credentials/{profile-name}` |
 | Data | `{url, email, apiToken}` | `{url, email, apiToken}` |
 
-Profile names are lowercase alphanumeric with hyphens (validated: `/^[a-z0-9][a-z0-9-]{0,62}$/`). Short, human-readable identifiers like `jambit`, `acme-corp`, `client-x`.
+Profile names are lowercase alphanumeric with hyphens (validated: `/^[a-z0-9][a-z0-9-]{0,62}$/`). Short, human-readable identifiers like `globex`, `acme-corp`, `client-x`.
 
 ### Configuration
 
@@ -44,7 +44,7 @@ Projects select a profile via the `CONFLUENCE_PROFILE` environment variable in `
     "confluence": {
       "command": "/opt/homebrew/bin/epimethian-mcp",
       "env": {
-        "CONFLUENCE_PROFILE": "jambit"
+        "CONFLUENCE_PROFILE": "globex"
       }
     }
   }
@@ -108,22 +108,22 @@ On every server start, before accepting any tool calls:
 
 1. **URL-token binding check**: Make a lightweight API call (`GET /wiki/api/v2/spaces?limit=1`) to confirm the token authenticates against the configured URL. If this returns 401/403, the server refuses to start with a clear error:
    ```
-   Error: Confluence credentials rejected by https://jambit.atlassian.net
-   The API token stored in profile "jambit" is not valid for this instance.
-   Run `epimethian-mcp setup --profile jambit` to update credentials.
+   Error: Confluence credentials rejected by https://globex.atlassian.net
+   The API token stored in profile "globex" is not valid for this instance.
+   Run `epimethian-mcp setup --profile globex` to update credentials.
    ```
 
 2. **Tenant identity verification**: After successful authentication, call `GET /wiki/rest/api/user/current` and verify the returned email matches the email stored in the profile. This guards against DNS hijacking or URL reassignment scenarios where the URL resolves to a different tenant but the token still authenticates. A mismatch is a hard error:
    ```
-   Error: Tenant identity mismatch for profile "jambit".
-   Expected user: richard.myers@jambit.com
+   Error: Tenant identity mismatch for profile "globex".
+   Expected user: richard.myers@globex.com
    Authenticated as: someone.else@othertenant.com
-   This may indicate a DNS or configuration issue. Run `epimethian-mcp setup --profile jambit` to reconfigure.
+   This may indicate a DNS or configuration issue. Run `epimethian-mcp setup --profile globex` to reconfigure.
    ```
 
 3. **Tenant identity log**: Emit to stderr (visible to MCP clients that surface server logs):
    ```
-   epimethian-mcp: connected to https://jambit.atlassian.net as richard.myers@jambit.com (profile: jambit)
+   epimethian-mcp: connected to https://globex.atlassian.net as richard.myers@globex.com (profile: globex)
    ```
 
 4. **Freeze validated config**: The `_config` singleton records the confirmed tenant URL and is frozen with `Object.freeze()`. All subsequent operations use this validated, immutable config. No code path can modify it at runtime.
@@ -134,8 +134,8 @@ Every mutating tool response (create, update, delete, add_attachment, add_drawio
 
 ```
 Page created: "Sprint 42 Retrospective" (ID: 123456)
-URL: https://jambit.atlassian.net/wiki/spaces/DEV/pages/123456
-Tenant: jambit.atlassian.net (profile: jambit)
+URL: https://globex.atlassian.net/wiki/spaces/DEV/pages/123456
+Tenant: globex.atlassian.net (profile: globex)
 ```
 
 This makes the target tenant visible in the AI assistant's conversation, giving the user a final opportunity to catch a mismatch before the conversation continues.
@@ -147,21 +147,21 @@ This makes the target tenant visible in the AI assistant's conversation, giving 
 Interactive credential setup for a named profile:
 
 ```
-$ epimethian-mcp setup --profile jambit
+$ epimethian-mcp setup --profile globex
 
-Epimethian MCP - Credential setup for profile "jambit"
+Epimethian MCP - Credential setup for profile "globex"
 
-Confluence URL (e.g. https://yoursite.atlassian.net): https://jambit.atlassian.net
-Email: richard.myers@jambit.com
+Confluence URL (e.g. https://yoursite.atlassian.net): https://globex.atlassian.net
+Email: richard.myers@globex.com
 API token: ************************************
 
-Testing connection to https://jambit.atlassian.net...
+Testing connection to https://globex.atlassian.net...
 Connected. 14 spaces accessible.
 
-Credentials saved to OS keychain (profile: jambit).
+Credentials saved to OS keychain (profile: globex).
 ```
 
-Running `setup --profile jambit` again updates only the `jambit` entry. Other profiles are untouched.
+Running `setup --profile globex` again updates only the `globex` entry. Other profiles are untouched.
 
 `setup` without `--profile` writes to the `default` profile (backward compatible with the current single-entry model, but with a migration nudge).
 
@@ -174,16 +174,16 @@ $ epimethian-mcp profiles
 
   Profile      URL                                Email
   ─────────    ──────────────────────────────      ─────────────────────────
-  jambit       https://jambit.atlassian.net        richard.myers@jambit.com
+  globex       https://globex.atlassian.net        richard.myers@globex.com
   acme-corp    https://acme.atlassian.net          rmyers@acme-consulting.com
-  default      https://jambit.atlassian.net        richard.myers@jambit.com
+  default      https://globex.atlassian.net        richard.myers@globex.com
 ```
 
 Implementation: the keychain does not support listing entries by prefix. Instead, maintain a profile registry file at `~/.config/epimethian-mcp/profiles.json`:
 
 ```json
 {
-  "profiles": ["jambit", "acme-corp", "default"]
+  "profiles": ["globex", "acme-corp", "default"]
 }
 ```
 
@@ -201,11 +201,11 @@ This file contains only profile names (no secrets). The `setup` command appends 
 Show the currently active connection (useful when debugging which profile a terminal session is using):
 
 ```
-$ CONFLUENCE_PROFILE=jambit epimethian-mcp status
+$ CONFLUENCE_PROFILE=globex epimethian-mcp status
 
-Profile:  jambit
-URL:      https://jambit.atlassian.net
-Email:    richard.myers@jambit.com
+Profile:  globex
+URL:      https://globex.atlassian.net
+Email:    richard.myers@globex.com
 Status:   Connected (14 spaces accessible)
 ```
 
@@ -338,7 +338,7 @@ The following tests must exist before multi-tenant support ships. They are the a
   │  VS Code (Project A)  │     │  VS Code (Project B)  │
   │  .mcp.json:           │     │  .mcp.json:           │
   │    CONFLUENCE_PROFILE  │     │    CONFLUENCE_PROFILE  │
-  │    = "jambit"          │     │    = "acme-corp"       │
+  │    = "globex"          │     │    = "acme-corp"       │
   └───────┬──────────────┘     └───────┬──────────────┘
           │ stdio                       │ stdio
           ▼                             ▼
@@ -346,15 +346,15 @@ The following tests must exist before multi-tenant support ships. They are the a
   │  epimethian-mcp       │     │  epimethian-mcp       │
   │  (process 1)          │     │  (process 2)          │
   │                       │     │                       │
-  │  Profile: "jambit"    │     │  Profile: "acme-corp" │
+  │  Profile: "globex"    │     │  Profile: "acme-corp" │
   │  Reads keychain:      │     │  Reads keychain:      │
   │  confluence-           │     │  confluence-           │
-  │  credentials/jambit    │     │  credentials/acme-corp │
+  │  credentials/globex    │     │  credentials/acme-corp │
   └───────┬──────────────┘     └───────┬──────────────┘
           │ HTTPS                       │ HTTPS
           ▼                             ▼
   ┌──────────────────────┐     ┌──────────────────────┐
-  │  jambit.atlassian.net  │     │  acme.atlassian.net   │
+  │  globex.atlassian.net  │     │  acme.atlassian.net   │
   └──────────────────────┘     └──────────────────────┘
 ```
 
@@ -368,7 +368,7 @@ Each MCP server process is fully isolated: separate OS process, separate keychai
 
 3. **Startup validation uses in-memory caching, not filesystem.** The startup API call adds ~200-500ms of latency. A filesystem-based cache (`$TMPDIR`) was considered but rejected due to TOCTOU race conditions, symlink attacks on shared Linux machines, and the difficulty of binding cache validity to specific credentials. Instead, validation results are cached in-memory within the process. Since each MCP server process lives for the duration of the MCP client session (typically hours), the validation cost is paid once per session -- an acceptable trade-off for a security-critical check. If the server process is restarted, it re-validates. This is the correct behavior: a restart may follow a credential rotation.
 
-4. **MCP server name includes the profile.** The server registers with `name: "confluence-{profile}"` (e.g., `confluence-jambit`) rather than the generic `confluence`. This causes MCP clients that namespace tools by server name to display `confluence-jambit.create_page` vs `confluence-acme-corp.create_page`, preventing tool routing confusion in multi-root VS Code workspaces. Multi-root workspaces with multiple Confluence profiles are supported but should be documented as requiring extra caution.
+4. **MCP server name includes the profile.** The server registers with `name: "confluence-{profile}"` (e.g., `confluence-globex`) rather than the generic `confluence`. This causes MCP clients that namespace tools by server name to display `confluence-globex.create_page` vs `confluence-acme-corp.create_page`, preventing tool routing confusion in multi-root VS Code workspaces. Multi-root workspaces with multiple Confluence profiles are supported but should be documented as requiring extra caution.
 
 5. **URL validation beyond `https://`.** The `setup` command parses the URL with `new URL()` and rejects anything containing `@`, newlines, or non-printable characters. If the URL hostname does not match `*.atlassian.net`, emit a warning (not a hard block, for Confluence Data Center users): `"Warning: URL does not match *.atlassian.net. Ensure this is the correct Confluence instance."` The security model depends on TLS certificate validation -- the design explicitly documents that setting `NODE_TLS_REJECT_UNAUTHORIZED=0` undermines all tenant isolation guarantees.
 
