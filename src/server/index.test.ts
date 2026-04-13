@@ -597,8 +597,13 @@ describe("get_page format: markdown", () => {
     title: "T",
     body: { storage: { value: '<h1>Title</h1><p>Hello <strong>world</strong></p><ac:structured-macro ac:name="toc"></ac:structured-macro>' } },
   };
+  const pageNoMacros = {
+    id: "2",
+    title: "Plain",
+    body: { storage: { value: "<h1>Title</h1><p>Hello <strong>world</strong></p>" } },
+  };
 
-  it("returns markdown with warning when format is markdown", async () => {
+  it("returns markdown with tokens and token reference table when page has macros", async () => {
     const { getPage, formatPage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce(pageWithBody);
     (formatPage as any).mockResolvedValueOnce("Title: T\nID: 1");
@@ -606,9 +611,41 @@ describe("get_page format: markdown", () => {
     const handler = registeredTools.get("get_page")!.handler;
     const result = await handler({ page_id: "1", include_body: true, headings_only: false, format: "markdown" });
     const text = result.content[0].text;
-    expect(text).toContain("Read-only markdown rendering");
+
+    // Should contain the heading and bold content as markdown
     expect(text).toContain("# Title");
     expect(text).toContain("**world**");
+
+    // Should contain the token reference table
+    expect(text).toContain("Tokens:");
+    expect(text).toContain("[[epi:T0001]]");
+    expect(text).toContain('<ac:structured-macro ac:name="toc">');
+
+    // Should contain the preservation comment
+    expect(text).toContain("Confluence macro");
+    expect(text).toContain("preserved as tokens");
+
+    // Should NOT contain the old lossy "Read-only" warning
+    expect(text).not.toContain("Read-only markdown rendering");
+  });
+
+  it("returns pure markdown (no token table) when page has no macros", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce(pageNoMacros);
+    (formatPage as any).mockResolvedValueOnce("Title: Plain\nID: 2");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({ page_id: "2", include_body: true, headings_only: false, format: "markdown" });
+    const text = result.content[0].text;
+
+    // Should have content
+    expect(text).toContain("# Title");
+    expect(text).toContain("**world**");
+
+    // No token table since no macros
+    expect(text).not.toContain("Tokens:");
+    expect(text).not.toContain("[[epi:");
+    expect(text).not.toContain("preserved as tokens");
   });
 
   it("returns storage format by default", async () => {
@@ -619,6 +656,7 @@ describe("get_page format: markdown", () => {
     const handler = registeredTools.get("get_page")!.handler;
     const result = await handler({ page_id: "1", include_body: true, headings_only: false, format: "storage" });
     expect(result.content[0].text).not.toContain("Read-only markdown");
+    expect(result.content[0].text).not.toContain("Tokens:");
   });
 
   it("format markdown + section returns markdown for section", async () => {

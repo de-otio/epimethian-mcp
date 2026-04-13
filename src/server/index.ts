@@ -59,6 +59,7 @@ import {
 import { markdownToStorage } from "./converter/md-to-storage.js";
 import { planUpdate } from "./converter/update-orchestrator.js";
 import { ConverterError } from "./converter/types.js";
+import { storageToMarkdown } from "./converter/storage-to-md.js";
 
 // --- Utilities ---
 
@@ -69,6 +70,38 @@ function escapeXml(s: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
+}
+
+/**
+ * Format the result of storageToMarkdown for the get_page markdown response.
+ * When tokens are present, appends a token reference table so agents can
+ * identify which macro each [[epi:T####]] represents.
+ */
+function formatMarkdownWithTokens(
+  markdown: string,
+  sidecar: Record<string, string>,
+  header: string
+): string {
+  const tokenCount = Object.keys(sidecar).length;
+  let body = markdown;
+  if (tokenCount > 0) {
+    const table = Object.entries(sidecar)
+      .map(([id, xml]) => {
+        // Extract the top-level tag name and optional ac:name for a human-readable hint
+        const m = xml.match(
+          /^<(ac:[a-zA-Z0-9_-]+|ri:[a-zA-Z0-9_-]+|time)(?:\s+[^>]*?ac:name="([^"]+)")?/
+        );
+        const tag = m ? m[1] : "unknown";
+        const name = m && m[2] ? ` ac:name="${m[2]}"` : "";
+        return `- [[epi:${id}]]: <${tag}${name}>`;
+      })
+      .join("\n");
+    body =
+      `<!-- ${tokenCount} Confluence macro${tokenCount === 1 ? "" : "s"} preserved as tokens; ` +
+      `remove a token to delete that macro on the next update_page -->\n\n` +
+      `${markdown}\n\n---\nTokens:\n${table}`;
+  }
+  return `${header}\n\n${body}`;
 }
 
 // --- Error-safe tool helpers ---
@@ -339,7 +372,11 @@ function registerTools(server: McpServer, config: Config): void {
             content = truncateStorageFormat(content, max_length);
           }
           if (format === "markdown") {
-            content = toMarkdownView(content);
+            const { markdown, sidecar } = storageToMarkdown(content);
+            const header = await formatPage(page, { includeBody: false });
+            return toolResult(
+              `${header}\n\nSection: ${section}\n${formatMarkdownWithTokens(markdown, sidecar, "").slice(2)}`
+            );
           }
           const header = await formatPage(page, { includeBody: false });
           return toolResult(`${header}\n\nSection: ${section}\n${content}`);
@@ -351,11 +388,9 @@ function registerTools(server: McpServer, config: Config): void {
           if (max_length && content.length > max_length) {
             content = truncateStorageFormat(content, max_length);
           }
-          const md = toMarkdownView(content);
+          const { markdown, sidecar } = storageToMarkdown(content);
           const header = await formatPage(page, { includeBody: false });
-          return toolResult(
-            `${header}\n\n⚠ Read-only markdown rendering. Macros and rich elements are summarized. To edit this page, use format: storage.\n\n${md}`
-          );
+          return toolResult(formatMarkdownWithTokens(markdown, sidecar, header));
         }
 
         if (include_body && max_length) {
@@ -774,7 +809,11 @@ function registerTools(server: McpServer, config: Config): void {
             content = truncateStorageFormat(content, max_length);
           }
           if (format === "markdown") {
-            content = toMarkdownView(content);
+            const { markdown, sidecar } = storageToMarkdown(content);
+            const header = await formatPage(page, { includeBody: false });
+            return toolResult(
+              `${header}\n\nSection: ${section}\n${formatMarkdownWithTokens(markdown, sidecar, "").slice(2)}`
+            );
           }
           const header = await formatPage(page, { includeBody: false });
           return toolResult(`${header}\n\nSection: ${section}\n${content}`);
@@ -786,11 +825,9 @@ function registerTools(server: McpServer, config: Config): void {
           if (max_length && content.length > max_length) {
             content = truncateStorageFormat(content, max_length);
           }
-          const md = toMarkdownView(content);
+          const { markdown, sidecar } = storageToMarkdown(content);
           const header = await formatPage(page, { includeBody: false });
-          return toolResult(
-            `${header}\n\n⚠ Read-only markdown rendering. Macros and rich elements are summarized. To edit this page, use format: storage.\n\n${md}`
-          );
+          return toolResult(formatMarkdownWithTokens(markdown, sidecar, header));
         }
 
         if (include_body && max_length) {
