@@ -92,7 +92,7 @@ describe("planUpdate — add content, preserve macros", () => {
     const { canonical } = tokeniseStorage(S);
     const callerMd = `# New Heading\n\n${canonical}`;
     const plan = planUpdate({ currentStorage: S, callerMarkdown: callerMd });
-    expect(plan.newStorage).toContain("<h1>New Heading</h1>");
+    expect(plan.newStorage).toContain('<h1 id="new-heading">New Heading</h1>');
     expect(plan.newStorage).toContain(MACRO_NOTE);
   });
 });
@@ -251,7 +251,7 @@ describe("planUpdate — replaceBody opt-out", () => {
       replaceBody: true,
     });
     // No tokens, no macros carried over.
-    expect(plan.newStorage).toContain("<h1>Fresh start</h1>");
+    expect(plan.newStorage).toContain('<h1 id="fresh-start">Fresh start</h1>');
     expect(plan.newStorage).toContain("<p>Brand new page.</p>");
     expect(plan.newStorage).not.toContain("ac:structured-macro");
     // deletedTokens is empty even when preserved elements were dropped —

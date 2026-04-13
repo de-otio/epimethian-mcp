@@ -18,27 +18,34 @@ function convert(md: string, opts?: Parameters<typeof markdownToStorage>[1]): st
 
 describe("headings", () => {
   it("renders h1", () => {
-    expect(convert("# Heading 1")).toContain("<h1>Heading 1</h1>");
+    // Stream 11: headings now carry Confluence-slug IDs.
+    const out = convert("# Heading 1");
+    expect(out).toContain('<h1 id="heading-1">Heading 1</h1>');
   });
 
   it("renders h2", () => {
-    expect(convert("## Heading 2")).toContain("<h2>Heading 2</h2>");
+    const out = convert("## Heading 2");
+    expect(out).toContain('<h2 id="heading-2">Heading 2</h2>');
   });
 
   it("renders h3", () => {
-    expect(convert("### Heading 3")).toContain("<h3>Heading 3</h3>");
+    const out = convert("### Heading 3");
+    expect(out).toContain('<h3 id="heading-3">Heading 3</h3>');
   });
 
   it("renders h4", () => {
-    expect(convert("#### Heading 4")).toContain("<h4>Heading 4</h4>");
+    const out = convert("#### Heading 4");
+    expect(out).toContain('<h4 id="heading-4">Heading 4</h4>');
   });
 
   it("renders h5", () => {
-    expect(convert("##### Heading 5")).toContain("<h5>Heading 5</h5>");
+    const out = convert("##### Heading 5");
+    expect(out).toContain('<h5 id="heading-5">Heading 5</h5>');
   });
 
   it("renders h6", () => {
-    expect(convert("###### Heading 6")).toContain("<h6>Heading 6</h6>");
+    const out = convert("###### Heading 6");
+    expect(out).toContain('<h6 id="heading-6">Heading 6</h6>');
   });
 });
 
@@ -531,5 +538,485 @@ describe("typographer off", () => {
     expect(out).toContain("--");
     expect(out).not.toContain("\u2013"); // en-dash
     expect(out).not.toContain("\u2014"); // em-dash
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stream 7 — GitHub alert panel syntax
+// ---------------------------------------------------------------------------
+
+describe("GitHub alert panels (Stream 7)", () => {
+  // All 5 types without title
+  it("renders [!INFO] as info macro (no title)", () => {
+    const md = "> [!INFO]\n> Body content.";
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="info" ac:schema-version="1">');
+    expect(out).toContain("<ac:rich-text-body>");
+    expect(out).toContain("Body content.");
+    expect(out).not.toContain('<ac:parameter ac:name="title">');
+    // Must NOT produce a plain blockquote.
+    expect(out).not.toContain("<blockquote>");
+  });
+
+  it("renders [!NOTE] as note macro (no title)", () => {
+    const md = "> [!NOTE]\n> Note content.";
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="note" ac:schema-version="1">');
+    expect(out).toContain("Note content.");
+  });
+
+  it("renders [!WARNING] as warning macro (no title)", () => {
+    const md = "> [!WARNING]\n> Watch out!";
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="warning" ac:schema-version="1">');
+    expect(out).toContain("Watch out!");
+  });
+
+  it("renders [!TIP] as tip macro (no title)", () => {
+    const md = "> [!TIP]\n> Helpful tip.";
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="tip" ac:schema-version="1">');
+    expect(out).toContain("Helpful tip.");
+  });
+
+  it("renders [!SUCCESS] as success macro (no title)", () => {
+    const md = "> [!SUCCESS]\n> It worked!";
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="success" ac:schema-version="1">');
+    expect(out).toContain("It worked!");
+  });
+
+  // Optional title
+  it("renders [!WARNING] with optional title", () => {
+    const md = "> [!WARNING] Danger Zone\n> Body.";
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="warning" ac:schema-version="1">');
+    expect(out).toContain('<ac:parameter ac:name="title">Danger Zone</ac:parameter>');
+    expect(out).toContain("Body.");
+  });
+
+  it("renders [!INFO] with title that contains XML-special chars (escaped)", () => {
+    const md = "> [!INFO] Title with <em> & 'quotes'\n> Body.";
+    const out = convert(md);
+    expect(out).toContain("&lt;em&gt;");
+    expect(out).toContain("&amp;");
+    // Should not contain unescaped angle brackets in parameter value.
+    expect(out).not.toContain('<ac:parameter ac:name="title">Title with <em>');
+  });
+
+  it("renders multi-paragraph body in alert", () => {
+    const md = "> [!INFO]\n> First paragraph.\n>\n> Second paragraph.";
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="info"');
+    expect(out).toContain("First paragraph.");
+    expect(out).toContain("Second paragraph.");
+  });
+
+  it("leaves plain blockquotes unchanged", () => {
+    const md = "> This is just a blockquote.";
+    const out = convert(md);
+    expect(out).toContain("<blockquote>");
+    expect(out).not.toContain("<ac:structured-macro");
+  });
+
+  it("is case-insensitive for the alert type keyword", () => {
+    const md = "> [!info]\n> Lower case type.";
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="info"');
+    expect(out).toContain("Lower case type.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stream 8 — Container fenced divs
+// ---------------------------------------------------------------------------
+
+describe("container fenced divs (Stream 8)", () => {
+  it("renders ::: panel with title", () => {
+    const md = '::: panel title="My Panel"\nContent.\n:::';
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="panel" ac:schema-version="1">');
+    expect(out).toContain('<ac:parameter ac:name="title">My Panel</ac:parameter>');
+    expect(out).toContain("<ac:rich-text-body>");
+    expect(out).toContain("Content.");
+    expect(out).toContain("</ac:rich-text-body></ac:structured-macro>");
+  });
+
+  it("renders ::: panel with bgColor", () => {
+    const md = '::: panel title="Coloured" bgColor=#FFF7E0\nContent.\n:::';
+    const out = convert(md);
+    expect(out).toContain('<ac:parameter ac:name="bgColor">#FFF7E0</ac:parameter>');
+  });
+
+  it("renders ::: panel with borderColor", () => {
+    const md = '::: panel title="Bordered" bgColor=#FFF7E0 borderColor=#36B37E\nContent.\n:::';
+    const out = convert(md);
+    expect(out).toContain('<ac:parameter ac:name="borderColor">#36B37E</ac:parameter>');
+  });
+
+  it("renders ::: panel without optional colour params", () => {
+    const md = '::: panel title="Minimal"\nJust text.\n:::';
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="panel"');
+    expect(out).not.toContain("bgColor");
+    expect(out).not.toContain("borderColor");
+  });
+
+  it("escapes XML-special chars in panel title", () => {
+    const md = '::: panel title="A & B <x>"\nContent.\n:::';
+    const out = convert(md);
+    expect(out).toContain("A &amp; B &lt;x&gt;");
+  });
+
+  it("renders ::: expand with title and macro-id", () => {
+    const md = '::: expand title="Click me"\nHidden content.\n:::';
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="expand" ac:schema-version="1"');
+    expect(out).toContain('ac:macro-id="');
+    expect(out).toContain('<ac:parameter ac:name="title">Click me</ac:parameter>');
+    expect(out).toContain("Hidden content.");
+  });
+
+  it("renders ::: expand without title", () => {
+    const md = '::: expand\nSome hidden text.\n:::';
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="expand"');
+    expect(out).not.toContain('<ac:parameter ac:name="title">');
+    expect(out).toContain("Some hidden text.");
+  });
+
+  it("renders two-column layout", () => {
+    const md = [
+      "::: columns",
+      "::: column",
+      "Left content.",
+      ":::",
+      "::: column",
+      "Right content.",
+      ":::",
+      ":::",
+    ].join("\n");
+    const out = convert(md);
+    expect(out).toContain("<ac:layout>");
+    expect(out).toContain('<ac:layout-section ac:type="two_equal">');
+    expect(out).toContain("<ac:layout-cell>");
+    expect(out).toContain("Left content.");
+    expect(out).toContain("Right content.");
+    expect(out).toContain("</ac:layout-cell>");
+    expect(out).toContain("</ac:layout-section>");
+    expect(out).toContain("</ac:layout>");
+    // No sentinel should remain.
+    expect(out).not.toContain("@@@");
+  });
+
+  it("renders three-column layout", () => {
+    const md = [
+      "::: columns",
+      "::: column",
+      "A.",
+      ":::",
+      "::: column",
+      "B.",
+      ":::",
+      "::: column",
+      "C.",
+      ":::",
+      ":::",
+    ].join("\n");
+    const out = convert(md);
+    expect(out).toContain('<ac:layout-section ac:type="three_equal">');
+    expect(out).toContain("A.");
+    expect(out).toContain("B.");
+    expect(out).toContain("C.");
+  });
+
+  it("throws ConverterError for unsupported column count (1 column)", () => {
+    const md = ["::: columns", "::: column", "Solo.", ":::", ":::"].join("\n");
+    expect(() => convert(md)).toThrow("exactly 2 or 3");
+  });
+
+  it("throws ConverterError for unsupported column count (4 columns)", () => {
+    const cols = ["::: columns", ...[1, 2, 3, 4].map((n) => `::: column\nCol ${n}.\n:::`), ":::"].join("\n");
+    expect(() => convert(cols)).toThrow("exactly 2 or 3");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stream 9 — Inline directives
+// ---------------------------------------------------------------------------
+
+describe("inline directives (Stream 9)", () => {
+  // --- :status ---
+  it("renders :status with valid colour", () => {
+    const out = convert("Status: :status[In Progress]{colour=Blue}");
+    expect(out).toContain('<ac:structured-macro ac:name="status" ac:schema-version="1">');
+    expect(out).toContain('<ac:parameter ac:name="title">In Progress</ac:parameter>');
+    expect(out).toContain('<ac:parameter ac:name="colour">Blue</ac:parameter>');
+  });
+
+  it.each(["Grey", "Red", "Yellow", "Green", "Blue", "Purple"])(
+    "accepts status colour %s",
+    (colour) => {
+      const out = convert(`:status[Label]{colour=${colour}}`);
+      expect(out).toContain(`<ac:parameter ac:name="colour">${colour}</ac:parameter>`);
+    }
+  );
+
+  it("throws ConverterError for invalid status colour", () => {
+    expect(() => convert(":status[Done]{colour=Pink}")).toThrow("Invalid status colour");
+    expect(() => convert(":status[Done]{colour=Pink}")).toThrow("Grey, Red, Yellow, Green, Blue, Purple");
+  });
+
+  it("escapes XML-special chars in status title", () => {
+    const out = convert(":status[A & B]{colour=Green}");
+    expect(out).toContain("A &amp; B");
+  });
+
+  // --- :mention ---
+  it("renders :mention with valid modern accountId", () => {
+    const accountId = "557058:abc12345-def0-1234-abcd-0123456789ab";
+    const out = convert(`:mention[Richard]{accountId=${accountId}}`);
+    expect(out).toContain("<ac:link>");
+    expect(out).toContain(`<ri:user ri:account-id="${accountId}"/>`);
+    expect(out).toContain("</ac:link>");
+  });
+
+  it("throws ConverterError for invalid accountId", () => {
+    expect(() => convert(":mention[Bob]{accountId=not-valid}")).toThrow("Invalid Atlassian account ID");
+  });
+
+  it("throws ConverterError for accountId with XML injection attempt", () => {
+    expect(() => convert(':mention[Bob]{accountId="><script>}')).toThrow("Invalid Atlassian account ID");
+  });
+
+  // --- :date ---
+  it("renders :date with valid ISO date", () => {
+    const out = convert(":date[2026-04-30]");
+    expect(out).toContain('<time datetime="2026-04-30"/>');
+  });
+
+  it("throws ConverterError for non-ISO date format", () => {
+    expect(() => convert(":date[April 30 2026]")).toThrow("Invalid date");
+    expect(() => convert(":date[April 30 2026]")).toThrow("YYYY-MM-DD");
+  });
+
+  it("throws ConverterError for partial date", () => {
+    expect(() => convert(":date[2026-04]")).toThrow("Invalid date");
+  });
+
+  // --- :emoji ---
+  it("renders :emoji with valid emoticon name", () => {
+    const out = convert(":emoji[smile]");
+    expect(out).toContain('<ac:emoticon ac:name="smile"/>');
+  });
+
+  it.each(["sad", "cheeky", "laugh", "wink", "thumbs-up", "thumbs-down", "tick", "cross"])(
+    "accepts emoticon %s",
+    (name) => {
+      const out = convert(`:emoji[${name}]`);
+      expect(out).toContain(`<ac:emoticon ac:name="${name}"/>`);
+    }
+  );
+
+  it("throws ConverterError for unknown emoticon name", () => {
+    expect(() => convert(":emoji[party-popper]")).toThrow("Unknown emoticon name");
+    expect(() => convert(":emoji[party-popper]")).toThrow("smile");
+  });
+
+  // --- :jira ---
+  it("renders :jira with key only", () => {
+    const out = convert(":jira[PROJ-123]");
+    expect(out).toContain('<ac:structured-macro ac:name="jira" ac:schema-version="1">');
+    expect(out).toContain('<ac:parameter ac:name="key">PROJ-123</ac:parameter>');
+    expect(out).not.toContain('<ac:parameter ac:name="server">');
+  });
+
+  it("renders :jira with key and server", () => {
+    // Server name with spaces must be quoted in the directive.
+    const out = convert(':jira[ABC-456]{server="System Jira"}');
+    expect(out).toContain('<ac:parameter ac:name="key">ABC-456</ac:parameter>');
+    expect(out).toContain('<ac:parameter ac:name="server">System Jira</ac:parameter>');
+  });
+
+  it("throws ConverterError for malformed Jira key", () => {
+    expect(() => convert(":jira[proj-123]")).toThrow("Invalid Jira issue key");
+    expect(() => convert(":jira[NOHYPHEN]")).toThrow("Invalid Jira issue key");
+  });
+
+  // --- :anchor ---
+  it("renders :anchor with a named anchor", () => {
+    const out = convert(":anchor[my-section]");
+    expect(out).toContain('<ac:structured-macro ac:name="anchor" ac:schema-version="1">');
+    expect(out).toContain('<ac:parameter ac:name="">my-section</ac:parameter>');
+  });
+
+  it("throws ConverterError for empty anchor name", () => {
+    expect(() => convert(":anchor[]")).toThrow("non-empty anchor name");
+  });
+
+  it("throws ConverterError for whitespace-only anchor name", () => {
+    expect(() => convert(":anchor[   ]")).toThrow("non-empty anchor name");
+  });
+
+  // Directives inside table cells
+  it("renders :status inside a table cell", () => {
+    const md = [
+      "| Feature | Status |",
+      "|---------|--------|",
+      "| Auth | :status[Done]{colour=Green} |",
+    ].join("\n");
+    const out = convert(md);
+    expect(out).toContain("<table>");
+    expect(out).toContain('<ac:structured-macro ac:name="status"');
+    expect(out).toContain('<ac:parameter ac:name="colour">Green</ac:parameter>');
+  });
+
+  // Multiple directives in one paragraph
+  it("renders multiple directives in one paragraph", () => {
+    const out = convert(":emoji[smile] :jira[EX-1] :date[2026-01-01]");
+    expect(out).toContain('<ac:emoticon ac:name="smile"/>');
+    expect(out).toContain('<ac:parameter ac:name="key">EX-1</ac:parameter>');
+    expect(out).toContain('<time datetime="2026-01-01"/>');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stream 10 — Frontmatter + ToC injection
+// ---------------------------------------------------------------------------
+
+describe("frontmatter and ToC injection (Stream 10)", () => {
+  it("injects ToC macro when toc: is present in frontmatter", () => {
+    const md = [
+      "---",
+      "toc:",
+      "  maxLevel: 3",
+      "  minLevel: 1",
+      "---",
+      "# Page",
+    ].join("\n");
+    const out = convert(md);
+    expect(out).toContain('<ac:structured-macro ac:name="toc" ac:schema-version="1">');
+    expect(out).toContain('<ac:parameter ac:name="maxLevel">3</ac:parameter>');
+    expect(out).toContain('<ac:parameter ac:name="minLevel">1</ac:parameter>');
+    // ToC must come first.
+    expect(out.indexOf("<ac:structured-macro ac:name=\"toc\"")).toBeLessThan(
+      out.indexOf("<h1")
+    );
+  });
+
+  it("injects ToC with style param", () => {
+    const md = ["---", "toc:", '  style: "disc"', "---", "# Title"].join("\n");
+    const out = convert(md);
+    expect(out).toContain('<ac:parameter ac:name="style">disc</ac:parameter>');
+  });
+
+  it("does not inject ToC when frontmatter is absent", () => {
+    const out = convert("# Page without frontmatter");
+    expect(out).not.toContain("<ac:structured-macro ac:name=\"toc\"");
+  });
+
+  it("strips frontmatter from the body (does not include --- markers)", () => {
+    const md = ["---", "toc:", "  maxLevel: 2", "---", "# Content"].join("\n");
+    const out = convert(md);
+    expect(out).not.toContain("---");
+    // The heading should still be rendered.
+    expect(out).toContain("Content");
+  });
+
+  it("applies headingOffset: 1 to shift all headings up by 1", () => {
+    const md = ["---", "headingOffset: 1", "---", "# H1 becomes H2", "## H2 becomes H3"].join("\n");
+    const out = convert(md);
+    // # becomes h2
+    expect(out).toMatch(/<h2\b[^>]*>H1 becomes H2<\/h2>/);
+    // ## becomes h3
+    expect(out).toMatch(/<h3\b[^>]*>H2 becomes H3<\/h3>/);
+    // Must not contain raw h1 or h2 for these headings.
+    expect(out).not.toMatch(/<h1\b/);
+  });
+
+  it("headingOffset: 0 (default) leaves headings unchanged", () => {
+    const md = ["---", "headingOffset: 0", "---", "# Top level"].join("\n");
+    const out = convert(md);
+    expect(out).toMatch(/<h1\b[^>]*>Top level<\/h1>/);
+  });
+
+  it("passes through markdown with no frontmatter unchanged", () => {
+    const out = convert("Just a paragraph.");
+    expect(out).toContain("<p>Just a paragraph.</p>");
+    expect(out).not.toContain("<ac:structured-macro");
+  });
+
+  it("does not treat bare --- (horizontal rule) as frontmatter", () => {
+    const out = convert("---");
+    expect(out).toContain("<hr/>");
+    expect(out).not.toContain("frontmatter");
+    expect(out).not.toContain("<ac:structured-macro");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stream 11 — Heading anchor slugger
+// ---------------------------------------------------------------------------
+
+describe("heading anchor slugger (Stream 11)", () => {
+  it("generates slug ID for plain ASCII heading", () => {
+    const out = convert("# Hello World");
+    expect(out).toContain('<h1 id="hello-world">Hello World</h1>');
+  });
+
+  it("lowercases the heading text in the slug", () => {
+    const out = convert("## My Heading");
+    expect(out).toContain('id="my-heading"');
+  });
+
+  it("replaces non-alphanumeric runs with a single hyphen", () => {
+    const out = convert("# Hello, World! How are you?");
+    expect(out).toContain('id="hello-world-how-are-you"');
+  });
+
+  it("trims leading and trailing hyphens from slug", () => {
+    const out = convert("# -- Leading and trailing --");
+    expect(out).toContain('id="leading-and-trailing"');
+  });
+
+  it("handles special characters (collapses to hyphens)", () => {
+    const out = convert("## C++ Performance");
+    expect(out).toContain('id="c-performance"');
+  });
+
+  it("handles duplicate headings with dot-number suffix", () => {
+    const md = "# Section\n\n## Section\n\n### Section";
+    const out = convert(md);
+    // First occurrence: bare slug.
+    expect(out).toContain('<h1 id="section">Section</h1>');
+    // Second occurrence: .1 suffix.
+    expect(out).toContain('<h2 id="section.1">Section</h2>');
+    // Third occurrence: .2 suffix.
+    expect(out).toContain('<h3 id="section.2">Section</h3>');
+  });
+
+  it("assigns unique IDs even for different level headings with same text", () => {
+    const md = "# Deploy\n\n## Deploy";
+    const out = convert(md);
+    expect(out).toContain('id="deploy"');
+    expect(out).toContain('id="deploy.1"');
+  });
+
+  it("all heading levels get IDs", () => {
+    const md = [1, 2, 3, 4, 5, 6].map((n) => `${"#".repeat(n)} Heading ${n}`).join("\n\n");
+    const out = convert(md);
+    for (let n = 1; n <= 6; n++) {
+      expect(out).toContain(`id="heading-${n}"`);
+    }
+  });
+
+  it("heading with numeric-only text gets a slug", () => {
+    const out = convert("## 2026");
+    expect(out).toContain('id="2026"');
+  });
+
+  it("heading with no alphanumeric chars falls back to 'heading'", () => {
+    const out = convert("## ---");
+    expect(out).toContain('id="heading"');
   });
 });

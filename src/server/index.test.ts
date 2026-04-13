@@ -1875,9 +1875,10 @@ describe("create_page markdown conversion (Stream 5)", () => {
     expect(result.content[0].text).toContain("New Page");
 
     // createPage must have been called with storage XHTML, not raw markdown
+    // Stream 11: headings now carry Confluence-slug IDs.
     const createCall = (createPage as any).mock.lastCall;
     const submittedBody: string = createCall[2];
-    expect(submittedBody).toContain("<h1>");
+    expect(submittedBody).toMatch(/<h1\b/);
     expect(submittedBody).not.toContain("# Hello World");
   });
 
@@ -1947,9 +1948,10 @@ describe("update_page markdown path (Stream 5)", () => {
     expect(result.content[0].text).toContain("Updated:");
 
     // updatePage must have received storage XHTML, not raw markdown
+    // Stream 11: headings now carry Confluence-slug IDs.
     const updateCall = (updatePage as any).mock.lastCall;
     const submittedBody: string = updateCall[1].body;
-    expect(submittedBody).toContain("<h1>");
+    expect(submittedBody).toMatch(/<h1\b/);
     expect(submittedBody).not.toContain("# New Heading");
   });
 
@@ -2050,8 +2052,9 @@ describe("update_page markdown path (Stream 5)", () => {
 
     const updateCall = (updatePage as any).mock.lastCall;
     const submittedBody: string = updateCall[1].body;
-    // Should be freshly converted markdown, no toc macro
-    expect(submittedBody).toContain("<h1>");
+    // Should be freshly converted markdown, no toc macro.
+    // Stream 11: headings now carry Confluence-slug IDs.
+    expect(submittedBody).toMatch(/<h1\b/);
     expect(submittedBody).not.toContain("ac:structured-macro");
   });
 
