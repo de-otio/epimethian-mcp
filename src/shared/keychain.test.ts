@@ -99,7 +99,7 @@ describe("PROFILE_NAME_RE", () => {
 
 describe("accountForProfile", () => {
   it("returns prefixed account name for valid profile", () => {
-    expect(accountForProfile("jambit")).toBe("confluence-credentials/jambit");
+    expect(accountForProfile("globex")).toBe("confluence-credentials/globex");
   });
 
   it("returns prefixed account name for numeric profile", () => {
@@ -174,7 +174,7 @@ describe("saveToKeychain", () => {
 
   it("uses profiled account when profile is given", async () => {
     mockExecSuccess();
-    await saveToKeychain(testCreds, "jambit");
+    await saveToKeychain(testCreds, "globex");
     const addCall = mockExecFile.mock.calls.find(
       (call) => (call[1] as string[])[0] === "add-generic-password"
     );
@@ -183,7 +183,7 @@ describe("saveToKeychain", () => {
       (addCall![1] as string[])[
         (addCall![1] as string[]).indexOf("-a") + 1
       ];
-    expect(accountArg).toBe("confluence-credentials/jambit");
+    expect(accountArg).toBe("confluence-credentials/globex");
   });
 
   it("throws on invalid profile name", async () => {
@@ -212,7 +212,7 @@ describe("readFromKeychain", () => {
 
   it("returns credentials from profiled account when profile given", async () => {
     mockExecSuccess(JSON.stringify(testCreds));
-    const result = await readFromKeychain("jambit");
+    const result = await readFromKeychain("globex");
     expect(result).toEqual(testCreds);
 
     const readCall = mockExecFile.mock.calls[0];
@@ -220,7 +220,7 @@ describe("readFromKeychain", () => {
       (readCall![1] as string[])[
         (readCall![1] as string[]).indexOf("-a") + 1
       ];
-    expect(accountArg).toBe("confluence-credentials/jambit");
+    expect(accountArg).toBe("confluence-credentials/globex");
   });
 
   it("returns null when entry not found", async () => {
@@ -244,8 +244,8 @@ describe("readFromKeychain", () => {
 
   it("throws on corrupted JSON with profile label", async () => {
     mockExecSuccess("not-valid-json{{{");
-    await expect(readFromKeychain("jambit")).rejects.toThrow(
-      'Corrupted keychain entry for profile "jambit": invalid JSON'
+    await expect(readFromKeychain("globex")).rejects.toThrow(
+      'Corrupted keychain entry for profile "globex": invalid JSON'
     );
   });
 
@@ -297,13 +297,13 @@ describe("deleteFromKeychain", () => {
 
   it("uses profiled account when profile given", async () => {
     mockExecSuccess();
-    await deleteFromKeychain("jambit");
+    await deleteFromKeychain("globex");
     const deleteCall = mockExecFile.mock.calls[0];
     const accountArg =
       (deleteCall![1] as string[])[
         (deleteCall![1] as string[]).indexOf("-a") + 1
       ];
-    expect(accountArg).toBe("confluence-credentials/jambit");
+    expect(accountArg).toBe("confluence-credentials/globex");
   });
 
   it("does not throw when entry does not exist", async () => {

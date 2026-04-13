@@ -62,7 +62,7 @@ describe("CLI entry point", () => {
   });
 
   it("passes --profile to runSetup", async () => {
-    process.argv = ["node", "index.js", "setup", "--profile", "jambit"];
+    process.argv = ["node", "index.js", "setup", "--profile", "globex"];
     vi.resetModules();
     vi.doMock("../server/index.js", () => ({ main: mockStartServer }));
     vi.doMock("./setup.js", () => ({ runSetup: mockRunSetup }));
@@ -72,7 +72,7 @@ describe("CLI entry point", () => {
     await import("./index.js");
 
     await new Promise((r) => setTimeout(r, 10));
-    expect(mockRunSetup).toHaveBeenCalledWith("jambit");
+    expect(mockRunSetup).toHaveBeenCalledWith("globex");
   });
 
   it("calls runProfiles when 'profiles' argument is provided", async () => {

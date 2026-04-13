@@ -66,6 +66,8 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     deleteInlineComment: vi.fn(),
     getPageVersions: vi.fn(),
     getPageVersionBody: vi.fn(),
+    searchUsers: vi.fn(),
+    searchPagesByTitle: vi.fn(),
     ConfluenceApiError: class ConfluenceApiError extends Error {
       status: number;
       constructor(status: number, body: string) {
@@ -164,6 +166,9 @@ describe("MCP server index", () => {
       "get_page_version",
       "diff_page_versions",
       "get_version",
+      // Stream 14
+      "lookup_user",
+      "resolve_page_link",
     ];
     for (const tool of expectedTools) {
       expect(registeredTools.has(tool), `tool "${tool}" should be registered`).toBe(true);
@@ -592,8 +597,13 @@ describe("get_page format: markdown", () => {
     title: "T",
     body: { storage: { value: '<h1>Title</h1><p>Hello <strong>world</strong></p><ac:structured-macro ac:name="toc"></ac:structured-macro>' } },
   };
+  const pageNoMacros = {
+    id: "2",
+    title: "Plain",
+    body: { storage: { value: "<h1>Title</h1><p>Hello <strong>world</strong></p>" } },
+  };
 
-  it("returns markdown with warning when format is markdown", async () => {
+  it("returns markdown with tokens and token reference table when page has macros", async () => {
     const { getPage, formatPage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce(pageWithBody);
     (formatPage as any).mockResolvedValueOnce("Title: T\nID: 1");
@@ -601,9 +611,41 @@ describe("get_page format: markdown", () => {
     const handler = registeredTools.get("get_page")!.handler;
     const result = await handler({ page_id: "1", include_body: true, headings_only: false, format: "markdown" });
     const text = result.content[0].text;
-    expect(text).toContain("Read-only markdown rendering");
+
+    // Should contain the heading and bold content as markdown
     expect(text).toContain("# Title");
     expect(text).toContain("**world**");
+
+    // Should contain the token reference table
+    expect(text).toContain("Tokens:");
+    expect(text).toContain("[[epi:T0001]]");
+    expect(text).toContain('<ac:structured-macro ac:name="toc">');
+
+    // Should contain the preservation comment
+    expect(text).toContain("Confluence macro");
+    expect(text).toContain("preserved as tokens");
+
+    // Should NOT contain the old lossy "Read-only" warning
+    expect(text).not.toContain("Read-only markdown rendering");
+  });
+
+  it("returns pure markdown (no token table) when page has no macros", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce(pageNoMacros);
+    (formatPage as any).mockResolvedValueOnce("Title: Plain\nID: 2");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({ page_id: "2", include_body: true, headings_only: false, format: "markdown" });
+    const text = result.content[0].text;
+
+    // Should have content
+    expect(text).toContain("# Title");
+    expect(text).toContain("**world**");
+
+    // No token table since no macros
+    expect(text).not.toContain("Tokens:");
+    expect(text).not.toContain("[[epi:");
+    expect(text).not.toContain("preserved as tokens");
   });
 
   it("returns storage format by default", async () => {
@@ -614,6 +656,7 @@ describe("get_page format: markdown", () => {
     const handler = registeredTools.get("get_page")!.handler;
     const result = await handler({ page_id: "1", include_body: true, headings_only: false, format: "storage" });
     expect(result.content[0].text).not.toContain("Read-only markdown");
+    expect(result.content[0].text).not.toContain("Tokens:");
   });
 
   it("format markdown + section returns markdown for section", async () => {
@@ -630,19 +673,8 @@ describe("get_page format: markdown", () => {
   });
 });
 
-describe("update_page markdown guard", () => {
-  it("rejects body that is clearly markdown", async () => {
-    const handler = registeredTools.get("update_page")!.handler;
-    const result = await handler({
-      page_id: "1",
-      title: "T",
-      version: 5,
-      body: "# Heading\n\nSome **bold** text and a [link](https://example.com)",
-    });
-    expect(result.content[0].text).toContain("appears to be markdown");
-  });
-
-  it("accepts storage format HTML", async () => {
+describe("update_page markdown / storage routing", () => {
+  it("accepts storage format HTML (backward compat)", async () => {
     const { updatePage } = await import("./confluence-client.js");
     (updatePage as any).mockClear();
     (updatePage as any).mockResolvedValueOnce({
@@ -660,7 +692,7 @@ describe("update_page markdown guard", () => {
     expect(result.content[0].text).toContain("Updated:");
   });
 
-  it("accepts plain text without markdown patterns", async () => {
+  it("accepts plain text without markdown patterns (treated as storage)", async () => {
     const { updatePage } = await import("./confluence-client.js");
     (updatePage as any).mockClear();
     (updatePage as any).mockResolvedValueOnce({
@@ -678,7 +710,7 @@ describe("update_page markdown guard", () => {
     expect(result.content[0].text).toContain("Updated:");
   });
 
-  it("accepts body with markdown-like patterns AND HTML tags", async () => {
+  it("treats body with <ac: tags as storage even if markdown patterns present", async () => {
     const { updatePage } = await import("./confluence-client.js");
     (updatePage as any).mockClear();
     (updatePage as any).mockResolvedValueOnce({
@@ -691,7 +723,7 @@ describe("update_page markdown guard", () => {
       page_id: "1",
       title: "T",
       version: 5,
-      body: "<p># Not actually a heading, just a hash in HTML</p>",
+      body: '<ac:structured-macro ac:name="info"><p># not markdown</p></ac:structured-macro>',
     });
     expect(result.content[0].text).toContain("Updated:");
   });
@@ -1687,5 +1719,480 @@ describe("get_version tool", () => {
     const handler = registeredTools.get("get_version")!.handler;
     const result = await handler({});
     expect(result.content[0].text).toMatch(/^epimethian-mcp v\d+\.\d+\.\d+$/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stream 14 — lookup_user tool
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("lookup_user tool", () => {
+  it("is registered", () => {
+    expect(registeredTools.has("lookup_user")).toBe(true);
+  });
+
+  it("happy path — returns formatted user list", async () => {
+    const { searchUsers } = await import("./confluence-client.js");
+    (searchUsers as any).mockResolvedValueOnce([
+      { accountId: "557058:aaa-111", displayName: "Alice Smith", email: "alice@example.com" },
+      { accountId: "557058:bbb-222", displayName: "Bob Jones", email: "bob@example.com" },
+      { accountId: "557058:ccc-333", displayName: "Carol White", email: "carol@example.com" },
+    ]);
+
+    const handler = registeredTools.get("lookup_user")!.handler;
+    const result = await handler({ query: "alice" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("3");
+    expect(result.content[0].text).toContain("557058:aaa-111");
+    expect(result.content[0].text).toContain("Alice Smith");
+    expect(result.content[0].text).toContain("alice@example.com");
+  });
+
+  it("empty result — returns informative message", async () => {
+    const { searchUsers } = await import("./confluence-client.js");
+    (searchUsers as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("lookup_user")!.handler;
+    const result = await handler({ query: "nobody" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("No users found");
+    expect(result.content[0].text).toContain("nobody");
+  });
+
+  it("API error — returns error result", async () => {
+    const { searchUsers } = await import("./confluence-client.js");
+    (searchUsers as any).mockRejectedValueOnce(new Error("User search failed"));
+
+    const handler = registeredTools.get("lookup_user")!.handler;
+    const result = await handler({ query: "error" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("User search failed");
+  });
+
+  it("shows (not disclosed) for empty email", async () => {
+    const { searchUsers } = await import("./confluence-client.js");
+    (searchUsers as any).mockResolvedValueOnce([
+      { accountId: "557058:xxx", displayName: "Private User", email: "" },
+    ]);
+
+    const handler = registeredTools.get("lookup_user")!.handler;
+    const result = await handler({ query: "private" });
+
+    expect(result.content[0].text).toContain("(not disclosed)");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stream 14 — resolve_page_link tool
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("resolve_page_link tool", () => {
+  it("is registered", () => {
+    expect(registeredTools.has("resolve_page_link")).toBe(true);
+  });
+
+  it("happy path — returns page details", async () => {
+    const { searchPagesByTitle } = await import("./confluence-client.js");
+    (searchPagesByTitle as any).mockResolvedValueOnce([
+      {
+        contentId: "123456",
+        url: "https://test.atlassian.net/wiki/spaces/ENG/pages/123456",
+        spaceKey: "ENG",
+        title: "Architecture Overview",
+      },
+    ]);
+
+    const handler = registeredTools.get("resolve_page_link")!.handler;
+    const result = await handler({ title: "Architecture Overview", space_key: "ENG" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("123456");
+    expect(result.content[0].text).toContain("https://test.atlassian.net");
+    expect(result.content[0].text).toContain("ENG");
+    expect(result.content[0].text).toContain("Architecture Overview");
+  });
+
+  it("page not found — returns error", async () => {
+    const { searchPagesByTitle } = await import("./confluence-client.js");
+    (searchPagesByTitle as any).mockResolvedValueOnce([]);
+
+    const handler = registeredTools.get("resolve_page_link")!.handler;
+    const result = await handler({ title: "Ghost Page", space_key: "ENG" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("No page found");
+    expect(result.content[0].text).toContain("Ghost Page");
+    expect(result.content[0].text).toContain("ENG");
+  });
+
+  it("ambiguous — returns first match with notice", async () => {
+    const { searchPagesByTitle } = await import("./confluence-client.js");
+    (searchPagesByTitle as any).mockResolvedValueOnce([
+      { contentId: "100", url: "https://test.atlassian.net/wiki/spaces/ENG/pages/100", spaceKey: "ENG", title: "Home" },
+      { contentId: "200", url: "https://test.atlassian.net/wiki/spaces/ENG/pages/200", spaceKey: "ENG", title: "Home" },
+    ]);
+
+    const handler = registeredTools.get("resolve_page_link")!.handler;
+    const result = await handler({ title: "Home", space_key: "ENG" });
+
+    expect(result.isError).toBeUndefined();
+    // First match returned
+    expect(result.content[0].text).toContain("100");
+    // Ambiguity notice
+    expect(result.content[0].text).toContain("2 pages matched");
+  });
+
+  it("API error — returns error result", async () => {
+    const { searchPagesByTitle } = await import("./confluence-client.js");
+    (searchPagesByTitle as any).mockRejectedValueOnce(new Error("Search failed"));
+
+    const handler = registeredTools.get("resolve_page_link")!.handler;
+    const result = await handler({ title: "Any Page", space_key: "ENG" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Search failed");
+  });
+});
+
+describe("create_page markdown conversion (Stream 5)", () => {
+  it("converts markdown body to storage XHTML before submission", async () => {
+    const { resolveSpaceId, createPage, formatPage } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (createPage as any).mockResolvedValueOnce({ id: "99", title: "New Page" });
+    (formatPage as any).mockReturnValueOnce("Title: New Page\nID: 99");
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({
+      title: "New Page",
+      space_key: "DEV",
+      body: "# Hello World\n\nThis is a paragraph.",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("New Page");
+
+    // createPage must have been called with storage XHTML, not raw markdown
+    // Stream 11: headings now carry Confluence-slug IDs.
+    const createCall = (createPage as any).mock.lastCall;
+    const submittedBody: string = createCall[2];
+    expect(submittedBody).toMatch(/<h1\b/);
+    expect(submittedBody).not.toContain("# Hello World");
+  });
+
+  it("passes storage body through unchanged", async () => {
+    const { resolveSpaceId, createPage, formatPage } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (createPage as any).mockResolvedValueOnce({ id: "100", title: "Storage Page" });
+    (formatPage as any).mockReturnValueOnce("Title: Storage Page\nID: 100");
+
+    const storageBody = "<p>Hello <strong>world</strong></p>";
+    const handler = registeredTools.get("create_page")!.handler;
+    await handler({
+      title: "Storage Page",
+      space_key: "DEV",
+      body: storageBody,
+    });
+
+    const createCall = (createPage as any).mock.lastCall;
+    expect(createCall[2]).toBe(storageBody);
+  });
+
+  it("allow_raw_html: true enables raw HTML passthrough", async () => {
+    const { resolveSpaceId, createPage, formatPage } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (createPage as any).mockResolvedValueOnce({ id: "101", title: "HTML Page" });
+    (formatPage as any).mockReturnValueOnce("Title: HTML Page");
+
+    const handler = registeredTools.get("create_page")!.handler;
+    // With raw HTML in markdown body and allow_raw_html: true, the raw HTML should survive
+    const result = await handler({
+      title: "HTML Page",
+      space_key: "DEV",
+      body: "# Title\n\n<div class=\"custom\">raw html</div>",
+      allow_raw_html: true,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const submittedBody: string = (createPage as any).mock.lastCall[2];
+    expect(submittedBody).toContain("raw html");
+  });
+});
+
+describe("update_page markdown path (Stream 5)", () => {
+  it("converts markdown body to storage and submits", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      version: { number: 5 },
+      body: { storage: { value: "<p>Existing content</p>" } },
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: "# New Heading\n\nNew paragraph text.",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Updated:");
+
+    // updatePage must have received storage XHTML, not raw markdown
+    // Stream 11: headings now carry Confluence-slug IDs.
+    const updateCall = (updatePage as any).mock.lastCall;
+    const submittedBody: string = updateCall[1].body;
+    expect(submittedBody).toMatch(/<h1\b/);
+    expect(submittedBody).not.toContain("# New Heading");
+  });
+
+  it("errors when markdown deletes a preserved macro and confirm_deletions is false", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    // Current page has a tokenisable macro
+    (getPage as any).mockResolvedValueOnce({
+      id: "2",
+      title: "T",
+      version: { number: 3 },
+      body: {
+        storage: {
+          value: '<p>Intro</p><ac:structured-macro ac:name="info"><ac:rich-text-body><p>note</p></ac:rich-text-body></ac:structured-macro><p>Outro</p>',
+        },
+      },
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    // Caller markdown omits the macro token → deletion without confirmation
+    const result = await handler({
+      page_id: "2",
+      title: "T",
+      version: 3,
+      body: "- Intro\n- Outro",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("confirm_deletions: true");
+    // updatePage must NOT have been called
+    expect((updatePage as any).mock.calls.length).toBe(0);
+  });
+
+  it("succeeds and records deletion in version message when confirm_deletions is true", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "3",
+      title: "T",
+      version: { number: 4 },
+      body: {
+        storage: {
+          value: '<p>Keep</p><ac:structured-macro ac:name="warning"><ac:rich-text-body><p>warning</p></ac:rich-text-body></ac:structured-macro>',
+        },
+      },
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "3", title: "T" },
+      newVersion: 5,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "3",
+      title: "T",
+      version: 4,
+      body: "- Keep",
+      confirm_deletions: true,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Updated:");
+
+    const updateCall = (updatePage as any).mock.lastCall;
+    // Version message should mention the deletion
+    expect(updateCall[1].versionMessage).toContain("Removed");
+  });
+
+  it("replace_body: true skips preservation and does wholesale rewrite", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "4",
+      title: "T",
+      version: { number: 2 },
+      body: {
+        storage: {
+          value: '<ac:structured-macro ac:name="toc"></ac:structured-macro><p>Old</p>',
+        },
+      },
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "4", title: "T" },
+      newVersion: 3,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "4",
+      title: "T",
+      version: 2,
+      body: "# Brand New\n\nFresh content.",
+      replace_body: true,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Updated:");
+
+    const updateCall = (updatePage as any).mock.lastCall;
+    const submittedBody: string = updateCall[1].body;
+    // Should be freshly converted markdown, no toc macro.
+    // Stream 11: headings now carry Confluence-slug IDs.
+    expect(submittedBody).toMatch(/<h1\b/);
+    expect(submittedBody).not.toContain("ac:structured-macro");
+  });
+
+  it("returns error for forged token in caller markdown", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "5",
+      title: "T",
+      version: { number: 1 },
+      body: { storage: { value: "<p>Simple page with no macros</p>" } },
+    });
+    (updatePage as any).mockClear();
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "5",
+      title: "T",
+      version: 1,
+      // Caller invents a token that was never in the sidecar
+      body: "# Updated\n\n[[epi:T9999]]\n\nMore text.",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("T9999");
+    expect((updatePage as any).mock.calls.length).toBe(0);
+  });
+
+  it("storage-format body passes through verbatim (backward compat)", async () => {
+    const { updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "6", title: "T" },
+      newVersion: 7,
+    });
+
+    const storageBody = "<p>Unchanged storage body</p>";
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "6",
+      title: "T",
+      version: 6,
+      body: storageBody,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const updateCall = (updatePage as any).mock.lastCall;
+    expect(updateCall[1].body).toBe(storageBody);
+  });
+
+  it("merges caller version_message with auto-generated deletion message", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "7",
+      title: "T",
+      version: { number: 5 },
+      body: {
+        storage: {
+          value: '<p>Text</p><ac:structured-macro ac:name="expand"><ac:rich-text-body><p>exp</p></ac:rich-text-body></ac:structured-macro>',
+        },
+      },
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "7", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    await handler({
+      page_id: "7",
+      title: "T",
+      version: 5,
+      body: "- Text",
+      confirm_deletions: true,
+      version_message: "My update note",
+    });
+
+    const updateCall = (updatePage as any).mock.lastCall;
+    const msg: string = updateCall[1].versionMessage;
+    expect(msg).toContain("My update note");
+    expect(msg).toContain("Removed");
+  });
+});
+
+describe("looksLikeMarkdown heuristic (Stream 5)", () => {
+  // Import the real function directly since the mock passes through the real impl
+  it("classifies markdown with incidental <br/> as markdown", async () => {
+    const { looksLikeMarkdown } = await import("./confluence-client.js");
+    const md = "# Heading\n\nLine one<br/>Line two";
+    expect(looksLikeMarkdown(md)).toBe(true);
+  });
+
+  it("classifies storage with <ac: tag as storage (not markdown)", async () => {
+    const { looksLikeMarkdown } = await import("./confluence-client.js");
+    const storage = '<ac:structured-macro ac:name="info"><ac:rich-text-body><p>hello</p></ac:rich-text-body></ac:structured-macro>';
+    expect(looksLikeMarkdown(storage)).toBe(false);
+  });
+
+  it("classifies storage with <ri: tag as storage", async () => {
+    const { looksLikeMarkdown } = await import("./confluence-client.js");
+    const storage = '<p><ri:page ri:content-title="Home" /></p>';
+    expect(looksLikeMarkdown(storage)).toBe(false);
+  });
+
+  it("classifies GFM table separator as markdown", async () => {
+    const { looksLikeMarkdown } = await import("./confluence-client.js");
+    const md = "| Col A | Col B |\n| --- | --- |\n| val | val |";
+    expect(looksLikeMarkdown(md)).toBe(true);
+  });
+
+  it("classifies fenced code block as markdown", async () => {
+    const { looksLikeMarkdown } = await import("./confluence-client.js");
+    const md = "Some text\n\n```typescript\nconst x = 1;\n```";
+    expect(looksLikeMarkdown(md)).toBe(true);
+  });
+
+  it("classifies unordered list as markdown", async () => {
+    const { looksLikeMarkdown } = await import("./confluence-client.js");
+    const md = "- item one\n- item two\n- item three";
+    expect(looksLikeMarkdown(md)).toBe(true);
+  });
+
+  it("classifies GitHub alert syntax as markdown", async () => {
+    const { looksLikeMarkdown } = await import("./confluence-client.js");
+    const md = "> [!NOTE]\n> This is a note";
+    expect(looksLikeMarkdown(md)).toBe(true);
+  });
+
+  it("classifies plain text without signals as storage (conservative fallback)", async () => {
+    const { looksLikeMarkdown } = await import("./confluence-client.js");
+    const plain = "Just some plain text with no special markers";
+    expect(looksLikeMarkdown(plain)).toBe(false);
+  });
+
+  it("short-circuits to false immediately when <ac: present even with markdown signals", async () => {
+    const { looksLikeMarkdown } = await import("./confluence-client.js");
+    // Has a heading but also ac: tag — storage wins
+    const mixed = '<ac:layout><h1>Title</h1></ac:layout>\n\n# Also a heading';
+    expect(looksLikeMarkdown(mixed)).toBe(false);
   });
 });

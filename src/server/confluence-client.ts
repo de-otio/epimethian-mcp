@@ -649,6 +649,97 @@ export async function getPageByTitle(
   return PagesResultSchema.parse(raw).results[0];
 }
 
+// --- User search ---
+
+export interface UserResult {
+  accountId: string;
+  displayName: string;
+  email: string;
+}
+
+const UserSchema = z.object({
+  user: z.object({
+    accountId: z.string(),
+    displayName: z.string(),
+    email: z.string().optional().default(""),
+  }),
+});
+
+const UserSearchResultSchema = z.object({
+  results: z.array(UserSchema).default([]),
+});
+
+/**
+ * Search for Confluence/Atlassian users by name, display name, or email substring.
+ * Uses the v1 CQL user search endpoint. Returns at most `limit` matches.
+ */
+export async function searchUsers(
+  query: string,
+  limit = 10
+): Promise<UserResult[]> {
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/search/user`);
+  url.searchParams.set("cql", `user.fullname~"${query.replace(/"/g, '\\"')}"`);
+  url.searchParams.set("limit", String(Math.min(limit, 10)));
+  const res = await confluenceRequest(url.toString());
+  const raw = await res.json();
+  const data = UserSearchResultSchema.parse(raw);
+  return data.results.map((r) => ({
+    accountId: r.user.accountId,
+    displayName: r.user.displayName,
+    email: r.user.email,
+  }));
+}
+
+// --- Page search by title and space key ---
+
+export interface PageLinkResult {
+  contentId: string;
+  url: string;
+  spaceKey: string;
+  title: string;
+}
+
+/**
+ * Search for a Confluence page by exact title within a space (identified by key).
+ * Uses CQL via the v1 search endpoint. Returns all matches (caller decides ambiguity policy).
+ */
+export async function searchPagesByTitle(
+  title: string,
+  spaceKey: string
+): Promise<PageLinkResult[]> {
+  const escapedTitle = title.replace(/"/g, '\\"');
+  const escapedSpace = spaceKey.replace(/"/g, '\\"');
+  const cql = `title="${escapedTitle}" AND space.key="${escapedSpace}" AND type=page`;
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/search`);
+  url.searchParams.set("cql", cql);
+  url.searchParams.set("limit", "10");
+  url.searchParams.set("expand", "space");
+  const res = await confluenceRequest(url.toString());
+  const raw = (await res.json()) as any;
+
+  const results: PageLinkResult[] = [];
+  for (const r of raw.results ?? []) {
+    const content = r.content ?? r;
+    const id = content.id as string | undefined;
+    const pageTitle = (content.title ?? r.title) as string | undefined;
+    const spaceObj = content.space ?? r.space;
+    const key = (spaceObj?.key ?? spaceKey) as string;
+    const links = content._links ?? r._links ?? {};
+    const base: string = links.base ?? cfg.url + "/wiki";
+    const webui: string = links.webui ?? "";
+    if (!id || !pageTitle) continue;
+    results.push({
+      contentId: id,
+      url: webui ? `${base}${webui}` : `${cfg.url}/wiki/spaces/${key}/pages/${id}`,
+      spaceKey: key,
+      title: pageTitle,
+    });
+  }
+  return results;
+}
+
 export async function getAttachments(
   pageId: string,
   limit: number
@@ -1293,17 +1384,51 @@ export function toMarkdownView(storageHtml: string): string {
   return markdown;
 }
 
-/** Pattern that strongly suggests content is markdown, not storage format. */
-const MARKDOWN_PATTERN_RE = /(?:^#{1,6}\s|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\)|^```)/m;
-const STORAGE_FORMAT_RE = /<(?:ac:|ri:|p |p>|h[1-6][ >]|div[ >]|table[ >])/i;
-
 /**
- * Detect if a body string is likely markdown rather than storage format.
- * Returns true only when the content matches markdown patterns AND
- * contains no storage format markers. Errs on the side of permissiveness.
+ * Detect if a body string is likely markdown rather than Confluence storage
+ * format (storage XHTML).
+ *
+ * Decision logic:
+ *  1. Strong storage signals → return false immediately (body is storage).
+ *     - Any `<ac:` or `<ri:` tag: these are Confluence-only storage elements
+ *       and never appear in markdown bodies.
+ *  2. Strong markdown signals → return true if at least one matches.
+ *     - GFM table separator line (`| --- |`)
+ *     - Fenced code block (``` at line start)
+ *     - ATX heading (`# Heading`)
+ *     - GitHub alert (`> [!NOTE]`)
+ *     - Pandoc container fence (`::: panel`)
+ *     - Setext heading underline (`---` or `===` alone on a line)
+ *     - Unordered list marker (`- ` or `* ` at line start)
+ *     - Ordered list marker (`1. ` at line start)
+ *     - Numbered reference (`[1]:` at line start)
+ *  3. Weak/neutral signals are ignored in isolation — a markdown body may
+ *     legitimately contain `<br/>`, `<hr/>`, `<details>`, etc.
+ *  4. Fallback: no strong storage signal AND no strong markdown signal → treat
+ *     as storage (conservative, matches prior behaviour).
  */
 export function looksLikeMarkdown(body: string): boolean {
-  return MARKDOWN_PATTERN_RE.test(body) && !STORAGE_FORMAT_RE.test(body);
+  // 1. Strong storage signals: Confluence-specific XML namespaces.
+  if (/<ac:/i.test(body) || /<ri:/i.test(body)) {
+    return false;
+  }
+
+  // 2. Strong markdown signals.
+  const STRONG_MARKDOWN_SIGNALS: RegExp[] = [
+    /^\|[\s\-:|]+\|\s*$/m,           // GFM table separator
+    /^```/m,                           // fenced code block
+    /^#{1,6}\s+/m,                     // ATX heading
+    /^>\s*\[!(INFO|NOTE|TIP|WARNING|CAUTION|IMPORTANT)\]/im, // GitHub alert
+    /^:::[ \t]/m,                      // Pandoc container fence
+    /^[-=]{2,}\s*$/m,                  // setext heading underline
+    /^[-*]\s+/m,                       // unordered list
+    /^\d+\.\s+/m,                      // ordered list
+    /^\[\d+\]:/m,                      // numbered reference
+    /\[[^\]]+\]\([^)]+\)/,            // inline link [text](url)
+    /\*\*[^*]+\*\*/,                   // inline bold **text**
+  ];
+
+  return STRONG_MARKDOWN_SIGNALS.some((re) => re.test(body));
 }
 
 export type FormatPageOptions = {

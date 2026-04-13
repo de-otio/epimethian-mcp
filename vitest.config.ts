@@ -11,6 +11,15 @@ export default defineConfig({
       include: ["src/**/*.ts"],
       exclude: ["src/**/*.test.ts"],
       thresholds: {
+        // Security-critical converter helpers — tightened to 95%.
+        "src/server/converter/escape.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/converter/url-parser.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/converter/account-id-validator.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/converter/filename-validator.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/converter/allowlist.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/converter/tokeniser.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/converter/restore.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/converter/diff.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
         "src/server/**": {
           lines: 80,
           branches: 80,

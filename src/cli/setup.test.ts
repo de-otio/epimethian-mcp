@@ -330,7 +330,7 @@ describe("runSetup", () => {
     process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
     process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
 
-    await runSetup("jambit");
+    await runSetup("globex");
 
     expect(mockSaveToKeychain).toHaveBeenCalledWith(
       {
@@ -338,9 +338,9 @@ describe("runSetup", () => {
         email: "user@test.com",
         apiToken: "tok",
       },
-      "jambit"
+      "globex"
     );
-    expect(mockAddToProfileRegistry).toHaveBeenCalledWith("jambit");
+    expect(mockAddToProfileRegistry).toHaveBeenCalledWith("globex");
 
     process.stdin.on = originalOn;
   });
