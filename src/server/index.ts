@@ -48,6 +48,8 @@ import {
   ConfluenceApiError,
   getPageVersions,
   getPageVersionBody,
+  searchUsers,
+  searchPagesByTitle,
 } from "./confluence-client.js";
 import {
   computeSummaryDiff,
@@ -109,6 +111,8 @@ const READ_ONLY_TOOLS = new Set([
   "get_page_version",
   "diff_page_versions",
   "get_version",
+  "lookup_user",
+  "resolve_page_link",
 ]);
 
 export function writeGuard(toolName: string, config: Config): ToolResult | null {
@@ -1454,6 +1458,90 @@ function registerTools(server: McpServer, config: Config): void {
         if (err instanceof ConfluenceApiError && (err.status === 403 || err.status === 404)) {
           return toolError(new Error("Page not found or inaccessible"));
         }
+        return toolError(err);
+      }
+    }
+  );
+
+  // lookup_user
+  server.registerTool(
+    "lookup_user",
+    {
+      description:
+        "Search for Atlassian/Confluence users by name, display name, or email substring. " +
+        "Returns up to 10 matches, each with accountId, displayName, and email. " +
+        "Use this to resolve an accountId for use with the :mention[Display]{accountId=…} " +
+        "markdown directive (shipped in Stream 9) when authoring pages via create_page or update_page.",
+      inputSchema: {
+        query: z
+          .string()
+          .min(1)
+          .describe("Name, display name, or email substring to search for."),
+      },
+    },
+    async ({ query }) => {
+      const echo = tenantEcho(config);
+      try {
+        const users = await searchUsers(query);
+        if (users.length === 0) {
+          return toolResult(`No users found matching "${query}".${echo}`);
+        }
+        const lines = users.map(
+          (u) =>
+            `- accountId: ${u.accountId}  displayName: ${u.displayName}  email: ${u.email || "(not disclosed)"}`
+        );
+        return toolResult(
+          `Users matching "${query}" (${users.length}):\n${lines.join("\n")}${echo}`
+        );
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  // resolve_page_link
+  server.registerTool(
+    "resolve_page_link",
+    {
+      description:
+        "Resolve a Confluence page to its stable content ID and URL given a page title and space key. " +
+        "Returns { contentId, url, spaceKey, title } for the matched page. " +
+        "Use this to obtain the contentId for <ac:link> page references via the confluence:// " +
+        "markdown scheme when authoring pages. " +
+        "Policy: if multiple pages share the same title in the space the first match is returned " +
+        "with a notice; use the exact page URL to disambiguate if needed.",
+      inputSchema: {
+        title: z.string().min(1).describe("Exact page title to look up."),
+        space_key: z
+          .string()
+          .min(1)
+          .describe('Confluence space key (e.g. "ENG", "PLAT").'),
+      },
+    },
+    async ({ title, space_key }) => {
+      const echo = tenantEcho(config);
+      try {
+        const pages = await searchPagesByTitle(title, space_key);
+        if (pages.length === 0) {
+          return toolError(
+            new Error(
+              `No page found with title "${title}" in space "${space_key}".`
+            )
+          );
+        }
+        const page = pages[0];
+        const ambiguousNote =
+          pages.length > 1
+            ? ` (${pages.length} pages matched — returning the first; use the URL to disambiguate)`
+            : "";
+        return toolResult(
+          `Page resolved${ambiguousNote}:\n` +
+            `  contentId: ${page.contentId}\n` +
+            `  url: ${page.url}\n` +
+            `  spaceKey: ${page.spaceKey}\n` +
+            `  title: ${page.title}${echo}`
+        );
+      } catch (err) {
         return toolError(err);
       }
     }

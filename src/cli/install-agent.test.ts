@@ -52,6 +52,8 @@ vi.mock("../server/confluence-client.js", () => ({
   resolveComment: vi.fn(),
   deleteFooterComment: vi.fn(),
   deleteInlineComment: vi.fn(),
+  searchUsers: vi.fn(),
+  searchPagesByTitle: vi.fn(),
   formatPage: vi.fn().mockReturnValue("formatted"),
   sanitizeError: (msg: string) => msg,
   getConfig: vi.fn().mockResolvedValue({
