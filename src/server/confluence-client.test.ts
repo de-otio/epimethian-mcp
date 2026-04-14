@@ -842,6 +842,25 @@ describe("updatePage", () => {
   });
 });
 
+describe("updatePage — pre-write snapshot (1F)", () => {
+  beforeEach(() => {
+    pageCache.clear();
+  });
+
+  it("stores snapshot when previousBody is provided", async () => {
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    const previousBody = "<p>current content</p>";
+    await updatePage("30", { title: "T", version: 5, previousBody });
+    expect(pageCache.getSnapshot("30", 5)).toBe(previousBody);
+  });
+
+  it("does not store snapshot when previousBody is omitted", async () => {
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    await updatePage("30", { title: "T", version: 5 });
+    expect(pageCache.getSnapshot("30", 5)).toBeUndefined();
+  });
+});
+
 describe("attribution footer deduplication", () => {
   it("strips exact attribution markers from body before adding new one", async () => {
     global.fetch = mockFetchResponse({ id: "30", title: "T" });

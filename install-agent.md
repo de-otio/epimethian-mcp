@@ -232,7 +232,7 @@ If **the server doesn't appear after restart**:
 - Verify the `command` value is an absolute path (run `which epimethian-mcp` to confirm)
 - Check that `.mcp.json` contains valid JSON (no trailing commas, correct quoting)
 
-## Available Tools (29)
+## Available Tools (32)
 
 | Tool | Description |
 |------|-------------|
@@ -241,7 +241,10 @@ If **the server doesn't appear after restart**:
 | `get_page_by_title` | Look up a page by title (use `headings_only` to preview structure first) |
 | `update_page` | Update an existing page |
 | `update_page_section` | Update a single section by heading name |
+| `prepend_to_page` | Insert content at the beginning of an existing page (additive, safe) |
+| `append_to_page` | Insert content at the end of an existing page (additive, safe) |
 | `delete_page` | Delete a page |
+| `revert_page` | Revert a page to a previous version |
 | `list_pages` | List pages in a space |
 | `get_page_children` | Get child pages of a page |
 | `search_pages` | Search pages using CQL (Confluence Query Language) |

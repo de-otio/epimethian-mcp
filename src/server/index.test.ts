@@ -169,6 +169,9 @@ describe("MCP server index", () => {
       // Stream 14
       "lookup_user",
       "resolve_page_link",
+      // PR 2
+      "prepend_to_page",
+      "append_to_page",
     ];
     for (const tool of expectedTools) {
       expect(registeredTools.has(tool), `tool "${tool}" should be registered`).toBe(true);
@@ -675,7 +678,11 @@ describe("get_page format: markdown", () => {
 
 describe("update_page markdown / storage routing", () => {
   it("accepts storage format HTML (backward compat)", async () => {
-    const { updatePage } = await import("./confluence-client.js");
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: "<p>Hello <strong>world</strong></p>" } },
+    });
     (updatePage as any).mockClear();
     (updatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
@@ -693,7 +700,11 @@ describe("update_page markdown / storage routing", () => {
   });
 
   it("accepts plain text without markdown patterns (treated as storage)", async () => {
-    const { updatePage } = await import("./confluence-client.js");
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: "Just some plain text" } },
+    });
     (updatePage as any).mockClear();
     (updatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
@@ -711,7 +722,11 @@ describe("update_page markdown / storage routing", () => {
   });
 
   it("treats body with <ac: tags as storage even if markdown patterns present", async () => {
-    const { updatePage } = await import("./confluence-client.js");
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: '<ac:structured-macro ac:name="info"><p># not markdown</p></ac:structured-macro>' } },
+    });
     (updatePage as any).mockClear();
     (updatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
@@ -2083,14 +2098,18 @@ describe("update_page markdown path (Stream 5)", () => {
   });
 
   it("storage-format body passes through verbatim (backward compat)", async () => {
-    const { updatePage } = await import("./confluence-client.js");
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    const storageBody = "<p>Unchanged storage body</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "6", title: "T", version: { number: 6 },
+      body: { storage: { value: storageBody } },
+    });
     (updatePage as any).mockClear();
     (updatePage as any).mockResolvedValueOnce({
       page: { id: "6", title: "T" },
       newVersion: 7,
     });
 
-    const storageBody = "<p>Unchanged storage body</p>";
     const handler = registeredTools.get("update_page")!.handler;
     const result = await handler({
       page_id: "6",
@@ -2194,5 +2213,530 @@ describe("looksLikeMarkdown heuristic (Stream 5)", () => {
     // Has a heading but also ac: tag — storage wins
     const mixed = '<ac:layout><h1>Title</h1></ac:layout>\n\n# Also a heading';
     expect(looksLikeMarkdown(mixed)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Content-safety guards integration tests (Finding 1 fix)
+// ---------------------------------------------------------------------------
+
+describe("update_page content-safety guards (Finding 1 fix)", () => {
+  const bigBody = "<p>" + "x".repeat(1000) + "</p>";
+
+  it("shrinkage guard triggers on markdown path with replace_body", async () => {
+    const { getPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: bigBody } },
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: "# tiny",
+      replace_body: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("shrink");
+  });
+
+  it("shrinkage guard triggers on storage-format path (CRITICAL fix)", async () => {
+    const { getPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: bigBody } },
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: "<p>tiny</p>", // storage format, not markdown
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("shrink");
+  });
+
+  it("confirm_shrinkage bypasses shrinkage guard", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: bigBody } },
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    // Use a body with enough text content to pass the empty-body guard (>100 chars)
+    const longBody = "# " + "replacement content ".repeat(10);
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: longBody,
+      replace_body: true,
+      confirm_shrinkage: true,
+    });
+
+    expect(result.content[0].text).toContain("Updated:");
+  });
+
+  it("empty-body guard rejects near-empty replacement", async () => {
+    const { getPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: bigBody } },
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: '<ac:structured-macro ac:name="toc"/>',
+      confirm_shrinkage: true, // bypass 1A to test 1C
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("accidental content loss");
+  });
+
+  it("body-length reporting includes char counts (1D)", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    const smallBody = "<p>hello world here</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: smallBody } },
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: "<p>updated content here</p>",
+    });
+
+    expect(result.content[0].text).toMatch(/body: \d+\u2192\d+ chars/);
+  });
+
+  it("structural integrity guard triggers on heading drop via storage path", async () => {
+    const headingBody =
+      "<h1>A</h1><h2>B</h2><h3>C</h3><h4>D</h4><p>" + "x".repeat(600) + "</p>";
+    const { getPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: headingBody } },
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      title: "T",
+      version: 5,
+      body: "<h1>Only one</h1><p>" + "x".repeat(600) + "</p>",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Heading count");
+  });
+});
+
+describe("update_page threads previousBody to updatePage (1F)", () => {
+  it("passes currentStorage as previousBody", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    const body = "<p>current content</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: body } },
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" }, newVersion: 6,
+    });
+    const handler = registeredTools.get("update_page")!.handler;
+    await handler({
+      page_id: "1", title: "T", version: 5,
+      body: body,
+    });
+    const call = (updatePage as any).mock.lastCall;
+    expect(call[1].previousBody).toBe(body);
+  });
+});
+
+// =============================================================================
+// prepend_to_page / append_to_page (PR 2)
+// =============================================================================
+
+describe("prepend_to_page", () => {
+  beforeEach(async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockReset();
+    (updatePage as any).mockReset();
+  });
+
+  it("inserts content before existing body", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" }, newVersion: 6,
+    });
+
+    const handler = registeredTools.get("prepend_to_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      version: 5,
+      content: "<p>new</p>",
+      allow_raw_html: false,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const updateCall = (updatePage as any).mock.lastCall;
+    expect(updateCall[1].body).toBe("<p>new</p><p>existing</p>");
+  });
+
+  it("converts markdown content to storage before prepending", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 3 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" }, newVersion: 4,
+    });
+
+    const handler = registeredTools.get("prepend_to_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      version: 3,
+      content: "# New Section\n\nSome text.",
+      allow_raw_html: false,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const updateCall = (updatePage as any).mock.lastCall;
+    const submitted: string = updateCall[1].body;
+    // Markdown converted to storage XML
+    expect(submitted).toMatch(/<h1/);
+    expect(submitted).not.toContain("# New Section");
+    // Existing content still present at the end
+    expect(submitted).toContain("<p>existing</p>");
+  });
+
+  it("respects custom separator", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 2 },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" }, newVersion: 3,
+    });
+
+    const handler = registeredTools.get("prepend_to_page")!.handler;
+    await handler({
+      page_id: "1",
+      version: 2,
+      content: "<p>new</p>",
+      separator: "---",
+      allow_raw_html: false,
+    });
+
+    const updateCall = (updatePage as any).mock.lastCall;
+    expect(updateCall[1].body).toBe("<p>new</p>---<p>old</p>");
+  });
+
+  it("rejects separator over 100 chars", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 1 },
+      body: { storage: { value: "<p>x</p>" } },
+    });
+
+    const handler = registeredTools.get("prepend_to_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      version: 1,
+      content: "<p>new</p>",
+      separator: "x".repeat(101),
+      allow_raw_html: false,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("100");
+    expect((updatePage as any).mock.calls.length).toBe(0);
+  });
+
+  it("rejects separator containing XML tags", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 1 },
+      body: { storage: { value: "<p>x</p>" } },
+    });
+
+    const handler = registeredTools.get("prepend_to_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      version: 1,
+      content: "<p>new</p>",
+      separator: "<br/>",
+      allow_raw_html: false,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("separator");
+    expect((updatePage as any).mock.calls.length).toBe(0);
+  });
+
+  it("rejects combined body over 2MB", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    const bigExisting = "x".repeat(1_500_000);
+    const bigNew = "y".repeat(600_000);
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 1 },
+      body: { storage: { value: bigExisting } },
+    });
+
+    const handler = registeredTools.get("prepend_to_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      version: 1,
+      content: bigNew,
+      allow_raw_html: false,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("2MB");
+    expect((updatePage as any).mock.calls.length).toBe(0);
+  });
+
+  it("includes body lengths in response", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "MyPage", version: { number: 7 },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "MyPage" }, newVersion: 8,
+    });
+
+    const handler = registeredTools.get("prepend_to_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      version: 7,
+      content: "<p>new</p>",
+      allow_raw_html: false,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Prepended to:");
+    expect(result.content[0].text).toMatch(/body: \d+\u2192\d+ chars/);
+    expect(result.content[0].text).toContain("version: 8");
+  });
+
+  it("blocked in read-only mode", async () => {
+    const { writeGuard } = await import("./index.js");
+    const readOnlyConfig = {
+      url: "https://test.atlassian.net",
+      email: "user@test.com",
+      profile: "acme",
+      readOnly: true,
+      attribution: true,
+      apiV2: "https://test.atlassian.net/wiki/api/v2",
+      apiV1: "https://test.atlassian.net/wiki/rest/api",
+      authHeader: "Basic dGVzdA==",
+      jsonHeaders: {},
+    };
+    const result = writeGuard("prepend_to_page", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+    expect(result!.content[0].text).toContain("Write blocked");
+  });
+});
+
+describe("append_to_page", () => {
+  beforeEach(async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockReset();
+    (updatePage as any).mockReset();
+  });
+
+  it("inserts content after existing body", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" }, newVersion: 6,
+    });
+
+    const handler = registeredTools.get("append_to_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      version: 5,
+      content: "<p>new</p>",
+      allow_raw_html: false,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Appended to:");
+    const updateCall = (updatePage as any).mock.lastCall;
+    expect(updateCall[1].body).toBe("<p>existing</p><p>new</p>");
+  });
+
+  it("blocked in read-only mode", async () => {
+    const { writeGuard } = await import("./index.js");
+    const readOnlyConfig = {
+      url: "https://test.atlassian.net",
+      email: "user@test.com",
+      profile: "acme",
+      readOnly: true,
+      attribution: true,
+      apiV2: "https://test.atlassian.net/wiki/api/v2",
+      apiV1: "https://test.atlassian.net/wiki/rest/api",
+      authHeader: "Basic dGVzdA==",
+      jsonHeaders: {},
+    };
+    const result = writeGuard("append_to_page", readOnlyConfig);
+    expect(result).not.toBeNull();
+    expect(result!.isError).toBe(true);
+    expect(result!.content[0].text).toContain("Write blocked");
+  });
+});
+
+// =============================================================================
+// revert_page (PR 4)
+// =============================================================================
+
+describe("revert_page", () => {
+  beforeEach(async () => {
+    const { getPage, updatePage, getPageVersionBody } = await import("./confluence-client.js");
+    (getPage as any).mockReset();
+    (updatePage as any).mockReset();
+    (getPageVersionBody as any).mockReset();
+  });
+
+  it("fetches raw storage and pushes as new version", async () => {
+    const { getPage, getPageVersionBody, updatePage } = await import("./confluence-client.js");
+    const currentBody = "<p>" + "x".repeat(200) + "</p>";
+    const historicalBody = "<p>" + "y".repeat(200) + "</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "My Page", version: { number: 5 },
+      body: { storage: { value: currentBody } },
+    });
+    (getPageVersionBody as any).mockResolvedValueOnce({
+      title: "My Page", rawBody: historicalBody, version: 3,
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "My Page" }, newVersion: 6,
+    });
+
+    const handler = registeredTools.get("revert_page")!.handler;
+    const result = await handler({
+      page_id: "1", target_version: 3, current_version: 5,
+    });
+    expect(result.content[0].text).toContain("Reverted:");
+    expect(result.content[0].text).toContain("v3");
+    // Verify updatePage received the historical body
+    const call = (updatePage as any).mock.lastCall;
+    expect(call[1].body).toBe(historicalBody);
+  });
+
+  it("applies shrinkage guard", async () => {
+    const { getPage, getPageVersionBody } = await import("./confluence-client.js");
+    const bigCurrent = "<p>" + "x".repeat(1000) + "</p>";
+    const smallHistorical = "<p>" + "y".repeat(150) + "</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: bigCurrent } },
+    });
+    (getPageVersionBody as any).mockResolvedValueOnce({
+      title: "T", rawBody: smallHistorical, version: 2,
+    });
+
+    const handler = registeredTools.get("revert_page")!.handler;
+    const result = await handler({
+      page_id: "1", target_version: 2, current_version: 5,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("shrink");
+  });
+
+  it("confirm_shrinkage bypasses guard", async () => {
+    const { getPage, getPageVersionBody, updatePage } = await import("./confluence-client.js");
+    const bigCurrent = "<p>" + "x".repeat(1000) + "</p>";
+    const smallHistorical = "<p>" + "y".repeat(150) + "</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 5 },
+      body: { storage: { value: bigCurrent } },
+    });
+    (getPageVersionBody as any).mockResolvedValueOnce({
+      title: "T", rawBody: smallHistorical, version: 2,
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" }, newVersion: 6,
+    });
+
+    const handler = registeredTools.get("revert_page")!.handler;
+    const result = await handler({
+      page_id: "1", target_version: 2, current_version: 5,
+      confirm_shrinkage: true,
+    });
+    expect(result.content[0].text).toContain("Reverted:");
+  });
+
+  it("detects version mismatch (Finding 6 TOCTOU mitigation)", async () => {
+    const { getPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 7 }, // actual is 7, caller says 5
+      body: { storage: { value: "<p>current</p>" } },
+    });
+
+    const handler = registeredTools.get("revert_page")!.handler;
+    const result = await handler({
+      page_id: "1", target_version: 2, current_version: 5,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Version mismatch");
+  });
+
+  it("includes body lengths in response", async () => {
+    const { getPage, getPageVersionBody, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1", title: "T", version: { number: 3 },
+      body: { storage: { value: "<p>current</p>" } },
+    });
+    (getPageVersionBody as any).mockResolvedValueOnce({
+      title: "T", rawBody: "<p>old version</p>", version: 1,
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" }, newVersion: 4,
+    });
+
+    const handler = registeredTools.get("revert_page")!.handler;
+    const result = await handler({
+      page_id: "1", target_version: 1, current_version: 3,
+    });
+    expect(result.content[0].text).toMatch(/body: \d+\u2192\d+ chars/);
   });
 });

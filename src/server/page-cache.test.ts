@@ -127,4 +127,70 @@ describe("PageCache", () => {
       expect(cache.size).toBe(2);
     });
   });
+
+  // --- Pre-write snapshot methods (1F) ---
+
+  describe("setSnapshot / getSnapshot (1F)", () => {
+    it("stores and retrieves a pre-write snapshot", () => {
+      cache.setSnapshot("1", 5, "<p>before</p>");
+      expect(cache.getSnapshot("1", 5)).toBe("<p>before</p>");
+    });
+
+    it("returns undefined when no snapshot exists", () => {
+      expect(cache.getSnapshot("1", 5)).toBeUndefined();
+    });
+
+    it("snapshots are isolated from the main cache (Finding 10)", () => {
+      cache.set("1", 5, "<p>current</p>");
+      cache.setSnapshot("1", 5, "<p>snapshot</p>");
+      // Both coexist without collision
+      expect(cache.get("1", 5)).toBe("<p>current</p>");
+      expect(cache.getSnapshot("1", 5)).toBe("<p>snapshot</p>");
+    });
+
+    it("snapshots do not count toward main cache size", () => {
+      cache.set("a", 1, "A");
+      cache.set("b", 1, "B");
+      cache.set("c", 1, "C");
+      // Main cache is full (3), but snapshot goes to separate map
+      cache.setSnapshot("d", 1, "snap-D");
+      expect(cache.size).toBe(3); // main cache unchanged
+      expect(cache.snapshotSize).toBe(1);
+      // All main entries still accessible
+      expect(cache.get("a", 1)).toBe("A");
+    });
+
+    it("snapshot eviction is independent of main cache eviction", () => {
+      const smallCache = new PageCache(3, 2); // 3 main, 2 snapshots
+      smallCache.setSnapshot("a", 1, "snap-A");
+      smallCache.setSnapshot("b", 1, "snap-B");
+      // Snapshot map is full (2). Adding "c" evicts oldest ("a").
+      smallCache.setSnapshot("c", 1, "snap-C");
+      expect(smallCache.getSnapshot("a", 1)).toBeUndefined();
+      expect(smallCache.getSnapshot("b", 1)).toBe("snap-B");
+      expect(smallCache.getSnapshot("c", 1)).toBe("snap-C");
+    });
+
+    it("promotes recently accessed snapshots (LRU)", () => {
+      const smallCache = new PageCache(3, 2);
+      smallCache.setSnapshot("a", 1, "snap-A");
+      smallCache.setSnapshot("b", 1, "snap-B");
+      // Access "a" to promote it
+      smallCache.getSnapshot("a", 1);
+      // Adding "c" should evict "b" (oldest after "a" was promoted)
+      smallCache.setSnapshot("c", 1, "snap-C");
+      expect(smallCache.getSnapshot("a", 1)).toBe("snap-A");
+      expect(smallCache.getSnapshot("b", 1)).toBeUndefined();
+    });
+
+    it("clear empties both main cache and snapshots", () => {
+      cache.set("1", 1, "main");
+      cache.setSnapshot("1", 1, "snap");
+      cache.clear();
+      expect(cache.size).toBe(0);
+      expect(cache.snapshotSize).toBe(0);
+      expect(cache.get("1", 1)).toBeUndefined();
+      expect(cache.getSnapshot("1", 1)).toBeUndefined();
+    });
+  });
 });

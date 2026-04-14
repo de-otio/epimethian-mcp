@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { readFile, writeFile, mkdtemp, rm, realpath } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 declare const __PKG_VERSION__: string;
@@ -59,7 +59,9 @@ import {
 import { markdownToStorage } from "./converter/md-to-storage.js";
 import { planUpdate } from "./converter/update-orchestrator.js";
 import { ConverterError } from "./converter/types.js";
+import { enforceContentSafetyGuards } from "./converter/content-safety-guards.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
+import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
 
 // --- Utilities ---
 
@@ -252,6 +254,69 @@ function registerTools(server: McpServer, config: Config): void {
 
   const pageIdSchema = z.string().regex(/^\d+$/, "Page ID must be numeric");
 
+  // ---------------------------------------------------------------------------
+  // concatPageContent — shared helper for prepend_to_page / append_to_page
+  // ---------------------------------------------------------------------------
+  async function concatPageContent(
+    page_id: string,
+    version: number,
+    newContent: string,
+    position: "prepend" | "append",
+    opts: {
+      separator?: string;
+      versionMessage?: string;
+      allowRawHtml?: boolean;
+      confluenceBaseUrl?: string;
+    } = {}
+  ): Promise<{ page: { id: string; title: string }; newVersion: number; oldLen: number; newLen: number }> {
+    const currentPage = await getPage(page_id, true);
+    const currentStorage: string =
+      currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
+
+    const isMarkdown = looksLikeMarkdown(newContent);
+    const contentStorage = isMarkdown
+      ? markdownToStorage(newContent, {
+          allowRawHtml: opts.allowRawHtml,
+          confluenceBaseUrl: opts.confluenceBaseUrl,
+        })
+      : newContent;
+
+    // Determine separator
+    let sep: string;
+    if (opts.separator !== undefined) {
+      sep = opts.separator;
+    } else {
+      sep = isMarkdown ? "\n\n" : "";
+    }
+
+    // Security: validate separator
+    if (sep.length > 100) {
+      throw new Error("separator must be 100 characters or fewer");
+    }
+    if (sep.includes("<")) {
+      throw new Error("separator must not contain XML/HTML tags (no '<' characters)");
+    }
+
+    // Security: validate combined size
+    if (currentStorage.length + contentStorage.length + sep.length > 2_000_000) {
+      throw new Error("Combined body exceeds 2MB limit");
+    }
+
+    const newBody =
+      position === "prepend"
+        ? contentStorage + sep + currentStorage
+        : currentStorage + sep + contentStorage;
+
+    const { page, newVersion } = await updatePage(page_id, {
+      title: currentPage.title,
+      body: newBody,
+      version,
+      versionMessage: opts.versionMessage,
+    });
+
+    return { page, newVersion, oldLen: currentStorage.length, newLen: newBody.length };
+  }
+
   // create_page
   server.registerTool(
     "create_page",
@@ -299,11 +364,20 @@ function registerTools(server: McpServer, config: Config): void {
         }
         const spaceId = await resolveSpaceId(space_key);
         const page = await createPage(spaceId, title, finalBody, parent_id);
+        logMutation({
+          timestamp: new Date().toISOString(),
+          operation: "create_page",
+          pageId: page.id,
+          newVersion: page.version?.number ?? 1,
+          newBodyLen: finalBody.length,
+        });
         return toolResult((await formatPage(page, false)) + echo);
       } catch (err) {
         if (err instanceof ConverterError) {
+          logMutation(errorRecord("create_page", "unknown", err));
           return toolError(err);
         }
+        logMutation(errorRecord("create_page", "unknown", err));
         return toolError(err);
       }
     }
@@ -420,8 +494,13 @@ function registerTools(server: McpServer, config: Config): void {
         "Markdown update flags:\n" +
         "- confirm_deletions: set to true to acknowledge removing preserved macros/elements (default false — any deletion errors until confirmed).\n" +
         "- replace_body: set to true for a wholesale rewrite that skips preservation (default false).\n" +
+        "- confirm_shrinkage: set to true to acknowledge a >50% body size reduction (default false).\n" +
+        "- confirm_structure_loss: set to true to acknowledge a >50% heading count drop (default false).\n" +
         "- allow_raw_html: allow raw HTML inside markdown bodies (default false).\n" +
-        "- confluence_base_url: override the URL used by the link rewriter.",
+        "- confluence_base_url: override the URL used by the link rewriter.\n\n" +
+        "replace_body skips all safety nets (token preservation, deletion confirmation). " +
+        "When delegating update_page to a subagent, ensure the agent includes the full existing body — " +
+        "replace_body replaces ALL content with only what you provide.",
         config
       ),
       inputSchema: {
@@ -450,6 +529,20 @@ function registerTools(server: McpServer, config: Config): void {
           .boolean()
           .default(false)
           .describe("Set to true for a wholesale page rewrite that skips token preservation. All existing macros will be lost. Use only when intentionally replacing the full body."),
+        confirm_shrinkage: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Set to true to acknowledge that the new body is significantly smaller than the existing body. " +
+            "Required when the body would shrink by more than 50%."
+          ),
+        confirm_structure_loss: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Set to true to acknowledge that the new body has significantly fewer headings than the existing body. " +
+            "Required when heading count would drop by more than 50%."
+          ),
         allow_raw_html: z
           .boolean()
           .default(false)
@@ -462,15 +555,20 @@ function registerTools(server: McpServer, config: Config): void {
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, title, version, body, version_message, confirm_deletions, replace_body, allow_raw_html, confluence_base_url }) => {
+    async ({ page_id, title, version, body, version_message, confirm_deletions, replace_body, confirm_shrinkage, confirm_structure_loss, allow_raw_html, confluence_base_url }) => {
       const blocked = writeGuard("update_page", config);
       if (blocked) return blocked;
       try {
+        // Fetch the current page for safety guards (both paths need this).
+        const cfg = await getConfig();
+        const currentPage = await getPage(page_id, true);
+        const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
+
+        let finalStorage: string;
+        let effectiveVersionMessage = version_message;
+
         if (body && looksLikeMarkdown(body)) {
           // Markdown path: token-aware write via the update orchestrator.
-          const cfg = await getConfig();
-          const currentPage = await getPage(page_id, true);
-          const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
           const plan = planUpdate({
             currentStorage,
             callerMarkdown: body,
@@ -481,34 +579,54 @@ function registerTools(server: McpServer, config: Config): void {
               confluenceBaseUrl: confluence_base_url ?? cfg.url,
             },
           });
-          const effectiveVersionMessage =
+          finalStorage = plan.newStorage;
+          effectiveVersionMessage =
             plan.versionMessage && version_message
               ? `${version_message}; ${plan.versionMessage}`
               : plan.versionMessage ?? version_message;
-          const { page, newVersion } = await updatePage(page_id, {
-            title,
-            body: plan.newStorage,
-            version,
-            versionMessage: effectiveVersionMessage,
-          });
-          return toolResult(
-            `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion})` + echo
-          );
+        } else {
+          // Storage format path: pass body through verbatim (backward compat).
+          finalStorage = body ?? "";
         }
-        // Storage format path: pass body through verbatim (backward compat).
+
+        // Content-safety guards applied to BOTH paths (Finding 1 fix).
+        enforceContentSafetyGuards({
+          oldStorage: currentStorage,
+          newStorage: finalStorage,
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+        });
+
         const { page, newVersion } = await updatePage(page_id, {
           title,
-          body,
+          body: finalStorage,
           version,
-          versionMessage: version_message,
+          versionMessage: effectiveVersionMessage,
+          previousBody: currentStorage,
         });
+
+        // Mutation log (1E)
+        logMutation({
+          timestamp: new Date().toISOString(),
+          operation: "update_page",
+          pageId: page_id,
+          oldVersion: version,
+          newVersion,
+          oldBodyLen: currentStorage.length,
+          newBodyLen: finalStorage.length,
+          replaceBody: replace_body || undefined,
+        });
+
+        // Body-length reporting (1D)
         return toolResult(
-          `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion})` + echo
+          `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion}, ` +
+            `body: ${currentStorage.length}\u2192${finalStorage.length} chars)` + echo
         );
       } catch (err) {
-        if (err instanceof ConverterError) {
-          return toolError(err);
-        }
+        logMutation(errorRecord("update_page", page_id, err, {
+          oldVersion: version,
+          replaceBody: replace_body || undefined,
+        }));
         return toolError(err);
       }
     }
@@ -529,8 +647,14 @@ function registerTools(server: McpServer, config: Config): void {
       if (blocked) return blocked;
       try {
         await deletePage(page_id);
+        logMutation({
+          timestamp: new Date().toISOString(),
+          operation: "delete_page",
+          pageId: page_id,
+        });
         return toolResult(`Deleted page ${page_id}` + echo);
       } catch (err) {
+        logMutation(errorRecord("delete_page", page_id, err));
         return toolError(err);
       }
     }
@@ -584,14 +708,105 @@ function registerTools(server: McpServer, config: Config): void {
           body: newFullBody,
           version,
           versionMessage: version_message,
+          previousBody: fullBody,
+        });
+        logMutation({
+          timestamp: new Date().toISOString(),
+          operation: "update_page",
+          pageId: page_id,
+          oldVersion: version,
+          newVersion,
+          oldBodyLen: fullBody.length,
+          newBodyLen: newFullBody.length,
         });
         return toolResult(
           `Updated section "${section}" in: ${updated.title} (ID: ${updated.id}, version: ${newVersion})` + echo
         );
       } catch (err) {
+        logMutation(errorRecord("update_page", page_id, err, { oldVersion: version }));
         return toolError(err);
       }
     }
+  );
+
+  // prepend_to_page
+  server.registerTool(
+    "prepend_to_page",
+    {
+      description: describeWithLock(
+        "Insert content at the beginning of an existing Confluence page. " +
+          "The caller provides only the new content — the server fetches the existing body and handles concatenation. " +
+          "Safer than update_page with replace_body for additive operations.\n\n" +
+          "Content can be GFM markdown or Confluence storage format (auto-detected).",
+        config,
+      ),
+      inputSchema: {
+        page_id: z.string().describe("The Confluence page ID"),
+        version: z.number().int().positive().describe("Page version from your most recent get_page call"),
+        content: z.string().describe("Content to insert before the existing body. GFM markdown or storage format (auto-detected)."),
+        separator: z.string().optional().describe("Separator between new and existing content. Max 100 chars, no XML tags. Defaults to blank line (markdown) or empty (storage)."),
+        version_message: z.string().optional().describe("Optional version comment"),
+        allow_raw_html: z.boolean().default(false).describe("Allow raw HTML inside markdown content (default false)."),
+        confluence_base_url: z.string().url().optional().describe("Override the Confluence base URL used by the link rewriter."),
+      },
+      annotations: { destructiveHint: false, idempotentHint: false },
+    },
+    async ({ page_id, version, content, separator, version_message, allow_raw_html, confluence_base_url }) => {
+      const blocked = writeGuard("prepend_to_page", config);
+      if (blocked) return blocked;
+      try {
+        const cfg = await getConfig();
+        const { page, newVersion, oldLen, newLen } = await concatPageContent(
+          page_id, version, content, "prepend",
+          { separator, versionMessage: version_message ?? "Prepend content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url },
+        );
+        logMutation({ timestamp: new Date().toISOString(), operation: "prepend_to_page", pageId: page_id, oldVersion: version, newVersion, oldBodyLen: oldLen, newBodyLen: newLen });
+        return toolResult(`Prepended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)` + echo);
+      } catch (err) {
+        logMutation(errorRecord("prepend_to_page", page_id, err, { oldVersion: version }));
+        return toolError(err);
+      }
+    },
+  );
+
+  // append_to_page
+  server.registerTool(
+    "append_to_page",
+    {
+      description: describeWithLock(
+        "Insert content at the end of an existing Confluence page. " +
+          "The caller provides only the new content — the server fetches the existing body and handles concatenation. " +
+          "Safer than update_page with replace_body for additive operations.\n\n" +
+          "Content can be GFM markdown or Confluence storage format (auto-detected).",
+        config,
+      ),
+      inputSchema: {
+        page_id: z.string().describe("The Confluence page ID"),
+        version: z.number().int().positive().describe("Page version from your most recent get_page call"),
+        content: z.string().describe("Content to insert after the existing body. GFM markdown or storage format (auto-detected)."),
+        separator: z.string().optional().describe("Separator between existing and new content. Max 100 chars, no XML tags. Defaults to blank line (markdown) or empty (storage)."),
+        version_message: z.string().optional().describe("Optional version comment"),
+        allow_raw_html: z.boolean().default(false).describe("Allow raw HTML inside markdown content (default false)."),
+        confluence_base_url: z.string().url().optional().describe("Override the Confluence base URL used by the link rewriter."),
+      },
+      annotations: { destructiveHint: false, idempotentHint: false },
+    },
+    async ({ page_id, version, content, separator, version_message, allow_raw_html, confluence_base_url }) => {
+      const blocked = writeGuard("append_to_page", config);
+      if (blocked) return blocked;
+      try {
+        const cfg = await getConfig();
+        const { page, newVersion, oldLen, newLen } = await concatPageContent(
+          page_id, version, content, "append",
+          { separator, versionMessage: version_message ?? "Append content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url },
+        );
+        logMutation({ timestamp: new Date().toISOString(), operation: "append_to_page", pageId: page_id, oldVersion: version, newVersion, oldBodyLen: oldLen, newBodyLen: newLen });
+        return toolResult(`Appended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)` + echo);
+      } catch (err) {
+        logMutation(errorRecord("append_to_page", page_id, err, { oldVersion: version }));
+        return toolError(err);
+      }
+    },
   );
 
   // search_pages
@@ -1441,7 +1656,12 @@ function registerTools(server: McpServer, config: Config): void {
         "Get the content of a Confluence page at a specific historical version. " +
         "Returns sanitized markdown (macros replaced with placeholders). " +
         "Note: historical versions may contain content that was intentionally deleted. " +
-        "Costs 1 API call.",
+        "Costs 1 API call." +
+        "\n\n" +
+        "Returns sanitized read-only markdown, NOT raw Confluence storage format. " +
+        "Macros are replaced with placeholders. This content is NOT suitable for round-trip " +
+        "updates via update_page — the conversion is lossy. " +
+        "To revert a page to a previous version, use revert_page instead.",
       inputSchema: {
         page_id: pageIdSchema.describe("Confluence page ID"),
         version: z
@@ -1580,6 +1800,130 @@ function registerTools(server: McpServer, config: Config): void {
     }
   );
 
+  // revert_page
+  server.registerTool(
+    "revert_page",
+    {
+      description: describeWithLock(
+        "Revert a Confluence page to a previous version. Fetches the exact storage-format body " +
+        "from the historical version and pushes it as a new version. This is a lossless revert \u2014 " +
+        "unlike reading get_page_version (which returns sanitized markdown) and passing it " +
+        "to update_page, this preserves all macros, formatting, and rich elements exactly.\n\n" +
+        "The shrinkage guard applies: if the reverted content is significantly smaller than the " +
+        "current content, you will be asked to confirm.",
+        config,
+      ),
+      inputSchema: {
+        page_id: pageIdSchema.describe("The Confluence page ID"),
+        target_version: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            "The version number to revert to. Must be less than the current version."
+          ),
+        current_version: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            "The current page version from your most recent get_page call (for optimistic locking)."
+          ),
+        confirm_shrinkage: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Set to true if the historical version is expected to be significantly smaller than the current version."
+          ),
+        confirm_structure_loss: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Set to true if the historical version has fewer headings than the current version."
+          ),
+        version_message: z
+          .string()
+          .optional()
+          .describe(
+            "Optional version comment. Defaults to 'Revert to version N'."
+          ),
+      },
+      annotations: { destructiveHint: false, idempotentHint: false },
+    },
+    async ({
+      page_id,
+      target_version,
+      current_version,
+      confirm_shrinkage,
+      confirm_structure_loss,
+      version_message,
+    }) => {
+      const blocked = writeGuard("revert_page", config);
+      if (blocked) return blocked;
+      try {
+        // 1. Fetch current page for body and metadata
+        const currentPage = await getPage(page_id, true);
+        const currentStorage =
+          currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
+
+        // Security (Finding 6): verify fetched version matches expected
+        const actualVersion = currentPage.version?.number;
+        if (actualVersion !== undefined && actualVersion !== current_version) {
+          return toolError(
+            new Error(
+              `Version mismatch: expected ${current_version}, but page is at version ${actualVersion}. ` +
+                `Re-read the page with get_page and retry with the current version number.`
+            )
+          );
+        }
+
+        // 2. Fetch historical version's raw storage (reuse existing function)
+        const historical = await getPageVersionBody(page_id, target_version);
+
+        // 3. Content-safety guards
+        enforceContentSafetyGuards({
+          oldStorage: currentStorage,
+          newStorage: historical.rawBody,
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+        });
+
+        // 4. Push the historical body as a new version (storage-format path)
+        const { page, newVersion } = await updatePage(page_id, {
+          title: currentPage.title,
+          body: historical.rawBody,
+          version: current_version,
+          versionMessage:
+            version_message ?? `Revert to version ${target_version}`,
+        });
+
+        // 5. Log mutation
+        logMutation({
+          timestamp: new Date().toISOString(),
+          operation: "revert_page",
+          pageId: page_id,
+          oldVersion: current_version,
+          newVersion,
+          oldBodyLen: currentStorage.length,
+          newBodyLen: historical.rawBody.length,
+        });
+
+        return toolResult(
+          `Reverted: ${page.title} (ID: ${page.id}, v${target_version}\u2192v${newVersion}, ` +
+            `body: ${currentStorage.length}\u2192${historical.rawBody.length} chars)` +
+            echo
+        );
+      } catch (err) {
+        logMutation(
+          errorRecord("revert_page", page_id, err, {
+            oldVersion: current_version,
+          })
+        );
+        return toolError(err);
+      }
+    }
+  );
+
   // lookup_user
   server.registerTool(
     "lookup_user",
@@ -1681,6 +2025,12 @@ export async function main() {
   // Resolve and validate credentials before accepting tool calls
   const config = await getConfig();
   await validateStartup(config);
+
+  // Initialize mutation log if opt-in
+  if (process.env.EPIMETHIAN_MUTATION_LOG === "true") {
+    const logDir = join(homedir(), ".epimethian", "logs");
+    initMutationLog(logDir);
+  }
 
   // Dynamic server name includes profile for disambiguation in multi-root workspaces
   const serverName = config.profile

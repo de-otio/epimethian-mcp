@@ -517,6 +517,7 @@ export async function updatePage(
     body?: string;
     version: number;
     versionMessage?: string;
+    previousBody?: string;
   }
 ): Promise<{ page: PageData; newVersion: number }> {
   const cfg = await getConfig();
@@ -541,6 +542,11 @@ export async function updatePage(
       representation: "storage",
       value: pageBody,
     };
+  }
+
+  // Pre-write snapshot for recovery
+  if (opts.previousBody !== undefined) {
+    pageCache.setSnapshot(pageId, opts.version, opts.previousBody);
   }
 
   let raw: unknown;

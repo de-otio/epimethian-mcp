@@ -8,10 +8,14 @@
  */
 export class PageCache {
   private cache = new Map<string, { version: number; body: string }>();
+  /** Separate map for pre-write snapshots to avoid eviction pressure (Finding 10). */
+  private snapshots = new Map<string, { version: number; body: string }>();
   private maxSize: number;
+  private maxSnapshotSize: number;
 
-  constructor(maxSize: number = 50) {
+  constructor(maxSize: number = 50, maxSnapshotSize: number = 30) {
     this.maxSize = maxSize;
+    this.maxSnapshotSize = maxSnapshotSize;
   }
 
   /** Return cached body if page_id exists and version matches. */
@@ -80,13 +84,48 @@ export class PageCache {
     this.cache.delete(pageId);
   }
 
+  /**
+   * Store a pre-write snapshot of the page body before a mutation.
+   * Uses a separate map from the main cache to avoid eviction pressure
+   * and key-collision attacks (Finding 10).
+   */
+  setSnapshot(pageId: string, version: number, body: string): void {
+    const key = `${pageId}:${version}`;
+    this.snapshots.delete(key);
+    if (this.snapshots.size >= this.maxSnapshotSize) {
+      const oldest = this.snapshots.keys().next().value!;
+      this.snapshots.delete(oldest);
+    }
+    this.snapshots.set(key, { version, body });
+  }
+
+  /**
+   * Retrieve a pre-write snapshot for a specific page and version.
+   */
+  getSnapshot(pageId: string, version: number): string | undefined {
+    const key = `${pageId}:${version}`;
+    const entry = this.snapshots.get(key);
+    if (entry) {
+      // Promote to MRU
+      this.snapshots.delete(key);
+      this.snapshots.set(key, entry);
+      return entry.body;
+    }
+    return undefined;
+  }
+
   /** Empty the cache. */
   clear(): void {
     this.cache.clear();
+    this.snapshots.clear();
   }
 
   get size(): number {
     return this.cache.size;
+  }
+
+  get snapshotSize(): number {
+    return this.snapshots.size;
   }
 }
 

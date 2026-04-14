@@ -64,3 +64,9 @@ export class ConverterError extends Error {
     this.name = "ConverterError";
   }
 }
+
+// --- Safety guard error codes ---
+
+export const SHRINKAGE_NOT_CONFIRMED = "SHRINKAGE_NOT_CONFIRMED";
+export const STRUCTURE_LOSS_NOT_CONFIRMED = "STRUCTURE_LOSS_NOT_CONFIRMED";
+export const EMPTY_BODY_REJECTED = "EMPTY_BODY_REJECTED";
