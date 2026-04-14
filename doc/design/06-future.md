@@ -8,6 +8,18 @@
 - Windows keychain support (Credential Manager via PowerShell)
 - Advisory file locking on profile registry (proper-lockfile) for concurrent CLI safety
 
+### Completed in v5.1.0
+- ~~Content-safety guards~~ → `confirm_shrinkage`, `confirm_structure_loss`, empty-body rejection on `update_page`
+- ~~Additive mutation tools~~ → `prepend_to_page`, `append_to_page`
+- ~~Lossless revert~~ → `revert_page` using raw storage from v1 API
+- ~~Write-ahead mutation log~~ → opt-in via `EPIMETHIAN_MUTATION_LOG=true`, writes to `~/.epimethian/logs/`
+- ~~Pre-write page snapshots~~ → cached before every write for recovery
+- ~~Body-length reporting~~ → `body: N→M chars` in all write responses
+- ~~User lookup and page link resolution~~ → `lookup_user`, `resolve_page_link`
+
+### Completed in v5.0.0
+- ~~Markdown input conversion~~ → `create_page` and `update_page` accept GFM markdown with auto-detection and token-aware preservation
+
 ### Completed in v4.5.0
 - ~~Content status badges~~ → `get_page_status`, `set_page_status`, `remove_page_status` tools
 - ~~Page version history / diff~~ → `get_page_versions`, `get_page_version`, `diff_page_versions` tools. See `investigations/investigate-version-history.md`

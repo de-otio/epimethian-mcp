@@ -134,9 +134,25 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `set_page_status`    | Set the content status badge on a page |
 | `remove_page_status` | Remove the content status badge from a page |
 | `get_page_versions`  | List version history for a page |
-| `get_page_version`   | Get page content at a specific historical version |
+| `get_page_version`   | Get page content at a specific historical version (read-only markdown) |
 | `diff_page_versions` | Compare two versions of a page |
+| `prepend_to_page`    | Insert content at the beginning of a page (additive, safe) |
+| `append_to_page`     | Insert content at the end of a page (additive, safe) |
+| `revert_page`        | Revert a page to a previous version (lossless) |
+| `lookup_user`        | Search for Atlassian users by name or email |
+| `resolve_page_link`  | Resolve a page title + space key to a stable page ID and URL |
 | `get_version`        | Return the server version      |
+
+## Content Safety
+
+Write operations are protected by layered safety guards to prevent accidental content loss:
+
+- **Shrinkage guard** — `update_page` rejects writes that reduce the body by more than 50%. Pass `confirm_shrinkage: true` to override.
+- **Structural integrity** — rejects writes that drop more than 50% of headings. Pass `confirm_structure_loss: true` to override.
+- **Empty-body rejection** — hard guard, no opt-out. Rejects writes that produce near-empty pages.
+- **Additive tools** — `prepend_to_page` and `append_to_page` avoid full-body replacement entirely.
+- **Lossless revert** — `revert_page` uses raw storage format, avoiding lossy markdown conversion.
+- **Mutation log** — opt-in via `EPIMETHIAN_MUTATION_LOG=true`. Writes JSONL records to `~/.epimethian/logs/` for every write operation.
 
 ## Credential Security
 

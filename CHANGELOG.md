@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.1.0] - 2026-04-14
+
+### Added
+
+- **Three new tools: `prepend_to_page`, `append_to_page`, `revert_page`**
+  - `prepend_to_page` / `append_to_page`: Additive-only mutations that concatenate content before/after the existing page body. Safer than `update_page` with `replace_body` for additive operations.
+  - `revert_page`: Lossless revert to a previous version using raw storage format from the v1 API. Avoids the lossy markdown conversion of `get_page_version` → `update_page`.
+
+- **Content-safety guards on `update_page`**
+  - `confirm_shrinkage: boolean` (default: false) — rejects >50% body size reduction unless explicitly acknowledged.
+  - `confirm_structure_loss: boolean` (default: false) — rejects >50% heading count drop unless explicitly acknowledged.
+  - Empty-body rejection — hard guard with no opt-out; rejects writes that would produce near-empty pages.
+  - Guards apply to both the markdown and storage-format code paths.
+
+- **Write-ahead mutation log (opt-in)**
+  - Enable via `EPIMETHIAN_MUTATION_LOG=true` environment variable.
+  - Appends JSONL records to `~/.epimethian/logs/` for every write operation.
+  - Security: 0o600 file perms, 0o700 directory perms, symlink checks, sanitized error messages.
+  - Auto-cleanup: log files older than 30 days are deleted on startup.
+
+- **Pre-write page snapshots** — page cache stores body snapshots before writes for recovery.
+
+- **Body-length reporting** — all write responses now include `body: N→M chars`.
+
+### Changed
+
+- `get_page_version` description now warns that returned markdown is lossy and recommends `revert_page` for lossless reverts.
+- `update_page` description documents the safety guards and warns about `replace_body` risks.
+
 ## [5.0.0] - 2026-04-13
 
 ### Changed (BREAKING)

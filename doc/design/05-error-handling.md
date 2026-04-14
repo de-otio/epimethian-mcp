@@ -27,4 +27,12 @@ API responses are validated at runtime using Zod schemas (`PageSchema`, `SpacesR
 | Rate limited | 429 | `isError: true` with API message |
 | Server error | 5xx | `isError: true` with API message |
 | File path outside CWD | N/A | `isError: true` with path restriction message |
+| Content shrinkage (>50%) | N/A | `isError: true` with `SHRINKAGE_NOT_CONFIRMED` — re-submit with `confirm_shrinkage: true` |
+| Structural loss (>50% headings) | N/A | `isError: true` with `STRUCTURE_LOSS_NOT_CONFIRMED` — re-submit with `confirm_structure_loss: true` |
+| Empty body | N/A | `isError: true` with `EMPTY_BODY_REJECTED` — no opt-out, must delete and recreate |
+| Invented token | N/A | `isError: true` with `INVENTED_TOKEN` — caller markdown contains unknown token IDs |
+| Deletions not confirmed | N/A | `isError: true` with `DELETIONS_NOT_CONFIRMED` — re-submit with `confirm_deletions: true` |
+| Separator invalid | N/A | `isError: true` — separator exceeds 100 chars or contains XML tags |
+| Combined body too large | N/A | `isError: true` — combined body exceeds 2MB limit |
+| Version mismatch (revert) | N/A | `isError: true` — page version changed since caller's read (TOCTOU guard) |
 | Missing config | N/A | stderr message + exit(1) at startup |

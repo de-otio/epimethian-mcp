@@ -12,7 +12,9 @@ When a profile is configured as read-only (`readOnly: true` in profile settings 
 |------|:---:|:---:|:---:|
 | `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments`, `get_labels`, `get_comments`, `get_page_status`, `get_page_versions`, `get_page_version`, `diff_page_versions`, `get_version` | yes | — | — |
 | `create_page`, `add_attachment`, `add_drawio_diagram`, `add_label`, `create_comment` | — | no | no |
-| `update_page`, `update_page_section`, `resolve_comment` | — | no | no |
+| `update_page`, `update_page_section`, `resolve_comment`, `prepend_to_page`, `append_to_page` | — | no | no |
+| `revert_page` | — | no | no |
+| `lookup_user`, `resolve_page_link` | yes | — | — |
 | `delete_page`, `remove_label`, `delete_comment`, `set_page_status`, `remove_page_status` | — | yes | yes |
 
 ## Tool Summary
@@ -45,6 +47,11 @@ When a profile is configured as read-only (`readOnly: true` in profile settings 
 | `get_page_versions` | page_id, limit? | List version history for a page |
 | `get_page_version` | page_id, version | Get page content at a specific historical version |
 | `diff_page_versions` | page_id, from_version, to_version?, max_length?, format? | Compare two versions of a page |
+| `prepend_to_page` | page_id, version, content, separator?, version_message?, allow_raw_html?, confluence_base_url? | Insert content at the beginning of an existing page |
+| `append_to_page` | page_id, version, content, separator?, version_message?, allow_raw_html?, confluence_base_url? | Insert content at the end of an existing page |
+| `revert_page` | page_id, target_version, current_version, confirm_shrinkage?, confirm_structure_loss?, version_message? | Revert page to a previous version (lossless, uses raw storage) |
+| `lookup_user` | query | Search for Atlassian users by name or email |
+| `resolve_page_link` | title, space_key | Resolve a page title + space key to a stable page ID and URL |
 | `get_version` | *(none)* | Return the epimethian-mcp server version |
 
 ## Tool Details
@@ -56,7 +63,7 @@ Creates a new page in a Confluence space. Resolves the human-readable `space_key
 Reads a page by its numeric ID. By default includes the page body in Confluence storage format. Returns title, ID, space, version, URL, and optionally the content. For large pages, use `headings_only: true` to get the page outline first (a numbered heading hierarchy), then use `section` to read a specific section, or `max_length` to limit the response size. The `format: "markdown"` option returns a read-only markdown rendering (macros and rich elements are summarized as placeholders, not preserved). Page bodies are cached in memory to avoid redundant API calls during iterative editing sessions.
 
 ### update_page
-Updates an existing page using optimistic concurrency control. The caller must provide the `version` number from their most recent `get_page` call. The server sends `version + 1` to the Confluence API. If the page has been modified since the caller's read (version mismatch), Confluence returns a 409 and the tool returns a `ConfluenceConflictError` instructing the agent to re-read the page. Both `title` and `version` are required; `body` is optional (omit to update only the title). Bodies that appear to be markdown (rather than storage format) are rejected with an error.
+Updates an existing page using optimistic concurrency control. The caller must provide the `version` number from their most recent `get_page` call. The server sends `version + 1` to the Confluence API. If the page has been modified since the caller's read (version mismatch), Confluence returns a 409 and the tool returns a `ConfluenceConflictError` instructing the agent to re-read the page. Both `title` and `version` are required; `body` is optional (omit to update only the title). Accepts GFM markdown or Confluence storage format (auto-detected). Markdown is converted via the token-aware write path, preserving existing macros and rich elements. Content-safety guards reject >50% body shrinkage (`confirm_shrinkage`), >50% heading loss (`confirm_structure_loss`), and near-empty replacement bodies.
 
 ### update_page_section
 Updates a single section of a page by heading name. The rest of the page is untouched. Fetches the full page body, replaces the content under the specified heading (case-insensitive match), and calls `update_page` with the reconstructed body. Uses the same optimistic concurrency pattern as `update_page`. This reduces the blast radius of edits — untouched sections are never re-serialized.
@@ -128,10 +135,25 @@ Removes the content status badge from a page. Idempotent — succeeds silently i
 Lists version history metadata for a page (version number, author, date, version message). Results are ordered from newest to oldest. The `limit` parameter caps at 200.
 
 ### get_page_version
-Fetches the content of a page at a specific historical version. Returns the body as sanitized markdown. Historical version bodies are cached separately from current versions in the page cache (using composite keys).
+Fetches the content of a page at a specific historical version. Returns sanitized read-only markdown — macros are replaced with placeholders. This content is NOT suitable for round-trip updates via `update_page` (the conversion is lossy). To revert a page to a previous version, use `revert_page` instead. Historical version bodies are cached separately from current versions in the page cache (using composite keys).
 
 ### diff_page_versions
 Compares two versions of a page. The `summary` format (default) uses section-aware diffing — it splits both versions by heading and reports added, removed, and modified sections with per-section change details. The `unified` format returns a standard unified diff. Both formats support `max_length` truncation. Uses the `diff` npm package internally. Size-limited to 500 KB per version.
 
+### prepend_to_page
+Inserts content at the beginning of an existing page. The caller provides only the new content — the server fetches the existing body and handles concatenation. Content can be GFM markdown or Confluence storage format (auto-detected). An optional `separator` parameter controls the boundary between new and existing content (max 100 chars, no XML tags). Safer than `update_page` with `replace_body` for additive operations like adding banners or notices. Logs mutations and reports body-length changes.
+
+### append_to_page
+Inserts content at the end of an existing page. Same interface and behavior as `prepend_to_page` but appends instead of prepends. Useful for adding appendices, changelog entries, or footnotes.
+
+### revert_page
+Reverts a page to a previous version by fetching the exact storage-format body from the historical version and pushing it as a new version. This is a lossless revert — unlike reading `get_page_version` (which returns sanitized markdown) and passing it to `update_page`, this preserves all macros, formatting, and rich elements. Content-safety guards apply: shrinkage and structural integrity guards protect against reverting to an unexpectedly smaller version. Includes TOCTOU mitigation — verifies the page's actual version matches `current_version` before proceeding.
+
+### lookup_user
+Searches for Atlassian/Confluence users by name, display name, or email substring. Returns up to 10 matches with `accountId`, `displayName`, and `email`. Use this to resolve an `accountId` for the `:mention[Display]{accountId=...}` inline directive.
+
+### resolve_page_link
+Resolves a page title and space key to a stable `contentId` and URL. Useful for constructing `<ac:link>` page references without hardcoding page IDs.
+
 ### get_version
-Returns the epimethian-mcp server version (e.g., `epimethian-mcp v4.3.0`). Takes no parameters. The version is injected at build time from `package.json` via esbuild's `define` and embedded in the attribution footer, page version comments, and this tool's output.
+Returns the epimethian-mcp server version (e.g., `epimethian-mcp v5.1.0`). Takes no parameters. The version is injected at build time from `package.json` via esbuild's `define` and embedded in the attribution footer, page version comments, and this tool's output.
