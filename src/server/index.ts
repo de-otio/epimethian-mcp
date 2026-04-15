@@ -86,6 +86,15 @@ function escapeXml(s: string): string {
  * When tokens are present, appends a token reference table so agents can
  * identify which macro each [[epi:T####]] represents.
  */
+/**
+ * Marker injected into `format: markdown` output. Detected by the
+ * `update_page` handler to reject lossy markdown round-trips — callers
+ * who read a page in markdown format and attempt to write it back would
+ * silently destroy content. See doc/design/11-safety-guards.md.
+ */
+const READ_ONLY_MARKDOWN_MARKER =
+  "<!-- epimethian:read-only-markdown — do not pass this content to update_page -->";
+
 function formatMarkdownWithTokens(
   markdown: string,
   sidecar: Record<string, string>,
@@ -106,9 +115,12 @@ function formatMarkdownWithTokens(
       })
       .join("\n");
     body =
+      `${READ_ONLY_MARKDOWN_MARKER}\n\n` +
       `<!-- ${tokenCount} Confluence macro${tokenCount === 1 ? "" : "s"} preserved as tokens; ` +
       `remove a token to delete that macro on the next update_page -->\n\n` +
       `${markdown}\n\n---\nTokens:\n${table}`;
+  } else {
+    body = `${READ_ONLY_MARKDOWN_MARKER}\n\n${markdown}`;
   }
   return `${header}\n\n${body}`;
 }
@@ -276,6 +288,16 @@ function registerTools(server: McpServer, config: Config): void {
       confluenceBaseUrl?: string;
     } = {}
   ): Promise<{ page: { id: string; title: string }; newVersion: number; oldLen: number; newLen: number }> {
+    // Reject read-only markdown round-trips (same guard as update_page).
+    if (newContent.includes("epimethian:read-only-markdown")) {
+      throw new ConverterError(
+        "The content contains output produced by get_page with format: 'markdown', which is a " +
+          "read-only rendering not suitable for prepend/append operations. " +
+          "Compose new content from scratch instead.",
+        "READ_ONLY_MARKDOWN_ROUND_TRIP"
+      );
+    }
+
     const currentPage = await getPage(page_id, true);
     const currentStorage: string =
       currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
@@ -362,6 +384,15 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("create_page", config);
       if (blocked) return blocked;
       try {
+        // Reject read-only markdown round-trips (same guard as update_page).
+        if (body.includes("epimethian:read-only-markdown")) {
+          throw new ConverterError(
+            "The body contains content produced by get_page with format: 'markdown', which is a " +
+              "read-only rendering not suitable for creating pages (tables, macros, and rich " +
+              "elements may be lost). Compose new markdown from scratch instead.",
+            "READ_ONLY_MARKDOWN_ROUND_TRIP"
+          );
+        }
         let finalBody = body;
         if (looksLikeMarkdown(body)) {
           const cfg = await getConfig();
@@ -572,10 +603,27 @@ function registerTools(server: McpServer, config: Config): void {
         const currentPage = await getPage(page_id, true);
         const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
 
-        let finalStorage: string;
+        let finalStorage: string | undefined;
         let effectiveVersionMessage = version_message;
 
-        if (body && looksLikeMarkdown(body)) {
+        // Reject read-only markdown round-trips. The format:markdown output
+        // includes this marker to prevent callers from accidentally destroying
+        // page content by writing back a lossy rendering.
+        if (body && body.includes("epimethian:read-only-markdown")) {
+          throw new ConverterError(
+            "The body contains content produced by get_page with format: 'markdown', which is a " +
+              "read-only rendering not suitable for round-trip updates (tables, macros, and rich " +
+              "elements may be lost). To update this page, either: (1) read with format: 'storage' " +
+              "and edit the storage XML, (2) use update_page_section for targeted edits, or " +
+              "(3) compose new markdown from scratch (do not copy from format: 'markdown' output).",
+            "READ_ONLY_MARKDOWN_ROUND_TRIP"
+          );
+        }
+
+        if (body === undefined || body === null) {
+          // Title-only update: caller omitted body, so leave page content unchanged.
+          finalStorage = undefined;
+        } else if (looksLikeMarkdown(body)) {
           // Markdown path: token-aware write via the update orchestrator.
           const plan = planUpdate({
             currentStorage,
@@ -594,16 +642,19 @@ function registerTools(server: McpServer, config: Config): void {
               : plan.versionMessage ?? version_message;
         } else {
           // Storage format path: pass body through verbatim (backward compat).
-          finalStorage = body ?? "";
+          finalStorage = body;
         }
 
-        // Content-safety guards applied to BOTH paths (Finding 1 fix).
-        enforceContentSafetyGuards({
-          oldStorage: currentStorage,
-          newStorage: finalStorage,
-          confirmShrinkage: confirm_shrinkage,
-          confirmStructureLoss: confirm_structure_loss,
-        });
+        // Content-safety guards applied to BOTH paths, but skipped for
+        // title-only updates (no body change).
+        if (finalStorage !== undefined) {
+          enforceContentSafetyGuards({
+            oldStorage: currentStorage,
+            newStorage: finalStorage,
+            confirmShrinkage: confirm_shrinkage,
+            confirmStructureLoss: confirm_structure_loss,
+          });
+        }
 
         const { page, newVersion } = await updatePage(page_id, {
           title,
@@ -622,14 +673,16 @@ function registerTools(server: McpServer, config: Config): void {
           oldVersion: version,
           newVersion,
           oldBodyLen: currentStorage.length,
-          newBodyLen: finalStorage.length,
+          newBodyLen: finalStorage?.length ?? currentStorage.length,
           replaceBody: replace_body || undefined,
         });
 
         // Body-length reporting (1D)
+        const bodyReport = finalStorage !== undefined
+          ? `body: ${currentStorage.length}\u2192${finalStorage.length} chars`
+          : `title only, body unchanged`;
         return toolResult(
-          `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion}, ` +
-            `body: ${currentStorage.length}\u2192${finalStorage.length} chars)` + echo
+          `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion}, ${bodyReport})` + echo
         );
       } catch (err) {
         logMutation(errorRecord("update_page", page_id, err, {
@@ -701,6 +754,16 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("update_page_section", config);
       if (blocked) return blocked;
       try {
+        // Reject read-only markdown round-trips (same guard as update_page).
+        if (body.includes("epimethian:read-only-markdown")) {
+          throw new ConverterError(
+            "The body contains content produced by get_page with format: 'markdown', which is a " +
+              "read-only rendering not suitable for section updates. " +
+              "Use format: 'storage' to read the section, then edit the storage XML.",
+            "READ_ONLY_MARKDOWN_ROUND_TRIP"
+          );
+        }
+
         // Fetch the full page body
         const page = await getPage(page_id, true);
         const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
