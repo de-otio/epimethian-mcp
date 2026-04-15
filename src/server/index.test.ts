@@ -340,6 +340,46 @@ describe("add_drawio_diagram filename normalization", () => {
     expect(updateCall[1].version).toBe(1);
     expect(updateCall[1].title).toBe("T");
   });
+
+  it("returns error when uploadAttachment succeeds but updatePage fails", async () => {
+    // Production scenario: attachment is uploaded to Confluence, but the
+    // page update that embeds the macro fails (409 conflict, permission
+    // error, etc.). The attachment is now orphaned.
+    const { uploadAttachment, getPage, updatePage } = await import(
+      "./confluence-client.js"
+    );
+    (uploadAttachment as any).mockResolvedValueOnce({
+      title: "diagram.drawio",
+      id: "att-orphan",
+    });
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      version: { number: 5 },
+      body: { storage: { value: "<p>important content</p>" } },
+    });
+    // updatePage rejects — simulates a 409 conflict or server error
+    (updatePage as any).mockRejectedValueOnce(new Error("version conflict"));
+
+    mockMkdtemp.mockResolvedValueOnce("/tmp/drawio-fail");
+    mockWriteFile.mockResolvedValueOnce(undefined);
+    mockReadFile.mockResolvedValueOnce(Buffer.from("<mxfile/>"));
+    mockRm.mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("add_drawio_diagram")!.handler;
+    const result = await handler({
+      page_id: "1",
+      diagram_xml: "<mxfile/>",
+      diagram_name: "diagram",
+      append: true,
+    });
+
+    // Must surface the error — not silently succeed
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error:");
+    // uploadAttachment was called (attachment is now orphaned)
+    expect((uploadAttachment as any).mock.calls.length).toBeGreaterThan(0);
+  });
 });
 
 describe("search_pages tool", () => {
@@ -2018,6 +2058,44 @@ describe("create_page markdown conversion (Stream 5)", () => {
     expect(result.isError).toBeUndefined();
     const submittedBody: string = (createPage as any).mock.lastCall[2];
     expect(submittedBody).toContain("raw html");
+  });
+});
+
+describe("update_page title-only (body omitted)", () => {
+  it("does not send body to API when body parameter is omitted", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "99",
+      title: "Old Title",
+      version: { number: 10 },
+      body: {
+        storage: {
+          value:
+            '<h1>Important</h1><ac:structured-macro ac:name="info"><ac:rich-text-body><p>critical data</p></ac:rich-text-body></ac:structured-macro><table><tr><td>A</td></tr></table>',
+        },
+      },
+    });
+    (updatePage as any).mockClear();
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "99", title: "New Title" },
+      newVersion: 11,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "99",
+      title: "New Title",
+      version: 10,
+      // body intentionally omitted — title-only update
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("title only, body unchanged");
+
+    // The critical assertion: updatePage must NOT receive a body field.
+    // If body is "" or anything truthy, the API overwrites the page.
+    const updateCall = (updatePage as any).mock.lastCall;
+    expect(updateCall[1].body).toBeUndefined();
   });
 });
 

@@ -440,6 +440,27 @@ describe("extractSection", () => {
     expect(result).toContain("<p>Intro text</p>");
     expect(result).not.toContain("Details");
   });
+
+  it("extracts section that contains a macro spanning its full body", () => {
+    // Production: sections often consist entirely of a macro (e.g. a code
+    // block or expand macro). The heading regex-based extraction must not
+    // split the macro.
+    const macroSection =
+      '<h1>Overview</h1><p>text</p>' +
+      '<h1>Code</h1>' +
+      '<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">js</ac:parameter>' +
+      '<ac:plain-text-body><![CDATA[function foo() { return 1; }]]></ac:plain-text-body>' +
+      '</ac:structured-macro>' +
+      '<h1>End</h1><p>footer</p>';
+    const result = extractSection(macroSection, "Code");
+    expect(result).toContain("<h1>Code</h1>");
+    expect(result).toContain("ac:structured-macro");
+    expect(result).toContain("CDATA");
+    expect(result).toContain("function foo");
+    // Must not leak into the next section
+    expect(result).not.toContain("footer");
+    expect(result).not.toContain("<h1>End</h1>");
+  });
 });
 
 describe("replaceSection", () => {
@@ -490,6 +511,27 @@ describe("replaceSection", () => {
     // Preserves the layout wrapper
     expect(result).toContain("ac:layout");
   });
+
+  it("replacement content containing macros survives toString() serialisation", () => {
+    // Production: callers pass storage format with macros as replacement content.
+    // node-html-parser's toString() could mangle ac: namespace attributes.
+    const doc = "<h1>Setup</h1><p>old setup</p><h1>Notes</h1><p>keep</p>";
+    const macroReplacement =
+      '<ac:structured-macro ac:name="info" ac:schema-version="1" ac:macro-id="abc-123">' +
+      '<ac:parameter ac:name="title">Warning</ac:parameter>' +
+      '<ac:rich-text-body><p>Do not delete</p></ac:rich-text-body>' +
+      '</ac:structured-macro>';
+    const result = replaceSection(doc, "Setup", macroReplacement);
+    expect(result).not.toBeNull();
+    // Macro must survive intact — attributes, namespace prefixes, nesting
+    expect(result).toContain('ac:name="info"');
+    expect(result).toContain('ac:schema-version="1"');
+    expect(result).toContain('ac:macro-id="abc-123"');
+    expect(result).toContain('<ac:parameter ac:name="title">Warning</ac:parameter>');
+    expect(result).toContain("<p>Do not delete</p>");
+    // Other section preserved
+    expect(result).toContain("<h1>Notes</h1><p>keep</p>");
+  });
 });
 
 describe("truncateStorageFormat", () => {
@@ -531,6 +573,33 @@ describe("truncateStorageFormat", () => {
     const html = "<p>" + "x".repeat(100) + "</p>";
     const result = truncateStorageFormat(html, 10);
     // No complete closing tag before maxLength, falls back to maxLength
+    expect(result).toContain("[truncated at");
+  });
+
+  it("truncation inside a macro produces output that does not split the macro tag", () => {
+    // Production data: pages are full of macros. If the cut lands inside
+    // <ac:structured-macro>, the output must not contain a half-open tag.
+    const html =
+      "<p>intro</p>" +
+      '<ac:structured-macro ac:name="info"><ac:rich-text-body><p>important data</p></ac:rich-text-body></ac:structured-macro>' +
+      "<p>outro</p>";
+    // Cut at 20 chars — well inside the macro opening tag
+    const result = truncateStorageFormat(html, 20);
+    // Should cut at the last complete element boundary BEFORE the macro,
+    // i.e. at </p> after "intro" (12 chars).
+    expect(result).toContain("<p>intro</p>");
+    expect(result).toContain("[truncated at");
+    // Must NOT contain a partial macro tag
+    expect(result).not.toContain("ac:structured-macro");
+  });
+
+  it("truncation preserves complete macros that fit before the cut point", () => {
+    const shortMacro = '<ac:structured-macro ac:name="toc"></ac:structured-macro>';
+    const html = shortMacro + "<p>" + "x".repeat(500) + "</p>";
+    const result = truncateStorageFormat(html, shortMacro.length + 10);
+    // The macro's closing tag is at position 57. If maxLength > 57,
+    // the macro should survive intact.
+    expect(result).toContain("ac:structured-macro");
     expect(result).toContain("[truncated at");
   });
 });

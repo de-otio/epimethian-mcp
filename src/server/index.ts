@@ -1338,9 +1338,7 @@ function registerTools(server: McpServer, config: Config): void {
           `Diagram "${filename}" added to page ${page.title} (ID: ${page.id}, version: ${newVersion})` + echo
         );
       } catch (err) {
-        logMutation(errorRecord("update_page", page_id, err, {
-          oldVersion: current.version?.number ?? 0,
-        }));
+        logMutation(errorRecord("update_page", page_id, err));
         return toolError(err);
       }
     }
