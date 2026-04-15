@@ -941,6 +941,26 @@ describe("legacy attribution footer stripping", () => {
     expect(putBody.body.value).not.toContain("Epimethian");
     expect(putBody.body.value).toContain("<h1>Title</h1>");
   });
+
+  it("does not wipe body when attribution follows many <p> tags", async () => {
+    global.fetch = mockFetchResponse({ id: "33", title: "T" });
+    // Regression: [\s\S]*? in the old regex crossed </p> boundaries,
+    // matching from the first <p> in the document to the attribution <a>,
+    // wiping the entire body.
+    const realContent =
+      "<p><strong>Audience:</strong> SRE</p>" +
+      "<h2>Cost model</h2>" +
+      "<p>The system targets $30/month.</p>" +
+      "<table><tr><td>Survey</td><td>$5</td></tr></table>" +
+      '<p><em>This page was created with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a> v5.1.0.</em></p>';
+    await updatePage("33", { title: "T", version: 1, body: realContent });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.body.value).not.toContain("Epimethian");
+    expect(putBody.body.value).toContain("<strong>Audience:</strong> SRE");
+    expect(putBody.body.value).toContain("<h2>Cost model</h2>");
+    expect(putBody.body.value).toContain("$30/month");
+    expect(putBody.body.value).toContain("<table>");
+  });
 });
 
 describe("version messages with client label", () => {

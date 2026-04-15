@@ -886,7 +886,10 @@ function stripAttributionFooter(body: string): string {
       // Also strip bare (unmarked) attribution paragraphs — these appear
       // when an agent copies page content from get_page and passes it
       // back to update_page without removing the footer.
-      /<p[^>]*>[\s\S]*?<a\s[^>]*href="https:\/\/github\.com\/de-otio\/epimethian-mcp"[^>]*>(?:<em>)?Epimethian(?:<\/em>)?<\/a>[\s\S]*?<\/p>/gi,
+      // Use (?:(?!<\/p>)[\s\S])*? instead of [\s\S]*? to prevent crossing
+      // </p> boundaries — without this, the match spans from the first <p>
+      // in the document to the attribution link, wiping the entire body.
+      /<p[^>]*>(?:(?!<\/p>)[\s\S])*?<a\s[^>]*href="https:\/\/github\.com\/de-otio\/epimethian-mcp"[^>]*>(?:<em>)?Epimethian(?:<\/em>)?<\/a>(?:(?!<\/p>)[\s\S])*?<\/p>/gi,
       ""
     )
     .trimEnd();
