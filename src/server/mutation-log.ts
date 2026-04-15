@@ -26,6 +26,7 @@ import {
   closeSync,
 } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 export interface MutationRecord {
   timestamp: string;
@@ -41,6 +42,12 @@ export interface MutationRecord {
   newVersion?: number;
   oldBodyLen?: number;
   newBodyLen?: number;
+  /** SHA-256 hash of the old body (for integrity verification without storing content). */
+  oldBodyHash?: string;
+  /** SHA-256 hash of the new body (for integrity verification without storing content). */
+  newBodyHash?: string;
+  /** MCP client label (e.g. "Claude Code", "Cursor") — identifies which agent made the change. */
+  clientLabel?: string;
   replaceBody?: boolean;
   confirmShrinkage?: boolean;
   confirmStructureLoss?: boolean;
@@ -49,6 +56,15 @@ export interface MutationRecord {
 
 const MAX_LOG_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const MAX_ERROR_LEN = 200;
+
+/**
+ * Compute a SHA-256 hash of a body string. Returns the first 16 hex chars
+ * (64 bits) — enough for integrity verification without bloating logs.
+ * Safe to log: no reverse mapping to content (Finding 5 compliant).
+ */
+export function bodyHash(body: string): string {
+  return createHash("sha256").update(body).digest("hex").slice(0, 16);
+}
 
 let logPath: string | null = null;
 let logFd: number | null = null;

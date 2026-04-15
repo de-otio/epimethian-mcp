@@ -23,6 +23,12 @@ import { planUpdate } from "./update-orchestrator.js";
 import { tokeniseStorage } from "./tokeniser.js";
 import { restoreFromTokens } from "./restore.js";
 import { ConverterError } from "./types.js";
+import {
+  enforceContentSafetyGuards,
+  countMacros,
+  countTables,
+  extractTextContent,
+} from "./content-safety-guards.js";
 
 // ---------------------------------------------------------------------------
 // 1. Drawio coexistence regression
@@ -550,5 +556,175 @@ describe("security: input size cap end-to-end", () => {
     expect(err.message.length).toBeGreaterThan(0);
     // Should mention the size cap somehow.
     expect(err.message.toLowerCase()).toMatch(/1 mb|cap|large|size/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Data Loss Prevention Audit — regression tests (v5.4.0)
+// ---------------------------------------------------------------------------
+
+describe("data loss prevention audit (v5.4.0)", () => {
+  // ---- Incident: toStorageFormat namespace tag wrapping (e1419b5) ----
+
+  it("toStorageFormat: Confluence namespace tags are NOT wrapped in <p>", async () => {
+    const { toStorageFormat } = await import("../confluence-client.js");
+    const macro = '<ac:structured-macro ac:name="toc"></ac:structured-macro>';
+    expect(toStorageFormat(macro)).toBe(macro); // NOT <p>..macro..</p>
+  });
+
+  it("toStorageFormat: body starting with closing tag is NOT double-wrapped", async () => {
+    const { toStorageFormat } = await import("../confluence-client.js");
+    const body = "</div><p>text</p>";
+    expect(toStorageFormat(body)).toBe(body); // NOT <p></div>...</p>
+  });
+
+  it("toStorageFormat: body with HTML entities is NOT wrapped", async () => {
+    const { toStorageFormat } = await import("../confluence-client.js");
+    const body = "&nbsp;&mdash;&lt;hello&gt;";
+    expect(toStorageFormat(body)).toBe(body); // NOT <p>&nbsp;...</p>
+  });
+
+  // ---- Incident: read-only markdown round-trip (c0e5e39) ----
+
+  it("read-only markdown marker is present in storageToMarkdown output", () => {
+    const storage = "<p>Hello</p>";
+    const md = storageToMarkdown(storage);
+    // storageToMarkdown itself doesn't add the marker; the handler does.
+    // But tokens should NOT contain the marker text.
+    expect(md.markdown).not.toContain("epimethian:read-only-markdown");
+  });
+
+  // ---- Guard: small page deletion now caught ----
+
+  it("macro-loss guard catches deletion of all macros from a small page", () => {
+    const oldStorage =
+      '<ac:structured-macro ac:name="info"><ac:rich-text-body><p>note</p></ac:rich-text-body></ac:structured-macro>';
+    const newStorage = "<p>just text</p>";
+    expect(() =>
+      enforceContentSafetyGuards({ oldStorage, newStorage })
+    ).toThrow(/macro/i);
+  });
+
+  it("table-loss guard catches deletion of all tables", () => {
+    const oldStorage =
+      "<h1>Title</h1><table><tr><td>A</td><td>B</td></tr></table><p>text</p>" +
+      "<table><tr><td>C</td></tr></table>";
+    const newStorage = "<h1>Title</h1><p>text</p>";
+    expect(() =>
+      enforceContentSafetyGuards({ oldStorage, newStorage })
+    ).toThrow(/table/i);
+  });
+
+  it("macro-loss guard is bypassed by confirmDeletions", () => {
+    const oldStorage =
+      '<ac:structured-macro ac:name="info"><ac:rich-text-body><p>note</p></ac:rich-text-body></ac:structured-macro>';
+    const newStorage = "<p>just text</p>";
+    expect(() =>
+      enforceContentSafetyGuards({ oldStorage, newStorage, confirmDeletions: true })
+    ).not.toThrow();
+  });
+
+  it("table-loss guard is bypassed by confirmStructureLoss", () => {
+    const oldStorage =
+      "<h1>Title</h1><table><tr><td>A</td></tr></table>";
+    const newStorage = "<h1>Title</h1><p>text</p>";
+    expect(() =>
+      enforceContentSafetyGuards({ oldStorage, newStorage, confirmStructureLoss: true })
+    ).not.toThrow();
+  });
+
+  // ---- Guard: entity-heavy pages ----
+
+  it("extractTextContent does not inflate &nbsp; entities", () => {
+    // 100x &nbsp; should NOT produce 500+ chars of text
+    const entityPage = "&nbsp;".repeat(100);
+    const text = extractTextContent(entityPage);
+    expect(text.length).toBeLessThan(200);
+  });
+
+  // ---- Guard: macro counting ----
+
+  it("countMacros counts structured macros outside code blocks", () => {
+    const storage =
+      '<ac:structured-macro ac:name="info"><ac:rich-text-body><p>text</p></ac:rich-text-body></ac:structured-macro>' +
+      '<ac:structured-macro ac:name="code"><ac:plain-text-body><ac:structured-macro ac:name="nested"></ac:structured-macro></ac:plain-text-body></ac:structured-macro>';
+    // Only the top-level info and code macros should count; the nested one inside plain-text-body should not.
+    expect(countMacros(storage)).toBe(2);
+  });
+
+  it("countTables counts tables outside code blocks", () => {
+    const storage =
+      "<table><tr><td>real</td></tr></table>" +
+      "<ac:plain-text-body><table><tr><td>fake</td></tr></table></ac:plain-text-body>";
+    expect(countTables(storage)).toBe(1);
+  });
+
+  // ---- looksLikeMarkdown hardening ----
+
+  it("looksLikeMarkdown: code block with <ac:*> is classified as markdown", async () => {
+    const { looksLikeMarkdown } = await import("../confluence-client.js");
+    const md = '# How to use macros\n\n```xml\n<ac:structured-macro ac:name="info"></ac:structured-macro>\n```\n';
+    expect(looksLikeMarkdown(md)).toBe(true);
+  });
+
+  it("looksLikeMarkdown: plain paragraph text is classified as markdown", async () => {
+    const { looksLikeMarkdown } = await import("../confluence-client.js");
+    expect(looksLikeMarkdown("Hello world, this is a paragraph.")).toBe(true);
+  });
+
+  it("looksLikeMarkdown: storage format starting with <p> is classified as storage", async () => {
+    const { looksLikeMarkdown } = await import("../confluence-client.js");
+    expect(looksLikeMarkdown("<p>Hello world</p>")).toBe(false);
+  });
+
+  it("looksLikeMarkdown: bare <ac:*> outside code blocks is classified as storage", async () => {
+    const { looksLikeMarkdown } = await import("../confluence-client.js");
+    const storage = '<ac:structured-macro ac:name="toc"></ac:structured-macro>';
+    expect(looksLikeMarkdown(storage)).toBe(false);
+  });
+
+  // ---- replaceBody version message ----
+
+  it("replaceBody=true produces a version message listing dropped elements", () => {
+    const storage =
+      '<ac:structured-macro ac:name="info"><ac:rich-text-body><p>note</p></ac:rich-text-body></ac:structured-macro><p>Hello</p>';
+    const plan = planUpdate({
+      currentStorage: storage,
+      callerMarkdown: "# New content",
+      replaceBody: true,
+    });
+    expect(plan.versionMessage).toContain("Wholesale rewrite");
+    expect(plan.versionMessage).toContain("dropped");
+    expect(plan.versionMessage).toContain("1"); // 1 preserved element
+  });
+
+  it("replaceBody=true on page with no macros produces no version message", () => {
+    const storage = "<p>Simple text</p>";
+    const plan = planUpdate({
+      currentStorage: storage,
+      callerMarkdown: "# New content",
+      replaceBody: true,
+    });
+    expect(plan.versionMessage).toBeUndefined();
+  });
+
+  // ---- shrinkage guard threshold lowered ----
+
+  it("shrinkage guard fires on 300-char pages (previously unprotected at 500 threshold)", () => {
+    const oldStorage = "<p>" + "x".repeat(300) + "</p>";
+    const newStorage = "<p>tiny</p>";
+    expect(() =>
+      enforceContentSafetyGuards({ oldStorage, newStorage })
+    ).toThrow(/shrink/i);
+  });
+
+  // ---- empty-body guard threshold ----
+
+  it("empty-body guard fires on 150-char pages (previously unprotected at 500 threshold)", () => {
+    const oldStorage = "<p>" + "x".repeat(150) + "</p>";
+    const newStorage = "<div></div>"; // no text content
+    expect(() =>
+      enforceContentSafetyGuards({ oldStorage, newStorage })
+    ).toThrow(/text content/i);
   });
 });

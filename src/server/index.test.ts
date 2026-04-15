@@ -2287,10 +2287,10 @@ describe("looksLikeMarkdown heuristic (Stream 5)", () => {
     expect(looksLikeMarkdown(md)).toBe(true);
   });
 
-  it("classifies plain text without signals as storage (conservative fallback)", async () => {
+  it("classifies plain text without signals as markdown (safe: both paths produce same output)", async () => {
     const { looksLikeMarkdown } = await import("./confluence-client.js");
     const plain = "Just some plain text with no special markers";
-    expect(looksLikeMarkdown(plain)).toBe(false);
+    expect(looksLikeMarkdown(plain)).toBe(true);
   });
 
   it("short-circuits to false immediately when <ac: present even with markdown signals", async () => {

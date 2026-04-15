@@ -62,7 +62,7 @@ import { planUpdate } from "./converter/update-orchestrator.js";
 import { ConverterError } from "./converter/types.js";
 import { enforceContentSafetyGuards } from "./converter/content-safety-guards.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
-import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
+import { logMutation, errorRecord, initMutationLog, bodyHash } from "./mutation-log.js";
 import {
   checkForUpdates,
   getPendingUpdate,
@@ -344,11 +344,20 @@ function registerTools(server: McpServer, config: Config): void {
         ? contentStorage + sep + currentStorage
         : currentStorage + sep + contentStorage;
 
+    // Content-safety guards — prevents silent body loss if the
+    // concatenation somehow produces a much smaller or empty result
+    // (e.g. separator injection, corrupt existing body).
+    enforceContentSafetyGuards({
+      oldStorage: currentStorage,
+      newStorage: newBody,
+    });
+
     const { page, newVersion } = await updatePage(page_id, {
       title: currentPage.title,
       body: newBody,
       version,
       versionMessage: opts.versionMessage,
+      previousBody: currentStorage,
       clientLabel: getClientLabel(server),
     });
 
@@ -417,6 +426,8 @@ function registerTools(server: McpServer, config: Config): void {
           pageId: page.id,
           newVersion: page.version?.number ?? 1,
           newBodyLen: finalBody.length,
+          newBodyHash: bodyHash(finalBody),
+          clientLabel: getClientLabel(server),
         });
         return toolResult((await formatPage(page, false)) + echo);
       } catch (err) {
@@ -661,6 +672,10 @@ function registerTools(server: McpServer, config: Config): void {
             newStorage: finalStorage,
             confirmShrinkage: confirm_shrinkage,
             confirmStructureLoss: confirm_structure_loss,
+            // confirm_deletions and replace_body both indicate the caller
+            // has acknowledged macro/element removal — bypass the macro
+            // and table loss guards, but NOT the shrinkage/structure guards.
+            confirmDeletions: confirm_deletions || replace_body,
           });
         }
 
@@ -682,6 +697,9 @@ function registerTools(server: McpServer, config: Config): void {
           newVersion,
           oldBodyLen: currentStorage.length,
           newBodyLen: finalStorage?.length ?? currentStorage.length,
+          oldBodyHash: bodyHash(currentStorage),
+          newBodyHash: finalStorage ? bodyHash(finalStorage) : undefined,
+          clientLabel: getClientLabel(server),
           replaceBody: replace_body || undefined,
         });
 
@@ -783,6 +801,13 @@ function registerTools(server: McpServer, config: Config): void {
           );
         }
 
+        // Content-safety guards — section replacement could still cause
+        // significant shrinkage if the wrong section is matched.
+        enforceContentSafetyGuards({
+          oldStorage: fullBody,
+          newStorage: newFullBody,
+        });
+
         const { page: updated, newVersion } = await updatePage(page_id, {
           title: page.title,
           body: newFullBody,
@@ -799,6 +824,9 @@ function registerTools(server: McpServer, config: Config): void {
           newVersion,
           oldBodyLen: fullBody.length,
           newBodyLen: newFullBody.length,
+          oldBodyHash: bodyHash(fullBody),
+          newBodyHash: bodyHash(newFullBody),
+          clientLabel: getClientLabel(server),
         });
         return toolResult(
           `Updated section "${section}" in: ${updated.title} (ID: ${updated.id}, version: ${newVersion})` + echo
@@ -1276,11 +1304,33 @@ function registerTools(server: McpServer, config: Config): void {
 
         const newBody = append ? `${existingBody}\n${macro}` : macro;
 
+        // Content-safety guards — prevents silent body loss when append=false
+        // replaces a rich page with just the macro, or when existingBody is
+        // corrupt and append produces broken XML.
+        enforceContentSafetyGuards({
+          oldStorage: existingBody,
+          newStorage: newBody,
+        });
+
         const { page, newVersion } = await updatePage(page_id, {
           title: current.title,
           body: newBody,
           version: current.version?.number ?? 0,
           versionMessage: `Added diagram: ${filename}`,
+          previousBody: existingBody,
+          clientLabel: getClientLabel(server),
+        });
+
+        logMutation({
+          timestamp: new Date().toISOString(),
+          operation: "update_page",
+          pageId: page_id,
+          oldVersion: current.version?.number ?? 0,
+          newVersion,
+          oldBodyLen: existingBody.length,
+          newBodyLen: newBody.length,
+          oldBodyHash: bodyHash(existingBody),
+          newBodyHash: bodyHash(newBody),
           clientLabel: getClientLabel(server),
         });
 
@@ -1288,6 +1338,9 @@ function registerTools(server: McpServer, config: Config): void {
           `Diagram "${filename}" added to page ${page.title} (ID: ${page.id}, version: ${newVersion})` + echo
         );
       } catch (err) {
+        logMutation(errorRecord("update_page", page_id, err, {
+          oldVersion: current.version?.number ?? 0,
+        }));
         return toolError(err);
       }
     }
@@ -1978,6 +2031,7 @@ function registerTools(server: McpServer, config: Config): void {
           version: current_version,
           versionMessage:
             version_message ?? `Revert to version ${target_version}`,
+          previousBody: currentStorage,
           clientLabel: getClientLabel(server),
         });
 
@@ -1990,6 +2044,9 @@ function registerTools(server: McpServer, config: Config): void {
           newVersion,
           oldBodyLen: currentStorage.length,
           newBodyLen: historical.rawBody.length,
+          oldBodyHash: bodyHash(currentStorage),
+          newBodyHash: bodyHash(historical.rawBody),
+          clientLabel: getClientLabel(server),
         });
 
         return toolResult(

@@ -201,7 +201,14 @@ export function planUpdate(params: PlanUpdateInput): UpdatePlan {
   // 1. Wholesale rewrite path: no tokenisation, no preservation.
   if (replaceBody) {
     const newStorage = markdownToStorage(callerMarkdown, converterOptions);
-    return { newStorage, deletedTokens: [] };
+    // Tokenise just to discover what will be lost — this information
+    // feeds the version message so audits can see what was dropped.
+    const { sidecar } = tokeniseStorage(currentStorage);
+    const droppedCount = Object.keys(sidecar).length;
+    const versionMessage = droppedCount > 0
+      ? `Wholesale rewrite (replace_body): dropped ${droppedCount} preserved element(s)`
+      : undefined;
+    return { newStorage, deletedTokens: [], versionMessage };
   }
 
   // 2. Tokenise the current storage to discover what must be preserved.

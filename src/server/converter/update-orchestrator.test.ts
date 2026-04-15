@@ -257,7 +257,9 @@ describe("planUpdate — replaceBody opt-out", () => {
     // deletedTokens is empty even when preserved elements were dropped —
     // the caller explicitly opted out of preservation.
     expect(plan.deletedTokens).toEqual([]);
-    expect(plan.versionMessage).toBeUndefined();
+    // versionMessage reports the wholesale rewrite so audits can see what was dropped.
+    expect(plan.versionMessage).toContain("Wholesale rewrite");
+    expect(plan.versionMessage).toContain("dropped");
   });
 
   it("replaceBody=true does not tokenise currentStorage (no invention check)", () => {
