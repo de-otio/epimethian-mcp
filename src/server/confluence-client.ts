@@ -490,6 +490,7 @@ export async function createPage(
 ): Promise<PageData> {
   const cfg = await getConfig();
   const pageBody = stripAttributionFooter(toStorageFormat(body));
+
   const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
   const versionMsg = cfg.attribution && clientLabel
     ? `Created by ${clientLabel} (via ${epimethianTag})`
@@ -547,14 +548,19 @@ export async function updatePage(
   else
     versionMessage = `Updated by ${epimethianTag}`;
 
+  // Compute the cleaned body ONCE — avoids double-execution of
+  // stripAttributionFooter which could diverge if regex state drifts.
+  const pageBody = opts.body
+    ? stripAttributionFooter(toStorageFormat(opts.body))
+    : undefined;
+
   const payload: Record<string, unknown> = {
     id: pageId,
     status: "current",
     title: opts.title,
     version: { number: newVersion, message: versionMessage },
   };
-  if (opts.body) {
-    const pageBody = stripAttributionFooter(toStorageFormat(opts.body));
+  if (pageBody !== undefined) {
     payload.body = {
       representation: "storage",
       value: pageBody,
@@ -577,9 +583,8 @@ export async function updatePage(
   }
   const page = PageSchema.parse(raw);
 
-  // Cache the body we just sent
-  if (opts.body) {
-    const pageBody = stripAttributionFooter(toStorageFormat(opts.body));
+  // Cache the body we just sent (reuse pre-computed pageBody)
+  if (pageBody !== undefined) {
     pageCache.set(pageId, newVersion, pageBody);
   }
 
@@ -1154,10 +1159,12 @@ export function sanitizeCommentBody(body: string): string {
   return stripped;
 }
 
-const HTML_TAG_RE = /<[a-z][a-z0-9]*(?::[a-z][a-z0-9-]*)?[\s>\/]/i;
+const HTML_TAG_RE = /<\/?[a-z][a-z0-9]*(?::[a-z][a-z0-9-]*)?[\s>\/]/i;
+const HTML_ENTITY_RE = /&(?:[a-zA-Z]+|#x?[0-9a-fA-F]+);/;
 
 export function toStorageFormat(body: string): string {
-  return HTML_TAG_RE.test(body) ? body : `<p>${body}</p>`;
+  if (HTML_TAG_RE.test(body) || HTML_ENTITY_RE.test(body)) return body;
+  return `<p>${body}</p>`;
 }
 
 /**
@@ -1445,8 +1452,14 @@ export function toMarkdownView(storageHtml: string): string {
  *     as storage (conservative, matches prior behaviour).
  */
 export function looksLikeMarkdown(body: string): boolean {
-  // 1. Strong storage signals: Confluence-specific XML namespaces.
-  if (/<ac:/i.test(body) || /<ri:/i.test(body)) {
+  // Strip fenced code blocks before checking for storage signals.
+  // Markdown documenting Confluence may contain <ac:*> inside code
+  // fences — those should NOT trigger the storage-format path.
+  const withoutCodeBlocks = body.replace(/^(`{3,})[^\n]*\n[\s\S]*?^\1\s*$/gm, "");
+
+  // 1. Strong storage signals: Confluence-specific XML namespaces
+  //    (checked OUTSIDE code blocks only).
+  if (/<ac:/i.test(withoutCodeBlocks) || /<ri:/i.test(withoutCodeBlocks)) {
     return false;
   }
 
@@ -1465,7 +1478,15 @@ export function looksLikeMarkdown(body: string): boolean {
     /\*\*[^*]+\*\*/,                   // inline bold **text**
   ];
 
-  return STRONG_MARKDOWN_SIGNALS.some((re) => re.test(body));
+  if (STRONG_MARKDOWN_SIGNALS.some((re) => re.test(body))) {
+    return true;
+  }
+
+  // 3. No strong signals either way. If body starts with an HTML/XML tag,
+  //    it's more likely storage format. Otherwise, treat as markdown —
+  //    plain paragraph text is valid markdown and should be converted.
+  const trimmed = body.trimStart();
+  return !/^<[a-zA-Z]/i.test(trimmed);
 }
 
 export type FormatPageOptions = {

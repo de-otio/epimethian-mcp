@@ -611,8 +611,10 @@ describe("looksLikeMarkdown", () => {
     expect(looksLikeMarkdown("<p>Hello <strong>world</strong></p>")).toBe(false);
   });
 
-  it("returns false for plain text with no markdown patterns", () => {
-    expect(looksLikeMarkdown("Just plain text")).toBe(false);
+  it("returns true for plain text with no markdown patterns (safe: both paths produce same output)", () => {
+    // Plain text without tags is treated as markdown — this is safe because
+    // both the markdown and storage paths produce <p>text</p> for plain text.
+    expect(looksLikeMarkdown("Just plain text")).toBe(true);
   });
 
   it("returns false for content with both markdown and HTML", () => {
@@ -960,6 +962,23 @@ describe("legacy attribution footer stripping", () => {
     expect(putBody.body.value).toContain("<h2>Cost model</h2>");
     expect(putBody.body.value).toContain("$30/month");
     expect(putBody.body.value).toContain("<table>");
+  });
+});
+
+// Post-transform body guard removed — handler-level content-safety guards
+// (enforceContentSafetyGuards) now cover shrinkage, macro loss, table loss,
+// and structure loss comprehensively. The client-level guard was redundant
+// and caused false positives on legitimate attribution stripping.
+
+describe("attribution stripping does not lose real content", () => {
+  it("allows normal attribution stripping", async () => {
+    global.fetch = mockFetchResponse({ id: "35", title: "T" });
+    const normal =
+      "<h1>Title</h1><p>Real content.</p>" +
+      '<p><em>This page was updated with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a>.</em></p>';
+    await updatePage("35", { title: "T", version: 1, body: normal });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.body.value).toContain("<h1>Title</h1>");
   });
 });
 
