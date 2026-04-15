@@ -62,6 +62,7 @@ import {
   type CommentData,
   getPageVersions,
   getPageVersionBody,
+  setClientLabel,
 } from "./confluence-client.js";
 import { pageCache } from "./page-cache.js";
 
@@ -773,7 +774,7 @@ describe("createPage", () => {
     expect(body.title).toBe("New Page");
     expect(body.spaceId).toBe("spaceA");
     expect(body.body.value).toContain("<p>body text</p>");
-    expect(body.body.value).toContain("epimethian-attribution");
+    expect(body.body.value).not.toContain("epimethian-attribution");
     expect(body.parentId).toBeUndefined();
   });
 
@@ -803,7 +804,7 @@ describe("updatePage", () => {
     await updatePage("30", { title: "T", version: 1, body: "new body" });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).toContain("<p>new body</p>");
-    expect(putBody.body.value).toContain("epimethian-attribution");
+    expect(putBody.body.value).not.toContain("epimethian-attribution");
   });
 
   it("includes custom versionMessage when provided", async () => {
@@ -861,8 +862,8 @@ describe("updatePage — pre-write snapshot (1F)", () => {
   });
 });
 
-describe("attribution footer deduplication", () => {
-  it("strips exact attribution markers from body before adding new one", async () => {
+describe("legacy attribution footer stripping", () => {
+  it("strips exact attribution markers from body", async () => {
     global.fetch = mockFetchResponse({ id: "30", title: "T" });
     const bodyWithFooter =
       "<p>content</p>\n" +
@@ -871,8 +872,8 @@ describe("attribution footer deduplication", () => {
       "<!-- epimethian-attribution-end -->";
     await updatePage("30", { title: "T", version: 1, body: bodyWithFooter });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
-    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
-    expect(occurrences).toHaveLength(1);
+    expect(putBody.body.value).not.toContain("epimethian-attribution");
+    expect(putBody.body.value).toContain("<p>content</p>");
   });
 
   it("strips attribution markers normalized by Confluence (no spaces)", async () => {
@@ -884,8 +885,8 @@ describe("attribution footer deduplication", () => {
       "<!--epimethian-attribution-end-->";
     await updatePage("30", { title: "T", version: 1, body: bodyWithNormalizedFooter });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
-    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
-    expect(occurrences).toHaveLength(1);
+    expect(putBody.body.value).not.toContain("epimethian-attribution");
+    expect(putBody.body.value).toContain("<p>content</p>");
   });
 
   it("strips attribution markers with extra whitespace", async () => {
@@ -897,40 +898,111 @@ describe("attribution footer deduplication", () => {
       "<!--  epimethian-attribution-end  -->";
     await updatePage("30", { title: "T", version: 1, body: bodyWithExtraSpaces });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
-    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
-    expect(occurrences).toHaveLength(1);
+    expect(putBody.body.value).not.toContain("epimethian-attribution");
+    expect(putBody.body.value).toContain("<p>content</p>");
   });
 
   it("strips bare (unmarked) attribution paragraphs", async () => {
     global.fetch = mockFetchResponse({ id: "31", title: "T" });
+    // Bare attribution only (no content before it) — verifies the regex strips it
     const bodyWithBareAttribution =
-      "<p>content</p>\n" +
       '<p style="font-size: 11.0px;color: rgb(153,153,153);margin-top: 2.0em;">' +
       '<em>This page was updated with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a>.</em></p>';
-    await updatePage("31", { title: "T", version: 1, body: bodyWithBareAttribution });
+    await updatePage("31", { title: "T", version: 1, body: "<h1>Title</h1>" + bodyWithBareAttribution });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
-    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
-    expect(occurrences).toHaveLength(1);
-    // The bare copy should be gone — only the marked one remains.
-    const epimethianLinks = putBody.body.value.match(/Epimethian/g);
-    expect(epimethianLinks).toHaveLength(1);
+    expect(putBody.body.value).not.toContain("Epimethian");
+    expect(putBody.body.value).toContain("<h1>Title</h1>");
   });
 
   it("strips bare attribution where Confluence wraps link text in <em>", async () => {
     global.fetch = mockFetchResponse({ id: "32", title: "T" });
-    // Confluence normalizes <em>...<a>text</a>...</em> by splitting the <em>
-    // so the link text gets its own <em> wrapper inside the <a> tag.
+    // Bare attribution with Confluence-normalized <em> wrapping
     const bodyWithNormalizedEm =
-      "<p>content</p>\n" +
       '<p local-id="37224ce031dc"><em>This page was updated with </em>' +
       '<a href="https://github.com/de-otio/epimethian-mcp"><em>Epimethian</em></a>' +
       "<em> v5.1.0.</em></p>";
-    await updatePage("32", { title: "T", version: 1, body: bodyWithNormalizedEm });
+    await updatePage("32", { title: "T", version: 1, body: "<h1>Title</h1>" + bodyWithNormalizedEm });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
-    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
-    expect(occurrences).toHaveLength(1);
-    const epimethianLinks = putBody.body.value.match(/Epimethian/g);
-    expect(epimethianLinks).toHaveLength(1);
+    expect(putBody.body.value).not.toContain("Epimethian");
+    expect(putBody.body.value).toContain("<h1>Title</h1>");
+  });
+});
+
+describe("version messages with client label", () => {
+  it("createPage includes client label when provided", async () => {
+    global.fetch = mockFetchResponse({ id: "40", title: "New" });
+    await createPage("spaceA", "New", "body", undefined, "Claude Code");
+    const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(body.version.message).toContain("Claude Code");
+    expect(body.version.message).toContain("via Epimethian");
+    expect(body.version.message).toMatch(/^Created by Claude Code \(via Epimethian v/);
+  });
+
+  it("createPage omits client label when not provided", async () => {
+    global.fetch = mockFetchResponse({ id: "41", title: "New" });
+    await createPage("spaceA", "New", "body");
+    const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(body.version.message).toMatch(/^Created by Epimethian v/);
+    expect(body.version.message).not.toContain("Claude");
+  });
+
+  it("updatePage includes client label without versionMessage", async () => {
+    global.fetch = mockFetchResponse({ id: "42", title: "T" });
+    await updatePage("42", { title: "T", version: 1, body: "text", clientLabel: "Claude Code" });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.version.message).toMatch(/^Updated by Claude Code \(via Epimethian v/);
+  });
+
+  it("updatePage includes client label with custom versionMessage", async () => {
+    global.fetch = mockFetchResponse({ id: "43", title: "T" });
+    await updatePage("43", { title: "T", version: 1, body: "text", versionMessage: "Fixed typo", clientLabel: "Claude Code" });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.version.message).toMatch(/^Fixed typo \(Claude Code via Epimethian v/);
+  });
+
+  it("updatePage omits client label with custom versionMessage", async () => {
+    global.fetch = mockFetchResponse({ id: "44", title: "T" });
+    await updatePage("44", { title: "T", version: 1, body: "text", versionMessage: "Fixed typo" });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.version.message).toMatch(/^Fixed typo \(via Epimethian v/);
+  });
+
+  it("updatePage omits client label when not provided", async () => {
+    global.fetch = mockFetchResponse({ id: "45", title: "T" });
+    await updatePage("45", { title: "T", version: 1, body: "text" });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.version.message).toMatch(/^Updated by Epimethian v/);
+    expect(putBody.version.message).not.toContain("Claude");
+  });
+});
+
+describe("comment attribution with client label", () => {
+  afterEach(() => {
+    setClientLabel(undefined);
+  });
+
+  it("createFooterComment includes client label when set", async () => {
+    global.fetch = mockFetchResponse({ id: "301", status: "current" });
+    setClientLabel("Claude Code");
+    await createFooterComment("42", "hello");
+    const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(body.body.value).toContain("[AI-generated by Claude Code via Epimethian]");
+  });
+
+  it("createFooterComment omits client label when not set", async () => {
+    global.fetch = mockFetchResponse({ id: "302", status: "current" });
+    await createFooterComment("42", "hello");
+    const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(body.body.value).toContain("[AI-generated via Epimethian]");
+    expect(body.body.value).not.toContain("by ");
+  });
+
+  it("createFooterComment escapes HTML in client label", async () => {
+    global.fetch = mockFetchResponse({ id: "303", status: "current" });
+    setClientLabel("bad<name>");
+    await createFooterComment("42", "hello");
+    const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(body.body.value).toContain("[AI-generated by bad&lt;name&gt; via Epimethian]");
   });
 });
 

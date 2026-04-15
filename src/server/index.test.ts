@@ -21,6 +21,9 @@ vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
   McpServer: vi.fn().mockImplementation(() => ({
     connect: mockConnect,
     registerTool: mockRegisterTool,
+    server: {
+      getClientVersion: () => ({ name: "test-client", version: "1.0.0" }),
+    },
   })),
 }));
 
@@ -68,6 +71,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     getPageVersionBody: vi.fn(),
     searchUsers: vi.fn(),
     searchPagesByTitle: vi.fn(),
+    setClientLabel: vi.fn(),
     ConfluenceApiError: class ConfluenceApiError extends Error {
       status: number;
       constructor(status: number, body: string) {

@@ -50,6 +50,7 @@ import {
   getPageVersionBody,
   searchUsers,
   searchPagesByTitle,
+  setClientLabel,
 } from "./confluence-client.js";
 import {
   computeSummaryDiff,
@@ -64,6 +65,12 @@ import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
 
 // --- Utilities ---
+
+function getClientLabel(server: McpServer): string | undefined {
+  const client = server.server.getClientVersion();
+  const raw = client?.title || client?.name || undefined;
+  return raw ? raw.slice(0, 80) : undefined;
+}
 
 function escapeXml(s: string): string {
   return s
@@ -312,6 +319,7 @@ function registerTools(server: McpServer, config: Config): void {
       body: newBody,
       version,
       versionMessage: opts.versionMessage,
+      clientLabel: getClientLabel(server),
     });
 
     return { page, newVersion, oldLen: currentStorage.length, newLen: newBody.length };
@@ -363,7 +371,7 @@ function registerTools(server: McpServer, config: Config): void {
           });
         }
         const spaceId = await resolveSpaceId(space_key);
-        const page = await createPage(spaceId, title, finalBody, parent_id);
+        const page = await createPage(spaceId, title, finalBody, parent_id, getClientLabel(server));
         logMutation({
           timestamp: new Date().toISOString(),
           operation: "create_page",
@@ -603,6 +611,7 @@ function registerTools(server: McpServer, config: Config): void {
           version,
           versionMessage: effectiveVersionMessage,
           previousBody: currentStorage,
+          clientLabel: getClientLabel(server),
         });
 
         // Mutation log (1E)
@@ -709,6 +718,7 @@ function registerTools(server: McpServer, config: Config): void {
           version,
           versionMessage: version_message,
           previousBody: fullBody,
+          clientLabel: getClientLabel(server),
         });
         logMutation({
           timestamp: new Date().toISOString(),
@@ -1200,6 +1210,7 @@ function registerTools(server: McpServer, config: Config): void {
           body: newBody,
           version: current.version?.number ?? 0,
           versionMessage: `Added diagram: ${filename}`,
+          clientLabel: getClientLabel(server),
         });
 
         return toolResult(
@@ -1509,6 +1520,7 @@ function registerTools(server: McpServer, config: Config): void {
     async ({ page_id, body, type, parent_comment_id, text_selection, text_selection_match_index }) => {
       const blocked = writeGuard("create_comment", config);
       if (blocked) return blocked;
+      setClientLabel(getClientLabel(server));
       try {
         let comment: CommentData;
         if (type === "inline") {
@@ -1895,6 +1907,7 @@ function registerTools(server: McpServer, config: Config): void {
           version: current_version,
           versionMessage:
             version_message ?? `Revert to version ${target_version}`,
+          clientLabel: getClientLabel(server),
         });
 
         // 5. Log mutation

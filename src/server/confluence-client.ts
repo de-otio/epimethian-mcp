@@ -3,9 +3,17 @@ import TurndownService from "turndown";
 import { readFromKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
 import { getProfileSettings } from "../shared/profiles.js";
 import { testConnection, verifyTenantIdentity } from "../shared/test-connection.js";
+import { escapeXmlText } from "./converter/escape.js";
 
 declare const __PKG_VERSION__: string;
 import { pageCache } from "./page-cache.js";
+
+// --- Client label (set once from index.ts after MCP initialize handshake) ---
+
+let _clientLabel: string | undefined;
+export function setClientLabel(label: string | undefined): void {
+  _clientLabel = label ? label.slice(0, 80) : undefined;
+}
 
 // --- Configuration ---
 
@@ -477,13 +485,15 @@ export async function createPage(
   spaceId: string,
   title: string,
   body: string,
-  parentId?: string
+  parentId?: string,
+  clientLabel?: string
 ): Promise<PageData> {
   const cfg = await getConfig();
-  const cleanBody = stripAttributionFooter(toStorageFormat(body));
-  const pageBody = cfg.attribution
-    ? cleanBody + "\n" + buildAttributionFooter("created")
-    : cleanBody;
+  const pageBody = stripAttributionFooter(toStorageFormat(body));
+  const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
+  const versionMsg = cfg.attribution && clientLabel
+    ? `Created by ${clientLabel} (via ${epimethianTag})`
+    : `Created by ${epimethianTag}`;
   const payload: Record<string, unknown> = {
     title,
     spaceId,
@@ -492,7 +502,7 @@ export async function createPage(
       representation: "storage",
       value: pageBody,
     },
-    version: { message: `Created by Epimethian v${__PKG_VERSION__}` },
+    version: { message: versionMsg },
   };
   if (parentId) payload.parentId = parentId;
   const raw = await v2Post("/pages", payload);
@@ -502,9 +512,9 @@ export async function createPage(
   pageCache.set(page.id, page.version?.number ?? 1, pageBody);
 
   try {
-    await addLabels(page.id, [ATTRIBUTION_LABEL]);
+    await ensureAttributionLabel(page.id);
   } catch {
-    // Label addition is non-critical
+    // Label management is non-critical
   }
 
   return page;
@@ -518,14 +528,24 @@ export async function updatePage(
     version: number;
     versionMessage?: string;
     previousBody?: string;
+    clientLabel?: string;
   }
 ): Promise<{ page: PageData; newVersion: number }> {
   const cfg = await getConfig();
   const newVersion = opts.version + 1;
 
-  const versionMessage = opts.versionMessage
-    ? `${opts.versionMessage} (via Epimethian v${__PKG_VERSION__})`
-    : `Updated by Epimethian v${__PKG_VERSION__}`;
+  const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
+  const effectiveClient = cfg.attribution ? opts.clientLabel : undefined;
+
+  let versionMessage: string;
+  if (opts.versionMessage && effectiveClient)
+    versionMessage = `${opts.versionMessage} (${effectiveClient} via ${epimethianTag})`;
+  else if (opts.versionMessage)
+    versionMessage = `${opts.versionMessage} (via ${epimethianTag})`;
+  else if (effectiveClient)
+    versionMessage = `Updated by ${effectiveClient} (via ${epimethianTag})`;
+  else
+    versionMessage = `Updated by ${epimethianTag}`;
 
   const payload: Record<string, unknown> = {
     id: pageId,
@@ -534,10 +554,7 @@ export async function updatePage(
     version: { number: newVersion, message: versionMessage },
   };
   if (opts.body) {
-    const cleanBody = stripAttributionFooter(toStorageFormat(opts.body));
-    const pageBody = cfg.attribution
-      ? cleanBody + "\n" + buildAttributionFooter("updated")
-      : cleanBody;
+    const pageBody = stripAttributionFooter(toStorageFormat(opts.body));
     payload.body = {
       representation: "storage",
       value: pageBody,
@@ -562,17 +579,14 @@ export async function updatePage(
 
   // Cache the body we just sent
   if (opts.body) {
-    const cleanBody = stripAttributionFooter(toStorageFormat(opts.body));
-    const pageBody = cfg.attribution
-      ? cleanBody + "\n" + buildAttributionFooter("updated")
-      : cleanBody;
+    const pageBody = stripAttributionFooter(toStorageFormat(opts.body));
     pageCache.set(pageId, newVersion, pageBody);
   }
 
   try {
-    await addLabels(page.id, [ATTRIBUTION_LABEL]);
+    await ensureAttributionLabel(page.id);
   } catch {
-    // Label addition is non-critical
+    // Label management is non-critical
   }
 
   return { page, newVersion };
@@ -841,21 +855,27 @@ export async function uploadAttachment(
 
 // --- Attribution ---
 
-const GITHUB_URL = "https://github.com/de-otio/epimethian-mcp";
-const ATTRIBUTION_LABEL = "epimethian-managed";
-const ATTRIBUTION_START = "<!-- epimethian-attribution-start -->";
-const ATTRIBUTION_END = "<!-- epimethian-attribution-end -->";
+const ATTRIBUTION_LABEL = "epimethian-edited";
+const LEGACY_ATTRIBUTION_LABEL = "epimethian-managed";
 
-function buildAttributionFooter(action: "created" | "updated"): string {
-  return (
-    ATTRIBUTION_START +
-    '<p style="font-size:9px;color:#999;margin-top:2em;">' +
-    `<em>This page was ${action} with ` +
-    `<a href="${GITHUB_URL}">Epimethian</a> v${__PKG_VERSION__}.</em></p>` +
-    ATTRIBUTION_END
-  );
+/**
+ * Ensure the page carries the current attribution label and not the legacy one.
+ * Best-effort — failures are swallowed since labelling is non-critical.
+ */
+async function ensureAttributionLabel(pageId: string): Promise<void> {
+  await addLabels(pageId, [ATTRIBUTION_LABEL]);
+  const labels = await getLabels(pageId);
+  if (labels.some((l) => l.name === LEGACY_ATTRIBUTION_LABEL)) {
+    await removeLabel(pageId, LEGACY_ATTRIBUTION_LABEL);
+  }
 }
 
+/**
+ * Strip legacy attribution footers from page bodies.
+ * Retained for cleanup of pages written by older versions that appended
+ * a visible footer. New versions no longer add a footer — attribution
+ * lives in Confluence version messages instead.
+ */
 function stripAttributionFooter(body: string): string {
   return body
     .replace(
@@ -993,8 +1013,12 @@ export async function createFooterComment(
   body: string,
   parentCommentId?: string
 ): Promise<CommentData> {
+  const cfg = await getConfig();
   const sanitized = sanitizeCommentBody(toStorageFormat(body));
-  const attributed = `<p><em>[AI-generated via Epimethian]</em></p>${sanitized}`;
+  const label = cfg.attribution ? _clientLabel : undefined;
+  const attributed = label
+    ? `<p><em>[AI-generated by ${escapeXmlText(label)} via Epimethian]</em></p>${sanitized}`
+    : `<p><em>[AI-generated via Epimethian]</em></p>${sanitized}`;
 
   const payload: Record<string, unknown> = parentCommentId
     ? {
@@ -1017,8 +1041,12 @@ export async function createInlineComment(
   textSelectionMatchIndex = 0,
   parentCommentId?: string
 ): Promise<CommentData> {
+  const cfg = await getConfig();
   const sanitized = sanitizeCommentBody(toStorageFormat(body));
-  const attributed = `<p><em>[AI-generated via Epimethian]</em></p>${sanitized}`;
+  const label = cfg.attribution ? _clientLabel : undefined;
+  const attributed = label
+    ? `<p><em>[AI-generated by ${escapeXmlText(label)} via Epimethian]</em></p>${sanitized}`
+    : `<p><em>[AI-generated via Epimethian]</em></p>${sanitized}`;
 
   if (parentCommentId) {
     const raw = await v2Post("/inline-comments", {

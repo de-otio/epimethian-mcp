@@ -195,20 +195,15 @@ describe("attribution footer regression", () => {
     expect(plan.newStorage).toContain(macro);
   });
 
-  it("double-update does not double-apply the footer", () => {
+  it("stripAttributionFooter produces clean body from legacy footer", () => {
     const body = "<p>Content.</p>";
-    const footer1 = buildAttributionFooter("created");
-    const footer2 = buildAttributionFooter("updated");
+    const footer = buildAttributionFooter("created");
+    const withFooter = body + "\n" + footer;
 
-    // First update: body + footer1.
-    const afterFirst = body + "\n" + footer1;
-    // Second update pipeline: strip, then add new footer.
-    const stripped = stripAttributionFooter(afterFirst);
-    const afterSecond = stripped + "\n" + footer2;
-
-    // Should have only one attribution block.
-    const footerCount = (afterSecond.match(/epimethian-attribution-start/g) ?? []).length;
-    expect(footerCount).toBe(1);
+    const stripped = stripAttributionFooter(withFooter);
+    expect(stripped).toBe(body);
+    expect(stripped).not.toContain("Epimethian");
+    expect(stripped).not.toContain("epimethian-attribution");
   });
 
   it("attribution footer HTML comments survive tokeniseStorage without tokenisation", () => {
