@@ -915,6 +915,23 @@ describe("attribution footer deduplication", () => {
     const epimethianLinks = putBody.body.value.match(/Epimethian/g);
     expect(epimethianLinks).toHaveLength(1);
   });
+
+  it("strips bare attribution where Confluence wraps link text in <em>", async () => {
+    global.fetch = mockFetchResponse({ id: "32", title: "T" });
+    // Confluence normalizes <em>...<a>text</a>...</em> by splitting the <em>
+    // so the link text gets its own <em> wrapper inside the <a> tag.
+    const bodyWithNormalizedEm =
+      "<p>content</p>\n" +
+      '<p local-id="37224ce031dc"><em>This page was updated with </em>' +
+      '<a href="https://github.com/de-otio/epimethian-mcp"><em>Epimethian</em></a>' +
+      "<em> v5.1.0.</em></p>";
+    await updatePage("32", { title: "T", version: 1, body: bodyWithNormalizedEm });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    const occurrences = putBody.body.value.match(/epimethian-attribution-start/g);
+    expect(occurrences).toHaveLength(1);
+    const epimethianLinks = putBody.body.value.match(/Epimethian/g);
+    expect(epimethianLinks).toHaveLength(1);
+  });
 });
 
 describe("deletePage", () => {
