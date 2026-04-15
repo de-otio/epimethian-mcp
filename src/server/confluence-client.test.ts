@@ -226,6 +226,21 @@ describe("toStorageFormat", () => {
     const html = '<p class="x">text</p>';
     expect(toStorageFormat(html)).toBe(html);
   });
+
+  it("passes through Confluence ac: namespace tags", () => {
+    const toc = '<ac:structured-macro ac:name="toc" ac:schema-version="1"><ac:parameter ac:name="maxLevel">2</ac:parameter></ac:structured-macro>';
+    expect(toStorageFormat(toc)).toBe(toc);
+  });
+
+  it("passes through Confluence ri: namespace tags", () => {
+    const ri = '<ri:page ri:content-title="Test" />';
+    expect(toStorageFormat(ri)).toBe(ri);
+  });
+
+  it("passes through mixed ac: macros and HTML", () => {
+    const mixed = '<ac:structured-macro ac:name="toc" /><p>text</p>';
+    expect(toStorageFormat(mixed)).toBe(mixed);
+  });
 });
 
 describe("formatPage", () => {

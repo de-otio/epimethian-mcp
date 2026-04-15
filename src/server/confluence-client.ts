@@ -1151,7 +1151,7 @@ export function sanitizeCommentBody(body: string): string {
   return stripped;
 }
 
-const HTML_TAG_RE = /<[a-z][a-z0-9]*[\s>\/]/i;
+const HTML_TAG_RE = /<[a-z][a-z0-9]*(?::[a-z][a-z0-9-]*)?[\s>\/]/i;
 
 export function toStorageFormat(body: string): string {
   return HTML_TAG_RE.test(body) ? body : `<p>${body}</p>`;
