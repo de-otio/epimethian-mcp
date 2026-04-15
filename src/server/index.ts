@@ -63,6 +63,13 @@ import { ConverterError } from "./converter/types.js";
 import { enforceContentSafetyGuards } from "./converter/content-safety-guards.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
+import {
+  checkForUpdates,
+  getPendingUpdate,
+  clearPendingUpdate,
+  performUpgrade,
+  type UpdateInfo,
+} from "../shared/update-check.js";
 
 // --- Utilities ---
 
@@ -168,6 +175,7 @@ const READ_ONLY_TOOLS = new Set([
   "get_page_version",
   "diff_page_versions",
   "get_version",
+  "upgrade",
   "lookup_user",
   "resolve_page_link",
 ]);
@@ -2088,10 +2096,65 @@ function registerTools(server: McpServer, config: Config): void {
   server.registerTool(
     "get_version",
     {
-      description: "Return the epimethian-mcp server version.",
+      description:
+        "Return the epimethian-mcp server version. " +
+        "Also reports available updates, if any.",
       inputSchema: {},
     },
-    async () => toolResult(`epimethian-mcp v${__PKG_VERSION__}`)
+    async () => {
+      let text = `epimethian-mcp v${__PKG_VERSION__}`;
+      try {
+        const pending = await getPendingUpdate();
+        if (pending) {
+          if (pending.autoInstalled) {
+            text +=
+              `\n\nBugfix v${pending.latest} has been installed automatically. ` +
+              `Restart the MCP server to apply.`;
+          } else {
+            text +=
+              `\n\n${pending.type === "major" ? "Major" : "Minor"} update available: ` +
+              `v${pending.current} → v${pending.latest}. ` +
+              `Call the upgrade tool to install.`;
+          }
+        }
+      } catch {
+        // Never let update info break version reporting
+      }
+      return toolResult(text);
+    }
+  );
+
+  // upgrade
+  server.registerTool(
+    "upgrade",
+    {
+      description:
+        "Upgrade epimethian-mcp to the latest available version. " +
+        "After a successful upgrade the user must restart the MCP server " +
+        "(reload the VS Code window or restart Claude).",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const pending = await getPendingUpdate();
+        if (!pending) {
+          return toolResult(
+            `epimethian-mcp v${__PKG_VERSION__} is already up to date.`
+          );
+        }
+
+        const output = await performUpgrade(pending.latest);
+        await clearPendingUpdate();
+        return toolResult(
+          `Upgraded epimethian-mcp from v${pending.current} to v${pending.latest}.\n\n` +
+            `⚠ Restart required: reload the VS Code window (or restart Claude) ` +
+            `so the new version takes effect.\n\n` +
+            output
+        );
+      } catch (err) {
+        return toolError(err);
+      }
+    }
   );
 }
 
@@ -2122,4 +2185,8 @@ export async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Fire-and-forget: check for updates in the background (max once/day).
+  // Patch releases are auto-installed; minor/major are stored for user confirmation.
+  checkForUpdates(__PKG_VERSION__).catch(() => {});
 }

@@ -110,6 +110,13 @@ vi.mock("./diff.js", () => ({
   MAX_DIFF_SIZE: 512000,
 }));
 
+vi.mock("../shared/update-check.js", () => ({
+  checkForUpdates: vi.fn().mockResolvedValue(null),
+  getPendingUpdate: vi.fn().mockResolvedValue(null),
+  clearPendingUpdate: vi.fn().mockResolvedValue(undefined),
+  performUpgrade: vi.fn().mockResolvedValue("installed"),
+}));
+
 // Mock node:fs/promises for add_attachment and add_drawio_diagram tests
 const mockReadFile = vi.fn();
 const mockWriteFile = vi.fn();
@@ -170,6 +177,7 @@ describe("MCP server index", () => {
       "get_page_version",
       "diff_page_versions",
       "get_version",
+      "upgrade",
       // Stream 14
       "lookup_user",
       "resolve_page_link",
@@ -1737,7 +1745,80 @@ describe("get_version tool", () => {
   it("returns the server version", async () => {
     const handler = registeredTools.get("get_version")!.handler;
     const result = await handler({});
-    expect(result.content[0].text).toMatch(/^epimethian-mcp v\d+\.\d+\.\d+$/);
+    expect(result.content[0].text).toMatch(/^epimethian-mcp v\d+\.\d+\.\d+/);
+  });
+
+  it("includes pending update info when available", async () => {
+    const { getPendingUpdate } = await import("../shared/update-check.js");
+    (getPendingUpdate as any).mockResolvedValueOnce({
+      current: "5.2.1",
+      latest: "6.0.0",
+      type: "major",
+    });
+    const handler = registeredTools.get("get_version")!.handler;
+    const result = await handler({});
+    expect(result.content[0].text).toContain("Major update available");
+    expect(result.content[0].text).toContain("6.0.0");
+  });
+
+  it("includes auto-installed patch info", async () => {
+    const { getPendingUpdate } = await import("../shared/update-check.js");
+    (getPendingUpdate as any).mockResolvedValueOnce({
+      current: "5.2.1",
+      latest: "5.2.2",
+      type: "patch",
+      autoInstalled: true,
+    });
+    const handler = registeredTools.get("get_version")!.handler;
+    const result = await handler({});
+    expect(result.content[0].text).toContain("installed automatically");
+    expect(result.content[0].text).toContain("Restart");
+  });
+});
+
+describe("upgrade tool", () => {
+  it("is registered", () => {
+    expect(registeredTools.has("upgrade")).toBe(true);
+  });
+
+  it("reports up-to-date when no pending update", async () => {
+    const { getPendingUpdate } = await import("../shared/update-check.js");
+    (getPendingUpdate as any).mockResolvedValueOnce(null);
+    const handler = registeredTools.get("upgrade")!.handler;
+    const result = await handler({});
+    expect(result.content[0].text).toContain("already up to date");
+  });
+
+  it("performs upgrade and reports restart needed", async () => {
+    const { getPendingUpdate, performUpgrade, clearPendingUpdate } =
+      await import("../shared/update-check.js");
+    (getPendingUpdate as any).mockResolvedValueOnce({
+      current: "5.2.1",
+      latest: "6.0.0",
+      type: "major",
+    });
+    (performUpgrade as any).mockResolvedValueOnce("added 1 package");
+    const handler = registeredTools.get("upgrade")!.handler;
+    const result = await handler({});
+    expect(result.content[0].text).toContain("Upgraded");
+    expect(result.content[0].text).toContain("6.0.0");
+    expect(result.content[0].text).toContain("Restart required");
+    expect(clearPendingUpdate).toHaveBeenCalled();
+  });
+
+  it("returns error on install failure", async () => {
+    const { getPendingUpdate, performUpgrade } =
+      await import("../shared/update-check.js");
+    (getPendingUpdate as any).mockResolvedValueOnce({
+      current: "5.2.1",
+      latest: "6.0.0",
+      type: "major",
+    });
+    (performUpgrade as any).mockRejectedValueOnce(new Error("EACCES: permission denied"));
+    const handler = registeredTools.get("upgrade")!.handler;
+    const result = await handler({});
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("permission denied");
   });
 });
 

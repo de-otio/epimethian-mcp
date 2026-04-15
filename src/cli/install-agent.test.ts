@@ -28,6 +28,13 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
   StdioServerTransport: vi.fn(),
 }));
 
+vi.mock("../shared/update-check.js", () => ({
+  checkForUpdates: vi.fn().mockResolvedValue(null),
+  getPendingUpdate: vi.fn().mockResolvedValue(null),
+  clearPendingUpdate: vi.fn().mockResolvedValue(undefined),
+  performUpgrade: vi.fn().mockResolvedValue("installed"),
+}));
+
 vi.mock("../server/confluence-client.js", () => ({
   resolveSpaceId: vi.fn(),
   getPage: vi.fn(),
