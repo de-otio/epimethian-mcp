@@ -14,7 +14,7 @@ The official [Atlassian MCP server](https://github.com/atlassian/atlassian-mcp-s
 - **Multi-tenant profile isolation** — Each Atlassian tenant gets its own named profile with fully separate credentials and keychain entries. No risk of cross-tenant writes when switching between clients.
 - **Tenant-aware write safety** — Write operations echo the target tenant so the AI agent (and you) always see where changes are going before they land.
 - **draw.io diagram support** — Create and embed draw.io diagrams directly in Confluence pages, something the official server doesn't expose.
-- **Attribution tracking** — Managed pages carry metadata so you can trace which AI-assisted edits touched which content.
+- **Attribution tracking** — Edited pages are labelled `epimethian-edited` for easy discovery. Confluence version messages include the MCP client name (e.g. "Updated by Claude Code (via Epimethian v5.2.0)") so you can trace which AI-assisted edits touched which content.
 
 If you don't need any of the above, the official Atlassian server is a fine choice.
 
@@ -113,7 +113,7 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `create_page`        | Create a new page          |
 | `get_page`           | Read a page by ID (`headings_only`, `section`, `max_length`, `format`) |
 | `get_page_by_title`  | Look up a page by title (same options as `get_page`) |
-| `update_page`        | Update an existing page (rejects markdown input) |
+| `update_page`        | Update an existing page    |
 | `update_page_section`| Update a single section by heading name |
 | `delete_page`        | Delete a page              |
 | `list_pages`         | List pages in a space      |

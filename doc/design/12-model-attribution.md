@@ -79,7 +79,7 @@ const versionMessage = opts.versionMessage
 | Mechanism | Visibility | Per-version | Notes |
 |---|---|---|---|
 | **Version message** | Version history UI | Yes | Already exists, one per edit |
-| **`epimethian-managed` label** | Page metadata, CQL-searchable | Page-level | Already exists |
+| **`epimethian-edited` label** | Page metadata, CQL-searchable | Page-level | Already exists |
 | **Confluence author** | Version history, page header | Yes | Native, automatic |
 
 ---
@@ -88,7 +88,7 @@ const versionMessage = opts.versionMessage
 
 The footer is the weakest attribution mechanism:
 
-- **Redundant** — Version messages already appear per-edit in the version history. The `epimethian-managed` label marks the page. Confluence natively tracks the author.
+- **Redundant** — Version messages already appear per-edit in the version history. The `epimethian-edited` label marks the page. Confluence natively tracks the author.
 - **Only reflects the last edit** — If a human edits after an AI edit, a stale AI footer persists.
 - **Engineering cost** — The entire deduplication subsystem (`stripAttributionFooter`, two regex patterns, `ATTRIBUTION_START`/`ATTRIBUTION_END` constants, multiple test cases for whitespace normalization) exists solely to manage the footer.
 - **Agent copy-paste artifacts** — When an AI agent reads a page via `get_page` and passes the body back to `update_page`, the footer gets embedded as content. Pattern 2 in the regex exists to catch this, but it's inherently fragile.
@@ -264,7 +264,7 @@ export function setClientLabel(label: string | undefined) { _clientLabel = label
 - The legacy strip patterns can be removed in a future major version.
 - The `attribution` config flag is repurposed: it now controls whether client identity appears in version messages and comments (not footer insertion).
 - `ATTRIBUTION_START` / `ATTRIBUTION_END` / `GITHUB_URL` constants are removed (the GitHub URL is no longer linked from page content; it remains in version messages as plain text if desired, or can be dropped).
-- The `epimethian-managed` label continues to be applied as before — it is independent of the footer.
+- The `epimethian-managed` label is renamed to `epimethian-edited`. The `ensureAttributionLabel()` function auto-migrates the old label on every `createPage`/`updatePage` call.
 
 ---
 
