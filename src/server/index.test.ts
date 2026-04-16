@@ -620,6 +620,40 @@ describe("update_page_section tool", () => {
     expect(result.content[0].text).toContain('Section "Missing" not found');
   });
 
+  it("auto-converts markdown body to storage format", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      body: { storage: { value: "<h1>A</h1><p>old</p><h1>B</h1><p>keep</p>" } },
+    });
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 7,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "1",
+      section: "A",
+      body: "This is **bold** markdown.\n\n- item one\n- item two",
+      version: 6,
+    });
+    expect(result.content[0].text).toContain('Updated section "A"');
+
+    // Verify the body was converted from markdown to storage format
+    const updateCall = (updatePage as any).mock.calls[0];
+    const updatedBody = updateCall[1].body;
+    // Should contain HTML tags, not raw markdown
+    expect(updatedBody).toContain("<strong>bold</strong>");
+    expect(updatedBody).toContain("<li>");
+    // Should NOT contain raw markdown syntax
+    expect(updatedBody).not.toContain("**bold**");
+    // Section B should be preserved
+    expect(updatedBody).toContain("<h1>B</h1><p>keep</p>");
+  });
+
   it("passes version_message to updatePage", async () => {
     const { getPage, updatePage } = await import("./confluence-client.js");
     (updatePage as any).mockClear();

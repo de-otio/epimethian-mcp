@@ -763,7 +763,7 @@ function registerTools(server: McpServer, config: Config): void {
           .describe("Heading text identifying the section to replace (case-insensitive)"),
         body: z
           .string()
-          .describe("New content for this section in Confluence storage format. The heading itself is preserved; only content under it is replaced."),
+          .describe("New content for this section — GFM markdown or Confluence storage format. Markdown is auto-detected and converted. The heading itself is preserved; only content under it is replaced."),
         version: z
           .number()
           .int()
@@ -794,7 +794,12 @@ function registerTools(server: McpServer, config: Config): void {
         const page = await getPage(page_id, true);
         const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
 
-        const newFullBody = replaceSection(fullBody, section, body);
+        // Auto-detect markdown and convert to storage format (same as update_page / prepend_to_page)
+        const sectionStorage = looksLikeMarkdown(body)
+          ? markdownToStorage(body)
+          : body;
+
+        const newFullBody = replaceSection(fullBody, section, sectionStorage);
         if (newFullBody === null) {
           return toolResult(
             `Section "${section}" not found. Use headings_only to see available sections.`
