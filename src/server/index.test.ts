@@ -2095,6 +2095,45 @@ describe("create_page markdown conversion (Stream 5)", () => {
   });
 });
 
+describe("create_page duplicate-title guard", () => {
+  it("rejects creation when a page with the same title already exists", async () => {
+    const { resolveSpaceId, getPageByTitle, createPage } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (getPageByTitle as any).mockResolvedValueOnce({ id: "42", title: "Existing Page" });
+    (createPage as any).mockClear();
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({
+      title: "Existing Page",
+      space_key: "DEV",
+      body: "<p>some content</p>",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("already exists");
+    expect(result.content[0].text).toContain("42");
+    expect(createPage).not.toHaveBeenCalled();
+  });
+
+  it("allows creation when no page with that title exists", async () => {
+    const { resolveSpaceId, getPageByTitle, createPage, formatPage } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (getPageByTitle as any).mockResolvedValueOnce(undefined);
+    (createPage as any).mockResolvedValueOnce({ id: "99", title: "Brand New Page" });
+    (formatPage as any).mockReturnValueOnce("Title: Brand New Page\nID: 99");
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({
+      title: "Brand New Page",
+      space_key: "DEV",
+      body: "<p>fresh content</p>",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(createPage).toHaveBeenCalled();
+  });
+});
+
 describe("update_page title-only (body omitted)", () => {
   it("does not send body to API when body parameter is omitted", async () => {
     const { getPage, updatePage } = await import("./confluence-client.js");

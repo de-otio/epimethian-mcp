@@ -419,6 +419,23 @@ function registerTools(server: McpServer, config: Config): void {
           });
         }
         const spaceId = await resolveSpaceId(space_key);
+
+        // Pre-flight: reject if a page with this title already exists in the space.
+        // Silently creating a duplicate is confusing; blindly suggesting update_page
+        // risks clobbering an unrelated page, so we surface the conflict and let
+        // the caller decide.
+        const existing = await getPageByTitle(spaceId, title, false);
+        if (existing) {
+          return toolError(
+            new Error(
+              `A page titled "${title}" already exists in this space (page ID: ${existing.id}). ` +
+              `Creating another page with the same title would produce a confusing duplicate. ` +
+              `If you intend to modify the existing page, call get_page with ID ${existing.id} first ` +
+              `to review its current content before deciding whether to update it.`
+            )
+          );
+        }
+
         const page = await createPage(spaceId, title, finalBody, parent_id, getClientLabel(server));
         logMutation({
           timestamp: new Date().toISOString(),
