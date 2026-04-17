@@ -1260,6 +1260,38 @@ export function extractSection(storageHtml: string, headingText: string): string
 }
 
 /**
+ * Extract only the body content under a heading (excluding the heading itself).
+ * Used by update_page_section to feed the current section body to the
+ * token-aware write path so that <ac:emoticon> and other Confluence elements
+ * within the section are preserved when the caller submits markdown.
+ */
+export function extractSectionBody(storageHtml: string, headingText: string): string | null {
+  const { parse } = require("node-html-parser") as typeof import("node-html-parser");
+  const root = parse(storageHtml);
+
+  const found = findHeadingInTree(root, headingText);
+  if (!found) return null;
+
+  const { siblings, startIdx, headingLevel } = found;
+
+  let endIdx = siblings.length;
+  for (let i = startIdx + 1; i < siblings.length; i++) {
+    const node = siblings[i];
+    if (node.nodeType !== 1) continue;
+    const el = node as import("node-html-parser").HTMLElement;
+    const tagMatch = el.tagName?.match(/^H([1-6])$/i);
+    if (tagMatch && parseInt(tagMatch[1], 10) <= headingLevel) {
+      endIdx = i;
+      break;
+    }
+  }
+
+  // startIdx + 1: skip the heading itself, return only content nodes
+  const bodyNodes = siblings.slice(startIdx + 1, endIdx);
+  return bodyNodes.map(n => n.toString()).join("");
+}
+
+/**
  * Replace the content under a specific heading in storage format HTML.
  * The heading itself is preserved; content between it and the next heading
  * of equal or higher level is replaced with newContent.

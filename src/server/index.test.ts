@@ -82,6 +82,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     },
     formatPage: vi.fn().mockReturnValue("formatted page"),
     extractSection: actual.extractSection,
+    extractSectionBody: actual.extractSectionBody,
     replaceSection: actual.replaceSection,
     truncateStorageFormat: actual.truncateStorageFormat,
     toMarkdownView: actual.toMarkdownView,
@@ -677,6 +678,152 @@ describe("update_page_section tool", () => {
     });
     const updateCall = (updatePage as any).mock.calls[0];
     expect(updateCall[1].versionMessage).toBe("Updated intro");
+  });
+});
+
+describe("update_page_section token-aware preservation", () => {
+  const EMOTICON = `<ac:emoticon ac:name="warning"/>`;
+
+  it("preserves emoticon when markdown update keeps its token", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    // Section A has an emoticon; agent edits Section A with markdown that keeps the token
+    const fullPage = {
+      id: "1",
+      title: "T",
+      body: {
+        storage: {
+          value: `<h1>A</h1><p>Important ${EMOTICON} note</p><h1>B</h1><p>keep</p>`,
+        },
+      },
+    };
+    (getPage as any).mockResolvedValueOnce(fullPage);
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    // The token-aware path will tokenise the section body, so the
+    // caller's markdown must include the token. Simulate by reading
+    // what the tokeniser produces for the section body.
+    const { tokeniseStorage } = await import("./converter/tokeniser.js");
+    const sectionBody = `<p>Important ${EMOTICON} note</p>`;
+    const { canonical } = tokeniseStorage(sectionBody);
+    // canonical looks like: <p>Important [[epi:T0001]] note</p>
+    // Agent keeps the token and adds text:
+    const agentMarkdown = canonical
+      .replace(/<\/?p>/g, "")
+      .replace("note", "note — updated");
+
+    const result = await handler({
+      page_id: "1",
+      section: "A",
+      body: agentMarkdown,
+      version: 5,
+    });
+    expect(result.isError).toBeUndefined();
+
+    const submittedBody = (updatePage as any).mock.calls[0][1].body;
+    expect(submittedBody).toContain("ac:emoticon");
+    expect(submittedBody).toContain("warning");
+    expect(submittedBody).toContain("updated");
+    // Section B untouched
+    expect(submittedBody).toContain("<h1>B</h1><p>keep</p>");
+  });
+
+  it("blocks emoticon deletion when confirm_deletions is false", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    const fullPage = {
+      id: "1",
+      title: "T",
+      body: {
+        storage: {
+          value: `<h1>A</h1><p>Note ${EMOTICON}</p><h1>B</h1><p>keep</p>`,
+        },
+      },
+    };
+    (getPage as any).mockResolvedValueOnce(fullPage);
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    // Agent writes markdown that omits the emoticon entirely
+    const result = await handler({
+      page_id: "1",
+      section: "A",
+      body: "Note without emoticon",
+      version: 5,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("confirm_deletions");
+    expect(updatePage).not.toHaveBeenCalled();
+  });
+
+  it("allows emoticon deletion when confirm_deletions is true", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    const fullPage = {
+      id: "1",
+      title: "T",
+      body: {
+        storage: {
+          value: `<h1>A</h1><p>Note ${EMOTICON}</p><h1>B</h1><p>keep</p>`,
+        },
+      },
+    };
+    (getPage as any).mockResolvedValueOnce(fullPage);
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "1",
+      section: "A",
+      body: "Note without emoticon",
+      version: 5,
+      confirm_deletions: true,
+    });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Updated section");
+    // emoticon should be gone from section A
+    const submittedBody = (updatePage as any).mock.calls[0][1].body;
+    expect(submittedBody).not.toContain("ac:emoticon");
+    // Section B still untouched
+    expect(submittedBody).toContain("<h1>B</h1><p>keep</p>");
+  });
+
+  it("storage-format body bypasses token-aware path (no change)", async () => {
+    const { getPage, updatePage } = await import("./confluence-client.js");
+    (updatePage as any).mockClear();
+    const fullPage = {
+      id: "1",
+      title: "T",
+      body: {
+        storage: {
+          value: `<h1>A</h1><p>old ${EMOTICON}</p><h1>B</h1><p>keep</p>`,
+        },
+      },
+    };
+    (getPage as any).mockResolvedValueOnce(fullPage);
+    (updatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    // Storage-format body: looksLikeMarkdown returns false → passes through
+    const result = await handler({
+      page_id: "1",
+      section: "A",
+      body: `<p>new content with ${EMOTICON}</p>`,
+      version: 5,
+    });
+    expect(result.isError).toBeUndefined();
+    const submittedBody = (updatePage as any).mock.calls[0][1].body;
+    expect(submittedBody).toContain("ac:emoticon");
+    expect(submittedBody).toContain("new content");
   });
 });
 

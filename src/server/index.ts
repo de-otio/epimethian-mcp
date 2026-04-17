@@ -28,6 +28,7 @@ import {
   removeContentState,
   formatPage,
   extractSection,
+  extractSectionBody,
   replaceSection,
   truncateStorageFormat,
   toMarkdownView,
@@ -780,7 +781,7 @@ function registerTools(server: McpServer, config: Config): void {
           .describe("Heading text identifying the section to replace (case-insensitive)"),
         body: z
           .string()
-          .describe("New content for this section — GFM markdown or Confluence storage format. Markdown is auto-detected and converted. The heading itself is preserved; only content under it is replaced."),
+          .describe("New content for this section — GFM markdown or Confluence storage format. Markdown is auto-detected and converted via the token-aware write path, which preserves existing macros and emoticons within the section. The heading itself is preserved; only content under it is replaced."),
         version: z
           .number()
           .int()
@@ -790,10 +791,14 @@ function registerTools(server: McpServer, config: Config): void {
           .string()
           .optional()
           .describe("Optional version comment"),
+        confirm_deletions: z
+          .boolean()
+          .default(false)
+          .describe("Set to true to acknowledge that your markdown removes preserved macros, emoticons, or rich elements from this section. Required when any preserved element would be deleted."),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, section, body, version, version_message }) => {
+    async ({ page_id, section, body, version, version_message, confirm_deletions }) => {
       const blocked = writeGuard("update_page_section", config);
       if (blocked) return blocked;
       try {
@@ -811,10 +816,34 @@ function registerTools(server: McpServer, config: Config): void {
         const page = await getPage(page_id, true);
         const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
 
-        // Auto-detect markdown and convert to storage format (same as update_page / prepend_to_page)
-        const sectionStorage = looksLikeMarkdown(body)
-          ? markdownToStorage(body)
-          : body;
+        let sectionStorage: string;
+        let effectiveVersionMessage = version_message;
+
+        if (looksLikeMarkdown(body)) {
+          // Token-aware write path: extract the current section body
+          // (without heading) so planUpdate can tokenise its <ac:> elements
+          // and preserve them in the caller's markdown output.
+          const currentSectionBody = extractSectionBody(fullBody, section);
+          if (currentSectionBody === null) {
+            return toolResult(
+              `Section "${section}" not found. Use headings_only to see available sections.`
+            );
+          }
+
+          const plan = planUpdate({
+            currentStorage: currentSectionBody,
+            callerMarkdown: body,
+            confirmDeletions: confirm_deletions,
+          });
+          sectionStorage = plan.newStorage;
+          effectiveVersionMessage =
+            plan.versionMessage && version_message
+              ? `${version_message}; ${plan.versionMessage}`
+              : plan.versionMessage ?? version_message;
+        } else {
+          // Storage format: pass through verbatim.
+          sectionStorage = body;
+        }
 
         const newFullBody = replaceSection(fullBody, section, sectionStorage);
         if (newFullBody === null) {
@@ -834,7 +863,7 @@ function registerTools(server: McpServer, config: Config): void {
           title: page.title,
           body: newFullBody,
           version,
-          versionMessage: version_message,
+          versionMessage: effectiveVersionMessage,
           previousBody: fullBody,
           clientLabel: getClientLabel(server),
         });
