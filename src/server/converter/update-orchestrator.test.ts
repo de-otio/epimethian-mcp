@@ -528,16 +528,19 @@ describe("planUpdate — C1: stable code-macro IDs", () => {
 describe("planUpdate — converterOptions forwarded", () => {
   it("confluenceBaseUrl is passed through to markdownToStorage", () => {
     // Use replaceBody to isolate the markdownToStorage call path.
-    const callerMd = `[click](https://example.atlassian.net/wiki/spaces/FOO/pages/12345/Title)`;
+    const url = "https://example.atlassian.net/wiki/spaces/FOO/pages/12345/Title";
+    const callerMd = `[click](${url})`;
     const plan = planUpdate({
       currentStorage: "",
       callerMarkdown: callerMd,
       replaceBody: true,
       converterOptions: { confluenceBaseUrl: "https://example.atlassian.net" },
     });
-    // Rewritten to an ac:link with the content-id.
-    expect(plan.newStorage).toContain(`<ac:link>`);
-    expect(plan.newStorage).toContain(`ri:content-id="12345"`);
+    // Post-B2: internal Confluence URLs are emitted as plain <a href> anchors
+    // (identical to external links). The option still affects behaviour via
+    // URL recognition paths elsewhere, but the emitted link shape is plain.
+    expect(plan.newStorage).toContain(`<a href="${url}">click</a>`);
+    expect(plan.newStorage).not.toContain(`<ac:link>`);
   });
 });
 

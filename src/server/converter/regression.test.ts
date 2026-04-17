@@ -468,12 +468,17 @@ describe("security: URL spoofing end-to-end", () => {
     expect(storage).toContain("<a href=");
   });
 
-  it("real Confluence URL is correctly rewritten to ac:link", () => {
-    const md = `[Link](https://entrixenergy.atlassian.net/wiki/spaces/DEV/pages/12345)`;
+  it("real Confluence URL is emitted as a plain <a href> anchor (B2)", () => {
+    const url = "https://entrixenergy.atlassian.net/wiki/spaces/DEV/pages/12345";
+    const md = `[Link](${url})`;
     const storage = markdownToStorage(md, { confluenceBaseUrl: BASE_URL });
-    // Must be an <ac:link>, not a plain <a>.
-    expect(storage).toContain("<ac:link>");
-    expect(storage).not.toContain('<a href="https://entrixenergy.atlassian.net');
+    // Post-B2: internal Confluence URLs use the same plain <a href> shape as
+    // external URLs. The legacy <ac:link> + ri:content-id + ac:plain-text-link-body
+    // shape rendered invisible anchor text on Confluence Cloud — see
+    // plans/centralized-write-safety.md §"rewriteConfluenceLinks emits a storage
+    // shape that doesn't render".
+    expect(storage).toContain(`<a href="${url}">Link</a>`);
+    expect(storage).not.toContain("<ac:link>");
   });
 });
 

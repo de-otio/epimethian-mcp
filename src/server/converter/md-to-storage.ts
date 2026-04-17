@@ -17,7 +17,9 @@ import container from "markdown-it-container";
 import matter from "gray-matter";
 import { randomUUID } from "crypto";
 import { escapeXmlAttr, escapeXmlText, escapeCdata } from "./escape.js";
-import { parseConfluenceUrl } from "./url-parser.js";
+// Note: `parseConfluenceUrl` is no longer imported — B2 (plain-anchor strategy)
+// made `rewriteConfluenceLinks` an identity pass. B3 (optional smart-link
+// variant) will re-import it if/when it lands.
 import { isMacroAllowed } from "./allowlist.js";
 import { isValidAccountId } from "./account-id-validator.js";
 import { ConverterError, type ConverterOptions } from "./types.js";
@@ -860,33 +862,24 @@ function extractConfluenceSchemeLinks(
 }
 
 /**
- * Rewrite <a href="..."> links to <ac:link> when the URL is recognised as an
- * internal Confluence page link. External links are left unchanged.
+ * Link rewriter for internal Confluence page URLs.
+ *
+ * B2 (centralized-write-safety, plain-anchor strategy): this is now an
+ * identity pass. markdown-it already produces `<a href="…">text</a>` for
+ * every link, and plain anchors render correctly on Confluence Cloud for
+ * both internal and external URLs. The previous implementation emitted
+ * `<ac:link>` with `<ri:page ri:content-id="…"/>` + `<ac:plain-text-link-body>`,
+ * a legacy storage shape that the modern renderer does not display anchor
+ * text for — a silent data-loss class bug. See `plans/centralized-write-safety.md`
+ * §"rewriteConfluenceLinks emits a storage shape that doesn't render" and
+ * the B1 tripwire test in `md-to-storage.test.ts`.
+ *
+ * The function is kept (not deleted) so B3 can replace its body later to
+ * add an opt-in smart-link variant (`ri:content-title` + `<ac:link-body>`
+ * behind a caller-supplied title resolver).
  */
-function rewriteConfluenceLinks(html: string, confluenceBaseUrl: string): string {
-  return html.replace(/<a href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (fullMatch, href, innerHtml) => {
-    // Strip tags from inner HTML to get display text.
-    const displayText = innerHtml.replace(/<[^>]+>/g, "");
-
-    const ref = parseConfluenceUrl(href, confluenceBaseUrl);
-    if (!ref) return fullMatch;
-
-    let riPage = `<ri:page ri:content-id="${escapeXmlAttr(ref.contentId)}"`;
-    if (ref.spaceKey) {
-      riPage += ` ri:space-key="${escapeXmlAttr(ref.spaceKey)}"`;
-    }
-    riPage += "/>";
-
-    let link = `<ac:link>`;
-    if (ref.anchor) {
-      link += `<ri:anchor ri:value="${escapeXmlAttr(ref.anchor)}"/>`;
-    }
-    link +=
-      riPage +
-      `<ac:plain-text-link-body><![CDATA[${escapeCdata(displayText)}]]></ac:plain-text-link-body>` +
-      `</ac:link>`;
-    return link;
-  });
+function rewriteConfluenceLinks(html: string, _confluenceBaseUrl: string): string {
+  return html;
 }
 
 /**

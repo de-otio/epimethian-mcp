@@ -269,13 +269,16 @@ describe("links", () => {
     expect(out).toContain('<a href="https://www.google.com">Google</a>');
   });
 
-  it("rewrites Confluence URL to ac:link with ri:content-id", () => {
+  it("emits a plain <a href> anchor for internal Confluence URLs (B2)", () => {
+    // Prior to B2, this path emitted <ac:link> with <ri:page ri:content-id="…"/>
+    // + <ac:plain-text-link-body> — a legacy storage shape that Confluence Cloud's
+    // modern renderer does NOT display anchor text for. B2 collapses internal and
+    // external links into the same plain-anchor shape, which always renders.
     const url = `${BASE_URL}/wiki/spaces/ETD/pages/875954196/EX-3946+Overview`;
     const out = convert(`[Overview](${url})`, { confluenceBaseUrl: BASE_URL });
-    expect(out).toContain("<ac:link>");
-    expect(out).toContain('<ri:page ri:content-id="875954196"');
-    expect(out).toContain("<ac:plain-text-link-body><![CDATA[Overview]]></ac:plain-text-link-body>");
-    expect(out).toContain("</ac:link>");
+    expect(out).toContain(`<a href="${url}">Overview</a>`);
+    expect(out).not.toContain("<ac:link>");
+    expect(out).not.toContain("ri:content-id");
   });
 
   it("rewrites confluence:// scheme to ac:link with space-key and content-title", () => {
@@ -310,29 +313,30 @@ describe("links", () => {
 //
 // These tests assert the renderer-visible behaviour of rewriteConfluenceLinks.
 //
-// The FIRST test is a KNOWN FAILING test (it.fails) — it will go green once B2
-// rewrites rewriteConfluenceLinks to emit plain <a href> anchors instead of the
-// legacy <ac:link>/<ac:plain-text-link-body> shape.
+// B2 has landed: rewriteConfluenceLinks is an identity pass and internal
+// URLs reach the output as plain <a href> anchors — the same shape markdown-it
+// already produces for external URLs. These tests pin that behaviour against
+// regressions that would reintroduce the renderer-invisible legacy shape.
 //
-// See: plans/centralized-write-safety-implementation.md  §B1
+// See: plans/centralized-write-safety-implementation.md  §B1, §B2
 //      plans/centralized-write-safety.md  §"rewriteConfluenceLinks emits a storage shape that doesn't render"
-//
-// When B2 lands: remove the `.fails` wrapper (leave the assertion and this comment).
 
 const B2_BASE = "https://configured.base";
 
 describe("B1 — rewriteConfluenceLinks anchor-text round-trip (B2 tripwire)", () => {
-  // KNOWN FAILING: current code emits <ac:plain-text-link-body> with ri:content-id,
-  // which the modern Confluence Cloud renderer does NOT display as anchor text.
-  // Remove .fails when B2 (rewrite to plain <a href>) lands.
-  it.fails(
+  // B2 has landed: rewriteConfluenceLinks is now an identity pass, so the
+  // markdown-it-produced `<a href="…">text</a>` reaches the output unchanged.
+  // This assertion pins that behaviour — if a future change reintroduces the
+  // legacy `<ac:link>` + `ri:content-id` + `<ac:plain-text-link-body>` shape
+  // for internal URLs, this test fails and the renderer-invisible-link class
+  // of bug is caught before it ships.
+  it(
     "internal link emits a plain <a> anchor whose visible text matches the markdown link label",
     () => {
       const internalUrl = `${B2_BASE}/wiki/spaces/X/pages/123`;
       const out = convert(`[click here](${internalUrl})`, { confluenceBaseUrl: B2_BASE });
-      // B2 target: plain <a href="...">click here</a> — renders correctly everywhere.
-      // Current output: <ac:link><ri:page ri:content-id="123"…/><ac:plain-text-link-body>…</ac:link>
-      //   — does NOT render visible anchor text on Atlassian-hosted Confluence Cloud (2026).
+      // Plain <a href="...">click here</a> renders correctly on Confluence Cloud
+      // and everywhere else, identical to how external links have always worked.
       expect(out).toContain(`<a href="${internalUrl}">click here</a>`);
     }
   );
@@ -522,12 +526,16 @@ describe("URL-spoofing regression", () => {
     expect(out).not.toContain("<ac:link>");
   });
 
-  it("rewrites URL with explicit port 443 same as default", () => {
+  it("treats URL with explicit port 443 as internal (plain <a> after B2)", () => {
     const explicit443 = "https://entrixenergy.atlassian.net:443/wiki/spaces/X/pages/12345/Foo";
     const out = convert(`[Foo](${explicit443})`, { confluenceBaseUrl: BASE_URL });
-    // Should rewrite since :443 == default https port
-    expect(out).toContain("<ac:link>");
-    expect(out).toContain('ri:content-id="12345"');
+    // :443 == default https port, so the URL is recognised as internal. Post-B2
+    // that no longer changes the emitted shape — markdown-it's plain <a href>
+    // is preserved. The spoofing-regression neighbours (above + below) assert
+    // the negative case; this one pins that matching an internal URL doesn't
+    // mangle it into the legacy <ac:link> shape.
+    expect(out).toContain(`<a href="${explicit443}">Foo</a>`);
+    expect(out).not.toContain("<ac:link>");
   });
 });
 
