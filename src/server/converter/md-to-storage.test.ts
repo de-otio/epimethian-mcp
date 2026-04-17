@@ -305,6 +305,49 @@ describe("links", () => {
 });
 
 // ---------------------------------------------------------------------------
+// B1 tripwire: internal Confluence link anchor-text round-trip
+// ---------------------------------------------------------------------------
+//
+// These tests assert the renderer-visible behaviour of rewriteConfluenceLinks.
+//
+// The FIRST test is a KNOWN FAILING test (it.fails) — it will go green once B2
+// rewrites rewriteConfluenceLinks to emit plain <a href> anchors instead of the
+// legacy <ac:link>/<ac:plain-text-link-body> shape.
+//
+// See: plans/centralized-write-safety-implementation.md  §B1
+//      plans/centralized-write-safety.md  §"rewriteConfluenceLinks emits a storage shape that doesn't render"
+//
+// When B2 lands: remove the `.fails` wrapper (leave the assertion and this comment).
+
+const B2_BASE = "https://configured.base";
+
+describe("B1 — rewriteConfluenceLinks anchor-text round-trip (B2 tripwire)", () => {
+  // KNOWN FAILING: current code emits <ac:plain-text-link-body> with ri:content-id,
+  // which the modern Confluence Cloud renderer does NOT display as anchor text.
+  // Remove .fails when B2 (rewrite to plain <a href>) lands.
+  it.fails(
+    "internal link emits a plain <a> anchor whose visible text matches the markdown link label",
+    () => {
+      const internalUrl = `${B2_BASE}/wiki/spaces/X/pages/123`;
+      const out = convert(`[click here](${internalUrl})`, { confluenceBaseUrl: B2_BASE });
+      // B2 target: plain <a href="...">click here</a> — renders correctly everywhere.
+      // Current output: <ac:link><ri:page ri:content-id="123"…/><ac:plain-text-link-body>…</ac:link>
+      //   — does NOT render visible anchor text on Atlassian-hosted Confluence Cloud (2026).
+      expect(out).toContain(`<a href="${internalUrl}">click here</a>`);
+    }
+  );
+
+  // Companion (passing): external links must continue to emit plain <a href> anchors.
+  // Pins existing external-link behaviour so B2 cannot accidentally regress it.
+  it("external link (non-matching host) still emits a plain <a> anchor with correct visible text", () => {
+    const externalUrl = "https://external.example.com/some/path";
+    const out = convert(`[read more](${externalUrl})`, { confluenceBaseUrl: B2_BASE });
+    expect(out).toContain(`<a href="${externalUrl}">read more</a>`);
+    expect(out).not.toContain("<ac:link>");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Images
 // ---------------------------------------------------------------------------
 
