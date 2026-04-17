@@ -319,6 +319,209 @@ describe("planUpdate — token reordering preserves content", () => {
 });
 
 // ---------------------------------------------------------------------------
+// C1: Stable ac:macro-id for unchanged code-block bodies
+//
+// When a caller re-emits a fenced code block whose body text is unchanged,
+// `markdownToStorage` generates a fresh `ac:macro-id` UUID, which the
+// tokeniser then sees as "old macro deleted, new macro inserted". Before
+// C1 that forced `confirm_deletions: true` for what is semantically a
+// no-op. After C1, `planUpdate` rescues the code macro by swapping the
+// new-UUID XML for the old sidecar XML when the normalised body matches.
+//
+// Scope: code macros only. Deletions of non-code macros (drawio, panel,
+// info, etc.) still require confirmation.
+// ---------------------------------------------------------------------------
+
+describe("planUpdate — C1: stable code-macro IDs", () => {
+  // A code macro that mirrors Confluence's on-wire shape (with macro-id).
+  const CODE_WITH_ID = (id: string, body: string) =>
+    `<ac:structured-macro ac:name="code" ac:macro-id="${id}"><ac:parameter ac:name="language">ts</ac:parameter><ac:plain-text-body><![CDATA[${body}]]></ac:plain-text-body></ac:structured-macro>`;
+
+  it("re-emitting a code block with an unchanged body reuses the old ac:macro-id and does not report a deletion", () => {
+    const oldId = "old-uuid-1111";
+    const body = "const x = 1;";
+    const S = `<p>Intro</p>${CODE_WITH_ID(oldId, body)}<p>Outro</p>`;
+
+    // Caller writes markdown that includes a fenced code block with the
+    // same body — no token reference, just fresh markdown. Without C1
+    // this would throw DELETIONS_NOT_CONFIRMED.
+    const callerMd = "Intro\n\n```ts\nconst x = 1;\n```\n\nOutro";
+
+    const plan = planUpdate({ currentStorage: S, callerMarkdown: callerMd });
+
+    // The original ac:macro-id survives — this is the whole point.
+    expect(plan.newStorage).toContain(`ac:macro-id="${oldId}"`);
+    // No freshly-minted UUID for the code macro.
+    const macroIds = [...plan.newStorage.matchAll(/ac:macro-id="([^"]+)"/g)].map(
+      (m) => m[1]
+    );
+    expect(macroIds).toEqual([oldId]);
+    // The deletion gate was not triggered and nothing is reported deleted.
+    expect(plan.deletedTokens).toEqual([]);
+    expect(plan.versionMessage).toBeUndefined();
+    // The body text is still there.
+    expect(plan.newStorage).toContain("const x = 1;");
+  });
+
+  it("re-emitting a code block with the SAME body but different surrounding whitespace still matches (leading/trailing trim)", () => {
+    const oldId = "old-uuid-2222";
+    // Sidecar body has no leading/trailing whitespace.
+    const S = CODE_WITH_ID(oldId, "return 42;");
+    // Caller's markdown fence has trailing newline in the body (markdown-it
+    // always includes a trailing newline from the fence close).
+    const callerMd = "```ts\nreturn 42;\n```";
+
+    const plan = planUpdate({ currentStorage: S, callerMarkdown: callerMd });
+
+    expect(plan.newStorage).toContain(`ac:macro-id="${oldId}"`);
+    expect(plan.deletedTokens).toEqual([]);
+  });
+
+  it("a CHANGED code body is still reported as a deletion (scope guard: behaviour must not regress for genuine edits)", () => {
+    const oldId = "old-uuid-3333";
+    const S = CODE_WITH_ID(oldId, "const x = 1;");
+    // Caller changes the body — the new macro does not match the old sidecar entry.
+    const callerMd = "```ts\nconst x = 999;\n```";
+
+    // Without confirm_deletions this must still throw — C1 is narrow to
+    // "body unchanged", not "any code block".
+    expect(() =>
+      planUpdate({ currentStorage: S, callerMarkdown: callerMd })
+    ).toThrow(ConverterError);
+
+    // And the thrown error references the original code token.
+    try {
+      planUpdate({ currentStorage: S, callerMarkdown: callerMd });
+    } catch (err) {
+      expect((err as ConverterError).code).toBe("DELETIONS_NOT_CONFIRMED");
+      expect((err as ConverterError).message).toContain("T0001");
+      expect((err as ConverterError).message).toContain(`ac:name="code"`);
+    }
+  });
+
+  it("a code body that differs by one character does not match (case-sensitive, internal whitespace preserved)", () => {
+    const oldId = "old-uuid-casecheck";
+    // Internal spacing matters: two spaces inside "=  1".
+    const S = CODE_WITH_ID(oldId, "const x =  1;");
+    const callerMd = "```ts\nconst x = 1;\n```"; // single space
+    expect(() =>
+      planUpdate({ currentStorage: S, callerMarkdown: callerMd })
+    ).toThrow(/DELETIONS_NOT_CONFIRMED|deletions/i);
+  });
+
+  it("narrow scope: a non-code macro deletion (drawio) is still reported even when a code body is unchanged", () => {
+    const oldCodeId = "old-code-uuid";
+    const DRAWIO_MACRO =
+      `<ac:structured-macro ac:name="drawio" ac:macro-id="drawio-uuid"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>`;
+    const CODE = CODE_WITH_ID(oldCodeId, "const x = 1;");
+    const S = CODE + DRAWIO_MACRO;
+
+    // Caller re-emits the code block (same body) but drops the drawio
+    // entirely. The code rescue fires; the drawio is still a deletion.
+    const callerMd = "```ts\nconst x = 1;\n```";
+
+    // Without confirm_deletions: must still throw for the drawio.
+    try {
+      planUpdate({ currentStorage: S, callerMarkdown: callerMd });
+      throw new Error("expected DELETIONS_NOT_CONFIRMED");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConverterError);
+      const e = err as ConverterError;
+      expect(e.code).toBe("DELETIONS_NOT_CONFIRMED");
+      // The error must name the drawio deletion, NOT the code one
+      // (the code macro was rescued and is no longer deleted).
+      expect(e.message).toContain(`ac:name="drawio"`);
+      expect(e.message).not.toContain(`ac:name="code"`);
+      // Exactly one deletion reported (drawio), not two.
+      expect(e.message).toMatch(/1 preserved element/);
+    }
+  });
+
+  it("a code-body match plus an unrelated drawio deletion: the drawio is still rescued by confirm_deletions, but the code is not listed in the version message", () => {
+    const oldCodeId = "old-code-uuid";
+    const DRAWIO_MACRO =
+      `<ac:structured-macro ac:name="drawio" ac:macro-id="drawio-uuid"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>`;
+    const CODE = CODE_WITH_ID(oldCodeId, "const x = 1;");
+    const S = CODE + DRAWIO_MACRO;
+    const callerMd = "```ts\nconst x = 1;\n```";
+
+    const plan = planUpdate({
+      currentStorage: S,
+      callerMarkdown: callerMd,
+      confirmDeletions: true,
+    });
+
+    // Only the drawio token ID appears in deletedTokens — the code one was rescued.
+    expect(plan.deletedTokens.length).toBe(1);
+    // The rescued code macro retains its old ac:macro-id in the output.
+    expect(plan.newStorage).toContain(`ac:macro-id="${oldCodeId}"`);
+    // The drawio is genuinely gone from the output.
+    expect(plan.newStorage).not.toContain(`ac:name="drawio"`);
+    // The version message names the drawio, not the code.
+    expect(plan.versionMessage).toContain(`ac:name="drawio"`);
+    expect(plan.versionMessage).not.toContain(`ac:name="code"`);
+  });
+
+  it("re-emitting a code block at a new position keeps the old ac:macro-id (position doesn't affect match)", () => {
+    const oldId = "old-uuid-4444";
+    const S = `<p>A</p>${CODE_WITH_ID(oldId, "return 1;")}<p>B</p>`;
+    // Caller moves the code to the bottom.
+    const callerMd = "A\n\nB\n\n```ts\nreturn 1;\n```";
+
+    const plan = planUpdate({ currentStorage: S, callerMarkdown: callerMd });
+
+    expect(plan.newStorage).toContain(`ac:macro-id="${oldId}"`);
+    expect(plan.deletedTokens).toEqual([]);
+  });
+
+  it("two identical code blocks in current storage, caller re-emits only one → one rescue, one deletion reported (with confirmation)", () => {
+    // Both code macros have the same body; they differ only in ac:macro-id.
+    // This is an unusual page shape but it's the edge case that pins down
+    // the 1:1 claim contract of the rescue.
+    const idA = "uuid-A";
+    const idB = "uuid-B";
+    const body = "print('hi')";
+    const S = CODE_WITH_ID(idA, body) + CODE_WITH_ID(idB, body);
+
+    const callerMd = "```python\nprint('hi')\n```";
+
+    // Without confirmation, throws because exactly one of the two
+    // code macros ends up deleted (the other is rescued).
+    expect(() =>
+      planUpdate({ currentStorage: S, callerMarkdown: callerMd })
+    ).toThrow(/DELETIONS_NOT_CONFIRMED|deletion/i);
+
+    // With confirmation, exactly one is reported deleted.
+    const plan = planUpdate({
+      currentStorage: S,
+      callerMarkdown: callerMd,
+      confirmDeletions: true,
+    });
+    expect(plan.deletedTokens.length).toBe(1);
+    // Output contains the rescued macro's id exactly once.
+    const ids = [...plan.newStorage.matchAll(/ac:macro-id="([^"]+)"/g)].map(
+      (m) => m[1]
+    );
+    expect(ids.length).toBe(1);
+    // First-match-wins: the first deleted token with a matching body is
+    // the one that gets rescued. Both IDs are valid rescue candidates;
+    // assert it's one of them, not a fresh UUID.
+    expect([idA, idB]).toContain(ids[0]);
+  });
+
+  it("sidecar attribute ordering does not break the match (old macro-id attr before ac:name vs after)", () => {
+    // Build a sidecar entry where ac:macro-id appears BEFORE ac:name —
+    // a shape that Confluence has been observed to emit.
+    const S = `<ac:structured-macro ac:macro-id="swap-uuid-5" ac:name="code" ac:schema-version="1"><ac:parameter ac:name="language">bash</ac:parameter><ac:plain-text-body><![CDATA[echo hi]]></ac:plain-text-body></ac:structured-macro>`;
+    const callerMd = "```bash\necho hi\n```";
+
+    const plan = planUpdate({ currentStorage: S, callerMarkdown: callerMd });
+    expect(plan.newStorage).toContain(`ac:macro-id="swap-uuid-5"`);
+    expect(plan.deletedTokens).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ConverterOptions plumbing
 // ---------------------------------------------------------------------------
 

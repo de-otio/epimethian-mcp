@@ -27,6 +27,181 @@ import {
   type TokenSidecar,
 } from "./types.js";
 
+// ---------------------------------------------------------------------------
+// Stable code-macro IDs (C1).
+//
+// Context: when a caller re-emits a fenced code block in their markdown,
+// `markdownToStorage` produces a brand-new `<ac:structured-macro ac:name="code"
+// ac:macro-id="{fresh UUID}">` element. The old code macro from the page's
+// current storage has a different `ac:macro-id`. Structurally this looks like
+// "old code token deleted, new untracked code macro inserted" — `planUpdate`
+// reports a deletion and demands `confirm_deletions: true`.
+//
+// That confirmation requirement is non-semantic churn: the caller did not
+// change anything meaningful. Worse, `confirm_deletions: true` is a blanket
+// ack that silently also accepts *unrelated* deletions (e.g. an embedded
+// drawio macro the caller never noticed) — see the 5.5.x incident in
+// plans/centralized-write-safety.md.
+//
+// The fix (narrow, code-macro specific): when a newly-emitted code macro's
+// normalised body text matches a sidecar entry for a code macro that the
+// diff classified as "deleted", treat that as the SAME macro. Swap the new
+// macro in the converted output for the old sidecar XML (preserving the old
+// `ac:macro-id`), and remove that token ID from the deletion list.
+//
+// Intentionally NOT extended to other macros (drawio, panel, info, etc.) —
+// those legitimately need `confirm_deletions` when removed. C1 narrows the
+// deletion signal, it does not broaden it.
+// ---------------------------------------------------------------------------
+
+/**
+ * Matches a self-contained code macro: `<ac:structured-macro ac:name="code" ...>
+ * ...<ac:plain-text-body><![CDATA[...]]></ac:plain-text-body>...</ac:structured-macro>`.
+ *
+ * Attribute order on the opening tag may differ between an emission from
+ * `md-to-storage`'s fence renderer (attrs in one order) and a Confluence
+ * sidecar entry (attrs in a potentially different order). The regex anchors
+ * on `ac:name="code"` appearing anywhere in the opening tag's attribute list,
+ * and treats the body up to the matching close tag as a unit.
+ *
+ * Non-greedy up to the *first* `</ac:structured-macro>` — code macros don't
+ * nest other structured macros (their body is CDATA), so first-close is
+ * always the right close.
+ */
+const CODE_MACRO_RE =
+  /<ac:structured-macro\b[^>]*\bac:name="code"[^>]*>[\s\S]*?<\/ac:structured-macro>/g;
+
+/**
+ * Extract the plain-text body (the text inside `<![CDATA[...]]>`) from a
+ * code macro's outer XML. Returns `undefined` if the macro has no
+ * `<ac:plain-text-body>` or no `<![CDATA[...]]>` inside it — those shapes
+ * can't be safely matched for reuse.
+ *
+ * Confluence-emitted code macros may emit `<![CDATA[...]]]]><![CDATA[...]]>`
+ * sequences to escape literal `]]>` in the body; we concatenate all CDATA
+ * runs inside `<ac:plain-text-body>` so the round-tripped body is captured
+ * as a single string.
+ */
+function extractCodeMacroBody(macroXml: string): string | undefined {
+  const bodyMatch = macroXml.match(
+    /<ac:plain-text-body>([\s\S]*?)<\/ac:plain-text-body>/
+  );
+  if (!bodyMatch) return undefined;
+  const bodyInner = bodyMatch[1]!;
+  // Concatenate all CDATA runs; non-CDATA content between them (usually the
+  // `]]` split trick) is dropped per the CDATA escape convention.
+  const cdataRe = /<!\[CDATA\[([\s\S]*?)\]\]>/g;
+  let body = "";
+  let sawCdata = false;
+  for (const m of bodyInner.matchAll(cdataRe)) {
+    sawCdata = true;
+    body += m[1]!;
+  }
+  if (!sawCdata) return undefined;
+  return body;
+}
+
+/**
+ * Normalise a code macro body for reuse matching. Per the C1 spec: trim
+ * leading/trailing whitespace on the body text; preserve internal
+ * whitespace exactly; compare case-sensitively.
+ */
+function normaliseCodeBody(body: string): string {
+  return body.replace(/^\s+|\s+$/g, "");
+}
+
+/**
+ * Heuristic: is this sidecar entry a code macro? A code macro's outer XML
+ * has `ac:structured-macro` as its top tag and carries `ac:name="code"`
+ * in its attribute list. We check the OPENING tag only — nested macros
+ * can't appear inside a code body (the body is CDATA), so a nested match
+ * inside a panel wouldn't survive tokenisation (the panel tokenises
+ * outermost-first and its inner code macro is opaque under the panel).
+ */
+function isCodeMacro(sidecarXml: string): boolean {
+  const openTagMatch = sidecarXml.match(/^<ac:structured-macro\b[^>]*>/);
+  if (!openTagMatch) return false;
+  return /\bac:name="code"(?:\s|>|$)/.test(openTagMatch[0]);
+}
+
+/**
+ * Build a lookup table for code-macro reuse: for every deleted token whose
+ * sidecar entry is a code macro with an extractable body, map the
+ * normalised body text to that token ID. Multiple deleted code macros
+ * with the same normalised body collapse into the *first* (stable, in
+ * document order); subsequent matches won't be reused because the first
+ * one will already be claimed.
+ */
+function buildDeletedCodeBodyIndex(
+  deleted: TokenId[],
+  sidecar: TokenSidecar
+): Map<string, TokenId> {
+  const index = new Map<string, TokenId>();
+  for (const id of deleted) {
+    const xml = sidecar[id];
+    if (!xml) continue;
+    if (!isCodeMacro(xml)) continue;
+    const body = extractCodeMacroBody(xml);
+    if (body === undefined) continue;
+    const key = normaliseCodeBody(body);
+    if (!index.has(key)) {
+      index.set(key, id);
+    }
+  }
+  return index;
+}
+
+/**
+ * Result of the code-macro rescue pass.
+ */
+interface CodeMacroRescueResult {
+  /** Storage with matched new code macros swapped for their old sidecar XML. */
+  rewrittenStorage: string;
+  /** Token IDs that were "rescued" — claimed by a matching new code macro and therefore no longer deleted. */
+  rescuedIds: Set<TokenId>;
+}
+
+/**
+ * Scan the converted storage for newly-emitted code macros and, for each
+ * one whose normalised body matches a deleted code-macro sidecar entry,
+ * replace the new macro's outer XML with the old sidecar XML. This
+ * reuses the old `ac:macro-id` so the diff no longer reports a deletion.
+ *
+ * Reuse is 1:1 — each deleted sidecar entry can only rescue a single
+ * new emission. If the caller re-emitted the same code body twice, the
+ * second emission keeps its new UUID (there's no old sidecar entry left
+ * to swap it for). This is the right behaviour: a caller who duplicated
+ * a code block is adding content, not preserving it.
+ */
+function rescueStableCodeMacroIds(
+  storage: string,
+  deleted: TokenId[],
+  sidecar: TokenSidecar
+): CodeMacroRescueResult {
+  const rescuedIds = new Set<TokenId>();
+  if (deleted.length === 0) {
+    return { rewrittenStorage: storage, rescuedIds };
+  }
+  const bodyIndex = buildDeletedCodeBodyIndex(deleted, sidecar);
+  if (bodyIndex.size === 0) {
+    return { rewrittenStorage: storage, rescuedIds };
+  }
+
+  const rewrittenStorage = storage.replace(CODE_MACRO_RE, (match) => {
+    const body = extractCodeMacroBody(match);
+    if (body === undefined) return match;
+    const key = normaliseCodeBody(body);
+    const hitId = bodyIndex.get(key);
+    if (hitId === undefined) return match;
+    // Claim this token — each sidecar entry rescues at most one emission.
+    bodyIndex.delete(key);
+    rescuedIds.add(hitId);
+    return sidecar[hitId]!;
+  });
+
+  return { rewrittenStorage, rescuedIds };
+}
+
 /**
  * Inputs accepted by the `planUpdate` orchestrator.
  */
@@ -175,16 +350,21 @@ function buildDeletionError(
  *   2. Otherwise, tokenise the current storage and diff the caller's
  *      markdown against the resulting canonical.
  *   3. Invented tokens → `ConverterError(INVENTED_TOKEN)`.
- *   4. Deletions without `confirmDeletions` → `ConverterError(DELETIONS_NOT_CONFIRMED)`.
- *   5. Convert caller markdown via `markdownToStorage` (tokens pass
+ *   4. Convert caller markdown via `markdownToStorage` (tokens pass
  *      through as text for preserved IDs).
- *   6. Unwrap `<p>`-only paragraphs that contain just tokens (see
+ *   5. Code-macro rescue (C1): swap newly-emitted code macros whose
+ *      normalised body matches a deleted sidecar code macro for the
+ *      old sidecar XML, and drop those IDs from the deletion list.
+ *   6. Remaining deletions without `confirmDeletions` →
+ *      `ConverterError(DELETIONS_NOT_CONFIRMED)`.
+ *   7. Unwrap `<p>`-only paragraphs that contain just tokens (see
  *      {@link TOKEN_ONLY_PARAGRAPH_RE}).
- *   7. Restore preserved tokens from the sidecar byte-for-byte. The
+ *   8. Restore preserved tokens from the sidecar byte-for-byte. The
  *      sidecar contains entries for deleted tokens too, but those
  *      tokens are absent from the output, so `restoreFromTokens`
  *      simply doesn't replace them — deletions become silent absences.
- *   8. Compose a version message listing the deleted IDs and return.
+ *   9. Compose a version message listing the remaining deleted IDs
+ *      and return.
  *
  * @throws ConverterError with codes `INVENTED_TOKEN`, `DELETIONS_NOT_CONFIRMED`,
  *   or any code surfaced by `markdownToStorage` / `restoreFromTokens`.
@@ -227,37 +407,67 @@ export function planUpdate(params: PlanUpdateInput): UpdatePlan {
     );
   }
 
-  // 5. Deletions gate: caller must opt in explicitly to losing any
-  //    preserved element.
-  if (diff.deleted.length > 0 && !confirmDeletions) {
-    throw buildDeletionError(diff.deleted, sidecar);
-  }
-
-  // 6. Convert the caller's markdown into storage. For preserved
+  // 5. Convert the caller's markdown into storage. For preserved
   //    tokens, the literal `[[epi:T####]]` passes through as text.
+  //
+  //    Intentionally runs BEFORE the deletions gate (below), because
+  //    step 6 (code-macro rescue) can reclassify a would-be deletion
+  //    as a reuse, in which case the gate must not fire. See C1.
   const storageFromConverter = markdownToStorage(
     callerMarkdown,
     converterOptions
   );
 
-  // 7. Unwrap `<p>` wrappers introduced by markdown-it around bare
+  // 6. Code-macro rescue (C1): when the caller re-emits a fenced code
+  //    block with an unchanged body, `markdownToStorage` generates a
+  //    fresh `ac:macro-id` UUID. Without this step the diff would
+  //    classify the old code macro as deleted and the new one as
+  //    non-token noise, forcing `confirm_deletions: true` for what is
+  //    semantically a no-op. The rescue matches new code macros to
+  //    deleted sidecar code macros by normalised body text and swaps
+  //    the new XML for the old (preserving the old macro-id), then
+  //    removes those IDs from the deletion list.
+  //
+  //    Narrow by design: code macros only. Other macro deletions still
+  //    require explicit confirmation.
+  const { rewrittenStorage, rescuedIds } = rescueStableCodeMacroIds(
+    storageFromConverter,
+    diff.deleted,
+    sidecar
+  );
+  const remainingDeleted =
+    rescuedIds.size > 0
+      ? diff.deleted.filter((id) => !rescuedIds.has(id))
+      : diff.deleted;
+
+  // 7. Deletions gate: caller must opt in explicitly to losing any
+  //    preserved element (after rescue has settled which tokens are
+  //    genuinely going away).
+  if (remainingDeleted.length > 0 && !confirmDeletions) {
+    throw buildDeletionError(remainingDeleted, sidecar);
+  }
+
+  // 8. Unwrap `<p>` wrappers introduced by markdown-it around bare
   //    block-level tokens (so the restored macro ends up at block
   //    level, not inside a paragraph — see TOKEN_ONLY_PARAGRAPH_RE).
-  const unwrapped = unwrapTokenOnlyParagraphs(storageFromConverter);
+  const unwrapped = unwrapTokenOnlyParagraphs(rewrittenStorage);
 
-  // 8. Restore preserved tokens. Deleted tokens have no presence in
-  //    `unwrapped`, so their sidecar entries are silently unused.
+  // 9. Restore preserved tokens. Remaining deleted tokens have no
+  //    presence in `unwrapped`, so their sidecar entries are silently
+  //    unused.
   const newStorage = restoreFromTokens(unwrapped, sidecar);
 
-  // 9. Compose the version message (only if there were deletions).
+  // 10. Compose the version message (only if there were *genuine*
+  //     deletions — rescued code macros are intentionally silent; they
+  //     represent a no-op replacement, not a user-visible change).
   const versionMessage =
-    diff.deleted.length > 0
-      ? buildVersionMessage(diff.deleted, sidecar)
+    remainingDeleted.length > 0
+      ? buildVersionMessage(remainingDeleted, sidecar)
       : undefined;
 
   return {
     newStorage,
-    deletedTokens: diff.deleted,
+    deletedTokens: remainingDeleted,
     ...(versionMessage !== undefined ? { versionMessage } : {}),
   };
 }
