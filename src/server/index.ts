@@ -298,35 +298,13 @@ function registerTools(server: McpServer, config: Config): void {
       confluenceBaseUrl?: string;
     } = {}
   ): Promise<{ page: { id: string; title: string }; newVersion: number; oldLen: number; newLen: number }> {
-    // Reject read-only markdown round-trips (same guard as update_page).
-    if (newContent.includes("epimethian:read-only-markdown")) {
-      throw new ConverterError(
-        "The content contains output produced by get_page with format: 'markdown', which is a " +
-          "read-only rendering not suitable for prepend/append operations. " +
-          "Compose new content from scratch instead.",
-        "READ_ONLY_MARKDOWN_ROUND_TRIP"
-      );
-    }
-
     const currentPage = await getPage(page_id, true);
     const currentStorage: string =
       currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
 
+    // Determine separator before prepare (default depends on markdown detection).
     const isMarkdown = looksLikeMarkdown(newContent);
-    const contentStorage = isMarkdown
-      ? markdownToStorage(newContent, {
-          allowRawHtml: opts.allowRawHtml,
-          confluenceBaseUrl: opts.confluenceBaseUrl,
-        })
-      : newContent;
-
-    // Determine separator
-    let sep: string;
-    if (opts.separator !== undefined) {
-      sep = opts.separator;
-    } else {
-      sep = isMarkdown ? "\n\n" : "";
-    }
+    const sep = opts.separator !== undefined ? opts.separator : (isMarkdown ? "\n\n" : "");
 
     // Security: validate separator
     if (sep.length > 100) {
@@ -336,34 +314,44 @@ function registerTools(server: McpServer, config: Config): void {
       throw new Error("separator must not contain XML/HTML tags (no '<' characters)");
     }
 
+    // scope: "additive" — read-only-markdown rejection, markdown→storage
+    // conversion, and the post-transform body guard run inside safePrepareBody.
+    // The prepared output is the addition only; currentStorage round-trips
+    // byte-for-byte into finalStorage after the handler concat below.
+    const prepared = await safePrepareBody({
+      body: newContent,
+      currentBody: currentStorage,
+      scope: "additive",
+      allowRawHtml: opts.allowRawHtml,
+      confluenceBaseUrl: opts.confluenceBaseUrl,
+    });
+
+    const contentStorage = prepared.finalStorage!;
+
     // Security: validate combined size
     if (currentStorage.length + contentStorage.length + sep.length > 2_000_000) {
       throw new Error("Combined body exceeds 2MB limit");
     }
 
+    // currentStorage is concatenated unchanged — the invariant for additive ops.
     const newBody =
       position === "prepend"
         ? contentStorage + sep + currentStorage
         : currentStorage + sep + contentStorage;
 
-    // Content-safety guards — prevents silent body loss if the
-    // concatenation somehow produces a much smaller or empty result
-    // (e.g. separator injection, corrupt existing body).
-    enforceContentSafetyGuards({
-      oldStorage: currentStorage,
-      newStorage: newBody,
-    });
-
-    const { page, newVersion } = await updatePage(page_id, {
+    const submitted = await safeSubmitPage({
+      pageId: page_id,
       title: currentPage.title,
-      body: newBody,
-      version,
-      versionMessage: opts.versionMessage,
+      finalStorage: newBody,
       previousBody: currentStorage,
+      version,
+      versionMessage: opts.versionMessage ?? prepared.versionMessage,
+      deletedTokens: prepared.deletedTokens,
       clientLabel: getClientLabel(server),
+      operation: position === "prepend" ? "prepend_to_page" : "append_to_page",
     });
 
-    return { page, newVersion, oldLen: currentStorage.length, newLen: newBody.length };
+    return { page: submitted.page, newVersion: submitted.newVersion, oldLen: currentStorage.length, newLen: newBody.length };
   }
 
   // create_page
