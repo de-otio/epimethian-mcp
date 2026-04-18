@@ -33,6 +33,7 @@ export interface MutationRecord {
   operation:
     | "create_page"
     | "update_page"
+    | "update_page_section"
     | "delete_page"
     | "prepend_to_page"
     | "append_to_page"

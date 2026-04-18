@@ -750,6 +750,7 @@ function registerTools(server: McpServer, config: Config): void {
           version,
           versionMessage: mergedVersionMessage,
           deletedTokens: prepared.deletedTokens,
+          operation: "update_page_section",
           clientLabel: getClientLabel(server),
         });
 
