@@ -36,7 +36,8 @@ export interface MutationRecord {
     | "delete_page"
     | "prepend_to_page"
     | "append_to_page"
-    | "revert_page";
+    | "revert_page"
+    | "add_drawio_diagram";
   pageId: string;
   oldVersion?: number;
   newVersion?: number;

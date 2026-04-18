@@ -1232,41 +1232,37 @@ function registerTools(server: McpServer, config: Config): void {
 
         const newBody = append ? `${existingBody}\n${macro}` : macro;
 
-        // Content-safety guards — prevents silent body loss when append=false
-        // replaces a rich page with just the macro, or when existingBody is
-        // corrupt and append produces broken XML.
-        enforceContentSafetyGuards({
-          oldStorage: existingBody,
-          newStorage: newBody,
+        // scope: "full" — newBody is the fully-assembled storage body (either
+        // append=true: existingBody + macro, or append=false: macro only).
+        // safePrepareBody detects non-markdown and passes it through unchanged;
+        // content guards compare existingBody→newBody, same as the old direct
+        // enforceContentSafetyGuards call did. safeSubmitPage owns mutation
+        // logging (success and failure), so no direct logMutation call is needed.
+        const prepared = await safePrepareBody({
+          body: newBody,
+          currentBody: existingBody,
+          scope: "full",
+          // append=true is additive but newBody already contains the concat,
+          // so "full" is correct: guards compare existingBody vs the complete
+          // new body, which is what we want for both branches.
         });
 
-        const { page, newVersion } = await updatePage(page_id, {
+        const submitted = await safeSubmitPage({
+          pageId: page_id,
           title: current.title,
-          body: newBody,
+          finalStorage: prepared.finalStorage,
+          previousBody: existingBody,
           version: current.version?.number ?? 0,
           versionMessage: `Added diagram: ${filename}`,
-          previousBody: existingBody,
+          deletedTokens: prepared.deletedTokens,
           clientLabel: getClientLabel(server),
-        });
-
-        logMutation({
-          timestamp: new Date().toISOString(),
-          operation: "update_page",
-          pageId: page_id,
-          oldVersion: current.version?.number ?? 0,
-          newVersion,
-          oldBodyLen: existingBody.length,
-          newBodyLen: newBody.length,
-          oldBodyHash: bodyHash(existingBody),
-          newBodyHash: bodyHash(newBody),
-          clientLabel: getClientLabel(server),
+          operation: "add_drawio_diagram",
         });
 
         return toolResult(
-          `Diagram "${filename}" added to page ${page.title} (ID: ${page.id}, version: ${newVersion})` + echo
+          `Diagram "${filename}" added to page ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion})` + echo
         );
       } catch (err) {
-        logMutation(errorRecord("update_page", page_id, err));
         return toolError(err);
       }
     }
