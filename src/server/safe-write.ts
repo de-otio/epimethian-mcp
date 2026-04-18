@@ -121,8 +121,13 @@ export interface SafePrepareBodyInput {
    * pipeline detects markdown via looksLikeMarkdown; storage is pass-through.
    * Markdown is converted via planUpdate when currentBody has preserved
    * tokens, via markdownToStorage otherwise.
+   *
+   * `undefined` is valid only for title-only updates (pageId set,
+   * body absent): the whole transformation pipeline is skipped and
+   * safeSubmitPage will submit without a `body` field, leaving page
+   * content untouched. Creates with `body === undefined` error.
    */
-  body: string;
+  body: string | undefined;
 
   /**
    * The page's current storage-format body. Required for token-aware
@@ -205,8 +210,12 @@ export interface SafePrepareBodyOutput {
    * transformed body; for "additive" this is the prepared-but-unconcatenated
    * addition that the handler must splice onto currentBody before passing
    * to safeSubmitPage.
+   *
+   * `undefined` for title-only updates (caller passed `body: undefined`):
+   * safeSubmitPage will submit without a `body` field, leaving page content
+   * unchanged.
    */
-  finalStorage: string;
+  finalStorage: string | undefined;
 
   /**
    * Suggested version message — surfaces deletion metadata and other
@@ -254,8 +263,12 @@ export interface SafeSubmitPageInput {
    * body, for scope "section"). The post-transform body guard runs on this
    * value inside safeSubmitPage — so handler-side splicing damage is caught
    * before the HTTP call.
+   *
+   * `undefined` means "title-only update — don't change the body". Valid
+   * only when `pageId` is set (updates). Creates with `finalStorage:
+   * undefined` error.
    */
-  finalStorage: string;
+  finalStorage: string | undefined;
 
   /**
    * The full page body at the current version. Required for updates; must
@@ -302,6 +315,15 @@ export interface SafeSubmitPageInput {
    * failure mutation-log records.
    */
   operation?: MutationRecord["operation"];
+
+  /**
+   * Forensic pass-through from the prepare step. When truthy, the emitted
+   * MutationRecord carries `replaceBody: true` so an audit of the mutation
+   * log can distinguish a wholesale-rewrite write from a normal one. Does
+   * not change behaviour otherwise — the actual `replaceBody` semantics
+   * happen inside safePrepareBody.
+   */
+  replaceBody?: boolean;
 }
 
 /**
@@ -557,6 +579,22 @@ export async function safePrepareBody(
     confluenceBaseUrl,
   } = input;
 
+  // 0. Title-only path: caller omitted body entirely. Valid only for updates
+  //    (currentBody defined) — creates can't submit a page with no body.
+  //    Short-circuit the whole pipeline; safeSubmitPage will submit without a
+  //    `body` field, leaving page content untouched. All guards are no-ops
+  //    for this branch (nothing transformed → nothing to guard against).
+  if (body === undefined) {
+    if (currentBody === undefined) {
+      throw new ConverterError(
+        "safePrepareBody: body is required when creating a page. " +
+          "Title-only updates are valid only for existing pages.",
+        "MISSING_BODY_FOR_CREATE",
+      );
+    }
+    return { finalStorage: undefined, versionMessage: "", deletedTokens: [] };
+  }
+
   // 1. Read-only-markdown rejection — hard guard, no opt-out. Mirrors the
   //    identical check in create_page / update_page / update_page_section
   //    handlers; consolidating it here lets those handlers drop their copies.
@@ -564,8 +602,9 @@ export async function safePrepareBody(
     throw new ConverterError(
       "The body contains content produced by get_page with format: 'markdown', which is a " +
         "read-only rendering not suitable for round-trip updates (tables, macros, and rich " +
-        "elements may be lost). Compose new markdown from scratch, or read with " +
-        "format: 'storage' and edit the storage XML.",
+        "elements may be lost). To update this page, either: (1) read with format: 'storage' " +
+        "and edit the storage XML, (2) use update_page_section for targeted edits, or " +
+        "(3) compose new markdown from scratch (do not copy from format: 'markdown' output).",
       READ_ONLY_MARKDOWN_ROUND_TRIP,
     );
   }
@@ -634,6 +673,27 @@ export async function safePrepareBody(
       deletedTokens = buildDeletedTokens(plan.deletedTokens, sidecar);
     } else {
       // No preservation needed — plain markdown conversion.
+      //
+      // planUpdate would have caught an INVENTED_TOKEN forgery (caller
+      // markdown references `[[epi:T####]]` IDs that don't exist in the
+      // sidecar), but this branch bypasses planUpdate so we run the same
+      // check by regex. Matches planUpdate's error shape byte-for-byte so
+      // the behaviour is identical regardless of whether the current page
+      // had preserved tokens. replaceBody skips the check (wholesale rewrite
+      // discards token semantics by design — same as planUpdate's replaceBody
+      // path).
+      if (replaceBody !== true) {
+        const epiMatches = body.match(/\[\[epi:(T\d+)\]\]/g);
+        if (epiMatches && epiMatches.length > 0) {
+          const ids = Array.from(
+            new Set(epiMatches.map((m) => m.slice(6, -2))),
+          );
+          throw new ConverterError(
+            `caller markdown contains unknown token IDs: ${ids.join(", ")}`,
+            "INVENTED_TOKEN",
+          );
+        }
+      }
       finalStorage = markdownToStorage(body, converterOptions);
     }
   } else {
@@ -729,11 +789,23 @@ export async function safeSubmitPage(
     deletedTokens,
     clientLabel,
     operation,
+    replaceBody,
   } = input;
 
   const isCreate = pageId === undefined;
   const resolvedOperation: MutationRecord["operation"] =
     operation ?? (isCreate ? "create_page" : "update_page");
+
+  // Title-only update: finalStorage is undefined. Valid ONLY for updates;
+  // a create with no body is rejected up front so the caller gets a clear
+  // error rather than an opaque Confluence 400.
+  const isTitleOnly = finalStorage === undefined;
+  if (isTitleOnly && isCreate) {
+    throw new Error(
+      "safeSubmitPage: finalStorage is required when creating a page. " +
+        "Title-only submissions are valid only for updates.",
+    );
+  }
 
   // 1. Duplicate-title check (create only).
   //
@@ -759,9 +831,15 @@ export async function safeSubmitPage(
   // 2. Post-submit safety guard — re-runs the post-transform body guard on
   // finalStorage independent of prepare's decision. Catches section-splicing
   // damage in handlers that splice prepared output into a larger body
-  // between calling safePrepareBody and safeSubmitPage.
+  // between calling safePrepareBody and safeSubmitPage. Skipped for
+  // title-only updates (no body to guard).
   const oldLen = previousBody?.length ?? 0;
-  assertPostTransformBody(oldLen > 0 ? oldLen : finalStorage.length, finalStorage);
+  if (!isTitleOnly) {
+    assertPostTransformBody(
+      oldLen > 0 ? oldLen : finalStorage!.length,
+      finalStorage!,
+    );
+  }
 
   // 3. API call — wrapped in try/catch so both success and failure are
   //    mutation-logged.
@@ -769,10 +847,12 @@ export async function safeSubmitPage(
     let page: PageData;
     let newVersion: number;
     if (isCreate) {
+      // finalStorage is guaranteed defined here (isTitleOnly && isCreate
+      // would have thrown above).
       page = await _rawCreatePage(
         spaceId!,
         title,
-        finalStorage,
+        finalStorage!,
         parentId,
         clientLabel,
       );
@@ -781,6 +861,10 @@ export async function safeSubmitPage(
       if (version === undefined) {
         throw new Error("safeSubmitPage: version is required for update");
       }
+      // Title-only updates: omit the `body` field; the HTTP wrapper (see
+      // confluence-client.ts updatePage, lines 524+) already supports
+      // `body: undefined` by leaving the field out of the payload so the
+      // Confluence API treats it as a title-only edit.
       const res = await _rawUpdatePage(pageId!, {
         title,
         body: finalStorage,
@@ -796,15 +880,23 @@ export async function safeSubmitPage(
     // 4. Mutation log (success). Shape matches the current handler
     //    emissions: { timestamp, operation, pageId, oldVersion, newVersion,
     //    oldBodyLen, newBodyLen, oldBodyHash, newBodyHash, clientLabel }.
+    //
+    // For title-only updates, `newBodyLen` and `newBodyHash` are omitted —
+    // mirrors `oldBodyLen` being carried through on creates and the
+    // corresponding `newBody*` fields being omitted. A forensic audit can
+    // then distinguish "title-only edit" from "full rewrite" by the
+    // presence of the body-metadata fields.
     const record: MutationRecord = {
       timestamp: new Date().toISOString(),
       operation: resolvedOperation,
       pageId: page.id,
       newVersion,
-      newBodyLen: finalStorage.length,
-      newBodyHash: bodyHash(finalStorage),
       clientLabel,
     };
+    if (!isTitleOnly) {
+      record.newBodyLen = finalStorage!.length;
+      record.newBodyHash = bodyHash(finalStorage!);
+    }
     if (!isCreate) {
       record.oldVersion = version;
       record.oldBodyLen = previousBody?.length ?? 0;
@@ -812,13 +904,20 @@ export async function safeSubmitPage(
         record.oldBodyHash = bodyHash(previousBody);
       }
     }
+    // Forensic flag: thread replaceBody through so a log audit can tell a
+    // wholesale-rewrite write apart from a normal one. Only emitted when
+    // the caller actually set it — absent (not `false`) otherwise, to
+    // avoid noise in the log.
+    if (replaceBody === true) {
+      record.replaceBody = true;
+    }
     logMutation(record);
 
     return {
       page,
       newVersion,
       oldLen,
-      newLen: finalStorage.length,
+      newLen: isTitleOnly ? 0 : finalStorage!.length,
       deletedTokens,
     };
   } catch (err) {
@@ -829,6 +928,7 @@ export async function safeSubmitPage(
     logMutation(
       errorRecord(resolvedOperation, errPageId, err, {
         oldVersion: version,
+        ...(replaceBody === true ? { replaceBody: true } : {}),
       }),
     );
     throw err;

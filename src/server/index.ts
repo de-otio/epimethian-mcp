@@ -640,43 +640,8 @@ function registerTools(server: McpServer, config: Config): void {
         const currentPage = await getPage(page_id, true);
         const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
 
-        // Title-only update: caller omitted body, bypass the prepare/submit
-        // pipeline and hit the raw updater with body: undefined so the API
-        // leaves the page content untouched.
-        if (body === undefined || body === null) {
-          const { page, newVersion } = await updatePage(page_id, {
-            title,
-            body: undefined,
-            version,
-            versionMessage: version_message,
-            previousBody: currentStorage,
-            clientLabel: getClientLabel(server),
-          });
-          return toolResult(
-            `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion}, title only, body unchanged)` + echo
-          );
-        }
-
-        // Workaround for a gap in safe-write.ts: when the current page has no
-        // preserved tokens, safePrepareBody skips planUpdate and loses the
-        // INVENTED_TOKEN forgery check. Catch the simplest such case (any
-        // [[epi:T####]] in caller markdown against a no-sidecar page) here so
-        // forged IDs still error before submit. Skipped for replace_body
-        // (wholesale rewrite intentionally discards token semantics).
-        // See report (f).
-        if (!replace_body) {
-          const epiMatches = body.match(/\[\[epi:(T\d+)\]\]/g);
-          if (epiMatches && !/<ac:|<ri:|<time[\s/>]/i.test(currentStorage)) {
-            const ids = Array.from(new Set(epiMatches.map((m) => m.slice(6, -2))));
-            throw new ConverterError(
-              `caller markdown contains unknown token IDs: ${ids.join(", ")}`,
-              "INVENTED_TOKEN"
-            );
-          }
-        }
-
         const prepared = await safePrepareBody({
-          body,
+          body: body ?? undefined,
           currentBody: currentStorage,
           confirmDeletions: confirm_deletions || undefined,
           confirmShrinkage: confirm_shrinkage,
@@ -700,8 +665,15 @@ function registerTools(server: McpServer, config: Config): void {
           versionMessage: mergedVersionMessage,
           deletedTokens: prepared.deletedTokens,
           clientLabel: getClientLabel(server),
+          replaceBody: replace_body,
         });
 
+        const isTitleOnly = prepared.finalStorage === undefined;
+        if (isTitleOnly) {
+          return toolResult(
+            `Updated: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, title only, body unchanged)` + echo
+          );
+        }
         const removalNote =
           submitted.deletedTokens.length > 0
             ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`

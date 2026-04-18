@@ -125,7 +125,7 @@ type Outcome =
  */
 interface Row {
   name: string;
-  input: Partial<SafePrepareBodyInput> & { body: string };
+  input: Partial<SafePrepareBodyInput> & { body: string | undefined };
   outcome: Outcome;
 }
 
@@ -359,6 +359,74 @@ const cases: Row[] = [
     },
     outcome: { kind: "success" },
   },
+  // --- Gap 1 (A2.1): forgery detection when currentBody has no preserved tokens. ---
+  // planUpdate doesn't run in this branch (no <ac:>/<ri:>/<time> in currentBody),
+  // but the pipeline must still catch invented [[epi:T####]] IDs in caller markdown.
+  {
+    name: "forged token in caller markdown against tokenless currentBody is rejected",
+    input: {
+      body: "# Updated\n\n[[epi:T9999]]\n\nMore text.",
+      currentBody: "<p>Simple page with no macros</p>",
+    },
+    outcome: {
+      kind: "error",
+      code: "INVENTED_TOKEN",
+      messageContains: /T9999/,
+    },
+  },
+  {
+    name: "forged token in caller markdown against empty currentBody (create path) is rejected",
+    input: {
+      body: "# New\n\n[[epi:T0042]]\n\nBody text.",
+      currentBody: undefined,
+    },
+    outcome: {
+      kind: "error",
+      code: "INVENTED_TOKEN",
+      messageContains: /T0042/,
+    },
+  },
+  {
+    name: "forged token skipped when replaceBody: true (wholesale rewrite path)",
+    input: {
+      body: `# Updated\n\n[[epi:T9999]]\n\nMore text.\n\n${"y".repeat(200)}`,
+      currentBody: `<p>Simple page with no macros ${"x".repeat(1500)}</p>`,
+      replaceBody: true,
+      confirmShrinkage: true,
+    },
+    // No throw — the literal `[[epi:T####]]` passes through as text into
+    // the stored body, which is consistent with replaceBody's stated
+    // "discard token semantics" contract in planUpdate.
+    outcome: { kind: "success", finalStorageContains: /\[\[epi:T9999\]\]/ },
+  },
+  {
+    name: "non-forged markdown against tokenless currentBody still succeeds",
+    input: {
+      body: "# Updated\n\nA plain paragraph, no tokens.",
+      currentBody: "<p>Simple page with no macros</p>",
+    },
+    outcome: { kind: "success", finalStorageContains: /<h1/ },
+  },
+  // --- Gap 2 (A2.1): title-only updates (body === undefined). ---
+  {
+    name: "title-only update: body undefined on update returns finalStorage undefined",
+    input: {
+      body: undefined,
+      currentBody: "<p>Existing body with content</p>",
+    },
+    outcome: { kind: "success" },
+  },
+  {
+    name: "title-only update: body undefined errors for create (currentBody undefined)",
+    input: {
+      body: undefined,
+      currentBody: undefined,
+    },
+    outcome: {
+      kind: "error",
+      code: "MISSING_BODY_FOR_CREATE",
+    },
+  },
 ];
 
 describe("safePrepareBody — permutation suite", () => {
@@ -439,6 +507,18 @@ describe("safePrepareBody — permutation suite", () => {
     const messages = warn.mock.calls.map((c) => String(c[0])).join("\n");
     expect(messages).not.toMatch(/confirm_deletions: true is deprecated/);
     warn.mockRestore();
+  });
+
+  // --- Gap 2: title-only update returns finalStorage: undefined (whole
+  // pipeline short-circuited; all guards are no-ops). ---
+  it("title-only update: body undefined returns finalStorage undefined with no guards", async () => {
+    const result = await safePrepareBody({
+      body: undefined,
+      currentBody: "<p>Existing body that would trip shrinkage etc. if a guard fired.</p>",
+    });
+    expect(result.finalStorage).toBeUndefined();
+    expect(result.versionMessage).toBe("");
+    expect(result.deletedTokens).toEqual([]);
   });
 });
 
@@ -629,6 +709,149 @@ describe("safeSubmitPage — mutation log", () => {
       expect.objectContaining({ oldVersion: 1 }),
     );
     expect(logMutation).toHaveBeenCalledTimes(1);
+  });
+
+  // --- Gap 2: title-only updates (finalStorage: undefined) flow through
+  // safeSubmitPage without a body field and with newBody* fields omitted
+  // from the mutation log. ---
+  it("title-only update: submits without body field and omits newBody* in mutation log", async () => {
+    (updatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "77", title: "New Title", version: { number: 3 } },
+      newVersion: 3,
+    });
+
+    const previousBody = "<p>current body, unchanged</p>";
+    const result = await safeSubmitPage({
+      pageId: "77",
+      title: "New Title",
+      finalStorage: undefined, // title-only
+      previousBody,
+      version: 2,
+      versionMessage: "",
+      deletedTokens: [],
+      clientLabel: "claude-code",
+    });
+
+    // The HTTP wrapper was called with body undefined (title-only).
+    const updateCall = (updatePage as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0];
+    expect(updateCall[0]).toBe("77");
+    expect(updateCall[1].body).toBeUndefined();
+    expect(updateCall[1].title).toBe("New Title");
+
+    // Mutation log omits newBody*; carries oldBody* (the body we didn't write).
+    const record = (logMutation as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    expect(record.operation).toBe("update_page");
+    expect(record.pageId).toBe("77");
+    expect(record.oldVersion).toBe(2);
+    expect(record.oldBodyLen).toBe(previousBody.length);
+    expect(record.oldBodyHash).toBeDefined();
+    expect(record.newBodyLen).toBeUndefined();
+    expect(record.newBodyHash).toBeUndefined();
+
+    // Output newLen is 0 (nothing was written).
+    expect(result.newLen).toBe(0);
+    expect(result.oldLen).toBe(previousBody.length);
+  });
+
+  it("create with finalStorage undefined errors (title-only creates are invalid)", async () => {
+    let thrown: Error | undefined;
+    try {
+      await safeSubmitPage({
+        pageId: undefined, // create
+        spaceId: "space-1",
+        title: "Whatever",
+        finalStorage: undefined,
+        versionMessage: "",
+        deletedTokens: [],
+        clientLabel: undefined,
+      });
+    } catch (e) {
+      thrown = e as Error;
+    }
+    expect(thrown).toBeDefined();
+    expect(thrown!.message).toMatch(/finalStorage is required when creating/);
+    expect(createPage).not.toHaveBeenCalled();
+  });
+
+  // --- Gap 3: replaceBody forensic pass-through to the mutation log. ---
+  it("replaceBody: true is threaded into the success MutationRecord", async () => {
+    (updatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "T", version: { number: 2 } },
+      newVersion: 2,
+    });
+
+    await safeSubmitPage({
+      pageId: "42",
+      title: "T",
+      finalStorage: "<p>wholesale rewrite</p>",
+      previousBody: "<p>old content</p>",
+      version: 1,
+      versionMessage: "",
+      deletedTokens: [],
+      clientLabel: undefined,
+      replaceBody: true,
+    });
+
+    const record = (logMutation as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    expect(record.replaceBody).toBe(true);
+    expect(record.operation).toBe("update_page");
+  });
+
+  it("replaceBody unset or false is NOT present in the MutationRecord", async () => {
+    (updatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "T", version: { number: 2 } },
+      newVersion: 2,
+    });
+
+    await safeSubmitPage({
+      pageId: "42",
+      title: "T",
+      finalStorage: "<p>normal update</p>",
+      previousBody: "<p>old content</p>",
+      version: 1,
+      versionMessage: "",
+      deletedTokens: [],
+      clientLabel: undefined,
+      // replaceBody not set
+    });
+
+    const record = (logMutation as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    expect(record.replaceBody).toBeUndefined();
+  });
+
+  it("replaceBody: true is threaded into the failure MutationRecord too", async () => {
+    const apiErr = new Error("boom");
+    (updatePage as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(
+      apiErr,
+    );
+
+    let thrown: unknown;
+    try {
+      await safeSubmitPage({
+        pageId: "42",
+        title: "T",
+        finalStorage: "<p>wholesale rewrite</p>",
+        previousBody: "<p>old content</p>",
+        version: 1,
+        versionMessage: "",
+        deletedTokens: [],
+        clientLabel: undefined,
+        replaceBody: true,
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBe(apiErr);
+    expect(errorRecord).toHaveBeenCalledWith(
+      "update_page",
+      "42",
+      apiErr,
+      expect.objectContaining({ oldVersion: 1, replaceBody: true }),
+    );
   });
 
   it("post-submit body guard rejects a spliced-empty finalStorage", async () => {
