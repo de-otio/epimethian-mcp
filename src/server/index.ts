@@ -1938,50 +1938,38 @@ function registerTools(server: McpServer, config: Config): void {
         // 2. Fetch historical version's raw storage (reuse existing function)
         const historical = await getPageVersionBody(page_id, target_version);
 
-        // 3. Content-safety guards
-        enforceContentSafetyGuards({
-          oldStorage: currentStorage,
-          newStorage: historical.rawBody,
+        // 3. Prepare body — replaceBody: true intentionally skips token diff;
+        //    shrinkage and macro-loss guards still apply.
+        const prepared = await safePrepareBody({
+          body: historical.rawBody,
+          currentBody: currentStorage,
+          scope: "full",
+          replaceBody: true,
           confirmShrinkage: confirm_shrinkage,
           confirmStructureLoss: confirm_structure_loss,
         });
 
-        // 4. Push the historical body as a new version (storage-format path)
-        const { page, newVersion } = await updatePage(page_id, {
-          title: currentPage.title,
-          body: historical.rawBody,
-          version: current_version,
-          versionMessage:
-            version_message ?? `Revert to version ${target_version}`,
-          previousBody: currentStorage,
-          clientLabel: getClientLabel(server),
-        });
-
-        // 5. Log mutation
-        logMutation({
-          timestamp: new Date().toISOString(),
-          operation: "revert_page",
+        // 4. Submit via pipeline — replaceBody: true is threaded into the
+        //    mutation log; logMutation lives inside safeSubmitPage.
+        const submitted = await safeSubmitPage({
           pageId: page_id,
-          oldVersion: current_version,
-          newVersion,
-          oldBodyLen: currentStorage.length,
-          newBodyLen: historical.rawBody.length,
-          oldBodyHash: bodyHash(currentStorage),
-          newBodyHash: bodyHash(historical.rawBody),
+          title: currentPage.title,
+          finalStorage: prepared.finalStorage,
+          previousBody: currentStorage,
+          version: current_version,
+          versionMessage: version_message ?? `Revert to version ${target_version}`,
+          deletedTokens: prepared.deletedTokens,
           clientLabel: getClientLabel(server),
+          operation: "revert_page",
+          replaceBody: true,
         });
 
         return toolResult(
-          `Reverted: ${page.title} (ID: ${page.id}, v${target_version}\u2192v${newVersion}, ` +
-            `body: ${currentStorage.length}\u2192${historical.rawBody.length} chars)` +
+          `Reverted: ${submitted.page.title} (ID: ${submitted.page.id}, v${target_version}\u2192v${submitted.newVersion}, ` +
+            `body: ${submitted.oldLen}\u2192${submitted.newLen} chars)` +
             echo
         );
       } catch (err) {
-        logMutation(
-          errorRecord("revert_page", page_id, err, {
-            oldVersion: current_version,
-          })
-        );
         return toolError(err);
       }
     }
