@@ -751,88 +751,56 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("update_page_section", config);
       if (blocked) return blocked;
       try {
-        // Reject read-only markdown round-trips (same guard as update_page).
-        if (body.includes("epimethian:read-only-markdown")) {
-          throw new ConverterError(
-            "The body contains content produced by get_page with format: 'markdown', which is a " +
-              "read-only rendering not suitable for section updates. " +
-              "Use format: 'storage' to read the section, then edit the storage XML.",
-            "READ_ONLY_MARKDOWN_ROUND_TRIP"
-          );
-        }
-
-        // Fetch the full page body
+        const cfg = await getConfig();
         const page = await getPage(page_id, true);
         const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
 
-        let sectionStorage: string;
-        let effectiveVersionMessage = version_message;
-
-        if (looksLikeMarkdown(body)) {
-          // Token-aware write path: extract the current section body
-          // (without heading) so planUpdate can tokenise its <ac:> elements
-          // and preserve them in the caller's markdown output.
-          const currentSectionBody = extractSectionBody(fullBody, section);
-          if (currentSectionBody === null) {
-            return toolResult(
-              `Section "${section}" not found. Use headings_only to see available sections.`
-            );
-          }
-
-          const plan = planUpdate({
-            currentStorage: currentSectionBody,
-            callerMarkdown: body,
-            confirmDeletions: confirm_deletions,
-          });
-          sectionStorage = plan.newStorage;
-          effectiveVersionMessage =
-            plan.versionMessage && version_message
-              ? `${version_message}; ${plan.versionMessage}`
-              : plan.versionMessage ?? version_message;
-        } else {
-          // Storage format: pass through verbatim.
-          sectionStorage = body;
+        const currentSectionBody = extractSectionBody(fullBody, section);
+        if (currentSectionBody === null) {
+          return toolResult(
+            `Section "${section}" not found. Use headings_only to see available sections.`
+          );
         }
 
-        const newFullBody = replaceSection(fullBody, section, sectionStorage);
+        const prepared = await safePrepareBody({
+          body,
+          currentBody: currentSectionBody,
+          scope: "section",
+          confirmDeletions: confirm_deletions || undefined,
+          confluenceBaseUrl: cfg.url,
+        });
+
+        const newFullBody = replaceSection(fullBody, section, prepared.finalStorage!);
         if (newFullBody === null) {
           return toolResult(
             `Section "${section}" not found. Use headings_only to see available sections.`
           );
         }
 
-        // Content-safety guards — section replacement could still cause
-        // significant shrinkage if the wrong section is matched.
-        enforceContentSafetyGuards({
-          oldStorage: fullBody,
-          newStorage: newFullBody,
+        const mergedVersionMessage =
+          prepared.versionMessage && version_message
+            ? `${version_message}; ${prepared.versionMessage}`
+            : prepared.versionMessage || version_message || "";
+
+        const submitted = await safeSubmitPage({
+          pageId: page_id,
+          title: page.title,
+          finalStorage: newFullBody,
+          previousBody: fullBody,
+          version,
+          versionMessage: mergedVersionMessage,
+          deletedTokens: prepared.deletedTokens,
+          clientLabel: getClientLabel(server),
         });
 
-        const { page: updated, newVersion } = await updatePage(page_id, {
-          title: page.title,
-          body: newFullBody,
-          version,
-          versionMessage: effectiveVersionMessage,
-          previousBody: fullBody,
-          clientLabel: getClientLabel(server),
-        });
-        logMutation({
-          timestamp: new Date().toISOString(),
-          operation: "update_page",
-          pageId: page_id,
-          oldVersion: version,
-          newVersion,
-          oldBodyLen: fullBody.length,
-          newBodyLen: newFullBody.length,
-          oldBodyHash: bodyHash(fullBody),
-          newBodyHash: bodyHash(newFullBody),
-          clientLabel: getClientLabel(server),
-        });
+        const removalNote =
+          submitted.deletedTokens.length > 0
+            ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`
+            : "";
         return toolResult(
-          `Updated section "${section}" in: ${updated.title} (ID: ${updated.id}, version: ${newVersion})` + echo
+          `Updated section "${section}" in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}${removalNote})` + echo
         );
       } catch (err) {
-        logMutation(errorRecord("update_page", page_id, err, { oldVersion: version }));
         return toolError(err);
       }
     }
