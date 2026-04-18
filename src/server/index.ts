@@ -391,58 +391,30 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("create_page", config);
       if (blocked) return blocked;
       try {
-        // Reject read-only markdown round-trips (same guard as update_page).
-        if (body.includes("epimethian:read-only-markdown")) {
-          throw new ConverterError(
-            "The body contains content produced by get_page with format: 'markdown', which is a " +
-              "read-only rendering not suitable for creating pages (tables, macros, and rich " +
-              "elements may be lost). Compose new markdown from scratch instead.",
-            "READ_ONLY_MARKDOWN_ROUND_TRIP"
-          );
-        }
-        let finalBody = body;
-        if (looksLikeMarkdown(body)) {
-          const cfg = await getConfig();
-          finalBody = markdownToStorage(body, {
-            allowRawHtml: allow_raw_html,
-            confluenceBaseUrl: confluence_base_url ?? cfg.url,
-          });
-        }
+        // Space validation is create_page-specific; stays in the handler.
         const spaceId = await resolveSpaceId(space_key);
+        const cfg = await getConfig();
 
-        // Pre-flight: reject if a page with this title already exists in the space.
-        // Silently creating a duplicate is confusing; blindly suggesting update_page
-        // risks clobbering an unrelated page, so we surface the conflict and let
-        // the caller decide.
-        const existing = await getPageByTitle(spaceId, title, false);
-        if (existing) {
-          return toolError(
-            new Error(
-              `A page titled "${title}" already exists in this space (page ID: ${existing.id}). ` +
-              `Creating another page with the same title would produce a confusing duplicate. ` +
-              `If you intend to modify the existing page, call get_page with ID ${existing.id} first ` +
-              `to review its current content before deciding whether to update it.`
-            )
-          );
-        }
+        const prepared = await safePrepareBody({
+          body,
+          currentBody: undefined,
+          allowRawHtml: allow_raw_html,
+          confluenceBaseUrl: confluence_base_url ?? cfg.url,
+        });
 
-        const page = await createPage(spaceId, title, finalBody, parent_id, getClientLabel(server));
-        logMutation({
-          timestamp: new Date().toISOString(),
-          operation: "create_page",
-          pageId: page.id,
-          newVersion: page.version?.number ?? 1,
-          newBodyLen: finalBody.length,
-          newBodyHash: bodyHash(finalBody),
+        const submitted = await safeSubmitPage({
+          pageId: undefined,
+          spaceId,
+          parentId: parent_id,
+          title,
+          finalStorage: prepared.finalStorage,
+          versionMessage: prepared.versionMessage,
+          deletedTokens: prepared.deletedTokens,
           clientLabel: getClientLabel(server),
         });
-        return toolResult((await formatPage(page, false)) + echo);
+
+        return toolResult((await formatPage(submitted.page, false)) + echo);
       } catch (err) {
-        if (err instanceof ConverterError) {
-          logMutation(errorRecord("create_page", "unknown", err));
-          return toolError(err);
-        }
-        logMutation(errorRecord("create_page", "unknown", err));
         return toolError(err);
       }
     }
