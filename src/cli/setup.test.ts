@@ -1,11 +1,13 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockTestConnection = vi.fn();
+const mockFetchTenantInfo = vi.fn();
 const mockSaveToKeychain = vi.fn().mockResolvedValue(undefined);
 const mockReadFromKeychain = vi.fn().mockResolvedValue(null);
 
 vi.mock("../shared/test-connection.js", () => ({
   testConnection: (...args: unknown[]) => mockTestConnection(...args),
+  fetchTenantInfo: (...args: unknown[]) => mockFetchTenantInfo(...args),
 }));
 
 vi.mock("../shared/keychain.js", () => ({
@@ -45,6 +47,20 @@ describe("runSetup", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // mockClear / clearAllMocks does NOT drain the mockResolvedValueOnce queue
+    // in vitest — stale "once" responses from earlier tests would otherwise be
+    // consumed by the next test's first rl.question call. Explicitly reset.
+    mockQuestion.mockReset();
+    mockTestConnection.mockReset();
+    mockFetchTenantInfo.mockReset();
+    mockReadFromKeychain.mockReset();
+    mockReadFromKeychain.mockResolvedValue(null);
+    // Default: tenant_info unreachable (graceful degrade). Tests that exercise
+    // the seal/confirmation path override this explicitly.
+    mockFetchTenantInfo.mockResolvedValue({
+      ok: false,
+      message: "not tested",
+    });
     exitCode = undefined;
     Object.defineProperty(process.stdin, "isTTY", { value: true, writable: true });
     process.stdin.setRawMode = vi.fn().mockReturnValue(process.stdin);
@@ -438,6 +454,124 @@ describe("runSetup", () => {
     await runSetup("acme");
 
     expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { readOnly: false });
+
+    process.stdin.on = originalOn;
+  });
+
+  // --- Tenant seal (cloudId confirmation) ---
+
+  it("seals profile with cloudId when tenant_info is reachable and user confirms", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockFetchTenantInfo.mockResolvedValueOnce({
+      ok: true,
+      info: { cloudId: "cid-abc-123", displayName: "Globex Corp" },
+    });
+    mockQuestion
+      .mockResolvedValueOnce("https://globex.atlassian.net")
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("y") // tenant confirmation
+      .mockResolvedValueOnce("y"); // Enable writes?
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("globex");
+
+    expect(mockSaveToKeychain).toHaveBeenCalledWith(
+      {
+        url: "https://globex.atlassian.net",
+        email: "user@test.com",
+        apiToken: "t",
+        cloudId: "cid-abc-123",
+        tenantDisplayName: "Globex Corp",
+      },
+      "globex"
+    );
+
+    process.stdin.on = originalOn;
+  });
+
+  it("aborts without saving when user rejects the tenant confirmation", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockFetchTenantInfo.mockResolvedValueOnce({
+      ok: true,
+      info: { cloudId: "cid-xyz", displayName: "Wrong Tenant" },
+    });
+    mockQuestion
+      .mockResolvedValueOnce("https://globex.atlassian.net")
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n"); // tenant confirmation → No
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await expect(runSetup("globex")).rejects.toThrow("process.exit(1)");
+    expect(exitCode).toBe(1);
+    expect(mockSaveToKeychain).not.toHaveBeenCalled();
+
+    process.stdin.on = originalOn;
+  });
+
+  it("saves without a seal when tenant_info is unreachable (graceful degrade)", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockFetchTenantInfo.mockResolvedValueOnce({
+      ok: false,
+      message: "endpoint not found",
+    });
+    mockQuestion
+      .mockResolvedValueOnce("https://onprem.example.com")
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("y"); // Enable writes? (no tenant prompt — skipped)
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("onprem");
+
+    expect(mockSaveToKeychain).toHaveBeenCalledWith(
+      {
+        url: "https://onprem.example.com",
+        email: "user@test.com",
+        apiToken: "t",
+      },
+      "onprem"
+    );
 
     process.stdin.on = originalOn;
   });

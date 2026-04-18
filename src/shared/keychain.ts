@@ -29,6 +29,10 @@ export interface KeychainCredentials {
   url: string;
   email: string;
   apiToken: string;
+  /** Tenant seal: the Atlassian cloudId of the site. Added in v5.5+. Optional for backward compatibility with pre-seal profiles. */
+  cloudId?: string;
+  /** Tenant seal: human-readable display name (cloudName or host) captured at setup. Purely for user-facing messages. */
+  tenantDisplayName?: string;
 }
 
 function exec(cmd: string, args: string[]): Promise<string> {
@@ -177,7 +181,18 @@ export async function readFromKeychain(profile?: string): Promise<KeychainCreden
     );
   }
 
-  return parsed as KeychainCredentials;
+  const p = parsed as Record<string, unknown>;
+  const result: KeychainCredentials = {
+    url: p.url as string,
+    email: p.email as string,
+    apiToken: p.apiToken as string,
+  };
+  // Tenant seal fields — optional, string-only. Silently drop non-strings.
+  if (typeof p.cloudId === 'string' && p.cloudId) result.cloudId = p.cloudId;
+  if (typeof p.tenantDisplayName === 'string' && p.tenantDisplayName) {
+    result.tenantDisplayName = p.tenantDisplayName;
+  }
+  return result;
 }
 
 /**

@@ -1,8 +1,12 @@
 import { z } from "zod";
 import TurndownService from "turndown";
-import { readFromKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
+import { readFromKeychain, saveToKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
 import { getProfileSettings } from "../shared/profiles.js";
-import { testConnection, verifyTenantIdentity } from "../shared/test-connection.js";
+import {
+  testConnection,
+  verifyTenantIdentity,
+  fetchTenantInfo,
+} from "../shared/test-connection.js";
 import { escapeXmlText } from "./converter/escape.js";
 
 declare const __PKG_VERSION__: string;
@@ -27,6 +31,10 @@ export interface Config {
   apiV1: string;
   authHeader: string;
   jsonHeaders: Record<string, string>;
+  /** Tenant seal: cloudId stored in the keychain entry for this profile (undefined for env-var mode or pre-seal profiles). */
+  sealedCloudId?: string;
+  /** Tenant seal: display name stored alongside the cloudId, used for human-readable error messages. */
+  sealedDisplayName?: string;
 }
 
 let _config: Config | null = null;
@@ -38,14 +46,15 @@ let _config: Config | null = null;
  * Resolution order (no merging across sources):
  *   1. CONFLUENCE_PROFILE env var → read all fields from named keychain entry
  *   2. All 3 env vars set → use directly (CI/CD mode)
- *   3. Partial env vars (1 or 2 of 3) → hard error
- *   4. No env vars → read legacy keychain entry (backward compat, deprecation warning)
+ *   3. Anything else (partial env vars, or none) → hard error
  */
 export async function resolveCredentials(): Promise<{
   url: string;
   email: string;
   apiToken: string;
   profile: string | null;
+  sealedCloudId?: string;
+  sealedDisplayName?: string;
 }> {
   const profileEnv = process.env.CONFLUENCE_PROFILE || "";
   const urlEnv = process.env.CONFLUENCE_URL?.replace(/\/$/, "") || "";
@@ -72,6 +81,8 @@ export async function resolveCredentials(): Promise<{
       email: creds.email,
       apiToken: creds.apiToken,
       profile: profileEnv,
+      sealedCloudId: creds.cloudId,
+      sealedDisplayName: creds.tenantDisplayName,
     };
   }
 
@@ -110,7 +121,8 @@ export async function resolveCredentials(): Promise<{
 export async function getConfig(): Promise<Config> {
   if (_config) return _config;
 
-  const { url, email, apiToken, profile } = await resolveCredentials();
+  const { url, email, apiToken, profile, sealedCloudId, sealedDisplayName } =
+    await resolveCredentials();
 
   // Resolve read-only flag: strict-mode OR — either source saying read-only wins.
   // CONFLUENCE_READ_ONLY=false does NOT override a registry-level read-only flag.
@@ -143,6 +155,8 @@ export async function getConfig(): Promise<Config> {
       Authorization: authHeader,
       "Content-Type": "application/json",
     },
+    sealedCloudId,
+    sealedDisplayName,
   });
   return _config;
 }
@@ -151,7 +165,9 @@ export async function getConfig(): Promise<Config> {
  * Validate credentials against the Confluence instance before accepting tool calls.
  * 1. Test authentication (GET spaces)
  * 2. Verify tenant identity (email matches)
- * 3. Log connection info to stderr
+ * 3. Tenant seal: verify cloudId matches the one sealed at setup time.
+ *    Opportunistically seal pre-5.5 profiles on first startup after upgrade.
+ * 4. Log connection info to stderr
  */
 export async function validateStartup(config: Config): Promise<void> {
   const { url, email, profile } = config;
@@ -193,13 +209,93 @@ export async function validateStartup(config: Config): Promise<void> {
     process.exit(1);
   }
 
-  // Step 3: Log connection info
+  // Step 3: Tenant seal verification (skipped for env-var mode — no keychain entry to seal).
+  if (profile) {
+    await verifyOrSealTenant(config, apiToken);
+  }
+
+  // Step 4: Log connection info
   const profileLabel = profile ? `profile: ${profile}` : "env-var mode";
   const readOnlyLabel = config.readOnly ? ", READ-ONLY" : "";
   const attributionLabel = config.attribution ? "" : ", NO-ATTRIBUTION";
   console.error(
     `epimethian-mcp: connected to ${url} as ${email} (${profileLabel}${readOnlyLabel}${attributionLabel})`
   );
+}
+
+/**
+ * Verify the live tenant's cloudId against the one sealed at setup time.
+ * For profiles without a seal (upgraded from pre-5.5), opportunistically
+ * fetch the cloudId and write it back to the keychain entry so future
+ * startups are protected.
+ *
+ * Callers must ensure `config.profile` is non-null.
+ */
+async function verifyOrSealTenant(config: Config, apiToken: string): Promise<void> {
+  const { url, email, profile, sealedCloudId, sealedDisplayName } = config;
+  if (!profile) return;
+
+  const live = await fetchTenantInfo(url, email, apiToken);
+  if (!live.ok) {
+    // Endpoint unreachable — cannot verify or seal. Surface a warning but
+    // do not hard-fail: the email-identity check has already passed and
+    // we do not want to regress users whose tenants lack this endpoint.
+    console.error(
+      `epimethian-mcp: warning — tenant_info unavailable for profile "${profile}" (${live.message}). ` +
+        `Skipping tenant seal check.`
+    );
+    return;
+  }
+
+  const liveCloudId = live.info.cloudId;
+  const liveDisplayName = live.info.displayName;
+
+  if (sealedCloudId) {
+    if (sealedCloudId !== liveCloudId) {
+      console.error(
+        `Error: Tenant seal mismatch for profile "${profile}".\n` +
+          `  Expected tenant : ${sealedDisplayName ?? "(unknown)"} (cloudId ${sealedCloudId})\n` +
+          `  Live tenant     : ${liveDisplayName} (cloudId ${liveCloudId})\n` +
+          `  URL             : ${url}\n` +
+          `\n` +
+          `This indicates the profile's stored URL/credentials now point at a different ` +
+          `Atlassian tenant than when the profile was created. Refusing to connect to ` +
+          `prevent cross-tenant writes. Run \`epimethian-mcp setup --profile ${profile}\` ` +
+          `to reconfigure if this change was intentional.`
+      );
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Opportunistic seal: profile has no cloudId yet (pre-5.5 setup). Write it
+  // back to the keychain so future startups are protected. Read the current
+  // entry first so we preserve url/email/apiToken exactly as stored.
+  const stored = await readFromKeychain(profile);
+  if (!stored) {
+    // Shouldn't happen — we just resolved from this profile. Skip silently.
+    return;
+  }
+  try {
+    await saveToKeychain(
+      {
+        ...stored,
+        cloudId: liveCloudId,
+        tenantDisplayName: liveDisplayName,
+      },
+      profile
+    );
+    console.error(
+      `epimethian-mcp: sealed profile "${profile}" to tenant "${liveDisplayName}" ` +
+        `(cloudId ${liveCloudId}). Future startups will verify this seal.`
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(
+      `epimethian-mcp: warning — could not write tenant seal for profile "${profile}" (${message}). ` +
+        `Continuing without seal; will retry on next startup.`
+    );
+  }
 }
 
 // --- Zod response schemas (runtime validation) ---

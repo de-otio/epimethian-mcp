@@ -12,8 +12,8 @@ The official [Atlassian MCP server](https://github.com/atlassian/atlassian-mcp-s
 
 - **OS keychain credential storage** — API tokens are stored in macOS Keychain or Linux libsecret, never in plaintext config files. Setup uses masked input so tokens don't leak into terminal scrollback.
 - **Multi-tenant profile isolation** — Each Atlassian tenant gets its own named profile with fully separate credentials and keychain entries. No risk of cross-tenant writes when switching between clients.
-- **Tenant-aware write safety** — Write operations echo the target tenant so the AI agent (and you) always see where changes are going before they land.
-- **draw.io diagram support** — Create and embed draw.io diagrams directly in Confluence pages, something the official server doesn't expose.
+- **Tenant-aware write safety** — Write operations echo the target tenant so the AI agent (and you) always see where changes are going.
+- **draw.io diagram support** — Create and embed draw.io diagrams directly in Confluence pages (assuming the tenant has draw.io installed), something the official server doesn't expose.
 - **Attribution tracking** — Edited pages are labelled `epimethian-edited` for easy discovery. Confluence version messages include the MCP client name (e.g. "Updated by Claude Code (via Epimethian v5.2.0)") so you can trace which AI-assisted edits touched which content.
 
 If you don't need any of the above, the official Atlassian server is a fine choice.
@@ -108,40 +108,40 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 
 ## Tools
 
-| Tool                 | Description                |
-| -------------------- | -------------------------- |
-| `create_page`        | Create a new page          |
-| `get_page`           | Read a page by ID (`headings_only`, `section`, `max_length`, `format`) |
-| `get_page_by_title`  | Look up a page by title (same options as `get_page`) |
-| `update_page`        | Update an existing page    |
-| `update_page_section`| Update a single section by heading name |
-| `delete_page`        | Delete a page              |
-| `list_pages`         | List pages in a space      |
-| `get_page_children`  | Get child pages            |
-| `search_pages`       | Search via CQL (includes content excerpts) |
-| `get_spaces`         | List available spaces      |
-| `add_attachment`     | Upload a file attachment   |
-| `get_attachments`    | List attachments on a page |
-| `add_drawio_diagram` | Add a draw.io diagram      |
-| `get_labels`         | Get all labels on a page   |
-| `add_label`          | Add one or more labels to a page |
-| `remove_label`       | Remove a label from a page |
-| `get_comments`       | Read page comments (footer and inline) |
-| `create_comment`     | Add a comment to a page    |
-| `resolve_comment`    | Resolve or reopen an inline comment |
-| `delete_comment`     | Delete a comment           |
-| `get_page_status`    | Get the content status badge on a page |
-| `set_page_status`    | Set the content status badge on a page |
-| `remove_page_status` | Remove the content status badge from a page |
-| `get_page_versions`  | List version history for a page |
-| `get_page_version`   | Get page content at a specific historical version (read-only markdown) |
-| `diff_page_versions` | Compare two versions of a page |
-| `prepend_to_page`    | Insert content at the beginning of a page (additive, safe) |
-| `append_to_page`     | Insert content at the end of a page (additive, safe) |
-| `revert_page`        | Revert a page to a previous version (lossless) |
-| `lookup_user`        | Search for Atlassian users by name or email |
-| `resolve_page_link`  | Resolve a page title + space key to a stable page ID and URL |
-| `get_version`        | Return the server version      |
+| Tool                  | Description                                                            |
+| --------------------- | ---------------------------------------------------------------------- |
+| `create_page`         | Create a new page                                                      |
+| `get_page`            | Read a page by ID (`headings_only`, `section`, `max_length`, `format`) |
+| `get_page_by_title`   | Look up a page by title (same options as `get_page`)                   |
+| `update_page`         | Update an existing page                                                |
+| `update_page_section` | Update a single section by heading name                                |
+| `delete_page`         | Delete a page                                                          |
+| `list_pages`          | List pages in a space                                                  |
+| `get_page_children`   | Get child pages                                                        |
+| `search_pages`        | Search via CQL (includes content excerpts)                             |
+| `get_spaces`          | List available spaces                                                  |
+| `add_attachment`      | Upload a file attachment                                               |
+| `get_attachments`     | List attachments on a page                                             |
+| `add_drawio_diagram`  | Add a draw.io diagram                                                  |
+| `get_labels`          | Get all labels on a page                                               |
+| `add_label`           | Add one or more labels to a page                                       |
+| `remove_label`        | Remove a label from a page                                             |
+| `get_comments`        | Read page comments (footer and inline)                                 |
+| `create_comment`      | Add a comment to a page                                                |
+| `resolve_comment`     | Resolve or reopen an inline comment                                    |
+| `delete_comment`      | Delete a comment                                                       |
+| `get_page_status`     | Get the content status badge on a page                                 |
+| `set_page_status`     | Set the content status badge on a page                                 |
+| `remove_page_status`  | Remove the content status badge from a page                            |
+| `get_page_versions`   | List version history for a page                                        |
+| `get_page_version`    | Get page content at a specific historical version (read-only markdown) |
+| `diff_page_versions`  | Compare two versions of a page                                         |
+| `prepend_to_page`     | Insert content at the beginning of a page (additive, safe)             |
+| `append_to_page`      | Insert content at the end of a page (additive, safe)                   |
+| `revert_page`         | Revert a page to a previous version (lossless)                         |
+| `lookup_user`         | Search for Atlassian users by name or email                            |
+| `resolve_page_link`   | Resolve a page title + space key to a stable page ID and URL           |
+| `get_version`         | Return the server version                                              |
 
 ## Content Safety
 
@@ -173,6 +173,34 @@ npm install
 npm run build
 npm test
 ```
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Agent["AI Agent<br/>(Claude Code, Cursor, ...)"]
+
+    subgraph Local["Local machine"]
+        MCP["Epimethian MCP Server"]
+        Keychain["OS Keychain<br/>(macOS Keychain / libsecret)"]
+        Registry["Tenant Profile Registry<br/>(~/.config/epimethian-mcp/profiles.json)"]
+    end
+
+    subgraph Atlassian["Atlassian Cloud"]
+        TenantA["Tenant A<br/>(e.g. globex)"]
+        TenantB["Tenant B<br/>(e.g. acme-corp)"]
+    end
+
+    Agent -- "stdio (MCP)" --> MCP
+    MCP -- "list / select profile" --> Registry
+    MCP -- "read credentials for profile" --> Keychain
+    MCP -- "HTTPS + API token<br/>(tenant A)" --> TenantA
+    MCP -- "HTTPS + API token<br/>(tenant B)" --> TenantB
+
+    Registry -. "names + read-only flags<br/>(no secrets)" .- Keychain
+```
+
+The MCP server resolves the active profile from `CONFLUENCE_PROFILE`, loads its URL/email/token from the keychain, and talks directly to the matching Atlassian tenant. The profile registry stores only non-secret metadata (profile names, read-only flags); tokens never leave the keychain in plaintext.
 
 ## License
 

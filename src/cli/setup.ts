@@ -1,6 +1,6 @@
 import * as readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { testConnection } from "../shared/test-connection.js";
+import { testConnection, fetchTenantInfo } from "../shared/test-connection.js";
 import {
   saveToKeychain,
   readFromKeychain,
@@ -150,9 +150,63 @@ export async function runSetup(profile?: string): Promise<void> {
       process.exit(1);
     }
 
-    console.log(`${result.message}\n`);
+    console.log(`${result.message}`);
 
-    await saveToKeychain({ url, email, apiToken }, profile);
+    // Fetch tenant identity (cloudId + display name) so we can (a) show the
+    // user exactly which tenant they've connected to and (b) seal the profile
+    // against future cross-tenant credential corruption.
+    const tenantResult = await fetchTenantInfo(url, email, apiToken);
+    let sealedCloudId: string | undefined;
+    let sealedDisplayName: string | undefined;
+
+    if (tenantResult.ok) {
+      const { cloudId, displayName } = tenantResult.info;
+      console.log(
+        `\nTenant identity:\n` +
+          `  Display name : ${displayName}\n` +
+          `  Cloud ID     : ${cloudId}\n` +
+          `  URL          : ${url}\n`
+      );
+
+      const rlConfirm = readline.createInterface({ input: stdin, output: stdout });
+      try {
+        const args = process.argv.slice(2);
+        const assumeYes = args.includes("--yes") || args.includes("-y");
+        let answer = "y";
+        if (!assumeYes) {
+          answer = (
+            await rlConfirm.question("Is this the tenant you intended? [y/N] ")
+          ).trim().toLowerCase();
+        }
+        if (answer !== "y" && answer !== "yes") {
+          console.error(
+            "\nAborted: tenant identity not confirmed. No credentials were saved."
+          );
+          process.exit(1);
+        }
+      } finally {
+        rlConfirm.close();
+      }
+
+      sealedCloudId = cloudId;
+      sealedDisplayName = displayName;
+    } else {
+      console.log(
+        `\nWarning: Could not fetch tenant identity (${tenantResult.message}).\n` +
+          "Profile will be saved without a tenant seal. Cross-tenant verification at startup will be skipped.\n"
+      );
+    }
+
+    await saveToKeychain(
+      {
+        url,
+        email,
+        apiToken,
+        ...(sealedCloudId ? { cloudId: sealedCloudId } : {}),
+        ...(sealedDisplayName ? { tenantDisplayName: sealedDisplayName } : {}),
+      },
+      profile
+    );
     if (profile) {
       await addToProfileRegistry(profile);
 

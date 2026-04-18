@@ -42,6 +42,73 @@ export async function verifyTenantIdentity(
   }
 }
 
+/**
+ * Fetch the tenant's cloudId and a friendly display name.
+ *
+ * Uses the site-level `/_edge/tenant_info` endpoint which returns
+ * `{ cloudId: "<uuid>" }` (and sometimes `cloudName`). This is a stable
+ * Atlassian Cloud edge endpoint used for identifying the tenant backing a
+ * given `*.atlassian.net` host.
+ *
+ * The endpoint is site-scoped and does not require authentication, but we
+ * still pass the Basic auth header so the call shares cache/connection with
+ * the authenticated API calls and so a broken token surfaces consistently.
+ *
+ * Returns `{ ok: false }` (graceful degrade) on any failure — callers should
+ * treat a missing tenant_info as "cannot seal" rather than a hard error, so
+ * that sites where the endpoint is unavailable still work.
+ */
+export interface TenantInfo {
+  cloudId: string;
+  displayName: string;
+}
+
+export async function fetchTenantInfo(
+  url: string,
+  email: string,
+  apiToken: string
+): Promise<{ ok: true; info: TenantInfo } | { ok: false; message: string }> {
+  const base = url.replace(/\/+$/, '');
+  const endpoint = `${base}/_edge/tenant_info`;
+  const auth = Buffer.from(`${email}:${apiToken}`).toString('base64');
+
+  // Derive a fallback display name from the host (e.g. "globex" from
+  // "globex.atlassian.net"). Used if the response has no cloudName.
+  let hostFallback = base;
+  try {
+    const parsed = new URL(base);
+    hostFallback = parsed.hostname.replace(/\.atlassian\.net$/i, '') || parsed.hostname;
+  } catch {
+    // keep base as-is
+  }
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'GET',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        Accept: 'application/json',
+      },
+    });
+    if (!response.ok) {
+      return { ok: false, message: `HTTP ${response.status}: ${response.statusText}` };
+    }
+    const body = (await response.json()) as { cloudId?: unknown; cloudName?: unknown };
+    const cloudId = typeof body.cloudId === 'string' ? body.cloudId.trim() : '';
+    if (!cloudId) {
+      return { ok: false, message: 'tenant_info response missing cloudId' };
+    }
+    const cloudName =
+      typeof body.cloudName === 'string' && body.cloudName.trim()
+        ? body.cloudName.trim()
+        : hostFallback;
+    return { ok: true, info: { cloudId, displayName: cloudName } };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `tenant_info fetch failed: ${message}` };
+  }
+}
+
 export async function testConnection(
   url: string,
   email: string,
