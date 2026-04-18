@@ -24,9 +24,15 @@ import {
   openSync,
   writeSync,
   closeSync,
+  constants as fsConstants,
 } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+
+// `O_NOFOLLOW` is POSIX-only; fall back to 0 on Windows. (E2: added so the
+// initial create refuses to follow an attacker-planted symlink at logPath,
+// complementing the existing `O_EXCL` / `"ax"` protection.)
+const O_NOFOLLOW: number = fsConstants.O_NOFOLLOW ?? 0;
 
 export interface MutationRecord {
   timestamp: string;
@@ -132,12 +138,26 @@ export function initMutationLog(dir: string): void {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   logPath = join(dir, `mutations-${ts}.jsonl`);
 
-  // Open with exclusive create + append + owner-only perms (Finding 4)
+  // Open with exclusive create + append + owner-only perms (Finding 4) and
+  // O_NOFOLLOW (E2) — the numeric flag form is required because the string
+  // mode "ax" does not compose with extra flags.
+  const CREATE_FLAGS =
+    fsConstants.O_WRONLY |
+    fsConstants.O_APPEND |
+    fsConstants.O_CREAT |
+    fsConstants.O_EXCL |
+    O_NOFOLLOW;
+  const FALLBACK_FLAGS =
+    fsConstants.O_WRONLY |
+    fsConstants.O_APPEND |
+    fsConstants.O_CREAT |
+    O_NOFOLLOW;
   try {
-    logFd = openSync(logPath, "ax", 0o600);
+    logFd = openSync(logPath, CREATE_FLAGS, 0o600);
   } catch {
-    // If the file already exists (unlikely with timestamp), fall back
-    logFd = openSync(logPath, "a", 0o600);
+    // If the file already exists (unlikely with timestamp), fall back —
+    // O_NOFOLLOW still applies, so an attacker-planted symlink is rejected.
+    logFd = openSync(logPath, FALLBACK_FLAGS, 0o600);
   }
 }
 

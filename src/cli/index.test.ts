@@ -120,4 +120,23 @@ describe("CLI entry point", () => {
     expect(mockRunAgentGuide).toHaveBeenCalledOnce();
     expect(mockStartServer).not.toHaveBeenCalled();
   });
+
+  it("calls runUpgrade when 'upgrade' argument is provided (Track A2)", async () => {
+    const mockRunUpgrade = vi
+      .fn()
+      .mockResolvedValue({ status: "up-to-date", message: "Already on v1" });
+    process.argv = ["node", "index.js", "upgrade"];
+    vi.resetModules();
+    vi.doMock("../server/index.js", () => ({ main: mockStartServer }));
+    vi.doMock("./setup.js", () => ({ runSetup: mockRunSetup }));
+    vi.doMock("./profiles.js", () => ({ runProfiles: mockRunProfiles }));
+    vi.doMock("./status.js", () => ({ runStatus: mockRunStatus }));
+    vi.doMock("./upgrade.js", () => ({ runUpgrade: mockRunUpgrade }));
+
+    await import("./index.js");
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(mockRunUpgrade).toHaveBeenCalledOnce();
+    expect(mockStartServer).not.toHaveBeenCalled();
+  });
 });

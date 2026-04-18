@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - security audit fixes
+
+This release implements the fixes from the 2026-04-18 security audit
+(see `plans/security-audit-fixes.md`). No user data migration is required.
+
+### Changed (breaking)
+
+- **Auto-update is now check-and-notify only by default.** Previously the
+  server silently ran `npm install -g` when a patch release was detected.
+  The audit flagged this as Critical: a compromise of the npm publisher
+  account or a registry MITM would execute code on every user's machine
+  within 24 hours.
+  - **Default behaviour:** the daily check records a pending update in
+    `~/.config/epimethian-mcp/update-check.json`. The stderr startup banner
+    and the `get_version` MCP tool surface the "update available" signal.
+    The user installs with the new `epimethian-mcp upgrade` command (from
+    their terminal, not via the agent).
+  - **Opt-in:** set `EPIMETHIAN_AUTO_UPGRADE=patches` to restore automatic
+    installation for **patch releases only**. The startup banner logs a
+    loud supply-chain warning when this is active.
+  - **Integrity check:** every install (manual or opt-in) now calls
+    `npm audit signatures` and refuses to install unless the npm provenance
+    attestation verifies. Failure leaves the pending-update record intact
+    so the banner keeps nagging.
+  - **Migration:** users who relied on silent auto-update must either run
+    `epimethian-mcp upgrade` manually (recommended) or opt in with the
+    env var above.
+
+### Added
+
+- **`epimethian-mcp upgrade` CLI subcommand** — runs the integrity-verified
+  install path. Non-zero exit on integrity or install failure so scripts /
+  CI can detect.
+- **Prompt-injection fencing on read tools** — every tenant-authored piece
+  of text returned to the agent is wrapped in
+  `<<<CONFLUENCE_UNTRUSTED … >>>` / `<<<END_CONFLUENCE_UNTRUSTED>>>`
+  markers. The fence is a behavioural defence (not cryptographic);
+  tool-description paragraphs instruct the agent to treat fenced content
+  as data, never as instructions. Applies to: `get_page`,
+  `get_page_by_title`, `get_page_versions`, `get_page_version`,
+  `diff_page_versions`, `search_pages`, `get_comments`, `get_labels`,
+  `lookup_user`, `resolve_page_link`, `get_page_status`.
+- **Destructive-flag warning on write tools** — tool descriptions of the
+  16 write tools gain a paragraph telling the agent that destructive
+  flags (`confirm_shrinkage`, `confirm_structure_loss`, `replace_body`,
+  etc.) must come from the user's original request, never from page
+  content.
+- **`CONTENT_FLOOR_BREACHED` guard (no opt-out)** — rejects writes that
+  shrink the body below 10 % of the original (>500-char pages) or below
+  10 visible characters (>200-char text pages), even with every
+  `confirm_*` flag set. Backstop against prompt-injection chains that
+  talk the agent into passing the opt-out flags.
+
+### Security
+
+- **Tenant seal fails closed on sealed profiles when `/_edge/tenant_info`
+  is unreachable.** Previously the server logged a warning and continued
+  even when a seal existed. An attacker who could selectively block the
+  endpoint (network MITM, egress filter) thereby bypassed the seal.
+  Profiles without a stored seal (pre-5.5 upgrade paths) still degrade
+  gracefully with a warning.
+- **Filesystem TOCTOU hardening** — replaced `stat + readFile` patterns
+  on `profiles.json` and `update-check.json` with `open(O_NOFOLLOW)` +
+  `fstat`-on-fd + read. `audit.log` appends now use `O_NOFOLLOW` too.
+  Mutation-log file creation adds `O_NOFOLLOW` to the existing `O_EXCL`.
+  A new `verifyDirChain` helper walks parent directories lstat-checking
+  each for symlinks / wrong ownership / group-world-writable modes.
+- **MCP client label sanitisation** — `setClientLabel()` now strips
+  characters outside `[A-Za-z0-9 _./()\-]` before truncation, so a
+  malicious MCP client cannot inject ANSI escapes, newlines, or control
+  characters into the server's log output or comment attribution.
+- **Deep-frozen `Config.jsonHeaders`** — `Object.freeze` is shallow, so
+  `config.jsonHeaders.Authorization` was mutable at runtime despite the
+  frozen outer object. Now frozen explicitly.
+
+### Documentation
+
+- `doc/design/security/` updated to describe the new trust model,
+  fencing convention, floor guard, seal fail-closed semantics, and
+  filesystem-hardening helpers. See the index at
+  `doc/design/security/README.md`.
+
 ## [5.1.0] - 2026-04-14
 
 ### Added

@@ -10,6 +10,14 @@ vi.mock("node:fs/promises", () => ({
   appendFile: vi.fn().mockResolvedValue(undefined),
 }));
 
+// safe-fs wraps fs/promises with O_NOFOLLOW + fstat-on-fd. For unit tests we
+// mock it directly — the integration tests in safe-fs.test.ts cover the
+// real-fd behaviour. Track E2 of plans/security-audit-fixes.md.
+vi.mock("./safe-fs.js", () => ({
+  safeOpenRead: vi.fn(),
+  safeOpenAppend: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("node:crypto", () => ({
   randomBytes: vi.fn().mockReturnValue({
     toString: () => "abcd1234",
@@ -17,6 +25,7 @@ vi.mock("node:crypto", () => ({
 }));
 
 import { readFile, writeFile, rename, mkdir, appendFile, stat } from "node:fs/promises";
+import { safeOpenRead, safeOpenAppend } from "./safe-fs.js";
 import {
   readProfileRegistry,
   addToProfileRegistry,
@@ -32,9 +41,17 @@ const mockWriteFile = vi.mocked(writeFile);
 const mockRename = vi.mocked(rename);
 const mockMkdir = vi.mocked(mkdir);
 const mockStat = vi.mocked(stat);
+const mockSafeOpenRead = vi.mocked(safeOpenRead);
+const mockSafeOpenAppend = vi.mocked(safeOpenAppend);
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Tests set up registry contents via mockReadFile.mockResolvedValueOnce.
+  // Track E2 replaced the direct readFile call with safeOpenRead; bridge the
+  // two so the existing tests exercise the same queued return values.
+  mockSafeOpenRead.mockImplementation((path: string) => {
+    return (mockReadFile as any)(path, "utf-8");
+  });
 });
 
 describe("getProfileRegistryPath", () => {
@@ -263,8 +280,11 @@ describe("setProfileSettings", () => {
 });
 
 describe("permission verification", () => {
+  // E2: permission rejection moved into safe-fs.ts's safeOpenRead. The bridge
+  // in beforeEach delegates to mockReadFile; here we short-circuit that and
+  // throw the string error shape that safeOpenRead produces.
   it("rejects world-writable registry file", async () => {
-    mockStat.mockResolvedValue({ mode: 0o100666 } as any); // world-writable
+    mockSafeOpenRead.mockRejectedValueOnce(new Error("unsafe-permissions"));
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const result = await readProfileRegistry();
@@ -277,7 +297,7 @@ describe("permission verification", () => {
   });
 
   it("rejects group-writable registry file", async () => {
-    mockStat.mockResolvedValue({ mode: 0o100660 } as any); // group-writable
+    mockSafeOpenRead.mockRejectedValueOnce(new Error("unsafe-permissions"));
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const result = await readProfileRegistry();
@@ -289,8 +309,22 @@ describe("permission verification", () => {
     spy.mockRestore();
   });
 
+  it("rejects a registry file that is a symlink (E2 regression guard)", async () => {
+    const eloop = new Error("symlink") as NodeJS.ErrnoException;
+    eloop.code = "ELOOP";
+    mockSafeOpenRead.mockRejectedValueOnce(eloop);
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await readProfileRegistry();
+
+    expect(result).toEqual([]);
+    expect(spy).toHaveBeenCalledWith(
+      expect.stringContaining("symlink")
+    );
+    spy.mockRestore();
+  });
+
   it("accepts owner-only permissions", async () => {
-    mockStat.mockResolvedValue({ mode: 0o100600 } as any);
     mockReadFile.mockResolvedValue(
       JSON.stringify({ profiles: ["acme"] })
     );
@@ -319,13 +353,15 @@ describe("addToProfileRegistry preserves settings", () => {
 });
 
 describe("appendAuditLog", () => {
-  it("appends timestamped entry to audit log", async () => {
+  it("appends timestamped entry to audit log via safeOpenAppend (E2)", async () => {
     await appendAuditLog('Removed profile "test"');
 
-    expect(vi.mocked(appendFile)).toHaveBeenCalledWith(
+    // E2: migrated from node:fs/promises.appendFile to safe-fs.safeOpenAppend
+    // (O_NOFOLLOW). The signature is now (path, data) — no mode argument
+    // because safeOpenAppend hardcodes 0o600 in the open flags.
+    expect(mockSafeOpenAppend).toHaveBeenCalledWith(
       expect.stringContaining("audit.log"),
-      expect.stringMatching(/^\[.*\] Removed profile "test"\n$/),
-      { mode: 0o600 }
+      expect.stringMatching(/^\[.*\] Removed profile "test"\n$/)
     );
   });
 });

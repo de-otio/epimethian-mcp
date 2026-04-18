@@ -160,9 +160,10 @@ Write operations are protected by layered safety guards to prevent accidental co
 - URL, email, and API token are stored as an atomic unit — no mixing across profiles
 - Tokens are never written to disk in plaintext
 - The `setup` command uses masked input so tokens don't appear in terminal scrollback
-- Startup validation verifies credentials, tenant identity (email), and tenant seal (cloudId) before accepting tool calls
+- Startup validation verifies credentials, tenant identity (email), and tenant seal (cloudId) before accepting tool calls. Sealed profiles fail closed if the tenant-id endpoint is unreachable.
 - Write operations include a tenant echo so the target is always visible
 - For CI/headless environments, set all three env vars (`CONFLUENCE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`) — partial combinations are rejected
+- Updates are **check-and-notify** by default. Run `epimethian-mcp upgrade` to install — the CLI verifies the npm provenance attestation first and refuses to install without it. Set `EPIMETHIAN_AUTO_UPGRADE=patches` to opt in to automatic patch installs (same integrity check).
 
 For a full security & safety evaluation — threat model, defence-in-depth mechanisms, known limitations — see [doc/design/security/](doc/design/security/README.md).
 

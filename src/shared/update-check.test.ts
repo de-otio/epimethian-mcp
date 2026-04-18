@@ -7,6 +7,13 @@ vi.mock("node:fs/promises", () => ({
   mkdir: vi.fn().mockResolvedValue(undefined),
 }));
 
+// E2: readCheckState now goes through safeOpenRead. Bridge to the existing
+// readFile mock so test setups that prime readFile still drive behaviour.
+vi.mock("./safe-fs.js", () => ({
+  safeOpenRead: vi.fn(),
+  safeOpenAppend: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("node:crypto", () => ({
   randomBytes: vi.fn().mockReturnValue({
     toString: () => "abcd1234",
@@ -26,6 +33,7 @@ vi.mock("node:util", async (importOriginal) => {
 });
 
 import { readFile, writeFile, rename } from "node:fs/promises";
+import { safeOpenRead } from "./safe-fs.js";
 import {
   parseSemVer,
   classifyUpdate,
@@ -38,6 +46,7 @@ import {
 const mockReadFile = vi.mocked(readFile);
 const mockWriteFile = vi.mocked(writeFile);
 const mockRename = vi.mocked(rename);
+const mockSafeOpenRead = vi.mocked(safeOpenRead);
 
 // Mock global fetch
 const mockFetch = vi.fn();
@@ -46,6 +55,12 @@ vi.stubGlobal("fetch", mockFetch);
 beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.EPIMETHIAN_NO_UPDATE_CHECK;
+  delete process.env.EPIMETHIAN_AUTO_UPGRADE;
+  // Bridge safeOpenRead to the existing readFile mock so test setups that
+  // prime readFile still drive readCheckState's behaviour after E2.
+  mockSafeOpenRead.mockImplementation((path: string) => {
+    return (mockReadFile as any)(path, "utf-8");
+  });
 });
 
 // --- Unit tests for pure functions ---
@@ -278,6 +293,151 @@ describe("checkForUpdates", () => {
       { mode: 0o600 }
     );
     expect(mockRename).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security audit Track A: new trust model.
+//   - Default: check-and-notify only. No auto-install for any type.
+//   - Opt-in: EPIMETHIAN_AUTO_UPGRADE=patches restores auto-install for
+//     patches only, gated by verifyNpmProvenance.
+// These tests document the trust model — see src/shared/update-check.ts
+// top-of-file design note for full rationale.
+// ---------------------------------------------------------------------------
+
+describe("checkForUpdates — trust model (Track A)", () => {
+  it("DEFAULT: patch update is stored as pending, NOT auto-installed", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ lastCheck: "2020-01-01T00:00:00.000Z" })
+    );
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ version: "5.2.2" }),
+    });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await checkForUpdates("5.2.1");
+
+    expect(result).toEqual({
+      current: "5.2.1",
+      latest: "5.2.2",
+      type: "patch",
+    });
+    // Critical: autoInstalled must NOT be set in default mode.
+    expect(result?.autoInstalled).toBeUndefined();
+
+    // Pending record is persisted; no "installed automatically" log.
+    const written = mockWriteFile.mock.calls[0]?.[1] as string;
+    const parsed = JSON.parse(written);
+    expect(parsed.pendingUpdate.type).toBe("patch");
+    expect(parsed.pendingUpdate.autoInstalled).toBeUndefined();
+
+    // Nag line points the user at the CLI upgrade command.
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Patch update available")
+    );
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining("epimethian-mcp upgrade")
+    );
+    stderrSpy.mockRestore();
+  });
+
+  it("DEFAULT: does not log the supply-chain warning when opt-in is off", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ lastCheck: "2020-01-01T00:00:00.000Z" })
+    );
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ version: "5.2.2" }),
+    });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await checkForUpdates("5.2.1");
+
+    const calls = stderrSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(calls).not.toContain("EPIMETHIAN_AUTO_UPGRADE=patches is active");
+    stderrSpy.mockRestore();
+  });
+
+  it("OPT-IN: EPIMETHIAN_AUTO_UPGRADE=patches logs the supply-chain warning", async () => {
+    process.env.EPIMETHIAN_AUTO_UPGRADE = "patches";
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ lastCheck: "2020-01-01T00:00:00.000Z" })
+    );
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ version: "5.2.2" }),
+    });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await checkForUpdates("5.2.1");
+
+    const calls = stderrSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(calls).toContain("EPIMETHIAN_AUTO_UPGRADE=patches is active");
+    expect(calls).toContain("provenance attestation");
+    stderrSpy.mockRestore();
+  });
+
+  it("OPT-IN: does not unlock auto-install for MINOR updates", async () => {
+    process.env.EPIMETHIAN_AUTO_UPGRADE = "patches";
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ lastCheck: "2020-01-01T00:00:00.000Z" })
+    );
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ version: "5.3.0" }),
+    });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await checkForUpdates("5.2.1");
+
+    expect(result?.type).toBe("minor");
+    // Minor updates are notify-only even under the opt-in.
+    expect(result?.autoInstalled).toBeUndefined();
+    stderrSpy.mockRestore();
+  });
+
+  it("OPT-IN: does not unlock auto-install for MAJOR updates", async () => {
+    process.env.EPIMETHIAN_AUTO_UPGRADE = "patches";
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ lastCheck: "2020-01-01T00:00:00.000Z" })
+    );
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ version: "6.0.0" }),
+    });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await checkForUpdates("5.2.1");
+
+    expect(result?.type).toBe("major");
+    expect(result?.autoInstalled).toBeUndefined();
+    stderrSpy.mockRestore();
+  });
+
+  it("pending record is persisted BEFORE auto-install attempt (so failures keep nagging)", async () => {
+    // Document the ordering guarantee from the design note: the pending
+    // record is written first so an integrity-check or install failure
+    // leaves the nag signal in place.
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ lastCheck: "2020-01-01T00:00:00.000Z" })
+    );
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ version: "5.2.2" }),
+    });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await checkForUpdates("5.2.1");
+
+    // In default mode, writeFile is called exactly once — and it contains
+    // the pending record. In opt-in mode with a failing install, we also
+    // expect the record present on first write.
+    expect(mockWriteFile).toHaveBeenCalled();
+    const firstWritten = mockWriteFile.mock.calls[0]?.[1] as string;
+    const parsed = JSON.parse(firstWritten);
+    expect(parsed.pendingUpdate).toBeDefined();
+    stderrSpy.mockRestore();
   });
 });
 

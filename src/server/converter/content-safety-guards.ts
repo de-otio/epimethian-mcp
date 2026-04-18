@@ -6,6 +6,10 @@
  * architectural decision — see doc/design/11-safety-guards.md Finding 1.
  *
  * Guards:
+ *   1F. Content floor guard — hard floor, no opt-out (fires even with
+ *       confirm_shrinkage + confirm_structure_loss). Catches catastrophic
+ *       reductions that defeat the confirmation-gated guards. Security audit
+ *       Finding 3 (C1).
  *   1A. Shrinkage guard — rejects >50% body reduction unless confirmed.
  *   1B. Structural integrity — rejects >50% heading loss unless confirmed.
  *   1C. Empty-body rejection — hard guard, no opt-out.
@@ -15,6 +19,7 @@
 
 import {
   ConverterError,
+  CONTENT_FLOOR_BREACHED,
   SHRINKAGE_NOT_CONFIRMED,
   STRUCTURE_LOSS_NOT_CONFIRMED,
   EMPTY_BODY_REJECTED,
@@ -35,6 +40,24 @@ export const STRUCTURE_GUARD_MAX_RATIO = 0.5;
 
 export const EMPTY_BODY_MIN_OLD_LEN = 100;
 export const EMPTY_BODY_MIN_TEXT_LEN = 3;
+
+/**
+ * Content floor guard thresholds (1F). No opt-out — these fire regardless
+ * of `confirm_shrinkage` / `confirm_structure_loss`. See security audit
+ * Finding 3.
+ *
+ * - Length floor: reject when `newLen < 10% of oldLen` on pages >500 chars.
+ *   Mirrors the post-transform catastrophic-reduction threshold already
+ *   enforced in safeSubmitPage, but fires pre-transform too so markdown and
+ *   storage-format write paths get the same protection.
+ * - Text floor: reject when `newTextLen < 10` on pages whose old text
+ *   content was >200 chars. Stricter variant of the empty-body guard (1C),
+ *   which only catches bodies wiped to 3-9 visible characters.
+ */
+export const CONTENT_FLOOR_MIN_OLD_LEN = 500;
+export const CONTENT_FLOOR_MIN_RATIO = 0.1;
+export const CONTENT_FLOOR_MIN_OLD_TEXT_LEN = 200;
+export const CONTENT_FLOOR_MIN_NEW_TEXT_LEN = 10;
 
 // --- Heading counter ---
 
@@ -112,6 +135,63 @@ export interface ContentSafetyInput {
 }
 
 // --- Guard runner ---
+
+/**
+ * 1F: Content floor guard — hard floor, no opt-out.
+ *
+ * Fires regardless of any `confirm_*` flag. This is the backstop against a
+ * prompt-injection chain where an agent has been coerced into passing
+ * `confirm_shrinkage: true` AND `confirm_structure_loss: true`; those flags
+ * defeat 1A/1B but they **cannot** defeat this guard. See security audit
+ * Finding 3.
+ *
+ * Exported standalone so callers (e.g. safeSubmitPage, which runs on
+ * additive-scope bodies where the full guard runner is skipped) can invoke
+ * it independently.
+ */
+export function enforceContentFloorGuard(
+  oldStorage: string,
+  newStorage: string,
+): void {
+  const oldLen = oldStorage.length;
+  const newLen = newStorage.length;
+
+  // Length floor: catastrophic byte-level reduction on a non-trivial page.
+  if (
+    oldLen > CONTENT_FLOOR_MIN_OLD_LEN &&
+    newLen < oldLen * CONTENT_FLOOR_MIN_RATIO
+  ) {
+    const pct = Math.round((1 - newLen / oldLen) * 100);
+    throw new ConverterError(
+      `Body would shrink from ${oldLen} to ${newLen} characters ` +
+        `(${pct}% reduction — below the hard floor of ` +
+        `${Math.round(CONTENT_FLOOR_MIN_RATIO * 100)}% of the original). ` +
+        `This limit applies even with \`confirm_shrinkage: true\` / ` +
+        `\`confirm_structure_loss: true\`. ` +
+        `To rewrite a page this drastically, delete and recreate it.`,
+      CONTENT_FLOOR_BREACHED,
+    );
+  }
+
+  // Text floor: catastrophic visible-text reduction. Stricter variant of
+  // the empty-body guard (1C) — 1C only catches <3 visible chars, but a
+  // page wiped to e.g. 5 visible chars is just as unrecoverable.
+  const oldText = extractTextContent(oldStorage);
+  const newText = extractTextContent(newStorage);
+  if (
+    oldText.length > CONTENT_FLOOR_MIN_OLD_TEXT_LEN &&
+    newText.length < CONTENT_FLOOR_MIN_NEW_TEXT_LEN
+  ) {
+    throw new ConverterError(
+      `Visible text would shrink from ${oldText.length} to ${newText.length} characters ` +
+        `(below the hard floor of ${CONTENT_FLOOR_MIN_NEW_TEXT_LEN} visible characters). ` +
+        `This limit applies even with \`confirm_shrinkage: true\` / ` +
+        `\`confirm_structure_loss: true\`. ` +
+        `To rewrite a page this drastically, delete and recreate it.`,
+      CONTENT_FLOOR_BREACHED,
+    );
+  }
+}
 
 /**
  * Run all content-safety guards. Throws ConverterError if a guard
@@ -208,4 +288,11 @@ export function enforceContentSafetyGuards(input: ContentSafetyInput): void {
       TABLE_LOSS_NOT_CONFIRMED,
     );
   }
+
+  // 1F: Content floor guard — runs LAST, no opt-out. Backstop for cases
+  // where the caller has bypassed 1A/1B/1D/1E with confirm_* flags but the
+  // result is still catastrophically reduced. See security audit Finding 3.
+  // Runs after the gated guards so they produce their native error codes
+  // (SHRINKAGE_NOT_CONFIRMED, etc.) when applicable.
+  enforceContentFloorGuard(oldStorage, newStorage);
 }

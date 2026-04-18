@@ -149,7 +149,10 @@ describe("validateStartup — tenant seal", () => {
     expect(mockExit).not.toHaveBeenCalled();
   });
 
-  it("does not hard-fail when tenant_info is unreachable (graceful degrade)", async () => {
+  it("hard-fails when tenant_info is unreachable AND the profile is sealed (fail-closed)", async () => {
+    // An attacker who can selectively block /_edge/tenant_info (network MITM,
+    // DNS poisoning, egress filter) would bypass the seal entirely if we
+    // degraded gracefully here. Fail closed to defeat that.
     process.env.CONFLUENCE_PROFILE = "acme";
     mockReadFromKeychain.mockResolvedValue({
       url: "https://acme.atlassian.net",
@@ -157,6 +160,31 @@ describe("validateStartup — tenant seal", () => {
       apiToken: "tok",
       cloudId: "cid-acme-001",
       tenantDisplayName: "Acme Corp",
+    });
+    mockFetchTenantInfo.mockResolvedValue({
+      ok: false,
+      message: "endpoint not found",
+    });
+
+    const { getConfig, validateStartup } = await loadModule();
+    const config = await getConfig();
+
+    await expect(validateStartup(config)).rejects.toThrow("process.exit(1)");
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockSaveToKeychain).not.toHaveBeenCalled();
+  });
+
+  it("gracefully degrades when tenant_info is unreachable AND the profile is pre-5.5 (no seal yet)", async () => {
+    // Profiles without a stored cloudId are unsealed — there's nothing to
+    // verify against, so we cannot fail closed without blocking legitimate
+    // upgrades from pre-5.5. Log a warning and continue; seal will be
+    // attempted on the next startup.
+    process.env.CONFLUENCE_PROFILE = "legacy";
+    mockReadFromKeychain.mockResolvedValue({
+      url: "https://legacy.atlassian.net",
+      email: "user@test.com",
+      apiToken: "tok",
+      // no cloudId / tenantDisplayName
     });
     mockFetchTenantInfo.mockResolvedValue({
       ok: false,

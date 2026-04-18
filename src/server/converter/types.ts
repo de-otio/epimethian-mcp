@@ -70,3 +70,9 @@ export class ConverterError extends Error {
 export const SHRINKAGE_NOT_CONFIRMED = "SHRINKAGE_NOT_CONFIRMED";
 export const STRUCTURE_LOSS_NOT_CONFIRMED = "STRUCTURE_LOSS_NOT_CONFIRMED";
 export const EMPTY_BODY_REJECTED = "EMPTY_BODY_REJECTED";
+/**
+ * Hard floor guard — no opt-out. Fires when a write would catastrophically
+ * reduce the page body even after the caller has supplied every other
+ * `confirm_*` flag. Matches the security audit's Finding 3 fix (C1).
+ */
+export const CONTENT_FLOOR_BREACHED = "CONTENT_FLOOR_BREACHED";

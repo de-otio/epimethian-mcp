@@ -238,7 +238,7 @@ const cases: Row[] = [
     name: "replaceBody skips structure-loss but still enforces shrinkage",
     input: {
       body: "<p>tiny</p>",
-      currentBody: `<h1>A</h1><h2>B</h2><h3>C</h3><p>${"x".repeat(2000)}</p>`,
+      currentBody: `<h1>A</h1><h2>B</h2><h3>C</h3><p>${"x".repeat(500)}</p>`,
       replaceBody: true,
     },
     outcome: { kind: "error", code: "SHRINKAGE_NOT_CONFIRMED" },
@@ -247,7 +247,7 @@ const cases: Row[] = [
     name: "replaceBody + confirmShrinkage skips structure-loss too",
     input: {
       body: `<p>${"y".repeat(200)}</p>`,
-      currentBody: `<h1>A</h1><h2>B</h2><h3>C</h3><h4>D</h4><p>${"x".repeat(2000)}</p>`,
+      currentBody: `<h1>A</h1><h2>B</h2><h3>C</h3><h4>D</h4><p>${"x".repeat(500)}</p>`,
       replaceBody: true,
       confirmShrinkage: true,
     },
@@ -426,6 +426,73 @@ const cases: Row[] = [
       kind: "error",
       code: "MISSING_BODY_FOR_CREATE",
     },
+  },
+  // --- Content floor guard (1F) — no opt-out, security audit Finding 3. ---
+  // The floor is the last line of defence against prompt-injection chains
+  // that talk an agent into setting every confirm_* flag. These rows prove
+  // the floor fires regardless of confirm_shrinkage / confirm_structure_loss
+  // / confirmDeletions / replaceBody combinations.
+  {
+    name: "floor guard fires with confirmShrinkage + confirmStructureLoss set",
+    input: {
+      body: "<h1>Hello world</h1>", // ~20 chars, 11 visible — survives 1C
+      currentBody: `<h1>Old</h1><p>${"x".repeat(1500)}</p>`,
+      confirmShrinkage: true,
+      confirmStructureLoss: true,
+    },
+    outcome: { kind: "error", code: "CONTENT_FLOOR_BREACHED" },
+  },
+  {
+    name: "floor guard fires with every confirm flag set (the injection attack)",
+    input: {
+      body: "<h1>Hello world</h1>",
+      currentBody: `<h1>Old</h1>${MACRO_INFO}<p>${"x".repeat(1500)}</p>`,
+      confirmShrinkage: true,
+      confirmStructureLoss: true,
+      confirmDeletions: true,
+    },
+    outcome: { kind: "error", code: "CONTENT_FLOOR_BREACHED" },
+  },
+  {
+    name: "floor guard fires with replaceBody + confirmShrinkage too",
+    input: {
+      body: "<h1>Hello world</h1>",
+      currentBody: `<h1>A</h1><h2>B</h2><p>${"x".repeat(1500)}</p>`,
+      replaceBody: true,
+      confirmShrinkage: true,
+    },
+    outcome: { kind: "error", code: "CONTENT_FLOOR_BREACHED" },
+  },
+  {
+    name: "floor guard does NOT fire on legitimate moderate rewrites with confirms",
+    input: {
+      body: `<p>${"replaced content here. ".repeat(20)}</p>`, // ~460 chars
+      currentBody: `<h1>Old</h1><p>${"x".repeat(2000)}</p>`,
+      confirmShrinkage: true,
+      confirmStructureLoss: true,
+    },
+    outcome: { kind: "success" },
+  },
+  {
+    name: "floor guard does NOT pre-empt 1A's actionable error when no confirms set",
+    // Ordering: 1A (gated) fires first; 1F runs last as backstop.
+    input: {
+      body: "<p>tiny</p>",
+      currentBody: `<p>${"x".repeat(1500)}</p>`,
+    },
+    outcome: { kind: "error", code: "SHRINKAGE_NOT_CONFIRMED" },
+  },
+  {
+    name: "pre-existing 1C empty-body guard still fires when text drops <3 chars",
+    input: {
+      // Structure unchanged, but body wiped to empty tags. 1C fires because
+      // oldLen>100 and newText<3. Floor guard would also fire, but 1C runs
+      // earlier in the ordering.
+      body: "<p></p><p></p>",
+      currentBody: `<p>${"x".repeat(500)}</p>`,
+      confirmShrinkage: true,
+    },
+    outcome: { kind: "error", code: "EMPTY_BODY_REJECTED" },
   },
 ];
 
@@ -976,7 +1043,7 @@ describe("safePrepareBody — deletedTokens fingerprint format", () => {
     // Current body has a panel macro + filler; caller's markdown drops the
     // macro and replaces with plain text.
     const current =
-      `<ac:structured-macro ac:name="panel"><ac:rich-text-body><p>X</p></ac:rich-text-body></ac:structured-macro><p>${"x".repeat(2000)}</p>`;
+      `<ac:structured-macro ac:name="panel"><ac:rich-text-body><p>X</p></ac:rich-text-body></ac:structured-macro><p>${"x".repeat(500)}</p>`;
     const markdownBody =
       `# Heading\n\nA paragraph replacing everything.\n\n` + "y".repeat(100);
     const result = await safePrepareBody({
@@ -993,7 +1060,7 @@ describe("safePrepareBody — deletedTokens fingerprint format", () => {
   });
 
   it("fingerprints drawio macros by diagramDisplayName (filename)", async () => {
-    const current = `${MACRO_DRAWIO}<p>${"x".repeat(2000)}</p>`;
+    const current = `${MACRO_DRAWIO}<p>${"x".repeat(500)}</p>`;
     const markdownBody =
       `# Heading\n\nDropped the drawio.\n\n` + "y".repeat(100);
     const result = await safePrepareBody({
@@ -1012,7 +1079,7 @@ describe("safePrepareBody — deletedTokens fingerprint format", () => {
   });
 
   it("fingerprints emoticons by ac:name", async () => {
-    const current = `<p><ac:emoticon ac:name="smile"/></p><p>${"x".repeat(2000)}</p>`;
+    const current = `<p><ac:emoticon ac:name="smile"/></p><p>${"x".repeat(500)}</p>`;
     const markdownBody =
       `# Heading\n\nNo more emoticon.\n\n` + "y".repeat(100);
     const result = await safePrepareBody({

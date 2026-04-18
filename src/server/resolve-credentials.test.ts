@@ -84,13 +84,22 @@ describe("resolveCredentials", () => {
       expect(result.url).toBe("https://test.atlassian.net");
     });
 
-    it("exits when keychain entry not found for profile", async () => {
+    it("throws ProfileNotConfiguredError when keychain entry not found for profile", async () => {
       process.env.CONFLUENCE_PROFILE = "missing";
       mockReadFromKeychain.mockResolvedValue(null);
 
-      const resolve = await importResolveCredentials();
-      await expect(resolve()).rejects.toThrow("process.exit(1)");
-      expect(mockExit).toHaveBeenCalledWith(1);
+      vi.resetModules();
+      const mod = await import("./confluence-client.js");
+
+      await expect(mod.resolveCredentials()).rejects.toBeInstanceOf(
+        mod.ProfileNotConfiguredError
+      );
+      await expect(mod.resolveCredentials()).rejects.toMatchObject({
+        profile: "missing",
+      });
+      // Recovery-mode path: must NOT process.exit — the caller starts a
+      // setup-needed server instead.
+      expect(mockExit).not.toHaveBeenCalled();
     });
 
     it("exits on invalid profile name", async () => {

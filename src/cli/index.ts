@@ -20,6 +20,16 @@ async function run(): Promise<void> {
   } else if (command === "agent-guide") {
     const { runAgentGuide } = await import("./agent-guide.js");
     runAgentGuide();
+  } else if (command === "upgrade") {
+    const { runUpgrade } = await import("./upgrade.js");
+    const result = await runUpgrade();
+    // Non-zero exit on failure so scripts and CI can detect.
+    if (
+      result.status === "integrity-failed" ||
+      result.status === "install-failed"
+    ) {
+      process.exit(1);
+    }
   } else {
     await startServer();
   }

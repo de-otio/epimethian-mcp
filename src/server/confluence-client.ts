@@ -8,15 +8,28 @@ import {
   fetchTenantInfo,
 } from "../shared/test-connection.js";
 import { escapeXmlText } from "./converter/escape.js";
+import { fenceUntrusted } from "./converter/untrusted-fence.js";
 
 declare const __PKG_VERSION__: string;
 import { pageCache } from "./page-cache.js";
 
 // --- Client label (set once from index.ts after MCP initialize handshake) ---
 
+// Character class for safe client-label output. Intentionally narrow: ANSI
+// escape sequences, newlines, and other control chars are stripped so a
+// malicious MCP client cannot inject log-line breaks or terminal escapes
+// via its declared name. The set covers real-world labels like
+// "Claude Code", "Cursor (1.2.3)", and "VS Code / Continue".
+const CLIENT_LABEL_DISALLOWED_RE = /[^A-Za-z0-9 _./()\-]/g;
+
 let _clientLabel: string | undefined;
 export function setClientLabel(label: string | undefined): void {
-  _clientLabel = label ? label.slice(0, 80) : undefined;
+  if (!label) {
+    _clientLabel = undefined;
+    return;
+  }
+  const sanitized = label.replace(CLIENT_LABEL_DISALLOWED_RE, "").slice(0, 80);
+  _clientLabel = sanitized || undefined;
 }
 
 // --- Configuration ---
@@ -40,6 +53,19 @@ export interface Config {
 let _config: Config | null = null;
 
 /**
+ * Thrown when CONFLUENCE_PROFILE names a profile that has no keychain entry.
+ * Recoverable — the server starts in setup-needed mode rather than exiting.
+ */
+export class ProfileNotConfiguredError extends Error {
+  readonly profile: string;
+  constructor(profile: string) {
+    super(`No credentials found for profile "${profile}"`);
+    this.name = "ProfileNotConfiguredError";
+    this.profile = profile;
+  }
+}
+
+/**
  * Resolve credentials from environment / keychain without caching.
  * Exported for testability — callers should use getConfig() instead.
  *
@@ -47,6 +73,10 @@ let _config: Config | null = null;
  *   1. CONFLUENCE_PROFILE env var → read all fields from named keychain entry
  *   2. All 3 env vars set → use directly (CI/CD mode)
  *   3. Anything else (partial env vars, or none) → hard error
+ *
+ * Throws ProfileNotConfiguredError if a valid profile is named but has no
+ * keychain entry — the server can recover by entering setup-needed mode.
+ * All other credential errors still call process.exit(1).
  */
 export async function resolveCredentials(): Promise<{
   url: string;
@@ -71,10 +101,7 @@ export async function resolveCredentials(): Promise<{
     }
     const creds = await readFromKeychain(profileEnv);
     if (!creds) {
-      console.error(
-        `No credentials found for profile "${profileEnv}". Run \`epimethian-mcp setup --profile ${profileEnv}\` to configure.`
-      );
-      process.exit(1);
+      throw new ProfileNotConfiguredError(profileEnv);
     }
     return {
       url: creds.url.replace(/\/$/, ""),
@@ -142,6 +169,14 @@ export async function getConfig(): Promise<Config> {
   const authHeader =
     "Basic " + Buffer.from(`${email}:${apiToken}`).toString("base64");
 
+  // Deep-freeze: jsonHeaders must be frozen separately because Object.freeze
+  // is shallow. Without this, callers could mutate config.jsonHeaders.Authorization
+  // at runtime, breaking the immutability contract getConfig advertises.
+  const jsonHeaders = Object.freeze({
+    Authorization: authHeader,
+    "Content-Type": "application/json",
+  });
+
   _config = Object.freeze({
     url,
     email,
@@ -151,10 +186,7 @@ export async function getConfig(): Promise<Config> {
     apiV2: `${url}/wiki/api/v2`,
     apiV1: `${url}/wiki/rest/api`,
     authHeader,
-    jsonHeaders: {
-      Authorization: authHeader,
-      "Content-Type": "application/json",
-    },
+    jsonHeaders,
     sealedCloudId,
     sealedDisplayName,
   });
@@ -225,9 +257,17 @@ export async function validateStartup(config: Config): Promise<void> {
 
 /**
  * Verify the live tenant's cloudId against the one sealed at setup time.
- * For profiles without a seal (upgraded from pre-5.5), opportunistically
- * fetch the cloudId and write it back to the keychain entry so future
- * startups are protected.
+ *
+ * Failure modes:
+ *   - Seal mismatch (stored cloudId ≠ live cloudId): hard-exit. Core guard.
+ *   - Sealed profile + tenant_info endpoint unreachable: hard-exit. A
+ *     selective block on the endpoint would otherwise let an attacker with
+ *     a mis-pointed URL bypass the seal.
+ *   - Pre-5.5 profile (no stored cloudId) + tenant_info unreachable:
+ *     graceful degrade — log a warning and continue; seal will be
+ *     attempted again on next startup.
+ *   - Pre-5.5 profile + tenant_info reachable: opportunistic seal.
+ *     Fetch the cloudId and write it back to the keychain entry.
  *
  * Callers must ensure `config.profile` is non-null.
  */
@@ -237,12 +277,32 @@ async function verifyOrSealTenant(config: Config, apiToken: string): Promise<voi
 
   const live = await fetchTenantInfo(url, email, apiToken);
   if (!live.ok) {
-    // Endpoint unreachable — cannot verify or seal. Surface a warning but
-    // do not hard-fail: the email-identity check has already passed and
-    // we do not want to regress users whose tenants lack this endpoint.
+    if (sealedCloudId) {
+      // Sealed profile: we cannot verify the live tenant, so we must refuse.
+      // Distinct from a mismatch — an attacker who can selectively block
+      // `/_edge/tenant_info` (network MITM, DNS, egress filter) would
+      // otherwise bypass the seal entirely. Fail closed.
+      console.error(
+        `Error: Tenant seal cannot be verified for profile "${profile}".\n` +
+          `  Expected tenant : ${sealedDisplayName ?? "(unknown)"} (cloudId ${sealedCloudId})\n` +
+          `  URL             : ${url}\n` +
+          `  Reason          : tenant_info endpoint unreachable (${live.message})\n` +
+          `\n` +
+          `This is distinct from a tenant mismatch — the seal check did not run because ` +
+          `the verification endpoint was unavailable. Refusing to connect to prevent ` +
+          `cross-tenant writes in the face of a selective network block. Check network ` +
+          `connectivity to ${url}, or run \`epimethian-mcp setup --profile ${profile}\` ` +
+          `if the tenant has legitimately moved.`
+      );
+      process.exit(1);
+    }
+
+    // Pre-5.5 profile with no stored seal — graceful degrade. Nothing to
+    // verify against, and blocking here would break upgrade paths for users
+    // whose tenants legitimately lack this endpoint.
     console.error(
       `epimethian-mcp: warning — tenant_info unavailable for profile "${profile}" (${live.message}). ` +
-        `Skipping tenant seal check.`
+        `Skipping tenant seal check (will retry on next startup).`
     );
     return;
   }
@@ -1644,8 +1704,16 @@ export async function formatPage(
     ? `${base}${webui}`
     : `${cfg.url}/wiki/pages/${page.id}`;
 
+  // Titles are tenant-authored free text; wrap them in a per-title fence.
+  // Spec §4c (untrusted-content-fence-spec.md).
+  const titleFenced = fenceUntrusted(page.title, {
+    pageId: page.id,
+    field: "title",
+  });
+
   const lines = [
-    `Title: ${page.title}`,
+    "Title:",
+    titleFenced,
     `ID: ${page.id}`,
     `Space: ${spaceKey}`,
     `Version: ${version}`,
@@ -1654,11 +1722,20 @@ export async function formatPage(
 
   if (headingsOnly) {
     const body = page.body?.storage?.value ?? page.body?.value ?? "";
-    lines.push("", "Headings:", extractHeadings(body));
+    const outline = extractHeadings(body);
+    lines.push(
+      "",
+      "Headings:",
+      fenceUntrusted(outline, { pageId: page.id, field: "headings" })
+    );
   } else if (includeBody) {
     const body = page.body?.storage?.value ?? page.body?.value ?? "";
     if (body) {
-      lines.push("", `Content:`, body);
+      lines.push(
+        "",
+        "Content:",
+        fenceUntrusted(body, { pageId: page.id, field: "body" })
+      );
     }
   }
 
