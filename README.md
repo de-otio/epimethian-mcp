@@ -160,9 +160,11 @@ Write operations are protected by layered safety guards to prevent accidental co
 - URL, email, and API token are stored as an atomic unit — no mixing across profiles
 - Tokens are never written to disk in plaintext
 - The `setup` command uses masked input so tokens don't appear in terminal scrollback
-- Startup validation verifies credentials and tenant identity before accepting tool calls
+- Startup validation verifies credentials, tenant identity (email), and tenant seal (cloudId) before accepting tool calls
 - Write operations include a tenant echo so the target is always visible
 - For CI/headless environments, set all three env vars (`CONFLUENCE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`) — partial combinations are rejected
+
+For a full security & safety evaluation — threat model, defence-in-depth mechanisms, known limitations — see [doc/design/security/](doc/design/security/README.md).
 
 ## Development
 
