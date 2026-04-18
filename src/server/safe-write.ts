@@ -324,6 +324,19 @@ export interface SafeSubmitPageInput {
    * happen inside safePrepareBody.
    */
   replaceBody?: boolean;
+
+  /**
+   * Additive-scope invariant check. When truthy, safeSubmitPage asserts
+   * `finalStorage.length >= previousBody.length` — catching handler bugs
+   * where an additive op (prepend/append) produced a shrunken body instead
+   * of a growing one (e.g. the handler forgot to concatenate currentStorage
+   * back into the prepared delta).
+   *
+   * Only meaningful when `previousBody` is set. For non-additive scopes
+   * this flag should not be passed; set it explicitly for handlers that
+   * called safePrepareBody with `scope: "additive"`.
+   */
+  assertGrowth?: boolean;
 }
 
 /**
@@ -790,6 +803,7 @@ export async function safeSubmitPage(
     clientLabel,
     operation,
     replaceBody,
+    assertGrowth,
   } = input;
 
   const isCreate = pageId === undefined;
@@ -828,12 +842,32 @@ export async function safeSubmitPage(
     }
   }
 
-  // 2. Post-submit safety guard — re-runs the post-transform body guard on
+  const oldLen = previousBody?.length ?? 0;
+
+  // 2a. Additive-scope invariant — for prepend/append, finalStorage must be
+  // at least as large as previousBody. Catches the handler-bug case where a
+  // "scope: additive" prepare returned a small delta and the handler failed
+  // to concatenate it back onto currentStorage before calling submit.
+  // Runs before the post-transform guard so callers get the more specific
+  // error message (the post-transform guard would also fire for catastrophic
+  // cases, but "you forgot to concat" is more actionable than "body shrank").
+  if (assertGrowth && !isTitleOnly && previousBody !== undefined) {
+    if (finalStorage!.length < previousBody.length) {
+      throw new Error(
+        `Additive-scope invariant violated: finalStorage (${finalStorage!.length} chars) ` +
+          `is smaller than previousBody (${previousBody.length} chars). ` +
+          `An additive op (prepend/append) must produce a body at least as large as ` +
+          `the original — the handler likely forgot to concatenate currentStorage back ` +
+          `onto the prepared delta before calling safeSubmitPage.`,
+      );
+    }
+  }
+
+  // 2b. Post-submit safety guard — re-runs the post-transform body guard on
   // finalStorage independent of prepare's decision. Catches section-splicing
   // damage in handlers that splice prepared output into a larger body
   // between calling safePrepareBody and safeSubmitPage. Skipped for
   // title-only updates (no body to guard).
-  const oldLen = previousBody?.length ?? 0;
   if (!isTitleOnly) {
     assertPostTransformBody(
       oldLen > 0 ? oldLen : finalStorage!.length,

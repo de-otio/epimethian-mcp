@@ -344,6 +344,7 @@ function registerTools(server: McpServer, config: Config): void {
       deletedTokens: prepared.deletedTokens,
       clientLabel: getClientLabel(server),
       operation: position === "prepend" ? "prepend_to_page" : "append_to_page",
+      assertGrowth: true,
     });
 
     return { page: submitted.page, newVersion: submitted.newVersion, oldLen: currentStorage.length, newLen: newBody.length };

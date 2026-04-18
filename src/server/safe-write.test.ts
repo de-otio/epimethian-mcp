@@ -877,6 +877,91 @@ describe("safeSubmitPage — mutation log", () => {
     // API was not called.
     expect(_rawUpdatePage).not.toHaveBeenCalled();
   });
+
+  it("assertGrowth accepts finalStorage larger than previousBody (happy path)", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "99", title: "T", version: { number: 4 } },
+      newVersion: 4,
+    });
+
+    const prev = "<p>existing</p>";
+    const next = "<p>existing</p>\n\n<p>appended</p>";
+
+    const result = await safeSubmitPage({
+      pageId: "99",
+      title: "T",
+      finalStorage: next,
+      previousBody: prev,
+      version: 3,
+      versionMessage: "",
+      deletedTokens: [],
+      clientLabel: undefined,
+      operation: "append_to_page",
+      assertGrowth: true,
+    });
+
+    expect(result.newVersion).toBe(4);
+    expect(_rawUpdatePage).toHaveBeenCalled();
+  });
+
+  it("assertGrowth rejects finalStorage smaller than previousBody (handler forgot to concat)", async () => {
+    // Simulates the handler bug where scope:"additive" prepare returned a
+    // small delta and the handler submitted the delta alone instead of
+    // concatenating it onto previousBody. assertGrowth catches this before
+    // the API call, so the page is never overwritten.
+    const prev = `<p>${"x".repeat(500)}</p>`;
+    const deltaOnly = "<p>new line</p>"; // dramatically smaller — bug case
+
+    let thrown: unknown;
+    try {
+      await safeSubmitPage({
+        pageId: "99",
+        title: "T",
+        finalStorage: deltaOnly,
+        previousBody: prev,
+        version: 3,
+        versionMessage: "",
+        deletedTokens: [],
+        clientLabel: undefined,
+        operation: "append_to_page",
+        assertGrowth: true,
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(/Additive-scope invariant violated/);
+    expect((thrown as Error).message).toMatch(/forgot to concatenate/);
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("assertGrowth is a no-op when flag is unset", async () => {
+    // Without the flag, submit does not enforce growth — some non-additive
+    // flows legitimately shrink (e.g. replaceBody, revert_page).
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "99", title: "T", version: { number: 4 } },
+      newVersion: 4,
+    });
+
+    // previousBody > finalStorage but within the post-transform >90% limit
+    const prev = `<p>${"x".repeat(500)}</p>`;
+    const next = `<p>${"x".repeat(100)}</p>`;
+
+    const result = await safeSubmitPage({
+      pageId: "99",
+      title: "T",
+      finalStorage: next,
+      previousBody: prev,
+      version: 3,
+      versionMessage: "",
+      deletedTokens: [],
+      clientLabel: undefined,
+      // assertGrowth deliberately omitted
+    });
+
+    expect(result.newVersion).toBe(4);
+    expect(_rawUpdatePage).toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
