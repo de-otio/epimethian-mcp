@@ -43,8 +43,8 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
   return {
     resolveSpaceId: vi.fn(),
     getPage: vi.fn(),
-    createPage: vi.fn(),
-    updatePage: vi.fn(),
+    _rawCreatePage: vi.fn(),
+    _rawUpdatePage: vi.fn(),
     deletePage: vi.fn(),
     searchPages: vi.fn(),
     listPages: vi.fn(),
@@ -261,7 +261,7 @@ describe("add_attachment path security", () => {
 
 describe("add_drawio_diagram filename normalization", () => {
   it("appends .drawio if not present", async () => {
-    const { uploadAttachment, getPage, updatePage } = await import(
+    const { uploadAttachment, getPage, _rawUpdatePage } = await import(
       "./confluence-client.js"
     );
     (uploadAttachment as any).mockResolvedValueOnce({
@@ -274,7 +274,7 @@ describe("add_drawio_diagram filename normalization", () => {
       version: { number: 3 },
       body: { storage: { value: "<p>existing</p>" } },
     });
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 4,
     });
@@ -296,14 +296,14 @@ describe("add_drawio_diagram filename normalization", () => {
     expect((uploadAttachment as any).mock.lastCall[2]).toBe("arch.drawio");
     expect(result.content[0].text).toContain("arch.drawio");
 
-    // Verify updatePage received version and title from getPage
-    const updateCall = (updatePage as any).mock.lastCall;
+    // Verify _rawUpdatePage received version and title from getPage
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     expect(updateCall[1].version).toBe(3);
     expect(updateCall[1].title).toBe("T");
   });
 
   it("does not double-append .drawio", async () => {
-    const { uploadAttachment, getPage, updatePage } = await import(
+    const { uploadAttachment, getPage, _rawUpdatePage } = await import(
       "./confluence-client.js"
     );
     (uploadAttachment as any).mockResolvedValueOnce({
@@ -316,7 +316,7 @@ describe("add_drawio_diagram filename normalization", () => {
       version: { number: 1 },
       body: { storage: { value: "" } },
     });
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 2,
     });
@@ -336,17 +336,17 @@ describe("add_drawio_diagram filename normalization", () => {
 
     expect((uploadAttachment as any).mock.lastCall[2]).toBe("arch.drawio");
 
-    // Verify updatePage received version and title from getPage
-    const updateCall = (updatePage as any).mock.lastCall;
+    // Verify _rawUpdatePage received version and title from getPage
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     expect(updateCall[1].version).toBe(1);
     expect(updateCall[1].title).toBe("T");
   });
 
-  it("returns error when uploadAttachment succeeds but updatePage fails", async () => {
+  it("returns error when uploadAttachment succeeds but _rawUpdatePage fails", async () => {
     // Production scenario: attachment is uploaded to Confluence, but the
     // page update that embeds the macro fails (409 conflict, permission
     // error, etc.). The attachment is now orphaned.
-    const { uploadAttachment, getPage, updatePage } = await import(
+    const { uploadAttachment, getPage, _rawUpdatePage } = await import(
       "./confluence-client.js"
     );
     (uploadAttachment as any).mockResolvedValueOnce({
@@ -359,8 +359,8 @@ describe("add_drawio_diagram filename normalization", () => {
       version: { number: 5 },
       body: { storage: { value: "<p>important content</p>" } },
     });
-    // updatePage rejects — simulates a 409 conflict or server error
-    (updatePage as any).mockRejectedValueOnce(new Error("version conflict"));
+    // _rawUpdatePage rejects — simulates a 409 conflict or server error
+    (_rawUpdatePage as any).mockRejectedValueOnce(new Error("version conflict"));
 
     mockMkdtemp.mockResolvedValueOnce("/tmp/drawio-fail");
     mockWriteFile.mockResolvedValueOnce(undefined);
@@ -574,15 +574,15 @@ describe("get_page section/max_length params", () => {
 
 describe("update_page_section tool", () => {
   it("replaces section content and updates page", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
-    (updatePage as any).mockClear();
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
     const fullPage = {
       id: "1",
       title: "T",
       body: { storage: { value: "<h1>A</h1><p>old</p><h1>B</h1><p>keep</p>" } },
     };
     (getPage as any).mockResolvedValueOnce(fullPage);
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -597,8 +597,8 @@ describe("update_page_section tool", () => {
     expect(result.content[0].text).toContain('Updated section "A"');
     expect(result.content[0].text).toContain("version: 6");
 
-    // Verify updatePage was called with reconstructed body
-    const updateCall = (updatePage as any).mock.calls[0];
+    // Verify _rawUpdatePage was called with reconstructed body
+    const updateCall = (_rawUpdatePage as any).mock.calls[0];
     expect(updateCall[1].body).toContain("<p>new</p>");
     expect(updateCall[1].body).toContain("<h1>B</h1><p>keep</p>");
   });
@@ -622,14 +622,14 @@ describe("update_page_section tool", () => {
   });
 
   it("auto-converts markdown body to storage format", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
-    (updatePage as any).mockClear();
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
     (getPage as any).mockResolvedValueOnce({
       id: "1",
       title: "T",
       body: { storage: { value: "<h1>A</h1><p>old</p><h1>B</h1><p>keep</p>" } },
     });
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 7,
     });
@@ -644,7 +644,7 @@ describe("update_page_section tool", () => {
     expect(result.content[0].text).toContain('Updated section "A"');
 
     // Verify the body was converted from markdown to storage format
-    const updateCall = (updatePage as any).mock.calls[0];
+    const updateCall = (_rawUpdatePage as any).mock.calls[0];
     const updatedBody = updateCall[1].body;
     // Should contain HTML tags, not raw markdown
     expect(updatedBody).toContain("<strong>bold</strong>");
@@ -655,15 +655,15 @@ describe("update_page_section tool", () => {
     expect(updatedBody).toContain("<h1>B</h1><p>keep</p>");
   });
 
-  it("passes version_message to updatePage", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
-    (updatePage as any).mockClear();
+  it("passes version_message to _rawUpdatePage", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
     (getPage as any).mockResolvedValueOnce({
       id: "1",
       title: "T",
       body: { storage: { value: "<h1>A</h1><p>old</p>" } },
     });
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 3,
     });
@@ -676,7 +676,7 @@ describe("update_page_section tool", () => {
       version: 2,
       version_message: "Updated intro",
     });
-    const updateCall = (updatePage as any).mock.calls[0];
+    const updateCall = (_rawUpdatePage as any).mock.calls[0];
     expect(updateCall[1].versionMessage).toBe("Updated intro");
   });
 });
@@ -685,8 +685,8 @@ describe("update_page_section token-aware preservation", () => {
   const EMOTICON = `<ac:emoticon ac:name="warning"/>`;
 
   it("preserves emoticon when markdown update keeps its token", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
-    (updatePage as any).mockClear();
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
     // Section A has an emoticon; agent edits Section A with markdown that keeps the token
     const fullPage = {
       id: "1",
@@ -698,7 +698,7 @@ describe("update_page_section token-aware preservation", () => {
       },
     };
     (getPage as any).mockResolvedValueOnce(fullPage);
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -724,7 +724,7 @@ describe("update_page_section token-aware preservation", () => {
     });
     expect(result.isError).toBeUndefined();
 
-    const submittedBody = (updatePage as any).mock.calls[0][1].body;
+    const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
     expect(submittedBody).toContain("ac:emoticon");
     expect(submittedBody).toContain("warning");
     expect(submittedBody).toContain("updated");
@@ -733,8 +733,8 @@ describe("update_page_section token-aware preservation", () => {
   });
 
   it("blocks emoticon deletion when confirm_deletions is false", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
-    (updatePage as any).mockClear();
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
     const fullPage = {
       id: "1",
       title: "T",
@@ -756,12 +756,12 @@ describe("update_page_section token-aware preservation", () => {
     });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("confirm_deletions");
-    expect(updatePage).not.toHaveBeenCalled();
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
   });
 
   it("allows emoticon deletion when confirm_deletions is true", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
-    (updatePage as any).mockClear();
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
     const fullPage = {
       id: "1",
       title: "T",
@@ -772,7 +772,7 @@ describe("update_page_section token-aware preservation", () => {
       },
     };
     (getPage as any).mockResolvedValueOnce(fullPage);
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -788,15 +788,15 @@ describe("update_page_section token-aware preservation", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Updated section");
     // emoticon should be gone from section A
-    const submittedBody = (updatePage as any).mock.calls[0][1].body;
+    const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
     expect(submittedBody).not.toContain("ac:emoticon");
     // Section B still untouched
     expect(submittedBody).toContain("<h1>B</h1><p>keep</p>");
   });
 
   it("storage-format body bypasses token-aware path (no change)", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
-    (updatePage as any).mockClear();
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
     const fullPage = {
       id: "1",
       title: "T",
@@ -807,7 +807,7 @@ describe("update_page_section token-aware preservation", () => {
       },
     };
     (getPage as any).mockResolvedValueOnce(fullPage);
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -821,7 +821,7 @@ describe("update_page_section token-aware preservation", () => {
       version: 5,
     });
     expect(result.isError).toBeUndefined();
-    const submittedBody = (updatePage as any).mock.calls[0][1].body;
+    const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
     expect(submittedBody).toContain("ac:emoticon");
     expect(submittedBody).toContain("new content");
   });
@@ -911,13 +911,13 @@ describe("get_page format: markdown", () => {
 
 describe("update_page markdown / storage routing", () => {
   it("accepts storage format HTML (backward compat)", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 5 },
       body: { storage: { value: "<p>Hello <strong>world</strong></p>" } },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -933,13 +933,13 @@ describe("update_page markdown / storage routing", () => {
   });
 
   it("accepts plain text without markdown patterns (treated as storage)", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 5 },
       body: { storage: { value: "Just some plain text" } },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -955,13 +955,13 @@ describe("update_page markdown / storage routing", () => {
   });
 
   it("treats body with <ac: tags as storage even if markdown patterns present", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 5 },
       body: { storage: { value: '<ac:structured-macro ac:name="info"><p># not markdown</p></ac:structured-macro>' } },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -2180,9 +2180,9 @@ describe("resolve_page_link tool", () => {
 
 describe("create_page markdown conversion (Stream 5)", () => {
   it("converts markdown body to storage XHTML before submission", async () => {
-    const { resolveSpaceId, createPage, formatPage } = await import("./confluence-client.js");
+    const { resolveSpaceId, _rawCreatePage, formatPage } = await import("./confluence-client.js");
     (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
-    (createPage as any).mockResolvedValueOnce({ id: "99", title: "New Page" });
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "99", title: "New Page" });
     (formatPage as any).mockReturnValueOnce("Title: New Page\nID: 99");
 
     const handler = registeredTools.get("create_page")!.handler;
@@ -2195,18 +2195,18 @@ describe("create_page markdown conversion (Stream 5)", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("New Page");
 
-    // createPage must have been called with storage XHTML, not raw markdown
+    // _rawCreatePage must have been called with storage XHTML, not raw markdown
     // Stream 11: headings now carry Confluence-slug IDs.
-    const createCall = (createPage as any).mock.lastCall;
+    const createCall = (_rawCreatePage as any).mock.lastCall;
     const submittedBody: string = createCall[2];
     expect(submittedBody).toMatch(/<h1\b/);
     expect(submittedBody).not.toContain("# Hello World");
   });
 
   it("passes storage body through unchanged", async () => {
-    const { resolveSpaceId, createPage, formatPage } = await import("./confluence-client.js");
+    const { resolveSpaceId, _rawCreatePage, formatPage } = await import("./confluence-client.js");
     (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
-    (createPage as any).mockResolvedValueOnce({ id: "100", title: "Storage Page" });
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "100", title: "Storage Page" });
     (formatPage as any).mockReturnValueOnce("Title: Storage Page\nID: 100");
 
     const storageBody = "<p>Hello <strong>world</strong></p>";
@@ -2217,14 +2217,14 @@ describe("create_page markdown conversion (Stream 5)", () => {
       body: storageBody,
     });
 
-    const createCall = (createPage as any).mock.lastCall;
+    const createCall = (_rawCreatePage as any).mock.lastCall;
     expect(createCall[2]).toBe(storageBody);
   });
 
   it("allow_raw_html: true enables raw HTML passthrough", async () => {
-    const { resolveSpaceId, createPage, formatPage } = await import("./confluence-client.js");
+    const { resolveSpaceId, _rawCreatePage, formatPage } = await import("./confluence-client.js");
     (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
-    (createPage as any).mockResolvedValueOnce({ id: "101", title: "HTML Page" });
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "101", title: "HTML Page" });
     (formatPage as any).mockReturnValueOnce("Title: HTML Page");
 
     const handler = registeredTools.get("create_page")!.handler;
@@ -2237,17 +2237,17 @@ describe("create_page markdown conversion (Stream 5)", () => {
     });
 
     expect(result.isError).toBeUndefined();
-    const submittedBody: string = (createPage as any).mock.lastCall[2];
+    const submittedBody: string = (_rawCreatePage as any).mock.lastCall[2];
     expect(submittedBody).toContain("raw html");
   });
 });
 
 describe("create_page duplicate-title guard", () => {
   it("rejects creation when a page with the same title already exists", async () => {
-    const { resolveSpaceId, getPageByTitle, createPage } = await import("./confluence-client.js");
+    const { resolveSpaceId, getPageByTitle, _rawCreatePage } = await import("./confluence-client.js");
     (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
     (getPageByTitle as any).mockResolvedValueOnce({ id: "42", title: "Existing Page" });
-    (createPage as any).mockClear();
+    (_rawCreatePage as any).mockClear();
 
     const handler = registeredTools.get("create_page")!.handler;
     const result = await handler({
@@ -2259,14 +2259,14 @@ describe("create_page duplicate-title guard", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("already exists");
     expect(result.content[0].text).toContain("42");
-    expect(createPage).not.toHaveBeenCalled();
+    expect(_rawCreatePage).not.toHaveBeenCalled();
   });
 
   it("allows creation when no page with that title exists", async () => {
-    const { resolveSpaceId, getPageByTitle, createPage, formatPage } = await import("./confluence-client.js");
+    const { resolveSpaceId, getPageByTitle, _rawCreatePage, formatPage } = await import("./confluence-client.js");
     (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
     (getPageByTitle as any).mockResolvedValueOnce(undefined);
-    (createPage as any).mockResolvedValueOnce({ id: "99", title: "Brand New Page" });
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "99", title: "Brand New Page" });
     (formatPage as any).mockReturnValueOnce("Title: Brand New Page\nID: 99");
 
     const handler = registeredTools.get("create_page")!.handler;
@@ -2277,13 +2277,13 @@ describe("create_page duplicate-title guard", () => {
     });
 
     expect(result.isError).toBeUndefined();
-    expect(createPage).toHaveBeenCalled();
+    expect(_rawCreatePage).toHaveBeenCalled();
   });
 });
 
 describe("update_page title-only (body omitted)", () => {
   it("does not send body to API when body parameter is omitted", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "99",
       title: "Old Title",
@@ -2295,8 +2295,8 @@ describe("update_page title-only (body omitted)", () => {
         },
       },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "99", title: "New Title" },
       newVersion: 11,
     });
@@ -2312,24 +2312,24 @@ describe("update_page title-only (body omitted)", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("title only, body unchanged");
 
-    // The critical assertion: updatePage must NOT receive a body field.
+    // The critical assertion: _rawUpdatePage must NOT receive a body field.
     // If body is "" or anything truthy, the API overwrites the page.
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     expect(updateCall[1].body).toBeUndefined();
   });
 });
 
 describe("update_page markdown path (Stream 5)", () => {
   it("converts markdown body to storage and submits", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1",
       title: "T",
       version: { number: 5 },
       body: { storage: { value: "<p>Existing content</p>" } },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -2345,17 +2345,17 @@ describe("update_page markdown path (Stream 5)", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Updated:");
 
-    // updatePage must have received storage XHTML, not raw markdown
+    // _rawUpdatePage must have received storage XHTML, not raw markdown
     // Stream 11: headings now carry Confluence-slug IDs.
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     const submittedBody: string = updateCall[1].body;
     expect(submittedBody).toMatch(/<h1\b/);
     expect(submittedBody).not.toContain("# New Heading");
   });
 
   it("errors when markdown deletes a preserved macro and confirm_deletions is false", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
-    (updatePage as any).mockClear();
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
     // Current page has a tokenisable macro
     (getPage as any).mockResolvedValueOnce({
       id: "2",
@@ -2379,12 +2379,12 @@ describe("update_page markdown path (Stream 5)", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("confirm_deletions: true");
-    // updatePage must NOT have been called
-    expect((updatePage as any).mock.calls.length).toBe(0);
+    // _rawUpdatePage must NOT have been called
+    expect((_rawUpdatePage as any).mock.calls.length).toBe(0);
   });
 
   it("succeeds and records deletion in version message when confirm_deletions is true", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "3",
       title: "T",
@@ -2395,8 +2395,8 @@ describe("update_page markdown path (Stream 5)", () => {
         },
       },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "3", title: "T" },
       newVersion: 5,
     });
@@ -2413,13 +2413,13 @@ describe("update_page markdown path (Stream 5)", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Updated:");
 
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     // Version message should mention the deletion
     expect(updateCall[1].versionMessage).toContain("Removed");
   });
 
   it("replace_body: true skips preservation and does wholesale rewrite", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "4",
       title: "T",
@@ -2430,8 +2430,8 @@ describe("update_page markdown path (Stream 5)", () => {
         },
       },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "4", title: "T" },
       newVersion: 3,
     });
@@ -2448,7 +2448,7 @@ describe("update_page markdown path (Stream 5)", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Updated:");
 
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     const submittedBody: string = updateCall[1].body;
     // Should be freshly converted markdown, no toc macro.
     // Stream 11: headings now carry Confluence-slug IDs.
@@ -2457,14 +2457,14 @@ describe("update_page markdown path (Stream 5)", () => {
   });
 
   it("returns error for forged token in caller markdown", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "5",
       title: "T",
       version: { number: 1 },
       body: { storage: { value: "<p>Simple page with no macros</p>" } },
     });
-    (updatePage as any).mockClear();
+    (_rawUpdatePage as any).mockClear();
 
     const handler = registeredTools.get("update_page")!.handler;
     const result = await handler({
@@ -2477,18 +2477,18 @@ describe("update_page markdown path (Stream 5)", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("T9999");
-    expect((updatePage as any).mock.calls.length).toBe(0);
+    expect((_rawUpdatePage as any).mock.calls.length).toBe(0);
   });
 
   it("storage-format body passes through verbatim (backward compat)", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     const storageBody = "<p>Unchanged storage body</p>";
     (getPage as any).mockResolvedValueOnce({
       id: "6", title: "T", version: { number: 6 },
       body: { storage: { value: storageBody } },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "6", title: "T" },
       newVersion: 7,
     });
@@ -2502,12 +2502,12 @@ describe("update_page markdown path (Stream 5)", () => {
     });
 
     expect(result.isError).toBeUndefined();
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     expect(updateCall[1].body).toBe(storageBody);
   });
 
   it("merges caller version_message with auto-generated deletion message", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "7",
       title: "T",
@@ -2518,8 +2518,8 @@ describe("update_page markdown path (Stream 5)", () => {
         },
       },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "7", title: "T" },
       newVersion: 6,
     });
@@ -2534,7 +2534,7 @@ describe("update_page markdown path (Stream 5)", () => {
       version_message: "My update note",
     });
 
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     const msg: string = updateCall[1].versionMessage;
     expect(msg).toContain("My update note");
     expect(msg).toContain("Removed");
@@ -2646,13 +2646,13 @@ describe("update_page content-safety guards (Finding 1 fix)", () => {
   });
 
   it("confirm_shrinkage bypasses shrinkage guard", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 5 },
       body: { storage: { value: bigBody } },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -2693,14 +2693,14 @@ describe("update_page content-safety guards (Finding 1 fix)", () => {
   });
 
   it("body-length reporting includes char counts (1D)", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     const smallBody = "<p>hello world here</p>";
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 5 },
       body: { storage: { value: smallBody } },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" },
       newVersion: 6,
     });
@@ -2738,16 +2738,16 @@ describe("update_page content-safety guards (Finding 1 fix)", () => {
   });
 });
 
-describe("update_page threads previousBody to updatePage (1F)", () => {
+describe("update_page threads previousBody to _rawUpdatePage (1F)", () => {
   it("passes currentStorage as previousBody", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     const body = "<p>current content</p>";
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 5 },
       body: { storage: { value: body } },
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" }, newVersion: 6,
     });
     const handler = registeredTools.get("update_page")!.handler;
@@ -2755,7 +2755,7 @@ describe("update_page threads previousBody to updatePage (1F)", () => {
       page_id: "1", title: "T", version: 5,
       body: body,
     });
-    const call = (updatePage as any).mock.lastCall;
+    const call = (_rawUpdatePage as any).mock.lastCall;
     expect(call[1].previousBody).toBe(body);
   });
 });
@@ -2766,18 +2766,18 @@ describe("update_page threads previousBody to updatePage (1F)", () => {
 
 describe("prepend_to_page", () => {
   beforeEach(async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockReset();
-    (updatePage as any).mockReset();
+    (_rawUpdatePage as any).mockReset();
   });
 
   it("inserts content before existing body", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 5 },
       body: { storage: { value: "<p>existing</p>" } },
     });
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" }, newVersion: 6,
     });
 
@@ -2790,17 +2790,17 @@ describe("prepend_to_page", () => {
     });
 
     expect(result.isError).toBeUndefined();
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     expect(updateCall[1].body).toBe("<p>new</p><p>existing</p>");
   });
 
   it("converts markdown content to storage before prepending", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 3 },
       body: { storage: { value: "<p>existing</p>" } },
     });
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" }, newVersion: 4,
     });
 
@@ -2813,7 +2813,7 @@ describe("prepend_to_page", () => {
     });
 
     expect(result.isError).toBeUndefined();
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     const submitted: string = updateCall[1].body;
     // Markdown converted to storage XML
     expect(submitted).toMatch(/<h1/);
@@ -2823,12 +2823,12 @@ describe("prepend_to_page", () => {
   });
 
   it("respects custom separator", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 2 },
       body: { storage: { value: "<p>old</p>" } },
     });
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" }, newVersion: 3,
     });
 
@@ -2841,12 +2841,12 @@ describe("prepend_to_page", () => {
       allow_raw_html: false,
     });
 
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     expect(updateCall[1].body).toBe("<p>new</p>---<p>old</p>");
   });
 
   it("rejects separator over 100 chars", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 1 },
       body: { storage: { value: "<p>x</p>" } },
@@ -2863,11 +2863,11 @@ describe("prepend_to_page", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("100");
-    expect((updatePage as any).mock.calls.length).toBe(0);
+    expect((_rawUpdatePage as any).mock.calls.length).toBe(0);
   });
 
   it("rejects separator containing XML tags", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 1 },
       body: { storage: { value: "<p>x</p>" } },
@@ -2884,11 +2884,11 @@ describe("prepend_to_page", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("separator");
-    expect((updatePage as any).mock.calls.length).toBe(0);
+    expect((_rawUpdatePage as any).mock.calls.length).toBe(0);
   });
 
   it("rejects combined body over 2MB", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     const bigExisting = "x".repeat(1_500_000);
     const bigNew = "y".repeat(600_000);
     (getPage as any).mockResolvedValueOnce({
@@ -2906,16 +2906,16 @@ describe("prepend_to_page", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("2MB");
-    expect((updatePage as any).mock.calls.length).toBe(0);
+    expect((_rawUpdatePage as any).mock.calls.length).toBe(0);
   });
 
   it("includes body lengths in response", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "MyPage", version: { number: 7 },
       body: { storage: { value: "<p>old</p>" } },
     });
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "MyPage" }, newVersion: 8,
     });
 
@@ -2955,18 +2955,18 @@ describe("prepend_to_page", () => {
 
 describe("append_to_page", () => {
   beforeEach(async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockReset();
-    (updatePage as any).mockReset();
+    (_rawUpdatePage as any).mockReset();
   });
 
   it("inserts content after existing body", async () => {
-    const { getPage, updatePage } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 5 },
       body: { storage: { value: "<p>existing</p>" } },
     });
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" }, newVersion: 6,
     });
 
@@ -2980,7 +2980,7 @@ describe("append_to_page", () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Appended to:");
-    const updateCall = (updatePage as any).mock.lastCall;
+    const updateCall = (_rawUpdatePage as any).mock.lastCall;
     expect(updateCall[1].body).toBe("<p>existing</p><p>new</p>");
   });
 
@@ -3010,14 +3010,14 @@ describe("append_to_page", () => {
 
 describe("revert_page", () => {
   beforeEach(async () => {
-    const { getPage, updatePage, getPageVersionBody } = await import("./confluence-client.js");
+    const { getPage, _rawUpdatePage, getPageVersionBody } = await import("./confluence-client.js");
     (getPage as any).mockReset();
-    (updatePage as any).mockReset();
+    (_rawUpdatePage as any).mockReset();
     (getPageVersionBody as any).mockReset();
   });
 
   it("fetches raw storage and pushes as new version", async () => {
-    const { getPage, getPageVersionBody, updatePage } = await import("./confluence-client.js");
+    const { getPage, getPageVersionBody, _rawUpdatePage } = await import("./confluence-client.js");
     const currentBody = "<p>" + "x".repeat(200) + "</p>";
     const historicalBody = "<p>" + "y".repeat(200) + "</p>";
     (getPage as any).mockResolvedValueOnce({
@@ -3027,8 +3027,8 @@ describe("revert_page", () => {
     (getPageVersionBody as any).mockResolvedValueOnce({
       title: "My Page", rawBody: historicalBody, version: 3,
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "My Page" }, newVersion: 6,
     });
 
@@ -3038,8 +3038,8 @@ describe("revert_page", () => {
     });
     expect(result.content[0].text).toContain("Reverted:");
     expect(result.content[0].text).toContain("v3");
-    // Verify updatePage received the historical body
-    const call = (updatePage as any).mock.lastCall;
+    // Verify _rawUpdatePage received the historical body
+    const call = (_rawUpdatePage as any).mock.lastCall;
     expect(call[1].body).toBe(historicalBody);
   });
 
@@ -3064,7 +3064,7 @@ describe("revert_page", () => {
   });
 
   it("confirm_shrinkage bypasses guard", async () => {
-    const { getPage, getPageVersionBody, updatePage } = await import("./confluence-client.js");
+    const { getPage, getPageVersionBody, _rawUpdatePage } = await import("./confluence-client.js");
     const bigCurrent = "<p>" + "x".repeat(1000) + "</p>";
     const smallHistorical = "<p>" + "y".repeat(150) + "</p>";
     (getPage as any).mockResolvedValueOnce({
@@ -3074,8 +3074,8 @@ describe("revert_page", () => {
     (getPageVersionBody as any).mockResolvedValueOnce({
       title: "T", rawBody: smallHistorical, version: 2,
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" }, newVersion: 6,
     });
 
@@ -3103,7 +3103,7 @@ describe("revert_page", () => {
   });
 
   it("includes body lengths in response", async () => {
-    const { getPage, getPageVersionBody, updatePage } = await import("./confluence-client.js");
+    const { getPage, getPageVersionBody, _rawUpdatePage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 3 },
       body: { storage: { value: "<p>current</p>" } },
@@ -3111,8 +3111,8 @@ describe("revert_page", () => {
     (getPageVersionBody as any).mockResolvedValueOnce({
       title: "T", rawBody: "<p>old version</p>", version: 1,
     });
-    (updatePage as any).mockClear();
-    (updatePage as any).mockResolvedValueOnce({
+    (_rawUpdatePage as any).mockClear();
+    (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: "1", title: "T" }, newVersion: 4,
     });
 

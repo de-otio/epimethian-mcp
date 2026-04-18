@@ -36,8 +36,8 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
   return {
     ...actual,
     getPageByTitle: vi.fn(),
-    createPage: vi.fn(),
-    updatePage: vi.fn(),
+    _rawCreatePage: vi.fn(),
+    _rawUpdatePage: vi.fn(),
     getConfig: vi.fn().mockResolvedValue({
       url: "https://test.atlassian.net",
       email: "user@test.com",
@@ -74,8 +74,8 @@ import {
 } from "./safe-write.js";
 import {
   getPageByTitle,
-  createPage,
-  updatePage,
+  _rawCreatePage,
+  _rawUpdatePage,
 } from "./confluence-client.js";
 import { logMutation, errorRecord } from "./mutation-log.js";
 import { ConverterError } from "./converter/types.js";
@@ -581,7 +581,7 @@ describe("safeSubmitPage — mutation log", () => {
   it("emits a success record with the canonical shape (update)", async () => {
     const previousBody = "<p>before</p>";
     const finalStorage = "<p>after with more content to satisfy any thresholds.</p>";
-    (updatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       page: {
         id: "123",
         title: "T",
@@ -632,7 +632,7 @@ describe("safeSubmitPage — mutation log", () => {
     (getPageByTitle as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
       undefined,
     );
-    (createPage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    (_rawCreatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       id: "456",
       title: "New",
       version: { number: 1 },
@@ -658,7 +658,7 @@ describe("safeSubmitPage — mutation log", () => {
   });
 
   it("honours an explicit operation override (e.g. prepend_to_page)", async () => {
-    (updatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       page: { id: "1", title: "T", version: { number: 2 } },
       newVersion: 2,
     });
@@ -682,7 +682,7 @@ describe("safeSubmitPage — mutation log", () => {
 
   it("emits an error record and rethrows when the API call throws", async () => {
     const apiErr = new Error("boom");
-    (updatePage as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(
       apiErr,
     );
 
@@ -715,7 +715,7 @@ describe("safeSubmitPage — mutation log", () => {
   // safeSubmitPage without a body field and with newBody* fields omitted
   // from the mutation log. ---
   it("title-only update: submits without body field and omits newBody* in mutation log", async () => {
-    (updatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       page: { id: "77", title: "New Title", version: { number: 3 } },
       newVersion: 3,
     });
@@ -733,7 +733,7 @@ describe("safeSubmitPage — mutation log", () => {
     });
 
     // The HTTP wrapper was called with body undefined (title-only).
-    const updateCall = (updatePage as unknown as ReturnType<typeof vi.fn>).mock
+    const updateCall = (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mock
       .calls[0];
     expect(updateCall[0]).toBe("77");
     expect(updateCall[1].body).toBeUndefined();
@@ -772,12 +772,12 @@ describe("safeSubmitPage — mutation log", () => {
     }
     expect(thrown).toBeDefined();
     expect(thrown!.message).toMatch(/finalStorage is required when creating/);
-    expect(createPage).not.toHaveBeenCalled();
+    expect(_rawCreatePage).not.toHaveBeenCalled();
   });
 
   // --- Gap 3: replaceBody forensic pass-through to the mutation log. ---
   it("replaceBody: true is threaded into the success MutationRecord", async () => {
-    (updatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       page: { id: "42", title: "T", version: { number: 2 } },
       newVersion: 2,
     });
@@ -801,7 +801,7 @@ describe("safeSubmitPage — mutation log", () => {
   });
 
   it("replaceBody unset or false is NOT present in the MutationRecord", async () => {
-    (updatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       page: { id: "42", title: "T", version: { number: 2 } },
       newVersion: 2,
     });
@@ -825,7 +825,7 @@ describe("safeSubmitPage — mutation log", () => {
 
   it("replaceBody: true is threaded into the failure MutationRecord too", async () => {
     const apiErr = new Error("boom");
-    (updatePage as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(
       apiErr,
     );
 
@@ -875,7 +875,7 @@ describe("safeSubmitPage — mutation log", () => {
     }
     expect((thrown as ConverterError).code).toBe(POST_TRANSFORM_BODY_REJECTED);
     // API was not called.
-    expect(updatePage).not.toHaveBeenCalled();
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
   });
 });
 

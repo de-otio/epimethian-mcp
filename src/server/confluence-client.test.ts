@@ -27,8 +27,8 @@ import {
   sanitizeError,
   resolveSpaceId,
   getPage,
-  createPage,
-  updatePage,
+  _rawCreatePage,
+  _rawUpdatePage,
   deletePage,
   searchPages,
   listPages,
@@ -798,26 +798,26 @@ describe("getPage", () => {
 });
 
 describe("page cache integration", () => {
-  it("createPage caches the body", async () => {
+  it("_rawCreatePage caches the body", async () => {
     const createdPage = { id: "99", title: "New", version: { number: 1 } };
-    // createPage makes a POST then tries to add a label (2 fetches)
+    // _rawCreatePage makes a POST then tries to add a label (2 fetches)
     let callCount = 0;
     global.fetch = vi.fn().mockImplementation(() => {
       callCount++;
       return Promise.resolve({ ok: true, json: () => Promise.resolve(createdPage) });
     }) as any;
-    await createPage("space1", "New", "hello");
+    await _rawCreatePage("space1", "New", "hello");
     expect(pageCache.has("99")).toEqual({ version: 1 });
   });
 
-  it("updatePage caches the body", async () => {
+  it("_rawUpdatePage caches the body", async () => {
     const updatedPage = { id: "10", title: "T", version: { number: 6 } };
     let callCount = 0;
     global.fetch = vi.fn().mockImplementation(() => {
       callCount++;
       return Promise.resolve({ ok: true, json: () => Promise.resolve(updatedPage) });
     }) as any;
-    await updatePage("10", { title: "T", body: "<p>updated</p>", version: 5 });
+    await _rawUpdatePage("10", { title: "T", body: "<p>updated</p>", version: 5 });
     expect(pageCache.has("10")).toEqual({ version: 6 });
   });
 
@@ -828,11 +828,11 @@ describe("page cache integration", () => {
     expect(pageCache.has("10")).toBeUndefined();
   });
 
-  it("getPage after updatePage serves from cache", async () => {
+  it("getPage after _rawUpdatePage serves from cache", async () => {
     // Simulate update
     const updatedPage = { id: "10", title: "T", version: { number: 6 } };
     global.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(updatedPage) }) as any;
-    await updatePage("10", { title: "T", body: "<p>new content</p>", version: 5 });
+    await _rawUpdatePage("10", { title: "T", body: "<p>new content</p>", version: 5 });
 
     // Now getPage — should use cache
     const metadataPage = { id: "10", title: "T", spaceId: "s1", version: { number: 6 } };
@@ -844,12 +844,12 @@ describe("page cache integration", () => {
   });
 });
 
-describe("createPage", () => {
+describe("_rawCreatePage", () => {
   const createdPage = { id: "20", title: "New Page" };
 
   it("sends correct payload without parentId", async () => {
     global.fetch = mockFetchResponse(createdPage);
-    const page = await createPage("spaceA", "New Page", "body text");
+    const page = await _rawCreatePage("spaceA", "New Page", "body text");
     expect(page.id).toBe("20");
     const call = (global.fetch as any).mock.calls[0];
     const url = call[0] as string;
@@ -866,16 +866,16 @@ describe("createPage", () => {
 
   it("includes parentId when provided", async () => {
     global.fetch = mockFetchResponse(createdPage);
-    await createPage("spaceA", "New Page", "body", "parent-1");
+    await _rawCreatePage("spaceA", "New Page", "body", "parent-1");
     const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(body.parentId).toBe("parent-1");
   });
 });
 
-describe("updatePage", () => {
+describe("_rawUpdatePage", () => {
   it("sends version + 1 to Confluence", async () => {
     global.fetch = mockFetchResponse({ id: "30", title: "New Title" });
-    const { page, newVersion } = await updatePage("30", {
+    const { page, newVersion } = await _rawUpdatePage("30", {
       title: "New Title",
       version: 5,
     });
@@ -887,7 +887,7 @@ describe("updatePage", () => {
 
   it("sends body when provided", async () => {
     global.fetch = mockFetchResponse({ id: "30", title: "T" });
-    await updatePage("30", { title: "T", version: 1, body: "new body" });
+    await _rawUpdatePage("30", { title: "T", version: 1, body: "new body" });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).toContain("<p>new body</p>");
     expect(putBody.body.value).not.toContain("epimethian-attribution");
@@ -895,7 +895,7 @@ describe("updatePage", () => {
 
   it("includes custom versionMessage when provided", async () => {
     global.fetch = mockFetchResponse({ id: "30", title: "T" });
-    await updatePage("30", { title: "T", version: 1, body: "text", versionMessage: "Fixed typo" });
+    await _rawUpdatePage("30", { title: "T", version: 1, body: "text", versionMessage: "Fixed typo" });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message).toContain("Fixed typo");
     expect(putBody.version.message).toContain("via Epimethian");
@@ -903,7 +903,7 @@ describe("updatePage", () => {
 
   it("omits body from payload when not provided", async () => {
     global.fetch = mockFetchResponse({ id: "30", title: "Updated" });
-    await updatePage("30", { title: "Updated", version: 1 });
+    await _rawUpdatePage("30", { title: "Updated", version: 1 });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body).toBeUndefined();
   });
@@ -911,25 +911,25 @@ describe("updatePage", () => {
   it("throws ConfluenceConflictError on 409 response", async () => {
     global.fetch = mockFetchResponse({ message: "Version conflict" }, 409);
     await expect(
-      updatePage("30", { title: "T", version: 5 })
+      _rawUpdatePage("30", { title: "T", version: 5 })
     ).rejects.toThrow(ConfluenceConflictError);
     await expect(
-      updatePage("30", { title: "T", version: 5 })
+      _rawUpdatePage("30", { title: "T", version: 5 })
     ).rejects.toThrow(/get_page/);
   });
 
   it("rethrows non-409 errors unchanged", async () => {
     global.fetch = mockFetchResponse("Server Error", 500);
     await expect(
-      updatePage("30", { title: "T", version: 5 })
+      _rawUpdatePage("30", { title: "T", version: 5 })
     ).rejects.toThrow(ConfluenceApiError);
     await expect(
-      updatePage("30", { title: "T", version: 5 })
+      _rawUpdatePage("30", { title: "T", version: 5 })
     ).rejects.toThrow("Confluence API error (500)");
   });
 });
 
-describe("updatePage — pre-write snapshot (1F)", () => {
+describe("_rawUpdatePage — pre-write snapshot (1F)", () => {
   beforeEach(() => {
     pageCache.clear();
   });
@@ -937,13 +937,13 @@ describe("updatePage — pre-write snapshot (1F)", () => {
   it("stores snapshot when previousBody is provided", async () => {
     global.fetch = mockFetchResponse({ id: "30", title: "T" });
     const previousBody = "<p>current content</p>";
-    await updatePage("30", { title: "T", version: 5, previousBody });
+    await _rawUpdatePage("30", { title: "T", version: 5, previousBody });
     expect(pageCache.getSnapshot("30", 5)).toBe(previousBody);
   });
 
   it("does not store snapshot when previousBody is omitted", async () => {
     global.fetch = mockFetchResponse({ id: "30", title: "T" });
-    await updatePage("30", { title: "T", version: 5 });
+    await _rawUpdatePage("30", { title: "T", version: 5 });
     expect(pageCache.getSnapshot("30", 5)).toBeUndefined();
   });
 });
@@ -956,7 +956,7 @@ describe("legacy attribution footer stripping", () => {
       "<!-- epimethian-attribution-start -->" +
       '<p style="font-size:11px;color:#999;margin-top:2em;"><em>This page was created with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a>.</em></p>' +
       "<!-- epimethian-attribution-end -->";
-    await updatePage("30", { title: "T", version: 1, body: bodyWithFooter });
+    await _rawUpdatePage("30", { title: "T", version: 1, body: bodyWithFooter });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).not.toContain("epimethian-attribution");
     expect(putBody.body.value).toContain("<p>content</p>");
@@ -969,7 +969,7 @@ describe("legacy attribution footer stripping", () => {
       "<!--epimethian-attribution-start-->" +
       '<p style="font-size:11px;color:#999;margin-top:2em;"><em>This page was updated with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a>.</em></p>' +
       "<!--epimethian-attribution-end-->";
-    await updatePage("30", { title: "T", version: 1, body: bodyWithNormalizedFooter });
+    await _rawUpdatePage("30", { title: "T", version: 1, body: bodyWithNormalizedFooter });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).not.toContain("epimethian-attribution");
     expect(putBody.body.value).toContain("<p>content</p>");
@@ -982,7 +982,7 @@ describe("legacy attribution footer stripping", () => {
       "<!--  epimethian-attribution-start  -->" +
       "<p>old footer</p>" +
       "<!--  epimethian-attribution-end  -->";
-    await updatePage("30", { title: "T", version: 1, body: bodyWithExtraSpaces });
+    await _rawUpdatePage("30", { title: "T", version: 1, body: bodyWithExtraSpaces });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).not.toContain("epimethian-attribution");
     expect(putBody.body.value).toContain("<p>content</p>");
@@ -994,7 +994,7 @@ describe("legacy attribution footer stripping", () => {
     const bodyWithBareAttribution =
       '<p style="font-size: 11.0px;color: rgb(153,153,153);margin-top: 2.0em;">' +
       '<em>This page was updated with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a>.</em></p>';
-    await updatePage("31", { title: "T", version: 1, body: "<h1>Title</h1>" + bodyWithBareAttribution });
+    await _rawUpdatePage("31", { title: "T", version: 1, body: "<h1>Title</h1>" + bodyWithBareAttribution });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).not.toContain("Epimethian");
     expect(putBody.body.value).toContain("<h1>Title</h1>");
@@ -1007,7 +1007,7 @@ describe("legacy attribution footer stripping", () => {
       '<p local-id="37224ce031dc"><em>This page was updated with </em>' +
       '<a href="https://github.com/de-otio/epimethian-mcp"><em>Epimethian</em></a>' +
       "<em> v5.1.0.</em></p>";
-    await updatePage("32", { title: "T", version: 1, body: "<h1>Title</h1>" + bodyWithNormalizedEm });
+    await _rawUpdatePage("32", { title: "T", version: 1, body: "<h1>Title</h1>" + bodyWithNormalizedEm });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).not.toContain("Epimethian");
     expect(putBody.body.value).toContain("<h1>Title</h1>");
@@ -1024,7 +1024,7 @@ describe("legacy attribution footer stripping", () => {
       "<p>The system targets $30/month.</p>" +
       "<table><tr><td>Survey</td><td>$5</td></tr></table>" +
       '<p><em>This page was created with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a> v5.1.0.</em></p>';
-    await updatePage("33", { title: "T", version: 1, body: realContent });
+    await _rawUpdatePage("33", { title: "T", version: 1, body: realContent });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).not.toContain("Epimethian");
     expect(putBody.body.value).toContain("<strong>Audience:</strong> SRE");
@@ -1045,54 +1045,54 @@ describe("attribution stripping does not lose real content", () => {
     const normal =
       "<h1>Title</h1><p>Real content.</p>" +
       '<p><em>This page was updated with <a href="https://github.com/de-otio/epimethian-mcp">Epimethian</a>.</em></p>';
-    await updatePage("35", { title: "T", version: 1, body: normal });
+    await _rawUpdatePage("35", { title: "T", version: 1, body: normal });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.body.value).toContain("<h1>Title</h1>");
   });
 });
 
 describe("version messages with client label", () => {
-  it("createPage includes client label when provided", async () => {
+  it("_rawCreatePage includes client label when provided", async () => {
     global.fetch = mockFetchResponse({ id: "40", title: "New" });
-    await createPage("spaceA", "New", "body", undefined, "Claude Code");
+    await _rawCreatePage("spaceA", "New", "body", undefined, "Claude Code");
     const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(body.version.message).toContain("Claude Code");
     expect(body.version.message).toContain("via Epimethian");
     expect(body.version.message).toMatch(/^Created by Claude Code \(via Epimethian v/);
   });
 
-  it("createPage omits client label when not provided", async () => {
+  it("_rawCreatePage omits client label when not provided", async () => {
     global.fetch = mockFetchResponse({ id: "41", title: "New" });
-    await createPage("spaceA", "New", "body");
+    await _rawCreatePage("spaceA", "New", "body");
     const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(body.version.message).toMatch(/^Created by Epimethian v/);
     expect(body.version.message).not.toContain("Claude");
   });
 
-  it("updatePage includes client label without versionMessage", async () => {
+  it("_rawUpdatePage includes client label without versionMessage", async () => {
     global.fetch = mockFetchResponse({ id: "42", title: "T" });
-    await updatePage("42", { title: "T", version: 1, body: "text", clientLabel: "Claude Code" });
+    await _rawUpdatePage("42", { title: "T", version: 1, body: "text", clientLabel: "Claude Code" });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message).toMatch(/^Updated by Claude Code \(via Epimethian v/);
   });
 
-  it("updatePage includes client label with custom versionMessage", async () => {
+  it("_rawUpdatePage includes client label with custom versionMessage", async () => {
     global.fetch = mockFetchResponse({ id: "43", title: "T" });
-    await updatePage("43", { title: "T", version: 1, body: "text", versionMessage: "Fixed typo", clientLabel: "Claude Code" });
+    await _rawUpdatePage("43", { title: "T", version: 1, body: "text", versionMessage: "Fixed typo", clientLabel: "Claude Code" });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message).toMatch(/^Fixed typo \(Claude Code via Epimethian v/);
   });
 
-  it("updatePage omits client label with custom versionMessage", async () => {
+  it("_rawUpdatePage omits client label with custom versionMessage", async () => {
     global.fetch = mockFetchResponse({ id: "44", title: "T" });
-    await updatePage("44", { title: "T", version: 1, body: "text", versionMessage: "Fixed typo" });
+    await _rawUpdatePage("44", { title: "T", version: 1, body: "text", versionMessage: "Fixed typo" });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message).toMatch(/^Fixed typo \(via Epimethian v/);
   });
 
-  it("updatePage omits client label when not provided", async () => {
+  it("_rawUpdatePage omits client label when not provided", async () => {
     global.fetch = mockFetchResponse({ id: "45", title: "T" });
-    await updatePage("45", { title: "T", version: 1, body: "text" });
+    await _rawUpdatePage("45", { title: "T", version: 1, body: "text" });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message).toMatch(/^Updated by Epimethian v/);
     expect(putBody.version.message).not.toContain("Claude");

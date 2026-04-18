@@ -57,8 +57,8 @@
  */
 
 import {
-  createPage as _rawCreatePage,
-  updatePage as _rawUpdatePage,
+  _rawCreatePage,
+  _rawUpdatePage,
   getPageByTitle,
   looksLikeMarkdown,
   type PageData,
@@ -862,7 +862,7 @@ export async function safeSubmitPage(
         throw new Error("safeSubmitPage: version is required for update");
       }
       // Title-only updates: omit the `body` field; the HTTP wrapper (see
-      // confluence-client.ts updatePage, lines 524+) already supports
+      // confluence-client.ts _rawUpdatePage) already supports
       // `body: undefined` by leaving the field out of the payload so the
       // Confluence API treats it as a title-only edit.
       const res = await _rawUpdatePage(pageId!, {

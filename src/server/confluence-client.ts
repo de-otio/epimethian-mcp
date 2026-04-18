@@ -577,7 +577,7 @@ export async function getPage(
   return page;
 }
 
-export async function createPage(
+export async function _rawCreatePage(
   spaceId: string,
   title: string,
   body: string,
@@ -617,7 +617,7 @@ export async function createPage(
   return page;
 }
 
-export async function updatePage(
+export async function _rawUpdatePage(
   pageId: string,
   opts: {
     title: string;

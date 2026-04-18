@@ -38,8 +38,8 @@ vi.mock("../shared/update-check.js", () => ({
 vi.mock("../server/confluence-client.js", () => ({
   resolveSpaceId: vi.fn(),
   getPage: vi.fn(),
-  createPage: vi.fn(),
-  updatePage: vi.fn(),
+  _rawCreatePage: vi.fn(),
+  _rawUpdatePage: vi.fn(),
   deletePage: vi.fn(),
   searchPages: vi.fn(),
   listPages: vi.fn(),

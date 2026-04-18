@@ -10,8 +10,6 @@ declare const __PKG_VERSION__: string;
 import {
   resolveSpaceId,
   getPage,
-  createPage,
-  updatePage,
   deletePage,
   searchPages,
   listPages,
@@ -58,12 +56,9 @@ import {
   computeUnifiedDiff,
   MAX_DIFF_SIZE,
 } from "./diff.js";
-import { markdownToStorage } from "./converter/md-to-storage.js";
-import { planUpdate } from "./converter/update-orchestrator.js";
 import { ConverterError } from "./converter/types.js";
-import { enforceContentSafetyGuards } from "./converter/content-safety-guards.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
-import { logMutation, errorRecord, initMutationLog, bodyHash } from "./mutation-log.js";
+import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
 import { safePrepareBody, safeSubmitPage } from "./safe-write.js";
 import {
   checkForUpdates,
@@ -798,10 +793,9 @@ function registerTools(server: McpServer, config: Config): void {
           page_id, version, content, "prepend",
           { separator, versionMessage: version_message ?? "Prepend content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url },
         );
-        logMutation({ timestamp: new Date().toISOString(), operation: "prepend_to_page", pageId: page_id, oldVersion: version, newVersion, oldBodyLen: oldLen, newBodyLen: newLen });
+        // Mutation logging is handled inside safeSubmitPage (via concatPageContent).
         return toolResult(`Prepended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)` + echo);
       } catch (err) {
-        logMutation(errorRecord("prepend_to_page", page_id, err, { oldVersion: version }));
         return toolError(err);
       }
     },
@@ -838,10 +832,9 @@ function registerTools(server: McpServer, config: Config): void {
           page_id, version, content, "append",
           { separator, versionMessage: version_message ?? "Append content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url },
         );
-        logMutation({ timestamp: new Date().toISOString(), operation: "append_to_page", pageId: page_id, oldVersion: version, newVersion, oldBodyLen: oldLen, newBodyLen: newLen });
+        // Mutation logging is handled inside safeSubmitPage (via concatPageContent).
         return toolResult(`Appended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)` + echo);
       } catch (err) {
-        logMutation(errorRecord("append_to_page", page_id, err, { oldVersion: version }));
         return toolError(err);
       }
     },
