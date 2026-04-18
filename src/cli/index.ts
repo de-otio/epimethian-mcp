@@ -14,6 +14,9 @@ async function run(): Promise<void> {
   } else if (command === "status") {
     const { runStatus } = await import("./status.js");
     await runStatus();
+  } else if (command === "fix-legacy-links") {
+    const { runFixLegacyLinks } = await import("./fix-legacy-links.js");
+    await runFixLegacyLinks(process.argv.slice(3));
   } else if (command === "agent-guide") {
     const { runAgentGuide } = await import("./agent-guide.js");
     runAgentGuide();
