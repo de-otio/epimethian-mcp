@@ -64,6 +64,7 @@ import { ConverterError } from "./converter/types.js";
 import { enforceContentSafetyGuards } from "./converter/content-safety-guards.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog, bodyHash } from "./mutation-log.js";
+import { safePrepareBody, safeSubmitPage } from "./safe-write.js";
 import {
   checkForUpdates,
   getPendingUpdate,
@@ -635,104 +636,80 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("update_page", config);
       if (blocked) return blocked;
       try {
-        // Fetch the current page for safety guards (both paths need this).
         const cfg = await getConfig();
         const currentPage = await getPage(page_id, true);
         const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
 
-        let finalStorage: string | undefined;
-        let effectiveVersionMessage = version_message;
-
-        // Reject read-only markdown round-trips. The format:markdown output
-        // includes this marker to prevent callers from accidentally destroying
-        // page content by writing back a lossy rendering.
-        if (body && body.includes("epimethian:read-only-markdown")) {
-          throw new ConverterError(
-            "The body contains content produced by get_page with format: 'markdown', which is a " +
-              "read-only rendering not suitable for round-trip updates (tables, macros, and rich " +
-              "elements may be lost). To update this page, either: (1) read with format: 'storage' " +
-              "and edit the storage XML, (2) use update_page_section for targeted edits, or " +
-              "(3) compose new markdown from scratch (do not copy from format: 'markdown' output).",
-            "READ_ONLY_MARKDOWN_ROUND_TRIP"
+        // Title-only update: caller omitted body, bypass the prepare/submit
+        // pipeline and hit the raw updater with body: undefined so the API
+        // leaves the page content untouched.
+        if (body === undefined || body === null) {
+          const { page, newVersion } = await updatePage(page_id, {
+            title,
+            body: undefined,
+            version,
+            versionMessage: version_message,
+            previousBody: currentStorage,
+            clientLabel: getClientLabel(server),
+          });
+          return toolResult(
+            `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion}, title only, body unchanged)` + echo
           );
         }
 
-        if (body === undefined || body === null) {
-          // Title-only update: caller omitted body, so leave page content unchanged.
-          finalStorage = undefined;
-        } else if (looksLikeMarkdown(body)) {
-          // Markdown path: token-aware write via the update orchestrator.
-          const plan = planUpdate({
-            currentStorage,
-            callerMarkdown: body,
-            confirmDeletions: confirm_deletions,
-            replaceBody: replace_body,
-            converterOptions: {
-              allowRawHtml: allow_raw_html,
-              confluenceBaseUrl: confluence_base_url ?? cfg.url,
-            },
-          });
-          finalStorage = plan.newStorage;
-          effectiveVersionMessage =
-            plan.versionMessage && version_message
-              ? `${version_message}; ${plan.versionMessage}`
-              : plan.versionMessage ?? version_message;
-        } else {
-          // Storage format path: pass body through verbatim (backward compat).
-          finalStorage = body;
+        // Workaround for a gap in safe-write.ts: when the current page has no
+        // preserved tokens, safePrepareBody skips planUpdate and loses the
+        // INVENTED_TOKEN forgery check. Catch the simplest such case (any
+        // [[epi:T####]] in caller markdown against a no-sidecar page) here so
+        // forged IDs still error before submit. Skipped for replace_body
+        // (wholesale rewrite intentionally discards token semantics).
+        // See report (f).
+        if (!replace_body) {
+          const epiMatches = body.match(/\[\[epi:(T\d+)\]\]/g);
+          if (epiMatches && !/<ac:|<ri:|<time[\s/>]/i.test(currentStorage)) {
+            const ids = Array.from(new Set(epiMatches.map((m) => m.slice(6, -2))));
+            throw new ConverterError(
+              `caller markdown contains unknown token IDs: ${ids.join(", ")}`,
+              "INVENTED_TOKEN"
+            );
+          }
         }
 
-        // Content-safety guards applied to BOTH paths, but skipped for
-        // title-only updates (no body change).
-        if (finalStorage !== undefined) {
-          enforceContentSafetyGuards({
-            oldStorage: currentStorage,
-            newStorage: finalStorage,
-            confirmShrinkage: confirm_shrinkage,
-            confirmStructureLoss: confirm_structure_loss,
-            // confirm_deletions and replace_body both indicate the caller
-            // has acknowledged macro/element removal — bypass the macro
-            // and table loss guards, but NOT the shrinkage/structure guards.
-            confirmDeletions: confirm_deletions || replace_body,
-          });
-        }
-
-        const { page, newVersion } = await updatePage(page_id, {
-          title,
-          body: finalStorage,
-          version,
-          versionMessage: effectiveVersionMessage,
-          previousBody: currentStorage,
-          clientLabel: getClientLabel(server),
+        const prepared = await safePrepareBody({
+          body,
+          currentBody: currentStorage,
+          confirmDeletions: confirm_deletions || undefined,
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          replaceBody: replace_body,
+          allowRawHtml: allow_raw_html,
+          confluenceBaseUrl: confluence_base_url ?? cfg.url,
         });
 
-        // Mutation log (1E)
-        logMutation({
-          timestamp: new Date().toISOString(),
-          operation: "update_page",
+        const mergedVersionMessage =
+          prepared.versionMessage && version_message
+            ? `${version_message}; ${prepared.versionMessage}`
+            : prepared.versionMessage || version_message || "";
+
+        const submitted = await safeSubmitPage({
           pageId: page_id,
-          oldVersion: version,
-          newVersion,
-          oldBodyLen: currentStorage.length,
-          newBodyLen: finalStorage?.length ?? currentStorage.length,
-          oldBodyHash: bodyHash(currentStorage),
-          newBodyHash: finalStorage ? bodyHash(finalStorage) : undefined,
+          title,
+          finalStorage: prepared.finalStorage,
+          previousBody: currentStorage,
+          version,
+          versionMessage: mergedVersionMessage,
+          deletedTokens: prepared.deletedTokens,
           clientLabel: getClientLabel(server),
-          replaceBody: replace_body || undefined,
         });
 
-        // Body-length reporting (1D)
-        const bodyReport = finalStorage !== undefined
-          ? `body: ${currentStorage.length}\u2192${finalStorage.length} chars`
-          : `title only, body unchanged`;
+        const removalNote =
+          submitted.deletedTokens.length > 0
+            ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`
+            : "";
         return toolResult(
-          `Updated: ${page.title} (ID: ${page.id}, version: ${newVersion}, ${bodyReport})` + echo
+          `Updated: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, body: ${submitted.oldLen}\u2192${submitted.newLen} chars${removalNote})` + echo
         );
       } catch (err) {
-        logMutation(errorRecord("update_page", page_id, err, {
-          oldVersion: version,
-          replaceBody: replace_body || undefined,
-        }));
         return toolError(err);
       }
     }
