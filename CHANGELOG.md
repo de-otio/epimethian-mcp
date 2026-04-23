@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - reject mixed markdown + storage input
+
+### Changed
+
+- **Bodies that mix Confluence storage tags with markdown structure are now
+  rejected.** Previously, any body containing `<ac:`, `<ri:`, or `<time>`
+  tags was classified as storage format and passed through unconverted — so
+  callers that inlined a single `<ac:structured-macro>` at the top of an
+  otherwise-markdown body had their markdown stored verbatim, rendering as
+  literal `##` and `**` characters in Confluence. This was the most common
+  way agents produced broken pages with `create_page` / `update_page` /
+  `update_page_section`.
+  - `safePrepareBody` now fires a `MIXED_INPUT_DETECTED` guard when the
+    body contains BOTH a storage tag AND a line-anchored markdown
+    structural pattern (ATX heading, fenced code block, GFM table
+    separator, unordered/ordered list, GitHub alert, YAML frontmatter
+    delimiter).
+  - Detection strips fenced code blocks, `<![CDATA[...]]>`, and
+    `<ac:plain-text-body>` content first, so markdown that *documents*
+    storage format and storage code-macro bodies are not affected.
+  - The rejection message points callers at the supported fixes:
+    YAML frontmatter (`toc: { maxLevel, minLevel }`) for the TOC macro,
+    directive syntax (`:info[...]`, `:mention[...]{...}`, `:date[...]`)
+    for other macros, or a full conversion to storage format.
+  - Tool descriptions for `create_page`, `update_page`, and
+    `update_page_section` now spell out the same guidance up-front.
+
 ## [5.5.0] - 2026-04-18 - security audit fixes
 
 This release implements the fixes from the 2026-04-18 security audit

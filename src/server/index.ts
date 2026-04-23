@@ -399,6 +399,9 @@ function registerTools(server: McpServer, config: Config): void {
       description: describeWithLock(
         withDestructiveWarning(
           "Create a new page in Confluence. Accepts either Confluence storage format (XHTML) or GFM markdown — markdown is automatically converted to storage format before submission. " +
+          "Do NOT mix the two: a body that contains both <ac:.../> storage tags AND markdown structural patterns (## headings, lists, fenced code blocks) is rejected with MIXED_INPUT_DETECTED. " +
+          "To inject a TOC macro from markdown, use YAML frontmatter at the top of the body: `---\\ntoc:\\n  maxLevel: 3\\n  minLevel: 1\\n---`. " +
+          "For other macros from markdown, use directive syntax: `:info[content]`, `:mention[Name]{accountId=...}`, `:date[2026-04-23]`. " +
           "Use allow_raw_html: true to permit raw HTML inside markdown (disabled by default for security). " +
           "Use confluence_base_url to override the base URL used by the link rewriter (defaults to the configured Confluence URL)."
         ),
@@ -412,7 +415,7 @@ function registerTools(server: McpServer, config: Config): void {
         body: z
           .string()
           .describe(
-            "Page content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted."
+            "Page content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted. Do not mix the two: inlining <ac:.../> macros inside a markdown body is rejected. For a TOC use YAML frontmatter (toc: { maxLevel, minLevel }); for other macros use directive syntax (:info[...], :mention[...]{...})."
           ),
         parent_id: z.string().optional().describe("Optional parent page ID"),
         allow_raw_html: z
@@ -568,6 +571,9 @@ function registerTools(server: McpServer, config: Config): void {
       description: describeWithLock(
         withDestructiveWarning(
           "Update an existing Confluence page. Accepts GFM markdown or Confluence storage format — markdown is automatically converted via the token-aware write path, which preserves all existing macros and rich elements. " +
+          "Do NOT mix the two: a body that contains both <ac:.../> storage tags AND markdown structural patterns (## headings, lists, fenced code blocks) is rejected with MIXED_INPUT_DETECTED. " +
+          "To inject a TOC macro from markdown, use YAML frontmatter at the top of the body: `---\\ntoc:\\n  maxLevel: 3\\n  minLevel: 1\\n---`. " +
+          "For other macros from markdown, use directive syntax: `:info[content]`, `:mention[Name]{accountId=...}`, `:date[2026-04-23]`. " +
           "You must provide the version number from your most recent get_page call. If the page was modified by someone else since then, this will return a conflict error — re-read the page and retry.\n\n" +
           "For narrow changes to a single section, prefer update_page_section — it leaves the rest of the page untouched and is safer for targeted edits.\n\n" +
           "Markdown update flags:\n" +
@@ -596,7 +602,7 @@ function registerTools(server: McpServer, config: Config): void {
         body: z
           .string()
           .optional()
-          .describe("New body content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted via the token-aware write path."),
+          .describe("New body content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted via the token-aware write path. Do not mix the two: inlining <ac:.../> macros inside a markdown body is rejected. For a TOC use YAML frontmatter (toc: { maxLevel, minLevel }); for other macros use directive syntax (:info[...], :mention[...]{...})."),
         version_message: z
           .string()
           .optional()
@@ -738,7 +744,7 @@ function registerTools(server: McpServer, config: Config): void {
           .describe("Heading text identifying the section to replace (case-insensitive)"),
         body: z
           .string()
-          .describe("New content for this section — GFM markdown or Confluence storage format. Markdown is auto-detected and converted via the token-aware write path, which preserves existing macros and emoticons within the section. The heading itself is preserved; only content under it is replaced."),
+          .describe("New content for this section — GFM markdown or Confluence storage format. Markdown is auto-detected and converted via the token-aware write path, which preserves existing macros and emoticons within the section. The heading itself is preserved; only content under it is replaced. Do not mix the two: inlining <ac:.../> macros inside a markdown body is rejected with MIXED_INPUT_DETECTED. For macros from markdown use directive syntax (:info[...], :mention[...]{...})."),
         version: z
           .number()
           .int()

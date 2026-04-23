@@ -369,6 +369,70 @@ export const DELETION_ACK_MISMATCH = "DELETION_ACK_MISMATCH";
 export const POST_TRANSFORM_BODY_REJECTED = "POST_TRANSFORM_BODY_REJECTED";
 /** Thrown when the caller passes read-only markdown. */
 export const READ_ONLY_MARKDOWN_ROUND_TRIP = "READ_ONLY_MARKDOWN_ROUND_TRIP";
+/** Thrown when body contains BOTH Confluence storage tags and markdown structural patterns. */
+export const MIXED_INPUT_DETECTED = "MIXED_INPUT_DETECTED";
+
+// ---------------------------------------------------------------------------
+// Mixed-input detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect "mixed mode" inputs: a body that contains BOTH Confluence storage
+ * tags (`<ac:`/`<ri:`/`<time>`) AND line-anchored markdown structural
+ * patterns. The format detector (`looksLikeMarkdown`) classifies any body
+ * with `<ac:` outside code fences as storage and skips conversion. If the
+ * caller meant the body as markdown with one inlined macro (the common
+ * agent failure mode — a TOC macro inlined at the top), the markdown gets
+ * stored verbatim and Confluence renders it as literal text.
+ *
+ * The right shape is YAML frontmatter for TOC (`toc: { maxLevel, minLevel }`)
+ * or directive syntax for other macros (`:info[...]`, `:mention[...]{...}`).
+ *
+ * Returns the human-readable list of matched markdown patterns (empty if not
+ * mixed). The list goes into the rejection message so the caller can see
+ * exactly what tripped the guard.
+ *
+ * Excluded from detection:
+ * - content inside fenced code blocks (markdown documenting storage)
+ * - content inside `<![CDATA[...]]>` (storage code-macro bodies)
+ * - content inside `<ac:plain-text-body>...</ac:plain-text-body>` (same)
+ * - inline patterns like `**bold**` and `[text](url)` — too easy to occur
+ *   incidentally inside HTML attribute values to use as a strong signal.
+ */
+function detectMixedInput(body: string): string[] {
+  // Strip regions where markdown-looking text is legitimately present
+  // inside otherwise-storage content.
+  let stripped = body.replace(
+    /^(`{3,})[^\n]*\n[\s\S]*?^\1\s*$/gm,
+    "",
+  );
+  stripped = stripped.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, "");
+  stripped = stripped.replace(
+    /<ac:plain-text-body>[\s\S]*?<\/ac:plain-text-body>/gi,
+    "",
+  );
+
+  if (!/<ac:|<ri:|<time[\s/>]/i.test(stripped)) {
+    return []; // no storage tags after stripping → not mixed
+  }
+
+  const STRUCTURAL_MD: { name: string; re: RegExp }[] = [
+    { name: "ATX heading (## ...)", re: /^#{1,6}[ \t]+\S/m },
+    { name: "fenced code block (```...)", re: /^```/m },
+    { name: "GFM table separator (| --- |)", re: /^\|[\s\-:|]+\|\s*$/m },
+    { name: "unordered list (- ... or * ...)", re: /^[-*][ \t]+\S/m },
+    { name: "ordered list (1. ...)", re: /^\d+\.[ \t]+\S/m },
+    {
+      name: "GitHub alert (> [!NOTE])",
+      re: /^>\s*\[!(INFO|NOTE|TIP|WARNING|CAUTION|IMPORTANT)\]/im,
+    },
+    { name: "YAML frontmatter delimiter (---)", re: /^---\s*$/m },
+  ];
+
+  return STRUCTURAL_MD.filter(({ re }) => re.test(stripped)).map(
+    ({ name }) => name,
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Post-transform body guard
@@ -619,6 +683,29 @@ export async function safePrepareBody(
         "and edit the storage XML, (2) use update_page_section for targeted edits, or " +
         "(3) compose new markdown from scratch (do not copy from format: 'markdown' output).",
       READ_ONLY_MARKDOWN_ROUND_TRIP,
+    );
+  }
+
+  // 1b. Mixed-input rejection — hard guard, no opt-out. Catches the common
+  //     agent failure of inlining `<ac:structured-macro>` (typically a TOC
+  //     macro) at the top of an otherwise-markdown body. The format detector
+  //     would classify the body as storage and the markdown would be stored
+  //     verbatim, rendering as literal `##` and `**` text in Confluence.
+  const mixedSignals = detectMixedInput(body);
+  if (mixedSignals.length > 0) {
+    throw new ConverterError(
+      `Body contains BOTH Confluence storage tags (<ac:.../>, <ri:.../>) AND markdown structural patterns: ${mixedSignals.join(", ")}.\n\n` +
+        `The format detector classifies any body containing storage tags as storage format and skips markdown→storage conversion. Submitting this would store the markdown verbatim and Confluence would render it as literal text.\n\n` +
+        `Pick one path:\n` +
+        `  • TOC macro from markdown — drop the inline <ac:structured-macro ac:name="toc"/> and add YAML frontmatter at the top of the body:\n` +
+        `        ---\n` +
+        `        toc:\n` +
+        `          maxLevel: 3\n` +
+        `          minLevel: 1\n` +
+        `        ---\n` +
+        `  • Other macros from markdown — use directive syntax (e.g. ":info[content]", ":mention[Name]{accountId=...}", ":date[2026-04-23]").\n` +
+        `  • Pure storage format — convert the markdown structure (## headings, lists, tables, code fences) to <h1>/<h2>/<p>/<ul>/<table>/etc. before submitting.`,
+      MIXED_INPUT_DETECTED,
     );
   }
 
