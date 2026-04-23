@@ -71,6 +71,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     deletePage: vi.fn(),
     getContentState: vi.fn(),
     setContentState: vi.fn(),
+    getSiteDefaultLocale: vi.fn().mockResolvedValue(undefined),
     removeContentState: vi.fn(),
     getPageByTitle: vi.fn(),
     getConfig: vi.fn().mockResolvedValue({
@@ -140,7 +141,7 @@ describe("mass-damage integration (G3)", () => {
       // Fourth is rejected by the budget, BEFORE the HTTP call.
       const r = await handler({ page_id: "4", version: 5 });
       expect(r.isError).toBe(true);
-      expect(r.content[0].text).toMatch(/hourly write budget exhausted/i);
+      expect(r.content[0].text).toMatch(/rolling write budget exhausted/i);
       expect(deletePage).toHaveBeenCalledTimes(3);
 
       // Reset for other tests.

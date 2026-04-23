@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.2.0] - 2026-04-23 - tighter write-budget window (15 min)
+
+### Changed
+
+- **Rolling write-budget window shortened from 60 minutes to 15 minutes.** The
+  per-scope cap is unchanged (still 25 writes by default), but the window it
+  measures against is now a rolling 15-minute slice — four windows per hour
+  instead of one. The old 60-minute window made sustained legitimate usage
+  impractical for agents doing multi-step work against a page tree
+  (re-authoring with cross-refs, tree setup with drawio diagrams, etc.):
+  once the budget hit 25, the agent had to wait up to an hour before any
+  further writes, even if the bursts were legitimate. The 15-minute window
+  preserves the anti-burst guarantee (an attacker agent still can't issue
+  more than 25 writes in any short window) while letting legitimate
+  sustained work progress at a realistic cadence.
+
+  Operator-visible changes:
+  - Error message prefix is now "Rolling write budget exhausted" (was
+    "Hourly write budget exhausted"), and the body correctly reports "in
+    the last 15 min" rather than "in the last hour."
+  - Env var name `EPIMETHIAN_WRITE_BUDGET_HOURLY` is **retained** for
+    backward compatibility; it now governs the 15-minute rolling window.
+  - Internal field names (`hourlyTimestamps`, `hourlyLimit`), the
+    `WriteBudgetExceededError.scope === "hourly"` value, and the
+    `writeBudget.hourly` observability getter also retain the legacy
+    name. Call sites that branch on `scope === "hourly"` continue to
+    work unchanged.
+
+  To opt out of the new behaviour and keep a 60-minute effective window
+  at the old ceiling, set `EPIMETHIAN_WRITE_BUDGET_HOURLY=6` — that
+  approximates 25/hour at this window size. Setting `=0` still disables
+  the cap entirely.
+
 ## [6.1.1] - 2026-04-23 - content-state parsing fix
 
 ### Fixed

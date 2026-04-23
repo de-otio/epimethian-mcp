@@ -10,16 +10,20 @@
  * Two windows enforced:
  *   - Session total: absolute cap since process start. Prevents a long-
  *     running session from amortising a burst by pausing.
- *   - Hourly window: sliding 60-minute cap. Tighter limit that catches
- *     bursts.
+ *   - Rolling burst window: sliding 15-minute cap. Tighter limit that
+ *     catches bursts. (Historically a 60-minute cap, tightened to 15
+ *     minutes in 6.2.0 to make sustained legitimate usage more
+ *     practical without loosening the anti-burst guarantee: the same
+ *     25-write ceiling, with four windows per hour instead of one.)
  *
- * Defaults (Track F4-design):
+ * Defaults:
  *   SESSION_TOTAL: 100 writes per process lifetime
- *   HOURLY:        25 writes per rolling hour
+ *   ROLLING:       25 writes per rolling 15 minutes
  *
  * Env overrides:
  *   EPIMETHIAN_WRITE_BUDGET_SESSION=<n>
- *   EPIMETHIAN_WRITE_BUDGET_HOURLY=<n>
+ *   EPIMETHIAN_WRITE_BUDGET_HOURLY=<n>   (legacy name; governs the
+ *                                         15-minute rolling window)
  *
  * Set either to `0` to disable the window entirely (use with care).
  *
@@ -27,9 +31,13 @@
  * `prepend_*` / `revert_*` / `set_page_status` / `remove_page_status` /
  * `add_attachment` / `add_drawio_diagram` / `add_label` / `remove_label`
  * calls. Read operations are never counted.
+ *
+ * Backward-compat note: the env var, field names, `scope` value, and
+ * observability getter all retain the word "hourly" from the original
+ * design. The window itself is now 15 minutes — see WINDOW_MS below.
  */
 
-const HOUR_MS = 60 * 60 * 1000;
+const WINDOW_MS = 15 * 60 * 1000;
 
 const DEFAULT_SESSION_BUDGET = 100;
 const DEFAULT_HOURLY_BUDGET = 25;
@@ -73,7 +81,7 @@ class WriteBudget {
    */
   consume(): void {
     const now = Date.now();
-    const cutoff = now - HOUR_MS;
+    const cutoff = now - WINDOW_MS;
     this.hourlyTimestamps = this.hourlyTimestamps.filter((ts) => ts >= cutoff);
 
     const sessionLimit = this.sessionLimit;
@@ -92,11 +100,11 @@ class WriteBudget {
     const hourlyLimit = this.hourlyLimit;
     if (hourlyLimit > 0 && this.hourlyTimestamps.length >= hourlyLimit) {
       const oldest = this.hourlyTimestamps[0];
-      const waitMs = Math.max(0, oldest + HOUR_MS - now);
+      const waitMs = Math.max(0, oldest + WINDOW_MS - now);
       const waitMin = Math.ceil(waitMs / 60_000);
       throw new WriteBudgetExceededError(
-        `Hourly write budget exhausted: ${this.hourlyTimestamps.length} writes in ` +
-          `the last hour, limit ${hourlyLimit}. Window opens again in ~${waitMin} min. ` +
+        `Rolling write budget exhausted: ${this.hourlyTimestamps.length} writes in ` +
+          `the last 15 min, limit ${hourlyLimit}. Window opens again in ~${waitMin} min. ` +
           `Raise the cap with EPIMETHIAN_WRITE_BUDGET_HOURLY=<n> (or 0 to disable).`,
         "hourly",
         this.hourlyTimestamps.length,
@@ -116,7 +124,7 @@ class WriteBudget {
   /** Current hourly counter (for observability). */
   get hourly(): number {
     const now = Date.now();
-    const cutoff = now - HOUR_MS;
+    const cutoff = now - WINDOW_MS;
     this.hourlyTimestamps = this.hourlyTimestamps.filter((ts) => ts >= cutoff);
     return this.hourlyTimestamps.length;
   }

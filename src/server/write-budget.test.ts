@@ -74,8 +74,8 @@ describe("writeBudget (F4)", () => {
     );
   });
 
-  it("F4: hourly window is sliding (expires old entries)", async () => {
-    // Verify that entries outside the 60-minute window don't count. We
+  it("F4: rolling window is sliding (expires old entries)", async () => {
+    // Verify that entries outside the 15-minute window don't count. We
     // can't easily fast-forward without mocking Date.now, so exercise
     // the filter path: trigger the filter by reading `hourly` and
     // asserting the count matches consume() count (implicit: nothing
