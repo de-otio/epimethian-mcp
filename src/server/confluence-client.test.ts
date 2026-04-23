@@ -1710,20 +1710,40 @@ describe("removeLabel", () => {
 
 describe("getContentState", () => {
   it("constructs correct URL with ?status=current query param", async () => {
-    global.fetch = mockFetchResponse({ name: "In progress", color: "#2684FF" });
+    global.fetch = mockFetchResponse({
+      contentState: { id: 1, name: "In progress", color: "#2684FF" },
+      lastUpdated: "2026-04-23T15:00:00Z",
+    });
     await getContentState("page-42");
     const url = (global.fetch as any).mock.calls[0][0] as string;
     expect(url).toContain(`${API_V1}/content/page-42/state`);
     expect(url).toContain("status=current");
   });
 
-  it("returns parsed { name, color } on success", async () => {
+  it("parses the wrapped Confluence Cloud shape { contentState: { name, color, id }, lastUpdated }", async () => {
+    // Regression for the bug that made v6.1.0 badges invisible via MCP:
+    // the real API wraps the state in `contentState`, not flat at the top.
+    global.fetch = mockFetchResponse({
+      contentState: { id: 863862877, color: "#57D9A3", name: "Ready for review" },
+      lastUpdated: "2026-04-23T15:05:27.669Z",
+    });
+    const state = await getContentState("page-42");
+    expect(state).toEqual({ name: "Ready for review", color: "#57D9A3" });
+  });
+
+  it("parses the unwrapped shape { name, color } too (defensive)", async () => {
     global.fetch = mockFetchResponse({ name: "Ready for review", color: "#57D9A3" });
     const state = await getContentState("page-42");
     expect(state).toEqual({ name: "Ready for review", color: "#57D9A3" });
   });
 
-  it("returns null when no state is set (empty name)", async () => {
+  it("returns null when contentState is explicitly null (no state set)", async () => {
+    global.fetch = mockFetchResponse({ contentState: null, lastUpdated: null });
+    const state = await getContentState("page-42");
+    expect(state).toBeNull();
+  });
+
+  it("returns null when the flat shape has null name/color", async () => {
     global.fetch = mockFetchResponse({ name: null, color: null });
     const state = await getContentState("page-42");
     expect(state).toBeNull();
@@ -1735,16 +1755,19 @@ describe("getContentState", () => {
     expect(state).toBeNull();
   });
 
-  it("strips unexpected fields via strict schema", async () => {
+  it("ignores extra fields from the API (id, lastUpdated, etc.)", async () => {
     global.fetch = mockFetchResponse({
-      name: "Draft",
-      color: "#FFC400",
-      id: 42,
-      spaceIsEnabled: true,
-      isSpaceState: false,
+      contentState: {
+        name: "Draft",
+        color: "#FFC400",
+        id: 42,
+        spaceIsEnabled: true,
+        isSpaceState: false,
+      },
+      lastUpdated: "2026-04-23T15:00:00Z",
     });
-    // .strict() should reject extra fields
-    await expect(getContentState("page-42")).rejects.toThrow();
+    const state = await getContentState("page-42");
+    expect(state).toEqual({ name: "Draft", color: "#FFC400" });
   });
 });
 

@@ -1374,9 +1374,18 @@ export async function getContentState(
   try {
     const res = await confluenceRequest(url.toString());
     const data = await res.json();
-    // API returns contentState: null when no state is set
-    if (!data || !data.name) return null;
-    return ContentStateSchema.parse(data);
+    // Confluence Cloud returns the state wrapped:
+    //   { "contentState": { "id": …, "name": …, "color": … }, "lastUpdated": … }
+    // When no state is set: { "contentState": null } (or an older shape with
+    // just name/color at the top level on some DC variants).
+    const state =
+      data && typeof data === "object" && "contentState" in data
+        ? (data as { contentState: unknown }).contentState
+        : data;
+    if (!state || typeof state !== "object") return null;
+    const s = state as { name?: unknown; color?: unknown };
+    if (typeof s.name !== "string" || typeof s.color !== "string") return null;
+    return ContentStateSchema.parse({ name: s.name, color: s.color });
   } catch (err) {
     if (err instanceof ConfluenceApiError && err.status === 404) return null;
     throw err;

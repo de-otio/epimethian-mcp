@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.1.1] - 2026-04-23 - content-state parsing fix
+
+### Fixed
+
+- **fix(content-state): `getContentState` now correctly parses Confluence Cloud's
+  wrapped response shape.** The v1 `/content/{id}/state` endpoint returns
+  `{ "contentState": { "name": …, "color": … }, "lastUpdated": … }` — our parser
+  was looking at `data.name` at the top level, which never matched. As a result,
+  `get_page_status` reported "no status set" even when a status existed, and the
+  v6.1.0 idempotency check in `markPageUnverified` always missed, causing a
+  redundant `setContentState` call on every body edit. Set writes were never
+  broken (those went through `setContentState`, which serialises a known body
+  shape and just worked). The parser now unwraps `data.contentState` and
+  accepts the older flat shape as a fallback. Regression tests added.
+
 ## [6.1.0] - 2026-04-23 - provenance badge + permission posture
 
 ### Added
