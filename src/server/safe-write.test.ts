@@ -69,6 +69,7 @@ import {
   type SafePrepareBodyInput,
   type DeletedToken,
   DELETION_ACK_MISMATCH,
+  MIXED_INPUT_DETECTED,
   POST_TRANSFORM_BODY_REJECTED,
   READ_ONLY_MARKDOWN_ROUND_TRIP,
 } from "./safe-write.js";
@@ -173,6 +174,89 @@ const cases: Row[] = [
       replaceBody: true,
     },
     outcome: { kind: "error", code: READ_ONLY_MARKDOWN_ROUND_TRIP },
+  },
+  // --- Mixed-input hard-reject (no opt-out): the canonical case is an
+  //     agent inlining <ac:structured-macro ac:name="toc"/> at the top of
+  //     a markdown body. The format detector would treat the whole body
+  //     as storage and Confluence would render the markdown as literal
+  //     text. The error must teach the YAML-frontmatter / directive fix.
+  {
+    name: "mixed: inline TOC macro at top of markdown body rejected (the canonical agent error)",
+    input: {
+      body:
+        `<ac:structured-macro ac:name="toc"></ac:structured-macro>\n\n` +
+        `## Section one\n\n- bullet\n- bullet\n`,
+      currentBody: undefined,
+    },
+    outcome: {
+      kind: "error",
+      code: MIXED_INPUT_DETECTED,
+      messageContains: /toc:[\s\S]*maxLevel/,
+    },
+  },
+  {
+    name: "mixed: inline <ri: tag plus markdown headings rejected",
+    input: {
+      body: `<p>See <ri:page ri:content-title="Home"/></p>\n\n# Heading\n\nBody.`,
+      currentBody: undefined,
+    },
+    outcome: { kind: "error", code: MIXED_INPUT_DETECTED },
+  },
+  {
+    name: "mixed: rejection lists matched markdown patterns by name",
+    input: {
+      body:
+        `<ac:structured-macro ac:name="info"></ac:structured-macro>\n\n` +
+        `# Heading\n- list\n`,
+      currentBody: undefined,
+    },
+    outcome: {
+      kind: "error",
+      code: MIXED_INPUT_DETECTED,
+      messageContains: /ATX heading[\s\S]*unordered list/,
+    },
+  },
+  {
+    name: "mixed: not triggered when <ac:> appears only inside fenced code (markdown documenting storage)",
+    input: {
+      body:
+        `# Documenting macros\n\n` +
+        '```xml\n<ac:structured-macro ac:name="toc"/>\n```\n\n' +
+        `Plain markdown body with no inline storage tags.`,
+      currentBody: undefined,
+    },
+    outcome: { kind: "success" },
+  },
+  {
+    name: "mixed: not triggered when <ac:> appears only inside CDATA (storage code-macro body)",
+    input: {
+      body:
+        `<ac:structured-macro ac:name="code"><ac:plain-text-body>` +
+        `<![CDATA[\n## python comment style\n- not a list\n]]>` +
+        `</ac:plain-text-body></ac:structured-macro>`,
+      currentBody: undefined,
+    },
+    outcome: { kind: "success" },
+  },
+  {
+    name: "mixed: not triggered when <ac:> appears only inside ac:plain-text-body (storage code-macro body)",
+    input: {
+      body:
+        `<ac:structured-macro ac:name="code"><ac:plain-text-body>\n` +
+        `## comment\n- item\n` +
+        `</ac:plain-text-body></ac:structured-macro>`,
+      currentBody: undefined,
+    },
+    outcome: { kind: "success" },
+  },
+  {
+    name: "mixed: pure storage with hash mid-line (legacy test) is NOT mixed",
+    input: {
+      body:
+        `<ac:structured-macro ac:name="info"><p># not markdown</p></ac:structured-macro>`,
+      currentBody: undefined,
+    },
+    outcome: { kind: "success" },
   },
   // --- Shrinkage guard fired / skipped. ---
   {
