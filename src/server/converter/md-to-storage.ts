@@ -820,12 +820,24 @@ function escapeRegex(s: string): string {
  * Preprocess markdown to handle confluence:// scheme links.
  *
  * markdown-it's linkify doesn't recognise custom schemes and won't turn
- * [text](confluence://...) into an <a href>. We pre-render these to
- * ac:link XML before markdown-it sees them, using placeholder tokens,
- * then restore after rendering.
+ * [text](confluence://...) into an <a href>. We handle two forms here:
+ *
+ *   1. confluence://SPACE_KEY/PAGE_TITLE
+ *      Pre-rendered to <ac:link><ri:page ri:space-key=".." ri:content-title=".."/>
+ *      …</ac:link> via a placeholder that survives markdown-it rendering and
+ *      is restored afterward.
+ *
+ *   2. confluence://CONTENT_ID  (numeric)
+ *      Rewritten in-place to a regular markdown link with an absolute
+ *      Confluence URL (`{base}/wiki/pages/viewpage.action?pageId={id}`).
+ *      The result reaches markdown-it and renders as a plain `<a href>`
+ *      anchor — see the B2 comment on `rewriteConfluenceLinks` for why we
+ *      do *not* emit `<ri:page ri:content-id="…"/>` here (that legacy
+ *      shape silently loses the anchor text on Confluence Cloud).
  */
 function extractConfluenceSchemeLinks(
-  md: string
+  md: string,
+  confluenceBaseUrl?: string
 ): { processed: string; links: Map<string, string> } {
   const links = new Map<string, string>();
   let idx = 0;
@@ -836,8 +848,25 @@ function extractConfluenceSchemeLinks(
     (_match, text, href) => {
       const rest = href.slice("confluence://".length);
       const slashIdx = rest.indexOf("/");
-      if (slashIdx === -1) return _match;
 
+      // Form 2: bare content-id (no '/'). Rewrite to absolute URL and let
+      // markdown-it render as a plain anchor.
+      if (slashIdx === -1) {
+        if (!/^\d+$/.test(rest)) return _match;
+        if (!confluenceBaseUrl) {
+          throw new ConverterError(
+            `confluence://${rest} cannot be rewritten: no Confluence base URL is configured. ` +
+              `Either configure one (the harness normally injects this), or use the ` +
+              `confluence://SPACE_KEY/PAGE_TITLE form instead.`,
+            "CONFLUENCE_LINK_NO_BASE_URL"
+          );
+        }
+        const base = confluenceBaseUrl.replace(/\/+$/, "");
+        const absoluteUrl = `${base}/wiki/pages/viewpage.action?pageId=${rest}`;
+        return `[${text}](${absoluteUrl})`;
+      }
+
+      // Form 1: SPACE_KEY/PAGE_TITLE.
       const spaceKey = rest.slice(0, slashIdx);
       let pageTitle: string;
       try {
@@ -1103,9 +1132,12 @@ export function markdownToStorage(md: string, opts?: ConverterOptions): string {
   // These need to be pulled out before markdown-it escapes their angle-brackets.
   const { processed: mdWithoutAcBlocks, blocks: acBlocks } = extractRawAcBlocks(mdWithoutColumns);
 
-  // Pre-process confluence:// scheme links into ac:link XML (stored in placeholders).
+  // Pre-process confluence:// scheme links. The SPACE_KEY/PAGE_TITLE form
+  // is converted to ac:link XML (stored in placeholders); the bare CONTENT_ID
+  // form is rewritten to an absolute URL using opts.confluenceBaseUrl and
+  // falls through to the standard markdown-it pipeline.
   const { processed: mdWithoutConfluenceLinks, links: confluenceLinks } =
-    extractConfluenceSchemeLinks(mdWithoutAcBlocks);
+    extractConfluenceSchemeLinks(mdWithoutAcBlocks, opts?.confluenceBaseUrl);
 
   // --- Render ---
   let html: string;

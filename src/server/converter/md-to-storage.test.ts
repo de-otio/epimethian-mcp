@@ -291,6 +291,36 @@ describe("links", () => {
     expect(out).toContain("</ac:link>");
   });
 
+  it("rewrites bare-content-id confluence:// scheme to a plain anchor with absolute URL", () => {
+    // Bare CONTENT_ID form (confluence://918847500). Without this handler the
+    // converter would silently emit `<a href="confluence://918847500">…</a>` —
+    // a dead link in Confluence. The fix routes it through the standard
+    // absolute-URL path so the resulting anchor actually navigates.
+    const out = convert("[01](confluence://918847500)", {
+      confluenceBaseUrl: BASE_URL,
+    });
+    expect(out).not.toContain("confluence://");
+    expect(out).not.toContain("<ac:link>");
+    expect(out).toContain(
+      `<a href="${BASE_URL}/wiki/pages/viewpage.action?pageId=918847500">01</a>`
+    );
+  });
+
+  it("errors clearly on bare-content-id confluence:// when no base URL is configured", () => {
+    expect(() => convert("[01](confluence://918847500)")).toThrowError(
+      /confluence:\/\/918847500.*no Confluence base URL/
+    );
+  });
+
+  it("leaves a non-numeric confluence:// path untouched (unsupported form)", () => {
+    // `confluence://garbage` is neither SPACE_KEY/PAGE_TITLE nor CONTENT_ID.
+    // The converter passes it through; markdown-it will emit an <a href> with
+    // the literal scheme. Documents the boundary so a future change doesn't
+    // silently start interpreting unsupported forms.
+    const out = convert("[X](confluence://garbage)", { confluenceBaseUrl: BASE_URL });
+    expect(out).toContain('<a href="confluence://garbage">X</a>');
+  });
+
   it("does NOT rewrite external link that looks like confluence URL from different host", () => {
     const spoofUrl = "https://entrixenergy.atlassian.net.attacker.com/wiki/spaces/ETD/pages/12345/foo";
     const out = convert(`[Spoof](${spoofUrl})`, { confluenceBaseUrl: BASE_URL });

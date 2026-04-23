@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.0.1] - 2026-04-23 - confluence:// content-id link fix
+
+### Fixed
+
+- **`confluence://CONTENT_ID` markdown links now produce a working
+  hyperlink.** The `resolve_page_link` tool description has long
+  advertised the bare-content-id form (e.g.
+  `[text](confluence://918847500)`), but the converter only ever
+  recognised the `confluence://SPACE_KEY/PAGE_TITLE` form and silently
+  passed the bare-id form through to markdown-it, producing a literal
+  `<a href="confluence://918847500">…</a>` — a dead link in the
+  browser. The bare-id form is now rewritten to an absolute Confluence
+  URL (`{base}/wiki/pages/viewpage.action?pageId={id}`) and rendered as
+  a plain anchor, matching the B2 strategy already used for absolute
+  internal URLs. The legacy `<ri:page ri:content-id="…"/>` storage
+  shape is deliberately not emitted (it doesn't render anchor text on
+  Confluence Cloud — see the comment on `rewriteConfluenceLinks`).
+  - Throws `CONFLUENCE_LINK_NO_BASE_URL` if a bare-id link is
+    encountered when no Confluence base URL is configured (the harness
+    normally injects one).
+  - Affected both write paths equally — using `replace_body: true` did
+    not change the bug's surface area, despite earlier suspicion.
+
+### Documentation
+
+- **`resolve_page_link` description now documents both supported
+  link forms** (`confluence://SPACE_KEY/PAGE_TITLE` preferred,
+  `confluence://CONTENT_ID` supported) with the rendering trade-offs
+  spelled out.
+
 ## [6.0.0] - 2026-04-23 - agent-safety hardening
 
 Consolidates the findings from the 2026-04-23 agent-loop / mass-damage

@@ -2459,8 +2459,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       description: withUntrustedNote(
         "Resolve a Confluence page to its stable content ID and URL given a page title and space key. " +
         "Returns { contentId, url, spaceKey, title } for the matched page. " +
-        "Use this to obtain the contentId for <ac:link> page references via the confluence:// " +
-        "markdown scheme when authoring pages. " +
+        "When authoring pages, use the returned values to construct a confluence:// markdown link " +
+        "in either form: `[text](confluence://SPACE_KEY/PAGE_TITLE)` (preferred — produces an " +
+        "<ac:link> reference that follows the page across renames) or `[text](confluence://CONTENT_ID)` " +
+        "(produces a plain anchor to the page's stable URL). " +
         "Policy: if multiple pages share the same title in the space the first match is returned " +
         "with a notice; use the exact page URL to disambiguate if needed."
       ),
