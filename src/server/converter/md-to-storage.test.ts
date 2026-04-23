@@ -221,6 +221,42 @@ describe("fenced code blocks", () => {
     expect(out).toContain("a]]]]><![CDATA[>b]]]]><![CDATA[>c");
   });
 
+  // Regression: angle-bracketed placeholders inside code-fence bodies must
+  // survive unescaped, and the macro must close before the next paragraph.
+  //
+  // A legacy epimethian tree had a corrupted page where `<service>` and
+  // `<tenant-id>` had been stripped from the CDATA and `</ac:structured-macro>`
+  // was displaced far past its content, swallowing all subsequent paragraphs
+  // as pseudo-children of the code macro. The current fence renderer doesn't
+  // produce that shape, but this test pins that contract: no HTML-tag-style
+  // stripping inside the fence body, and the macro closes exactly where the
+  // fence closes.
+  it("preserves angle-bracketed placeholders inside a no-language fence and closes the macro before following content", () => {
+    const md =
+      "```\n" +
+      "alias/entrix/secrets/<service>         (per-service)\n" +
+      "alias/entrix/secrets/tenants/<tenant-id>   (per-tenant)\n" +
+      "```\n\n" +
+      "Per-service keys make it possible to revoke access.";
+    const out = convert(md);
+    // CDATA body preserves the angle brackets verbatim.
+    expect(out).toContain("<service>");
+    expect(out).toContain("<tenant-id>");
+    // The macro is properly wrapped in <ac:plain-text-body>.
+    expect(out).toMatch(
+      /<ac:structured-macro[^>]*ac:name="code"[^>]*><ac:plain-text-body><!\[CDATA\[/
+    );
+    // The macro closes before the next paragraph — no paragraph content is
+    // trapped inside the structured-macro element.
+    expect(out).toMatch(
+      /\]\]><\/ac:plain-text-body><\/ac:structured-macro>\s*<p>Per-service keys/
+    );
+    // Sanity: no double-close, no HTML-entity-escaped angle brackets inside
+    // the CDATA (that would indicate a pre-CDATA escape pass).
+    expect(out).not.toContain("&lt;service&gt;");
+    expect(out).not.toContain("&lt;tenant-id&gt;");
+  });
+
   // Attribute injection regression — language parameter
   it("escapes dangerous chars in language attribute", () => {
     const md = '```<script>"\'&\nnewline\n```';
