@@ -1363,6 +1363,51 @@ export async function removeLabel(
   await confluenceRequest(url.toString(), { method: "DELETE" });
 }
 
+// --- Site settings (default locale) ---
+
+/**
+ * Cache of site default-locale probes keyed by tenant base URL.
+ * Stores the in-flight Promise so concurrent callers share one request.
+ * Value resolves to a lowercase language subtag (e.g. "de") or undefined
+ * if the probe failed or returned nothing usable.
+ */
+const _siteLocaleCache = new Map<string, Promise<string | undefined>>();
+
+/** Test hook: clear the site-locale cache. */
+export function _resetSiteLocaleCacheForTests(): void {
+  _siteLocaleCache.clear();
+}
+
+/**
+ * Probes Confluence's site-wide default language via
+ * `GET /wiki/rest/api/settings/systemInfo` and returns the language subtag
+ * (e.g. `"de_DE"` → `"de"`). Cached per tenant URL for the process lifetime.
+ *
+ * Never throws: returns `undefined` on any failure (auth, network, missing
+ * scope, malformed payload). The caller (`pickLocale`) falls back to `"en"`.
+ */
+export async function getSiteDefaultLocale(cfg: Config): Promise<string | undefined> {
+  const key = cfg.url;
+  const cached = _siteLocaleCache.get(key);
+  if (cached !== undefined) return cached;
+
+  const promise = (async () => {
+    try {
+      const res = await confluenceRequest(`${cfg.apiV1}/settings/systemInfo`);
+      const data = (await res.json()) as { defaultLocale?: unknown };
+      const raw = typeof data?.defaultLocale === "string" ? data.defaultLocale : undefined;
+      if (!raw) return undefined;
+      // Confluence returns "en_GB"/"de_DE"; normalize to "en"/"de".
+      return raw.split(/[_-]/)[0].toLowerCase() || undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+
+  _siteLocaleCache.set(key, promise);
+  return promise;
+}
+
 // --- Content State (page status badge) ---
 
 export async function getContentState(
@@ -1638,6 +1683,30 @@ export function extractHeadings(storageHtml: string): string {
 }
 
 /**
+ * Replace every `<![CDATA[...]]>` block in storage with a same-length run of
+ * spaces so node-html-parser can parse the surrounding structure without
+ * being derailed by the CDATA payload.
+ *
+ * Why: node-html-parser has no notion of CDATA. When it encounters `<![CDATA[`
+ * it just keeps reading as HTML, so content like `` `<resource>.<access_mode>` ``
+ * inside a `<ac:plain-text-body><![CDATA[...]]></ac:plain-text-body>` gets
+ * parsed as nested `<resource>`/`<access_mode>` tags, the inner text is lost,
+ * and the enclosing `</ac:plain-text-body>` and `</ac:structured-macro>` close
+ * tags get attached to the wrong subtree — so sibling scans don't find the
+ * next heading, `toString()` re-serialisation drops the CDATA, and an
+ * `innerHTML = ...` round-trip destroys the code macro.
+ *
+ * Masking with same-length whitespace preserves every byte offset in the
+ * string, so we can parse the masked copy to discover structure, then slice
+ * the ORIGINAL string by the reported `.range` offsets to preserve CDATA
+ * byte-for-byte. This affects only read-side DOM traversal; the output is
+ * always built from the unmasked source.
+ */
+function maskCdataForParse(storage: string): string {
+  return storage.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, (m) => " ".repeat(m.length));
+}
+
+/**
  * Find a heading element anywhere in the DOM tree (including inside
  * ac:layout cells) whose text matches the target. Returns the heading
  * element and its sibling list within the parent container, or null.
@@ -1669,36 +1738,68 @@ function findHeadingInTree(
 }
 
 /**
- * Extract the content under a specific heading from storage format HTML.
- * Returns the heading element + all sibling content until the next heading
- * of equal or higher level. Returns null if the heading is not found.
+ * Compute the byte range of the section under a heading in `storageHtml`.
  *
- * Searches the entire DOM tree, including inside ac:layout cells.
+ * Returns `[sectionStart, sectionEnd)` where:
+ *   - sectionStart = heading element's start offset
+ *   - sectionEnd   = start of the next equal-or-higher-level heading among
+ *                    the heading's direct siblings, or the end of the last
+ *                    sibling in that list when no such heading exists.
+ *
+ * Works correctly in the presence of CDATA blocks via `maskCdataForParse`.
  */
-export function extractSection(storageHtml: string, headingText: string): string | null {
+function findSectionRange(
+  storageHtml: string,
+  headingText: string,
+): { headingStart: number; headingEnd: number; sectionEnd: number } | null {
   const { parse } = require("node-html-parser") as typeof import("node-html-parser");
-  const root = parse(storageHtml);
+  // Parse a CDATA-masked copy so the DOM structure reflects the real
+  // page layout; use the ORIGINAL string for the returned offsets.
+  const root = parse(maskCdataForParse(storageHtml));
 
   const found = findHeadingInTree(root, headingText);
   if (!found) return null;
 
   const { siblings, startIdx, headingLevel } = found;
+  const heading = siblings[startIdx] as import("node-html-parser").HTMLElement;
 
-  // Collect content until next heading of equal or higher level
-  let endIdx = siblings.length;
+  let sectionEnd: number | undefined;
   for (let i = startIdx + 1; i < siblings.length; i++) {
     const node = siblings[i];
     if (node.nodeType !== 1) continue;
     const el = node as import("node-html-parser").HTMLElement;
     const tagMatch = el.tagName?.match(/^H([1-6])$/i);
     if (tagMatch && parseInt(tagMatch[1], 10) <= headingLevel) {
-      endIdx = i;
+      sectionEnd = el.range[0];
       break;
     }
   }
+  if (sectionEnd === undefined) {
+    sectionEnd =
+      startIdx + 1 < siblings.length
+        ? siblings[siblings.length - 1].range[1]
+        : heading.range[1];
+  }
 
-  const sectionNodes = siblings.slice(startIdx, endIdx);
-  return sectionNodes.map(n => n.toString()).join("");
+  return {
+    headingStart: heading.range[0],
+    headingEnd: heading.range[1],
+    sectionEnd,
+  };
+}
+
+/**
+ * Extract the content under a specific heading from storage format HTML.
+ * Returns the heading element + all sibling content until the next heading
+ * of equal or higher level. Returns null if the heading is not found.
+ *
+ * Searches the entire DOM tree, including inside ac:layout cells. CDATA
+ * sections in the source are preserved byte-for-byte (see maskCdataForParse).
+ */
+export function extractSection(storageHtml: string, headingText: string): string | null {
+  const r = findSectionRange(storageHtml, headingText);
+  if (r === null) return null;
+  return storageHtml.slice(r.headingStart, r.sectionEnd);
 }
 
 /**
@@ -1706,31 +1807,13 @@ export function extractSection(storageHtml: string, headingText: string): string
  * Used by update_page_section to feed the current section body to the
  * token-aware write path so that <ac:emoticon> and other Confluence elements
  * within the section are preserved when the caller submits markdown.
+ *
+ * CDATA sections are preserved byte-for-byte (see maskCdataForParse).
  */
 export function extractSectionBody(storageHtml: string, headingText: string): string | null {
-  const { parse } = require("node-html-parser") as typeof import("node-html-parser");
-  const root = parse(storageHtml);
-
-  const found = findHeadingInTree(root, headingText);
-  if (!found) return null;
-
-  const { siblings, startIdx, headingLevel } = found;
-
-  let endIdx = siblings.length;
-  for (let i = startIdx + 1; i < siblings.length; i++) {
-    const node = siblings[i];
-    if (node.nodeType !== 1) continue;
-    const el = node as import("node-html-parser").HTMLElement;
-    const tagMatch = el.tagName?.match(/^H([1-6])$/i);
-    if (tagMatch && parseInt(tagMatch[1], 10) <= headingLevel) {
-      endIdx = i;
-      break;
-    }
-  }
-
-  // startIdx + 1: skip the heading itself, return only content nodes
-  const bodyNodes = siblings.slice(startIdx + 1, endIdx);
-  return bodyNodes.map(n => n.toString()).join("");
+  const r = findSectionRange(storageHtml, headingText);
+  if (r === null) return null;
+  return storageHtml.slice(r.headingEnd, r.sectionEnd);
 }
 
 /**
@@ -1739,47 +1822,23 @@ export function extractSectionBody(storageHtml: string, headingText: string): st
  * of equal or higher level is replaced with newContent.
  * Returns the full HTML with the section replaced, or null if heading not found.
  *
- * Searches the entire DOM tree, including inside ac:layout cells.
+ * Searches the entire DOM tree, including inside ac:layout cells. The splice
+ * is performed at byte offsets on the ORIGINAL storage string — the DOM is
+ * used only to locate section bounds — so CDATA sections in the preserved
+ * regions, and any CDATA the caller supplies in newContent, survive intact.
  */
 export function replaceSection(
   storageHtml: string,
   headingText: string,
   newContent: string
 ): string | null {
-  const { parse } = require("node-html-parser") as typeof import("node-html-parser");
-  const root = parse(storageHtml);
-
-  const found = findHeadingInTree(root, headingText);
-  if (!found) return null;
-
-  const { siblings, startIdx, headingLevel } = found;
-
-  let endIdx = siblings.length;
-  for (let i = startIdx + 1; i < siblings.length; i++) {
-    const node = siblings[i];
-    if (node.nodeType !== 1) continue;
-    const el = node as import("node-html-parser").HTMLElement;
-    const tagMatch = el.tagName?.match(/^H([1-6])$/i);
-    if (tagMatch && parseInt(tagMatch[1], 10) <= headingLevel) {
-      endIdx = i;
-      break;
-    }
-  }
-
-  // Reconstruct: before + heading + newContent + after
-  const before = siblings.slice(0, startIdx);
-  const heading = siblings[startIdx];
-  const after = siblings.slice(endIdx);
-
-  // Replace within the parent container, then return the full document
-  const parent = heading.parentNode as import("node-html-parser").HTMLElement;
-  parent.innerHTML =
-    before.map(n => n.toString()).join("") +
-    heading.toString() +
+  const r = findSectionRange(storageHtml, headingText);
+  if (r === null) return null;
+  return (
+    storageHtml.slice(0, r.headingEnd) +
     newContent +
-    after.map(n => n.toString()).join("");
-
-  return root.toString();
+    storageHtml.slice(r.sectionEnd)
+  );
 }
 
 /**

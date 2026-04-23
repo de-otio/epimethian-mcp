@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.2.1] - 2026-04-23 - bugfix: CDATA-aware section splicing
+
+### Fixed
+
+- **`update_page_section` no longer corrupts code macros whose body contains
+  angle-bracketed text.** When a section (or any part of the page) contained
+  a code macro with `<![CDATA[...]]>` wrapping content like
+  `` `<resource>.<access_mode>` ``, running `update_page_section` on the page
+  would:
+
+  - strip the `<ac:plain-text-body>` wrapper off the code macro,
+  - replace the CDATA body with just the non-angle-bracket fragments (e.g.
+    `` `.` ``), losing the bracketed text entirely,
+  - and, depending on where the macro lived, swallow subsequent sections into
+    the orphaned close tag so that downstream headings disappeared from the
+    page.
+
+  The same failure mode also affected `extractSection` / `extractSectionBody`
+  when the page had any CDATA-bearing macro anywhere in the source, because
+  both functions round-tripped storage XML through `node-html-parser` (which
+  has no CDATA handling — it parses `<![CDATA[<tag>]]>` as a nested `<tag>`
+  element and loses the CDATA wrapper on re-serialisation).
+
+  Fix: `extractSection`, `extractSectionBody`, and `replaceSection` now mask
+  each CDATA block to an equal-length run of whitespace before parsing, use
+  the parse result only to compute byte offsets, and splice against the
+  original storage string. CDATA bodies — in both the preserved regions AND
+  in the caller-supplied replacement — now survive byte-for-byte.
+
+  Regression tests live in `confluence-client.test.ts` under
+  "CDATA preservation across section operations (regression)".
+
 ## [6.2.0] - 2026-04-23 - tighter write-budget window (15 min)
 
 ### Changed

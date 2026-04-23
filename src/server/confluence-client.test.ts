@@ -38,6 +38,7 @@ import {
   getAttachments,
   uploadAttachment,
   extractSection,
+  extractSectionBody,
   replaceSection,
   truncateStorageFormat,
   toMarkdownView,
@@ -541,6 +542,80 @@ describe("replaceSection", () => {
     expect(result).toContain("<p>Do not delete</p>");
     // Other section preserved
     expect(result).toContain("<h1>Notes</h1><p>keep</p>");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: CDATA containing angle-bracketed content
+//
+// Prior to v6.2.1, extractSection / extractSectionBody / replaceSection
+// parsed storage with node-html-parser and then either serialised nodes via
+// toString() or ran parent.innerHTML = ... to splice. node-html-parser does
+// not understand CDATA, so a code macro body like
+// `<![CDATA[`<resource>.<access_mode>`]]>` was parsed as nested
+// <resource>/<access_mode> elements; the <ac:plain-text-body> wrapper and
+// the code macro's close tag got attached to the wrong subtree, and sibling
+// scans stopped short of later headings. Result: on update_page_section to
+// any page containing a code macro with backticked angle brackets, the code
+// body was wiped and subsequent sections were sucked inside the broken macro.
+//
+// The fix masks each <![CDATA[...]]> with same-length whitespace before
+// parsing, then slices the ORIGINAL (unmasked) string by byte ranges. These
+// tests lock in the byte-for-byte preservation.
+// ---------------------------------------------------------------------------
+describe("CDATA preservation across section operations (regression)", () => {
+  const codeMacro =
+    `<ac:structured-macro ac:name="code" ac:schema-version="1" ac:macro-id="u1">` +
+    `<ac:parameter ac:name="language">markdown</ac:parameter>` +
+    `<ac:plain-text-body><![CDATA[\`<resource>.<access_mode>\`]]></ac:plain-text-body>` +
+    `</ac:structured-macro>`;
+
+  const doc =
+    `<h2>Proposed addition</h2>` +
+    `<p>Intro</p>` +
+    codeMacro +
+    `<p>After</p>` +
+    `<h2>References</h2>` +
+    `<p>refs</p>`;
+
+  it("extractSectionBody preserves CDATA and <ac:plain-text-body> wrapper byte-for-byte", () => {
+    const body = extractSectionBody(doc, "Proposed addition");
+    expect(body).toBe(`<p>Intro</p>${codeMacro}<p>After</p>`);
+    // Specifically: the backticked angle brackets inside CDATA are not lost.
+    expect(body).toContain("<![CDATA[`<resource>.<access_mode>`]]>");
+    expect(body).toContain("</ac:plain-text-body>");
+    // The next section must not leak in.
+    expect(body).not.toContain("References");
+  });
+
+  it("extractSection preserves CDATA byte-for-byte", () => {
+    const section = extractSection(doc, "Proposed addition");
+    expect(section).toBe(
+      `<h2>Proposed addition</h2><p>Intro</p>${codeMacro}<p>After</p>`,
+    );
+    expect(section).toContain("<![CDATA[`<resource>.<access_mode>`]]>");
+  });
+
+  it("replaceSection does not mangle CDATA in the caller-supplied replacement", () => {
+    const result = replaceSection(
+      `<h2>Proposed addition</h2><p>old</p><h2>References</h2><p>refs</p>`,
+      "Proposed addition",
+      `<p>new</p>${codeMacro}`,
+    );
+    expect(result).toContain(codeMacro);
+    expect(result).toContain("<![CDATA[`<resource>.<access_mode>`]]>");
+    // Subsequent sections are not swallowed by the broken close-tag matching.
+    expect(result).toContain("<h2>References</h2><p>refs</p>");
+  });
+
+  it("replaceSection preserves CDATA in OTHER sections when editing a different one", () => {
+    // Edit the References section; the Proposed addition section's code
+    // macro with CDATA must survive unchanged.
+    const result = replaceSection(doc, "References", "<p>new refs</p>");
+    expect(result).toContain(codeMacro);
+    expect(result).toContain("<![CDATA[`<resource>.<access_mode>`]]>");
+    expect(result).toContain("<h2>References</h2><p>new refs</p>");
+    expect(result).not.toContain("<p>refs</p>");
   });
 });
 
