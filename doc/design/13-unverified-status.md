@@ -1,5 +1,7 @@
 # 13 — Default "Unverified" Status on AI-Edited Pages
 
+> **Status: shipped in v6.1.0** (parser fix in v6.1.1). The "Current State" and "What Breaks" sections describe the pre-6.1.0 baseline.
+
 ## Goal
 
 Any page **created or modified** by this MCP is automatically tagged with a Confluence content-status badge signaling "this page has been touched by an AI agent and has not yet been reviewed by a human." The badge is (re-)applied on every body-modifying tool call, persists until a human explicitly clears it, and is skipped when the page already carries an equivalent badge — so normal agent workflows do not spam the version history.
@@ -479,8 +481,8 @@ The realistic abuse case is a shared install where an admin pushes a malicious d
 16. `markPageUnverified` calls `setContentState` when current state is `null`.
 17. `markPageUnverified` calls `setContentState` when current state is a *different* (non-unverified) name.
 18. `markPageUnverified` does **not** call `setContentState` when current state is a different locale's unverified label (idempotency across locales).
-19. `markPageUnverified` swallows `setContentState` errors and logs a warning; does not throw.
-20. `markPageUnverified` swallows `getContentState` errors and falls through to `setContentState` (fail-open toward applying the badge).
+19. `markPageUnverified` catches `setContentState` errors and returns `{ warning }`; does not throw.
+20. `markPageUnverified` catches `getContentState` errors and falls through to `setContentState` (fail-open toward applying the badge).
 21. `CONFLUENCE_UNVERIFIED_STATUS=false` env var overrides a profile default of `true`.
 22. `CONFLUENCE_UNVERIFIED_STATUS_LOCALE=de` env var selects the German label.
 23. Module-load assertion throws if any label in `UNVERIFIED_LABELS` exceeds 20 code points.

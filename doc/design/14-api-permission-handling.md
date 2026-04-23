@@ -182,6 +182,8 @@ Three levels of investment. V1 commits to Level 1.
 
 ### Level 1 — Ship in v1
 
+> **Status: shipped in v6.1.0.** The implementation follows this design. Sections below describe the target behaviour; the `What Breaks` discussion above describes the pre-6.1.0 state.
+
 #### 1a. Error subclasses
 
 Add to `src/server/confluence-client.ts`:
