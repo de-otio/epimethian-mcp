@@ -45,11 +45,15 @@ import {
   deleteInlineComment,
   type CommentData,
   ConfluenceApiError,
+  ConfluenceAuthError,
+  ConfluencePermissionError,
+  ConfluenceNotFoundError,
   getPageVersions,
   getPageVersionBody,
   searchUsers,
   searchPagesByTitle,
   setClientLabel,
+  ensureAttributionLabel,
   ProfileNotConfiguredError,
 } from "./confluence-client.js";
 import {
@@ -61,6 +65,7 @@ import { ConverterError } from "./converter/types.js";
 import { fenceUntrusted } from "./converter/untrusted-fence.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
+import { markPageUnverified } from "./provenance.js";
 import { safePrepareBody, safeSubmitPage } from "./safe-write.js";
 import {
   listDestructiveFlagsSet,
@@ -72,6 +77,7 @@ import { gateOperation } from "./elicitation.js";
 import { resolveToolFilter } from "./tool-allowlist.js";
 import { getProfileSettings } from "../shared/profiles.js";
 import { assertSpaceAllowed } from "./space-allowlist.js";
+import { buildCheckPermissionsPayload } from "./check-permissions.js";
 import {
   checkForUpdates,
   getPendingUpdate,
@@ -198,7 +204,30 @@ type ToolResult = {
   isError?: boolean;
 };
 
+/**
+ * O2: Tracks whether we are in read-only mode for the one-time first-response note.
+ * Set to true by registerTools() when effectivePosture === "read-only".
+ */
+let _sessionIsReadOnly = false;
+
+/**
+ * O2: Tracks whether the one-time read-only note has been emitted in this session.
+ */
+let _readOnlyNoteEmitted = false;
+
+/** Exported for testing: reset the one-time note flags between test runs. */
+export function _resetReadOnlyNoteForTest(): void {
+  _readOnlyNoteEmitted = false;
+  _sessionIsReadOnly = false;
+}
+
 function toolResult(text: string): ToolResult {
+  if (_sessionIsReadOnly && !_readOnlyNoteEmitted) {
+    _readOnlyNoteEmitted = true;
+    const note =
+      "[epimethian-mcp] This profile is read-only; write tools are not exposed.";
+    return { content: [{ type: "text", text: `${note}\n\n${text}` }] };
+  }
   return { content: [{ type: "text", text }] };
 }
 
@@ -206,6 +235,69 @@ function toolError(err: unknown): ToolResult {
   const raw = err instanceof Error ? err.message : String(err);
   const message = sanitizeError(raw);
   return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
+}
+
+/** Context passed to toolErrorWithContext to enable remediation-oriented messages. */
+interface ErrCtx {
+  operation: string;
+  resource?: string;
+  /** The active profile name, for auth-error messages. */
+  profile?: string | null;
+}
+
+/**
+ * Like toolError, but maps Confluence-specific error subclasses (F1) to
+ * actionable remediation messages before falling back to the generic format.
+ */
+export function toolErrorWithContext(err: unknown, ctx: ErrCtx): ToolResult {
+  if (err instanceof ConfluenceAuthError) {
+    const profileName = ctx.profile ?? "<profile>";
+    return {
+      content: [{
+        type: "text",
+        text: `Error: Your Confluence API token is invalid or expired. Reauthenticate with 'epimethian-mcp login ${profileName}'.`,
+      }],
+      isError: true,
+    };
+  }
+  if (err instanceof ConfluencePermissionError) {
+    const resourcePart = ctx.resource ? ` on ${ctx.resource}` : "";
+    return {
+      content: [{
+        type: "text",
+        text: `Error: Your token lacks permission for ${ctx.operation}${resourcePart}. The operation was not performed.`,
+      }],
+      isError: true,
+    };
+  }
+  if (err instanceof ConfluenceNotFoundError) {
+    return {
+      content: [{
+        type: "text",
+        text: `Error: Resource not found. Confluence may return 'not found' when a token lacks permission to see the resource — verify the token has at least read access.`,
+      }],
+      isError: true,
+    };
+  }
+  return toolError(err);
+}
+
+// --- Warning accumulator (Track G) ---
+
+/**
+ * Collects non-fatal warning strings to be appended to a tool response.
+ * Used by Track G (ensureAttributionLabel) and Track P2 (markPageUnverified).
+ */
+export type WarningAccumulator = string[];
+
+/**
+ * Append warnings to a primary response string. If there are no warnings the
+ * primary string is returned unchanged. Otherwise each warning is formatted
+ * with a ⚠ prefix and appended after a blank line.
+ */
+export function appendWarnings(primary: string, warnings: WarningAccumulator): string {
+  if (warnings.length === 0) return primary;
+  return primary + "\n\n" + warnings.map(w => `⚠ ${w}`).join("\n");
 }
 
 // --- Tenant echo ---
@@ -250,6 +342,30 @@ const READ_ONLY_TOOLS = new Set([
   "upgrade",
   "lookup_user",
   "resolve_page_link",
+]);
+
+/**
+ * O2: The set of write tools that are only registered when effectivePosture === "read-write".
+ * This complements READ_ONLY_TOOLS — the registration-time gate (O2) is the primary
+ * enforcement; writeGuard remains a belt-and-suspenders runtime check.
+ */
+export const WRITE_TOOLS = new Set([
+  "create_page",
+  "update_page",
+  "append_to_page",
+  "prepend_to_page",
+  "update_page_section",
+  "delete_page",
+  "add_drawio_diagram",
+  "revert_page",
+  "add_attachment",
+  "add_label",
+  "remove_label",
+  "create_comment",
+  "delete_comment",
+  "resolve_comment",
+  "set_page_status",
+  "remove_page_status",
 ]);
 
 export function writeGuard(toolName: string, config: Config): ToolResult | null {
@@ -349,29 +465,42 @@ function formatComments(
 }
 
 function formatCommentThreads(
-  footer: { comment: CommentData; replies: CommentData[] }[],
-  inline: { comment: CommentData; replies: CommentData[] }[],
-  pageId: string
+  footer: Array<{ comment: CommentData; replies?: CommentData[]; error?: string }>,
+  inline: Array<{ comment: CommentData; replies?: CommentData[]; error?: string }>,
+  pageId: string,
+  failedFetches: number = 0,
+  totalFetches: number = 0
 ): string {
   const lines: string[] = [`Comments on page ${pageId}:`, ""];
   if (footer.length > 0) {
     lines.push(`Footer comments (${footer.length}):`);
-    footer.forEach(({ comment, replies }) => {
+    footer.forEach(({ comment, replies, error }) => {
       lines.push(formatCommentLine(comment));
-      replies.forEach((r) => lines.push(formatCommentLine(r, "  ")));
+      if (error) {
+        lines.push(`  Error fetching replies: ${error}`);
+      } else if (replies) {
+        replies.forEach((r) => lines.push(formatCommentLine(r, "  ")));
+      }
     });
     lines.push("");
   }
   if (inline.length > 0) {
     lines.push(`Inline comments (${inline.length}):`);
-    inline.forEach(({ comment, replies }) => {
+    inline.forEach(({ comment, replies, error }) => {
       lines.push(formatCommentLine(comment));
-      replies.forEach((r) => lines.push(formatCommentLine(r, "  ")));
+      if (error) {
+        lines.push(`  Error fetching replies: ${error}`);
+      } else if (replies) {
+        replies.forEach((r) => lines.push(formatCommentLine(r, "  ")));
+      }
     });
     lines.push("");
   }
   if (footer.length === 0 && inline.length === 0) {
     lines.push("No comments found.");
+  }
+  if (failedFetches > 0 && totalFetches > 0) {
+    lines.push(`Note: ${failedFetches} of ${totalFetches} reply fetches failed — partial results shown.`);
   }
   return lines.join("\n");
 }
@@ -393,14 +522,41 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
   const checkSpaceAllowed = (opts: { spaceKey?: string; pageId?: string }) =>
     assertSpaceAllowed({ spaces: allowedSpaces, ...opts });
 
-  // Wrap registerTool so subsequent calls transparently honour the
-  // allowlist. A single shim is vastly less error-prone than adding a
-  // guard to each of the ~34 registration sites.
+  // O2: resolve effective posture and emit the startup mode banner.
+  // effectivePosture is populated by validateStartup() before registerTools() is called.
+  const effectivePosture = config.effectivePosture ?? "read-write";
+  const isReadOnly = effectivePosture === "read-only";
+  const profileLabel = config.profile ? `"${config.profile}"` : `"env-var"`;
+  const sourceLabel = config.postureSource ?? "default";
+
+  if (isReadOnly) {
+    console.error(
+      `[epimethian-mcp] Profile ${profileLabel} — mode: read-only (${sourceLabel}).` +
+        `\n  Write tools are not exposed. Set posture: "read-write" in the profile to enable writes.`
+    );
+  } else {
+    console.error(
+      `[epimethian-mcp] Profile ${profileLabel} — mode: read-write (${sourceLabel}).`
+    );
+  }
+
+  // O2: Set the module-level read-only flag so the first tool response includes a note.
+  _sessionIsReadOnly = isReadOnly;
+  _readOnlyNoteEmitted = false;
+
+  // Wrap registerTool so subsequent calls transparently honour:
+  // 1. The per-profile tool allowlist/denylist (F2).
+  // 2. The effective posture gate: write tools are not registered in read-only mode (O2).
+  // A single shim is vastly less error-prone than adding guards to each registration site.
   const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = function (name: string, ...rest: unknown[]) {
     if (!isToolEnabled(name)) {
       // Intentionally quiet at registration time — the profile's CLI
       // tooling surfaces the effective set. Agents never see the tool.
+      return server;
+    }
+    // O2: Gate write tools on effectivePosture. writeGuard remains as belt-and-suspenders.
+    if (isReadOnly && WRITE_TOOLS.has(name)) {
       return server;
     }
     return (originalRegisterTool as any)(name, ...rest);
@@ -557,9 +713,15 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           clientLabel: getClientLabel(server),
         });
 
-        return toolResult((await formatPage(submitted.page, false)) + echo);
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(submitted.page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(submitted.page.id, cfg);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+
+        return toolResult(appendWarnings((await formatPage(submitted.page, false)), warnings) + echo);
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "create_page", resource: `space ${space_key}`, profile: config.profile });
       }
     }
   );
@@ -836,9 +998,16 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         });
 
         const isTitleOnly = prepared.finalStorage === undefined;
+
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(submitted.page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(submitted.page.id, cfg);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+
         if (isTitleOnly) {
           return toolResult(
-            `Updated: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, title only, body unchanged)` + echo
+            appendWarnings(`Updated: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, title only, body unchanged)`, warnings) + echo
           );
         }
         const removalNote =
@@ -846,10 +1015,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`
             : "";
         return toolResult(
-          `Updated: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, body: ${submitted.oldLen}\u2192${submitted.newLen} chars${removalNote})` + echo
+          appendWarnings(`Updated: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, body: ${submitted.oldLen}\u2192${submitted.newLen} chars${removalNote})`, warnings) + echo
         );
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "update_page", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -939,7 +1108,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         return toolResult(`Deleted page ${page_id}` + echo);
       } catch (err) {
         logMutation(errorRecord("delete_page", page_id, err));
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "delete_page", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -1035,15 +1204,21 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           clientLabel: getClientLabel(server),
         });
 
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(submitted.page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(submitted.page.id, cfg);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+
         const removalNote =
           submitted.deletedTokens.length > 0
             ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`
             : "";
         return toolResult(
-          `Updated section "${section}" in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}${removalNote})` + echo
+          appendWarnings(`Updated section "${section}" in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}${removalNote})`, warnings) + echo
         );
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "update_page_section", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -1084,9 +1259,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           { separator, versionMessage: version_message ?? "Prepend content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url },
         );
         // Mutation logging is handled inside safeSubmitPage (via concatPageContent).
-        return toolResult(`Prepended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)` + echo);
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(page.id, cfg);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+        return toolResult(appendWarnings(`Prepended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)`, warnings) + echo);
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "prepend_to_page", resource: `page ${page_id}`, profile: config.profile });
       }
     },
   );
@@ -1127,9 +1307,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           { separator, versionMessage: version_message ?? "Append content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url },
         );
         // Mutation logging is handled inside safeSubmitPage (via concatPageContent).
-        return toolResult(`Appended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)` + echo);
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(page.id, cfg);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+        return toolResult(appendWarnings(`Appended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)`, warnings) + echo);
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "append_to_page", resource: `page ${page_id}`, profile: config.profile });
       }
     },
   );
@@ -1277,6 +1462,27 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           lines.push(`- ${s.name} (key: ${s.key}, type: ${s.type})`);
         }
         return toolResult(lines.join("\n"));
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  // check_permissions — O3: always registered regardless of posture
+  server.registerTool(
+    "check_permissions",
+    {
+      description:
+        "Report the current profile's MCP access mode and the token's capabilities. " +
+        "Always available in every posture.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      try {
+        const cfg = await getConfig();
+        const payload = buildCheckPermissionsPayload(cfg);
+        return toolResult(JSON.stringify(payload, null, 2));
       } catch (err) {
         return toolError(err);
       }
@@ -1447,7 +1653,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           `Attached: ${att.title} (ID: ${att.id}, size: ${att.fileSize ?? "unknown"} bytes) to page ${page_id}` + echo
         );
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "add_attachment", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -1562,11 +1768,17 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           operation: "add_drawio_diagram",
         });
 
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(submitted.page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(submitted.page.id, config);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+
         return toolResult(
-          `Diagram "${filename}" added to page ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion})` + echo
+          appendWarnings(`Diagram "${filename}" added to page ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion})`, warnings) + echo
         );
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "add_drawio_diagram", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -1663,7 +1875,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         await addLabels(page_id, labels);
         return toolResult(`Added ${labels.length} label(s) to page ${page_id}: ${labels.join(", ")}` + echo);
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "add_label", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -1691,7 +1903,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         await removeLabel(page_id, label);
         return toolResult(`Removed label "${label}" from page ${page_id}` + echo);
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "remove_label", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -1785,7 +1997,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         await setContentState(page_id, name, color);
         return toolResult(`Set status on page ${page_id}: "${name}" (${color})` + echo);
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "set_page_status", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -1814,7 +2026,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         await removeContentState(page_id);
         return toolResult(`Removed status from page ${page_id}` + echo);
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "remove_page_status", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -1853,17 +2065,45 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         ]);
 
         if (include_replies) {
-          const [fr, ir] = await Promise.all([
-            Promise.all(footerComments.map(async (c) => ({
+          // Fetch replies using allSettled to capture per-comment errors
+          const footerRepliesResults = await Promise.allSettled(
+            footerComments.map((c) => getCommentReplies(c.id, "footer"))
+          );
+          const inlineRepliesResults = await Promise.allSettled(
+            inlineComments.map((c) => getCommentReplies(c.id, "inline"))
+          );
+
+          // Assemble per-comment results with success/error shape
+          const fr = footerComments.map((c, i) => {
+            const result = footerRepliesResults[i];
+            return {
               comment: c,
-              replies: await getCommentReplies(c.id, "footer"),
-            }))),
-            Promise.all(inlineComments.map(async (c) => ({
+              ...(result.status === "fulfilled"
+                ? { replies: result.value }
+                : { error: result.reason instanceof Error ? result.reason.message : String(result.reason) }),
+            };
+          });
+
+          const ir = inlineComments.map((c, i) => {
+            const result = inlineRepliesResults[i];
+            return {
               comment: c,
-              replies: await getCommentReplies(c.id, "inline"),
-            }))),
-          ]);
-          return toolResult(formatCommentThreads(fr, ir, page_id));
+              ...(result.status === "fulfilled"
+                ? { replies: result.value }
+                : { error: result.reason instanceof Error ? result.reason.message : String(result.reason) }),
+            };
+          });
+
+          // Count failures for the note
+          const totalFetches = footerRepliesResults.length + inlineRepliesResults.length;
+          const failedFetches = [
+            ...footerRepliesResults,
+            ...inlineRepliesResults,
+          ].filter((r) => r.status === "rejected").length;
+
+          return toolResult(
+            formatCommentThreads(fr, ir, page_id, failedFetches, totalFetches)
+          );
         }
 
         return toolResult(formatComments(footerComments, inlineComments, page_id));
@@ -1941,7 +2181,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           `Created ${type} comment ${comment.id} on page ${page_id}` + echo
         );
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "create_comment", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );
@@ -1979,7 +2219,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           `Comment ${comment_id} ${state} (version: ${comment.version?.number ?? "??"})` + echo
         );
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "resolve_comment", resource: `comment ${comment_id}`, profile: config.profile });
       }
     }
   );
@@ -2017,7 +2257,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         }
         return toolResult(`Deleted ${type} comment ${comment_id}` + echo);
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "delete_comment", resource: `comment ${comment_id}`, profile: config.profile });
       }
     }
   );
@@ -2397,13 +2637,21 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           source: effectiveSource,
         });
 
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(submitted.page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(submitted.page.id, config);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+
         return toolResult(
-          `Reverted: ${submitted.page.title} (ID: ${submitted.page.id}, v${target_version}\u2192v${submitted.newVersion}, ` +
-            `body: ${submitted.oldLen}\u2192${submitted.newLen} chars)` +
-            echo
+          appendWarnings(
+            `Reverted: ${submitted.page.title} (ID: ${submitted.page.id}, v${target_version}\u2192v${submitted.newVersion}, ` +
+              `body: ${submitted.oldLen}\u2192${submitted.newLen} chars)`,
+            warnings
+          ) + echo
         );
       } catch (err) {
-        return toolError(err);
+        return toolErrorWithContext(err, { operation: "revert_page", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );

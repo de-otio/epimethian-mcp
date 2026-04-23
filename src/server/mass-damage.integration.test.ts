@@ -85,6 +85,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
       jsonHeaders: {},
     }),
     validateStartup: vi.fn().mockResolvedValue(undefined),
+    ensureAttributionLabel: vi.fn().mockResolvedValue({}),
     ConfluenceConflictError,
   };
 });

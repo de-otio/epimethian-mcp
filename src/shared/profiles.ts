@@ -84,8 +84,34 @@ async function ensureConfigDir(): Promise<void> {
 // --- Registry types ---
 
 export interface ProfileSettings {
+  /**
+   * @deprecated Use `posture` instead. Retained as a legacy alias:
+   *   readOnly: true  → posture: "read-only"
+   *   readOnly: false → posture: "read-write"
+   * An explicitly-set `posture` wins over `readOnly`.
+   */
   readOnly?: boolean;
+  /**
+   * Tri-state MCP access posture (design doc #14). Independent of the API
+   * token's underlying capability — a user can pin the server to read-only
+   * even when the token grants writes.
+   *   "read-only"  → write tools not registered
+   *   "read-write" → write tools registered
+   *   "detect"     → startup probe infers from the token
+   */
+  posture?: "read-only" | "read-write" | "detect";
   attribution?: boolean;
+  /**
+   * Design doc #13 — default "AI-edited" status badge on pages the MCP
+   * creates or edits. Defaults to true; set false to disable.
+   */
+  unverifiedStatus?: boolean;
+  /** Optional override of the BCP-47 locale used for the badge label. */
+  unverifiedStatusLocale?: string;
+  /** Optional override of the badge label. Bypasses the locale table; must be ≤20 chars. */
+  unverifiedStatusName?: string;
+  /** Optional override of the badge color. Must be one of Confluence's 5 palette values. */
+  unverifiedStatusColor?: "#FFC400" | "#2684FF" | "#57D9A3" | "#FF7452" | "#8777D9";
   /**
    * Track F2: per-tool allowlist. When set, only listed tools are
    * registered with the MCP server on startup. Names are validated

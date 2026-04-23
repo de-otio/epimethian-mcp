@@ -12,6 +12,12 @@ import { fenceUntrusted } from "./converter/untrusted-fence.js";
 
 declare const __PKG_VERSION__: string;
 import { pageCache } from "./page-cache.js";
+import {
+  resolvePosture,
+  resolveEffectivePosture,
+  resolveUnverifiedStatusFlag,
+  resolveUnverifiedStatusLocale,
+} from "./config.js";
 
 // --- Client label (set once from index.ts after MCP initialize handshake) ---
 
@@ -38,8 +44,32 @@ export interface Config {
   url: string;
   email: string;
   profile: string | null;
+  /**
+   * Legacy boolean read-only flag derived from `posture`. `true` iff
+   * `posture === "read-only"`. Kept populated so existing `writeGuard`
+   * call sites continue to work; prefer `posture` for new code.
+   */
   readOnly: boolean;
+  /**
+   * Configured MCP access posture from design doc #14 (tri-state).
+   * "detect" is resolved to a concrete "read-only" | "read-write" by the
+   * startup probe in Track O1; until that ships, callers should treat
+   * "detect" as "read-write" to preserve current behavior.
+   *
+   * Optional on the type so that pre-existing test fixtures that construct
+   * Config literals continue to compile; the runtime value is always
+   * populated by `getConfig()`.
+   */
+  posture?: "read-only" | "read-write" | "detect";
   attribution: boolean;
+  /** Design doc #13 — default "AI-edited" status badge toggle. Optional for the same reason as posture. */
+  unverifiedStatus?: boolean;
+  /** Optional locale override for the badge label. */
+  unverifiedStatusLocale?: string;
+  /** Optional full-label override (bypasses locale table). */
+  unverifiedStatusName?: string;
+  /** Optional color override. */
+  unverifiedStatusColor?: "#FFC400" | "#2684FF" | "#57D9A3" | "#FF7452" | "#8777D9";
   apiV2: string;
   apiV1: string;
   authHeader: string;
@@ -48,6 +78,25 @@ export interface Config {
   sealedCloudId?: string;
   /** Tenant seal: display name stored alongside the cloudId, used for human-readable error messages. */
   sealedDisplayName?: string;
+  /**
+   * Effective posture after resolving configured tri-state + probe result.
+   * Populated by validateStartup() — always set at runtime after startup.
+   * Optional on the type so pre-existing test fixtures that construct Config
+   * literals continue to compile (same pattern as `posture?`).
+   */
+  effectivePosture?: "read-only" | "read-write";
+  /**
+   * Raw result from the write-capability probe. null when posture is not "detect"
+   * (probe is skipped). Populated by validateStartup().
+   * Optional for the same reason as effectivePosture.
+   */
+  probedCapability?: "write" | "read-only" | "inconclusive" | null;
+  /**
+   * How effectivePosture was determined: user config, probe result, or default.
+   * Populated by validateStartup().
+   * Optional for the same reason as effectivePosture.
+   */
+  postureSource?: "profile" | "probe" | "default";
 }
 
 let _config: Config | null = null;
@@ -151,17 +200,25 @@ export async function getConfig(): Promise<Config> {
   const { url, email, apiToken, profile, sealedCloudId, sealedDisplayName } =
     await resolveCredentials();
 
-  // Resolve read-only flag: strict-mode OR — either source saying read-only wins.
-  // CONFLUENCE_READ_ONLY=false does NOT override a registry-level read-only flag.
+  // Resolve configuration from profile registry and environment.
   const registrySettings = profile ? await getProfileSettings(profile) : undefined;
-  const readOnly =
-    (registrySettings?.readOnly === true) ||
-    (process.env.CONFLUENCE_READ_ONLY === "true");
 
-  // Resolve attribution flag: disabled if registry or env var says so.
+  // Posture (design doc #14): tri-state with legacy readOnly alias.
+  // Until Track O1's startup probe ships, "detect" is treated as "read-write"
+  // to preserve existing behavior. The legacy readOnly boolean is derived.
+  const posture = resolvePosture(registrySettings);
+  const readOnly = posture === "read-only";
+
+  // Attribution flag: disabled if registry or env var says so.
   const attribution =
     (registrySettings?.attribution !== false) &&
     (process.env.CONFLUENCE_ATTRIBUTION !== "false");
+
+  // Unverified-status badge (design doc #13).
+  const unverifiedStatus = resolveUnverifiedStatusFlag(registrySettings);
+  const unverifiedStatusLocale = resolveUnverifiedStatusLocale(registrySettings);
+  const unverifiedStatusName = registrySettings?.unverifiedStatusName;
+  const unverifiedStatusColor = registrySettings?.unverifiedStatusColor;
 
   // Confluence exposes two API generations:
   //   - v2 (REST): /wiki/api/v2  — used for page CRUD, spaces, children
@@ -182,15 +239,117 @@ export async function getConfig(): Promise<Config> {
     email,
     profile,
     readOnly,
+    posture,
     attribution,
+    unverifiedStatus,
+    unverifiedStatusLocale,
+    unverifiedStatusName,
+    unverifiedStatusColor,
     apiV2: `${url}/wiki/api/v2`,
     apiV1: `${url}/wiki/rest/api`,
     authHeader,
     jsonHeaders,
     sealedCloudId,
     sealedDisplayName,
+    // Placeholders — overwritten by validateStartup() once the probe runs.
+    // Until then, treat as read-write to preserve existing behavior.
+    effectivePosture: (posture === "read-only" ? "read-only" : "read-write") as "read-only" | "read-write",
+    probedCapability: null as "write" | "read-only" | "inconclusive" | null,
+    postureSource: "default" as "profile" | "probe" | "default",
   });
   return _config;
+}
+
+/**
+ * Probe whether the current credentials have write capability.
+ *
+ * Strategy:
+ *  1. Primary: GET /wiki/rest/api/user/current/permission/space/{spaceKey}
+ *     against the first accessible space. A `create` operation on `page`
+ *     content type in the response indicates write capability.
+ *  2. Fallback (when primary returns 404 or no spaces are available):
+ *     PUT /wiki/api/v2/pages/999999999999 with a trivially bad body.
+ *     - 403 → "read-only" (permission denied)
+ *     - 404 / 400 → "write" (token can write; hit a non-existent page or bad body)
+ *     - 401 → rethrown (auth failure, not a capability question)
+ * 3. Any other unexpected error → "inconclusive" (logs a warning).
+ *
+ * Returns one of: "write" | "read-only" | "inconclusive"
+ */
+export async function probeWriteCapability(): Promise<"write" | "read-only" | "inconclusive"> {
+  const cfg = await getConfig();
+
+  // --- Primary strategy: permission endpoint against first accessible space ---
+  try {
+    const spaces = await getSpaces(1);
+    if (spaces.length > 0) {
+      const spaceKey = spaces[0].key;
+      const permUrl = new URL(
+        `${cfg.apiV1}/user/current/permission/space/${encodeURIComponent(spaceKey)}`
+      );
+      permUrl.searchParams.set("operationKey", "create");
+      permUrl.searchParams.set("targetType", "page");
+
+      try {
+        const res = await confluenceRequest(permUrl.toString());
+        const raw = (await res.json()) as unknown;
+        // The response is typically { operation: { operation: "create", targetType: "page" }, havePermission: boolean }
+        // When operationKey+targetType are specified, Confluence returns a single permission object.
+        if (raw && typeof raw === "object") {
+          const obj = raw as Record<string, unknown>;
+          if (obj.havePermission === true) return "write";
+          if (obj.havePermission === false) return "read-only";
+          // Older Cloud returns an array of permitted operations — look for "create" on "page"
+          if (Array.isArray(obj.permissions)) {
+            const perms = obj.permissions as Array<Record<string, unknown>>;
+            const hasCreate = perms.some((p) => {
+              const op = p.operation as Record<string, unknown> | undefined;
+              return op?.operation === "create" && op?.targetType === "page";
+            });
+            return hasCreate ? "write" : "read-only";
+          }
+        }
+        // Unexpected shape — fall through to dry-run
+      } catch (permErr) {
+        if (permErr instanceof ConfluenceAuthError) throw permErr;
+        if (permErr instanceof ConfluenceNotFoundError) {
+          // Endpoint not available — fall through to dry-run
+        } else if (permErr instanceof ConfluencePermissionError) {
+          return "read-only";
+        }
+        // Any other error from permission endpoint — try dry-run
+      }
+    }
+  } catch (spacesErr) {
+    if (spacesErr instanceof ConfluenceAuthError) throw spacesErr;
+    // Cannot list spaces — fall through to dry-run
+  }
+
+  // --- Fallback strategy: dry-run PUT against a non-existent page ---
+  try {
+    await confluenceRequest(`${cfg.apiV2}/pages/999999999999`, {
+      method: "PUT",
+      body: JSON.stringify({}),
+    });
+    // 2xx would be very surprising, but if it happens the token can write
+    return "write";
+  } catch (err) {
+    if (err instanceof ConfluenceAuthError) throw err;
+    if (err instanceof ConfluencePermissionError) return "read-only";
+    // 404 (page not found) or any 400-class body-validation error = token can write
+    if (err instanceof ConfluenceNotFoundError) return "write";
+    if (err instanceof ConfluenceApiError && err.status >= 400 && err.status < 500) {
+      // 400 Bad Request = body rejected by schema, but token had permission to attempt the write
+      return "write";
+    }
+    // Unexpected / network error
+    console.error(
+      `epimethian-mcp: warning — write-capability probe failed with unexpected error: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    return "inconclusive";
+  }
 }
 
 /**
@@ -199,7 +358,8 @@ export async function getConfig(): Promise<Config> {
  * 2. Verify tenant identity (email matches)
  * 3. Tenant seal: verify cloudId matches the one sealed at setup time.
  *    Opportunistically seal pre-5.5 profiles on first startup after upgrade.
- * 4. Log connection info to stderr
+ * 4. Capability probe (when posture === "detect") + effective-posture resolution
+ * 5. Log connection info to stderr
  */
 export async function validateStartup(config: Config): Promise<void> {
   const { url, email, profile } = config;
@@ -246,13 +406,51 @@ export async function validateStartup(config: Config): Promise<void> {
     await verifyOrSealTenant(config, apiToken);
   }
 
-  // Step 4: Log connection info
+  // Step 4: Capability probe + effective-posture resolution
+  const configuredPosture = config.posture ?? "detect";
+  let probedCapability: "write" | "read-only" | "inconclusive" | null = null;
+
+  if (configuredPosture === "detect") {
+    try {
+      probedCapability = await probeWriteCapability();
+    } catch (err) {
+      // ConfluenceAuthError from the probe means auth already failed in step 1;
+      // shouldn't normally reach here, but treat as inconclusive to avoid masking the auth error.
+      console.error(
+        `epimethian-mcp: warning — write-capability probe threw unexpectedly: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      probedCapability = "inconclusive";
+    }
+  }
+
+  const resolved = resolveEffectivePosture(configuredPosture, probedCapability);
+
+  // Replace the frozen _config with a new frozen object that includes the resolved fields.
+  // This is safe because validateStartup() runs once during startup, before tools are registered.
+  _config = Object.freeze({
+    ..._config!,
+    effectivePosture: resolved.effective,
+    probedCapability,
+    postureSource: resolved.source,
+  });
+
+  // Step 5: Log connection info + posture banner
   const profileLabel = profile ? `profile: ${profile}` : "env-var mode";
   const readOnlyLabel = config.readOnly ? ", READ-ONLY" : "";
   const attributionLabel = config.attribution ? "" : ", NO-ATTRIBUTION";
   console.error(
     `epimethian-mcp: connected to ${url} as ${email} (${profileLabel}${readOnlyLabel}${attributionLabel})`
   );
+
+  const modeLabel = resolved.effective === "read-only" ? "read-only" : "read-write";
+  console.error(
+    `[epimethian-mcp] Profile "${profile ?? "env-var"}" — mode: ${modeLabel} (source: ${resolved.source}).`
+  );
+  if (resolved.warning) {
+    console.error(`[epimethian-mcp] Warning: ${resolved.warning}`);
+  }
 }
 
 /**
@@ -530,6 +728,12 @@ export class ConfluenceApiError extends Error {
   }
 }
 
+export class ConfluenceAuthError extends ConfluenceApiError {}        // 401
+
+export class ConfluencePermissionError extends ConfluenceApiError {}  // 403
+
+export class ConfluenceNotFoundError extends ConfluenceApiError {}    // 404
+
 export class ConfluenceConflictError extends Error {
   constructor(pageId: string) {
     super(
@@ -551,7 +755,16 @@ async function confluenceRequest(
   if (!res.ok) {
     const body = await res.text();
     console.error(`Confluence API error (${res.status}): ${sanitizeError(body)}`);
-    throw new ConfluenceApiError(res.status, body);
+
+    if (res.status === 401) {
+      throw new ConfluenceAuthError(res.status, body);
+    } else if (res.status === 403) {
+      throw new ConfluencePermissionError(res.status, body);
+    } else if (res.status === 404) {
+      throw new ConfluenceNotFoundError(res.status, body);
+    } else {
+      throw new ConfluenceApiError(res.status, body);
+    }
   }
   return res;
 }
@@ -668,11 +881,8 @@ export async function _rawCreatePage(
   // Cache the body we just sent (new pages start at version 1)
   pageCache.set(page.id, page.version?.number ?? 1, pageBody);
 
-  try {
-    await ensureAttributionLabel(page.id);
-  } catch {
-    // Label management is non-critical
-  }
+  // ensureAttributionLabel is now called by the handler via safeSubmitPage's
+  // caller chain so warnings can be surfaced. No call here.
 
   return page;
 }
@@ -760,11 +970,8 @@ export async function _rawUpdatePage(
     pageCache.set(pageId, newVersion, pageBody);
   }
 
-  try {
-    await ensureAttributionLabel(page.id);
-  } catch {
-    // Label management is non-critical
-  }
+  // ensureAttributionLabel is now called by the handler via safeSubmitPage's
+  // caller chain so warnings can be surfaced. No call here.
 
   return { page, newVersion };
 }
@@ -1060,13 +1267,32 @@ const LEGACY_ATTRIBUTION_LABEL = "epimethian-managed";
 
 /**
  * Ensure the page carries the current attribution label and not the legacy one.
- * Best-effort — failures are swallowed since labelling is non-critical.
+ *
+ * Returns `{}` on success, `{ warning }` when the token lacks permission to
+ * manage labels (403 / ConfluencePermissionError), and re-throws on any other
+ * error (e.g. 500 – a genuine infrastructure failure should not be masked).
+ *
+ * Track G: callers collect the warning and surface it through appendWarnings.
  */
-async function ensureAttributionLabel(pageId: string): Promise<void> {
-  await addLabels(pageId, [ATTRIBUTION_LABEL]);
-  const labels = await getLabels(pageId);
-  if (labels.some((l) => l.name === LEGACY_ATTRIBUTION_LABEL)) {
-    await removeLabel(pageId, LEGACY_ATTRIBUTION_LABEL);
+export async function ensureAttributionLabel(
+  pageId: string
+): Promise<{ warning?: string }> {
+  try {
+    await addLabels(pageId, [ATTRIBUTION_LABEL]);
+    const labels = await getLabels(pageId);
+    if (labels.some((l) => l.name === LEGACY_ATTRIBUTION_LABEL)) {
+      await removeLabel(pageId, LEGACY_ATTRIBUTION_LABEL);
+    }
+    return {};
+  } catch (err) {
+    if (err instanceof ConfluencePermissionError) {
+      return {
+        warning:
+          `Could not apply 'epimethian-edited' label (permission denied). ` +
+          `Provenance label is missing for page ${pageId}.`,
+      };
+    }
+    throw err;
   }
 }
 

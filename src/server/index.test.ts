@@ -42,6 +42,17 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
 // Mock the confluence-client so we don't need real HTTP
 vi.mock("./confluence-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./confluence-client.js")>();
+  class ConfluenceApiError extends Error {
+    status: number;
+    constructor(status: number, body: string) {
+      super(`Confluence API error (${status}): ${body.slice(0, 100)}`);
+      this.name = "ConfluenceApiError";
+      this.status = status;
+    }
+  }
+  class ConfluenceAuthError extends ConfluenceApiError {}
+  class ConfluencePermissionError extends ConfluenceApiError {}
+  class ConfluenceNotFoundError extends ConfluenceApiError {}
   class ConfluenceConflictError extends Error {
     constructor(pageId: string) {
       super(`Version conflict: page ${pageId} has been modified since you last read it. Call get_page to fetch the latest version, then retry your update with the new version number.`);
@@ -80,14 +91,11 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     searchUsers: vi.fn(),
     searchPagesByTitle: vi.fn(),
     setClientLabel: vi.fn(),
-    ConfluenceApiError: class ConfluenceApiError extends Error {
-      status: number;
-      constructor(status: number, body: string) {
-        super(`Confluence API error (${status}): ${body.slice(0, 100)}`);
-        this.name = "ConfluenceApiError";
-        this.status = status;
-      }
-    },
+    ensureAttributionLabel: vi.fn().mockResolvedValue({}),
+    ConfluenceApiError,
+    ConfluenceAuthError,
+    ConfluencePermissionError,
+    ConfluenceNotFoundError,
     formatPage: vi.fn().mockReturnValue("formatted page"),
     extractSection: actual.extractSection,
     extractSectionBody: actual.extractSectionBody,
@@ -140,6 +148,11 @@ vi.mock("node:fs/promises", () => ({
   mkdtemp: (...args: unknown[]) => mockMkdtemp(...args),
   rm: (...args: unknown[]) => mockRm(...args),
   realpath: (...args: unknown[]) => mockRealpath(...(args as [string])),
+}));
+
+// Mock provenance module (Track P2)
+vi.mock("./provenance.js", () => ({
+  markPageUnverified: vi.fn().mockResolvedValue({}),
 }));
 
 // We need to dynamically import AFTER mocks are set up
@@ -1741,6 +1754,61 @@ describe("get_comments tool", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("Error: API failure");
+  });
+
+  it("all reply fetches succeed → full replies returned, no note", async () => {
+    const { getFooterComments, getInlineComments, getCommentReplies } = await import("./confluence-client.js");
+    const reply = { id: "456", version: { number: 1, authorId: "user2", createdAt: "2024-01-02T00:00:00Z" }, body: { storage: { value: "<p>Reply</p>" } }, resolutionStatus: "open" };
+    (getFooterComments as any).mockResolvedValueOnce([mockComment]);
+    (getInlineComments as any).mockResolvedValueOnce([mockComment]);
+    (getCommentReplies as any).mockResolvedValueOnce([reply]);
+    (getCommentReplies as any).mockResolvedValueOnce([reply]);
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    const result = await handler({ page_id: "42", type: "all", resolution_status: "all", include_replies: true });
+
+    expect(result.isError).toBeUndefined();
+    const text = result.content[0].text;
+    expect(text).toContain("123"); // comment ID
+    expect(text).toContain("456"); // reply ID
+    expect(text).not.toContain("Note:"); // no partial results note
+    expect(text).not.toContain("Error fetching replies");
+  });
+
+  it("one reply fetch rejects with error → partial result with per-comment error + note", async () => {
+    const { getFooterComments, getInlineComments, getCommentReplies } = await import("./confluence-client.js");
+    const reply = { id: "456", version: { number: 1, authorId: "user2", createdAt: "2024-01-02T00:00:00Z" }, body: { storage: { value: "<p>Reply</p>" } }, resolutionStatus: "open" };
+    (getFooterComments as any).mockResolvedValueOnce([mockComment, mockComment]);
+    (getInlineComments as any).mockResolvedValueOnce([]);
+    (getCommentReplies as any).mockResolvedValueOnce([reply]);
+    (getCommentReplies as any).mockRejectedValueOnce(new Error("Permission denied"));
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    const result = await handler({ page_id: "42", type: "all", resolution_status: "all", include_replies: true });
+
+    expect(result.isError).toBeUndefined();
+    const text = result.content[0].text;
+    expect(text).toContain("123"); // first comment
+    expect(text).toContain("456"); // first reply succeeded
+    expect(text).toContain("Error fetching replies: Permission denied"); // second comment's error
+    expect(text).toContain("Note: 1 of 2 reply fetches failed — partial results shown.");
+  });
+
+  it("all reply fetches reject → each comment shows its error, note flags the full failure count", async () => {
+    const { getFooterComments, getInlineComments, getCommentReplies } = await import("./confluence-client.js");
+    (getFooterComments as any).mockResolvedValueOnce([mockComment, mockComment]);
+    (getInlineComments as any).mockResolvedValueOnce([mockComment]);
+    (getCommentReplies as any).mockRejectedValueOnce(new Error("403"));
+    (getCommentReplies as any).mockRejectedValueOnce(new Error("403"));
+    (getCommentReplies as any).mockRejectedValueOnce(new Error("403"));
+
+    const handler = registeredTools.get("get_comments")!.handler;
+    const result = await handler({ page_id: "42", type: "all", resolution_status: "all", include_replies: true });
+
+    expect(result.isError).toBeUndefined();
+    const text = result.content[0].text;
+    expect(text).toContain("Error fetching replies: 403");
+    expect(text).toContain("Note: 3 of 3 reply fetches failed — partial results shown.");
   });
 });
 
@@ -3558,5 +3626,945 @@ describe("prompt-injection fencing (Track B4)", () => {
     expect(text).toContain("Mallory");
     expect(text).toContain("field=versionNote");
     expect(text).toContain(INJECTION_PAYLOAD);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Track R — Remediation messages (toolErrorWithContext)
+// ---------------------------------------------------------------------------
+
+describe("Track R — toolErrorWithContext remediation messages", () => {
+  let toolErrorWithContext: (
+    err: unknown,
+    ctx: { operation: string; resource?: string; profile?: string | null }
+  ) => { content: { type: "text"; text: string }[]; isError?: boolean };
+
+  beforeAll(async () => {
+    const mod = await import("./index.js");
+    toolErrorWithContext = (mod as any).toolErrorWithContext;
+  });
+
+  it("R1: ConfluenceAuthError yields reauth message (no profile)", async () => {
+    const { ConfluenceAuthError } = await import("./confluence-client.js");
+    const err = new (ConfluenceAuthError as any)(401, "Unauthorized");
+    const result = toolErrorWithContext(err, { operation: "update_page", profile: null });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("API token is invalid or expired");
+    expect(result.content[0].text).toContain("epimethian-mcp login <profile>");
+  });
+
+  it("R1b: ConfluenceAuthError includes profile name when available", async () => {
+    const { ConfluenceAuthError } = await import("./confluence-client.js");
+    const err = new (ConfluenceAuthError as any)(401, "Unauthorized");
+    const result = toolErrorWithContext(err, { operation: "update_page", profile: "my-profile" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("epimethian-mcp login my-profile");
+  });
+
+  it("R2: ConfluencePermissionError yields permission message with operation + resource", async () => {
+    const { ConfluencePermissionError } = await import("./confluence-client.js");
+    const err = new (ConfluencePermissionError as any)(403, "Forbidden");
+    const result = toolErrorWithContext(err, {
+      operation: "update_page",
+      resource: "page 12345",
+      profile: null,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("lacks permission for update_page");
+    expect(result.content[0].text).toContain("on page 12345");
+    expect(result.content[0].text).toContain("The operation was not performed");
+  });
+
+  it("R3: ConfluenceNotFoundError yields visibility-note message", async () => {
+    const { ConfluenceNotFoundError } = await import("./confluence-client.js");
+    const err = new (ConfluenceNotFoundError as any)(404, "Not Found");
+    const result = toolErrorWithContext(err, { operation: "get_page", profile: null });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Resource not found");
+    expect(result.content[0].text).toContain("verify the token has at least read access");
+  });
+
+  it("R4: non-subclass error falls through to generic format", async () => {
+    const result = toolErrorWithContext(new Error("generic failure"), {
+      operation: "update_page",
+      profile: null,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("Error: generic failure");
+  });
+
+  it("R4b: non-Error throwable falls through to generic format", async () => {
+    const result = toolErrorWithContext("plain string error", {
+      operation: "delete_page",
+      profile: null,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("plain string error");
+  });
+
+  it("R5: update_page handler returns permission remediation message on 403", async () => {
+    const { getPage, ConfluencePermissionError } = await import("./confluence-client.js");
+    // getConfig already mocked; make getPage throw a 403
+    (getPage as any).mockRejectedValueOnce(
+      new (ConfluencePermissionError as any)(403, "Forbidden")
+    );
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "42",
+      title: "T",
+      version: 1,
+      body: "new body",
+    });
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text as string;
+    expect(text).toContain("lacks permission for update_page");
+    expect(text).toContain("page 42");
+    expect(text).toContain("The operation was not performed");
+  });
+
+  it("R6: create_page handler returns auth remediation message on 401", async () => {
+    const { resolveSpaceId, ConfluenceAuthError } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockRejectedValueOnce(
+      new (ConfluenceAuthError as any)(401, "Unauthorized")
+    );
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({
+      space_key: "DEV",
+      title: "New Page",
+      body: "content",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("API token is invalid or expired");
+  });
+
+  it("R7: delete_page handler returns not-found remediation message on 404", async () => {
+    const { deletePage, ConfluenceNotFoundError } = await import("./confluence-client.js");
+    (deletePage as any).mockRejectedValueOnce(
+      new (ConfluenceNotFoundError as any)(404, "Not Found")
+    );
+
+    const handler = registeredTools.get("delete_page")!.handler;
+    const result = await handler({ page_id: "99", version: 3 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Resource not found");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Track O2 — Conditional tool registration + read-only startup banner
+// ---------------------------------------------------------------------------
+
+const BASE_CONFIG = {
+  url: "https://test.atlassian.net",
+  email: "user@test.com",
+  profile: "my-profile",
+  readOnly: false,
+  attribution: true,
+  posture: "read-write" as const,
+  apiV2: "https://test.atlassian.net/wiki/api/v2",
+  apiV1: "https://test.atlassian.net/wiki/rest/api",
+  authHeader: "Basic dGVzdA==",
+  jsonHeaders: {},
+};
+
+/**
+ * Spin up a fresh server instance with the given config and return the
+ * registered tool names. The mockRegisterTool spy is reset before each call
+ * so we get only the tools registered in this run.
+ */
+async function spinUpWithPosture(
+  effectivePosture: "read-only" | "read-write",
+  postureSource: "profile" | "probe" | "default" = "profile"
+): Promise<Set<string>> {
+  const { getConfig } = await import("./confluence-client.js");
+  (getConfig as any).mockResolvedValueOnce({
+    ...BASE_CONFIG,
+    readOnly: effectivePosture === "read-only",
+    posture: effectivePosture,
+    effectivePosture,
+    postureSource,
+    probedCapability: null,
+  });
+
+  mockRegisterTool.mockClear();
+
+  const { main, _resetReadOnlyNoteForTest } = await import("./index.js");
+  _resetReadOnlyNoteForTest();
+  await main();
+
+  const names = new Set<string>();
+  for (const call of mockRegisterTool.mock.calls) {
+    names.add(call[0] as string);
+  }
+  return names;
+}
+
+describe("Track O2 — Conditional tool registration", () => {
+  it("O2-1: read-only mode → write tools are NOT registered", async () => {
+    const tools = await spinUpWithPosture("read-only");
+    const writeTool = "create_page";
+    expect(tools.has(writeTool)).toBe(false);
+    // Spot-check several other write tools too
+    expect(tools.has("update_page")).toBe(false);
+    expect(tools.has("delete_page")).toBe(false);
+    expect(tools.has("append_to_page")).toBe(false);
+    expect(tools.has("prepend_to_page")).toBe(false);
+    expect(tools.has("update_page_section")).toBe(false);
+    expect(tools.has("add_drawio_diagram")).toBe(false);
+    expect(tools.has("revert_page")).toBe(false);
+    expect(tools.has("add_attachment")).toBe(false);
+    expect(tools.has("add_label")).toBe(false);
+    expect(tools.has("remove_label")).toBe(false);
+    expect(tools.has("create_comment")).toBe(false);
+    expect(tools.has("delete_comment")).toBe(false);
+    expect(tools.has("resolve_comment")).toBe(false);
+    expect(tools.has("set_page_status")).toBe(false);
+    expect(tools.has("remove_page_status")).toBe(false);
+  });
+
+  it("O2-2: read-only mode → read tools ARE registered", async () => {
+    const tools = await spinUpWithPosture("read-only");
+    expect(tools.has("get_page")).toBe(true);
+    expect(tools.has("search_pages")).toBe(true);
+    expect(tools.has("list_pages")).toBe(true);
+    expect(tools.has("get_spaces")).toBe(true);
+    expect(tools.has("get_comments")).toBe(true);
+    expect(tools.has("get_attachments")).toBe(true);
+    expect(tools.has("get_labels")).toBe(true);
+    expect(tools.has("get_page_status")).toBe(true);
+    expect(tools.has("get_page_versions")).toBe(true);
+    expect(tools.has("diff_page_versions")).toBe(true);
+    expect(tools.has("lookup_user")).toBe(true);
+    expect(tools.has("resolve_page_link")).toBe(true);
+  });
+
+  it("O2-3: read-write mode → all expected tools are registered", async () => {
+    const tools = await spinUpWithPosture("read-write");
+    const expectedWriteTools = [
+      "create_page", "update_page", "delete_page", "update_page_section",
+      "prepend_to_page", "append_to_page", "add_attachment", "add_drawio_diagram",
+      "add_label", "remove_label", "set_page_status", "remove_page_status",
+      "create_comment", "resolve_comment", "delete_comment", "revert_page",
+    ];
+    for (const tool of expectedWriteTools) {
+      expect(tools.has(tool), `write tool "${tool}" should be registered in read-write mode`).toBe(true);
+    }
+    // read tools also present
+    expect(tools.has("get_page")).toBe(true);
+    expect(tools.has("search_pages")).toBe(true);
+  });
+
+  it("O2-4: startup log contains mode and source in read-only mode", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await spinUpWithPosture("read-only", "profile");
+      const calls = consoleSpy.mock.calls.map((c) => c.join(" "));
+      const modeLine = calls.find((l) => l.includes("[epimethian-mcp]") && l.includes("mode:"));
+      expect(modeLine).toBeDefined();
+      expect(modeLine).toContain("read-only");
+      expect(modeLine).toContain("profile");
+      expect(modeLine).toContain("Write tools are not exposed");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  it("O2-4b: startup log contains mode and source in read-write mode", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await spinUpWithPosture("read-write", "probe");
+      const calls = consoleSpy.mock.calls.map((c) => c.join(" "));
+      const modeLine = calls.find((l) => l.includes("[epimethian-mcp]") && l.includes("mode:"));
+      expect(modeLine).toBeDefined();
+      expect(modeLine).toContain("read-write");
+      expect(modeLine).toContain("probe");
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  it("O2-5: one-time note appears in the first tool response in read-only mode", async () => {
+    // Set up a fresh read-only server run with a get_page handler
+    const { getConfig, getPage, formatPage } = await import("./confluence-client.js");
+    (getConfig as any).mockResolvedValueOnce({
+      ...BASE_CONFIG,
+      readOnly: true,
+      posture: "read-only",
+      effectivePosture: "read-only",
+      postureSource: "profile",
+      probedCapability: null,
+    });
+    mockRegisterTool.mockClear();
+
+    const { main, _resetReadOnlyNoteForTest } = await import("./index.js");
+    _resetReadOnlyNoteForTest();
+    await main();
+
+    // Collect the newly registered tools
+    const localTools = new Map<string, Function>();
+    for (const call of mockRegisterTool.mock.calls) {
+      const [name, , handler] = call;
+      if (handler) localTools.set(name as string, handler as Function);
+    }
+
+    (getPage as any).mockResolvedValueOnce({ id: "1", title: "T" });
+    (formatPage as any).mockReturnValueOnce("Title: T");
+    const handler = localTools.get("get_page")!;
+    const firstResult = await handler({ page_id: "1", include_body: false });
+    expect(firstResult.content[0].text).toContain(
+      "[epimethian-mcp] This profile is read-only; write tools are not exposed."
+    );
+  });
+
+  it("O2-5b: one-time note does NOT appear in subsequent tool responses", async () => {
+    // The previous test already set _readOnlyNoteEmitted to true.
+    // Call get_page handler again (without resetting the flag).
+    const { getPage, formatPage } = await import("./confluence-client.js");
+
+    // Collect handlers from existing mockRegisterTool calls after the read-only run
+    const localTools = new Map<string, Function>();
+    for (const call of mockRegisterTool.mock.calls) {
+      const [name, , handler] = call;
+      if (handler) localTools.set(name as string, handler as Function);
+    }
+
+    (getPage as any).mockResolvedValueOnce({ id: "2", title: "S" });
+    (formatPage as any).mockReturnValueOnce("Title: S");
+    const handler = localTools.get("get_page")!;
+    const secondResult = await handler({ page_id: "2", include_body: false });
+    expect(secondResult.content[0].text).not.toContain(
+      "[epimethian-mcp] This profile is read-only"
+    );
+  });
+
+  it("O2-6: writeGuard still blocks write tools when called directly (regression)", async () => {
+    const { writeGuard } = await import("./index.js");
+    const readOnlyConfig = {
+      ...BASE_CONFIG,
+      readOnly: true,
+      effectivePosture: "read-only" as const,
+    };
+    // All write tools should be blocked
+    for (const tool of ["create_page", "update_page", "delete_page", "add_label"]) {
+      const result = writeGuard(tool, readOnlyConfig);
+      expect(result, `writeGuard should block ${tool}`).not.toBeNull();
+      expect(result!.isError).toBe(true);
+      expect(result!.content[0].text).toContain("Write blocked");
+    }
+    // Read tools should NOT be blocked
+    for (const tool of ["get_page", "search_pages", "get_comments"]) {
+      const result = writeGuard(tool, readOnlyConfig);
+      expect(result, `writeGuard should allow ${tool}`).toBeNull();
+    }
+  });
+
+  it("O2-7: WRITE_TOOLS set contains exactly the 16 expected write tools", async () => {
+    const { WRITE_TOOLS } = await import("./index.js");
+    const expected = new Set([
+      "create_page", "update_page", "append_to_page", "prepend_to_page",
+      "update_page_section", "delete_page", "add_drawio_diagram", "revert_page",
+      "add_attachment", "add_label", "remove_label", "create_comment",
+      "delete_comment", "resolve_comment", "set_page_status", "remove_page_status",
+    ]);
+    expect(WRITE_TOOLS.size).toBe(expected.size);
+    for (const tool of expected) {
+      expect(WRITE_TOOLS.has(tool), `WRITE_TOOLS should include "${tool}"`).toBe(true);
+    }
+  });
+
+  // O3 — check_permissions is always registered regardless of posture
+  it("O3-1: check_permissions is registered in read-only mode", async () => {
+    const tools = await spinUpWithPosture("read-only");
+    expect(tools.has("check_permissions")).toBe(true);
+  });
+
+  it("O3-2: check_permissions is registered in read-write mode", async () => {
+    const tools = await spinUpWithPosture("read-write");
+    expect(tools.has("check_permissions")).toBe(true);
+  });
+});
+
+// =============================================================================
+// Track G — appendWarnings helper + label-warning integration
+// =============================================================================
+
+describe("appendWarnings helper (Track G)", () => {
+  it("G-5: returns primary string unchanged when warnings list is empty", async () => {
+    const { appendWarnings } = await import("./index.js");
+    expect(appendWarnings("Primary result.", [])).toBe("Primary result.");
+  });
+
+  it("G-6: appends one warning with ⚠ prefix separated by blank line", async () => {
+    const { appendWarnings } = await import("./index.js");
+    const result = appendWarnings("Primary.", ["Something went wrong"]);
+    expect(result).toBe("Primary.\n\n⚠ Something went wrong");
+  });
+
+  it("G-7: appends multiple warnings each on their own line", async () => {
+    const { appendWarnings } = await import("./index.js");
+    const result = appendWarnings("Primary.", ["First warning", "Second warning"]);
+    expect(result).toBe("Primary.\n\n⚠ First warning\n⚠ Second warning");
+  });
+});
+
+describe("Track G — create_page label-warning integration", () => {
+  it("G-8: create_page returns SUCCESS + warning text when label returns 403", async () => {
+    const { resolveSpaceId, _rawCreatePage, formatPage, ensureAttributionLabel } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "pg-1", title: "New Page", version: { number: 1 } });
+    (formatPage as any).mockReturnValueOnce("Title: New Page\nID: pg-1");
+    // Simulate label 403: ensureAttributionLabel returns a warning
+    (ensureAttributionLabel as any).mockResolvedValueOnce({
+      warning: "Could not apply 'epimethian-edited' label (permission denied). Provenance label is missing for page pg-1.",
+    });
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({
+      title: "New Page",
+      space_key: "DEV",
+      body: "<p>Hello</p>",
+    });
+
+    // Must be SUCCESS (no isError)
+    expect(result.isError).toBeUndefined();
+    // Must contain the page details
+    expect(result.content[0].text).toContain("New Page");
+    // Must contain the warning
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("permission denied");
+    expect(result.content[0].text).toContain("pg-1");
+  });
+
+  it("G-8b: create_page returns clean response when label succeeds", async () => {
+    const { resolveSpaceId, _rawCreatePage, formatPage, ensureAttributionLabel } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "pg-2", title: "Clean Page", version: { number: 1 } });
+    (formatPage as any).mockReturnValueOnce("Title: Clean Page\nID: pg-2");
+    (ensureAttributionLabel as any).mockResolvedValueOnce({});
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({
+      title: "Clean Page",
+      space_key: "DEV",
+      body: "<p>Hello</p>",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).not.toContain("⚠");
+  });
+
+  it("G-10: create_page with label 500 returns ERROR (500 bubbles up, not masked)", async () => {
+    const { resolveSpaceId, _rawCreatePage, formatPage, ensureAttributionLabel, ConfluenceApiError } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "pg-3", title: "Fail Page", version: { number: 1 } });
+    (formatPage as any).mockReturnValueOnce("Title: Fail Page\nID: pg-3");
+    // 500 should be re-thrown by ensureAttributionLabel; simulate that behavior
+    (ensureAttributionLabel as any).mockRejectedValueOnce(
+      new (ConfluenceApiError as any)(500, "Internal Server Error")
+    );
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({
+      title: "Fail Page",
+      space_key: "DEV",
+      body: "<p>Hello</p>",
+    });
+
+    // Must be an ERROR
+    expect(result.isError).toBe(true);
+  });
+});
+
+describe("Track G — update_page label-warning integration", () => {
+  it("G-9: update_page returns SUCCESS + warning when label returns 403", async () => {
+    const { getPage, _rawUpdatePage, ensureAttributionLabel } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "p-10",
+      title: "My Page",
+      version: { number: 3 },
+      body: { storage: { value: "<p>Old</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "p-10", title: "My Page" },
+      newVersion: 4,
+    });
+    (ensureAttributionLabel as any).mockResolvedValueOnce({
+      warning: "Could not apply 'epimethian-edited' label (permission denied). Provenance label is missing for page p-10.",
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "p-10",
+      title: "My Page",
+      version: 3,
+      body: "<p>New</p>",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Updated:");
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("permission denied");
+  });
+});
+
+// =============================================================================
+// Track P2 — markPageUnverified wired into body-modifying handlers
+// =============================================================================
+
+describe("Track P2 — create_page calls markPageUnverified", () => {
+  beforeEach(async () => {
+    const { resolveSpaceId, _rawCreatePage, formatPage, ensureAttributionLabel } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (resolveSpaceId as any).mockReset();
+    (_rawCreatePage as any).mockReset();
+    (formatPage as any).mockReset();
+    (ensureAttributionLabel as any).mockReset();
+    (ensureAttributionLabel as any).mockResolvedValue({});
+    (markPageUnverified as any).mockReset();
+    (markPageUnverified as any).mockResolvedValue({});
+  });
+
+  it("P2-1a: create_page calls markPageUnverified with the created page id", async () => {
+    const { resolveSpaceId, _rawCreatePage, formatPage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "pg-badge-1", title: "Badge Test", version: { number: 1 } });
+    (formatPage as any).mockReturnValueOnce("Title: Badge Test\nID: pg-badge-1");
+
+    const handler = registeredTools.get("create_page")!.handler;
+    await handler({ title: "Badge Test", space_key: "DEV", body: "<p>Hello</p>" });
+
+    expect(markPageUnverified).toHaveBeenCalledWith("pg-badge-1", expect.objectContaining({ url: expect.any(String) }));
+  });
+
+  it("P2-2a: create_page includes badge warning in response when markPageUnverified returns warning", async () => {
+    const { resolveSpaceId, _rawCreatePage, formatPage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "pg-badge-warn", title: "Badge Warn", version: { number: 1 } });
+    (formatPage as any).mockReturnValueOnce("Title: Badge Warn\nID: pg-badge-warn");
+    (markPageUnverified as any).mockResolvedValueOnce({
+      warning: "Could not apply 'AI-edited' status badge (permission denied). Provenance badge is missing for page pg-badge-warn.",
+    });
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({ title: "Badge Warn", space_key: "DEV", body: "<p>Hello</p>" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Badge Warn");
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("AI-edited");
+    expect(result.content[0].text).toContain("pg-badge-warn");
+  });
+
+  it("P2-3a: create_page response contains no badge warning when markPageUnverified returns {}", async () => {
+    const { resolveSpaceId, _rawCreatePage, formatPage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (_rawCreatePage as any).mockResolvedValueOnce({ id: "pg-badge-ok", title: "No Badge Warn", version: { number: 1 } });
+    (formatPage as any).mockReturnValueOnce("Title: No Badge Warn\nID: pg-badge-ok");
+    (markPageUnverified as any).mockResolvedValueOnce({});
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({ title: "No Badge Warn", space_key: "DEV", body: "<p>Hello</p>" });
+
+    expect(result.isError).toBeUndefined();
+    // No badge-related warning in response
+    expect(result.content[0].text).not.toContain("AI-edited");
+    expect(result.content[0].text).not.toContain("status badge");
+  });
+});
+
+describe("Track P2 — update_page calls markPageUnverified", () => {
+  beforeEach(async () => {
+    const { markPageUnverified } = await import("./provenance.js");
+    (markPageUnverified as any).mockClear();
+    (markPageUnverified as any).mockResolvedValue({});
+  });
+
+  it("P2-1b: update_page calls markPageUnverified with the page id", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "p-upd-1", title: "Update Test", version: { number: 5 },
+      body: { storage: { value: "<p>Old</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "p-upd-1", title: "Update Test" }, newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    await handler({ page_id: "p-upd-1", title: "Update Test", version: 5, body: "<p>New</p>" });
+
+    expect(markPageUnverified).toHaveBeenCalledWith("p-upd-1", expect.objectContaining({ url: expect.any(String) }));
+  });
+
+  it("P2-2b: update_page includes badge warning when markPageUnverified returns warning", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "p-upd-2", title: "Update Warn", version: { number: 3 },
+      body: { storage: { value: "<p>Old</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "p-upd-2", title: "Update Warn" }, newVersion: 4,
+    });
+    (markPageUnverified as any).mockResolvedValueOnce({
+      warning: "Could not apply 'AI-edited' status badge (permission denied). Provenance badge is missing for page p-upd-2.",
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({ page_id: "p-upd-2", title: "Update Warn", version: 3, body: "<p>New</p>" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Updated:");
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("AI-edited");
+  });
+
+  it("P2-4b: update_page primary result unchanged regardless of badge outcome", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "p-upd-3", title: "Primary Unchanged", version: { number: 7 },
+      body: { storage: { value: "<p>Old</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "p-upd-3", title: "Primary Unchanged" }, newVersion: 8,
+    });
+    // Badge succeeds — no warning
+    (markPageUnverified as any).mockResolvedValueOnce({});
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({ page_id: "p-upd-3", title: "Primary Unchanged", version: 7, body: "<p>New</p>" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Updated:");
+    expect(result.content[0].text).toContain("p-upd-3");
+    expect(result.content[0].text).toContain("version: 8");
+  });
+});
+
+describe("Track P2 — update_page_section calls markPageUnverified", () => {
+  beforeEach(async () => {
+    const { markPageUnverified } = await import("./provenance.js");
+    (markPageUnverified as any).mockClear();
+    (markPageUnverified as any).mockResolvedValue({});
+  });
+
+  it("P2-1c: update_page_section calls markPageUnverified with page id", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "ps-1", title: "Section Page",
+      body: { storage: { value: "<h1>A</h1><p>old</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "ps-1", title: "Section Page" }, newVersion: 3,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    await handler({ page_id: "ps-1", section: "A", body: "<p>new</p>", version: 2 });
+
+    expect(markPageUnverified).toHaveBeenCalledWith("ps-1", expect.objectContaining({ url: expect.any(String) }));
+  });
+
+  it("P2-2c: update_page_section includes badge warning when markPageUnverified returns warning", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "ps-2", title: "Section Warn",
+      body: { storage: { value: "<h1>A</h1><p>old</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "ps-2", title: "Section Warn" }, newVersion: 4,
+    });
+    (markPageUnverified as any).mockResolvedValueOnce({
+      warning: "Could not apply 'AI-edited' status badge (permission denied). Provenance badge is missing for page ps-2.",
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({ page_id: "ps-2", section: "A", body: "<p>new</p>", version: 3 });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain('Updated section');
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("AI-edited");
+  });
+});
+
+describe("Track P2 — prepend_to_page calls markPageUnverified", () => {
+  beforeEach(async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockReset();
+    (_rawUpdatePage as any).mockReset();
+    (markPageUnverified as any).mockClear();
+    (markPageUnverified as any).mockResolvedValue({});
+  });
+
+  it("P2-1d: prepend_to_page calls markPageUnverified with page id", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "pp-1", title: "Prepend Page", version: { number: 2 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "pp-1", title: "Prepend Page" }, newVersion: 3,
+    });
+
+    const handler = registeredTools.get("prepend_to_page")!.handler;
+    await handler({ page_id: "pp-1", version: 2, content: "<p>new</p>", allow_raw_html: false });
+
+    expect(markPageUnverified).toHaveBeenCalledWith("pp-1", expect.objectContaining({ url: expect.any(String) }));
+  });
+
+  it("P2-2d: prepend_to_page includes badge warning when markPageUnverified returns warning", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "pp-2", title: "Prepend Warn", version: { number: 1 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "pp-2", title: "Prepend Warn" }, newVersion: 2,
+    });
+    (markPageUnverified as any).mockResolvedValueOnce({
+      warning: "Could not apply 'AI-edited' status badge (permission denied). Provenance badge is missing for page pp-2.",
+    });
+
+    const handler = registeredTools.get("prepend_to_page")!.handler;
+    const result = await handler({ page_id: "pp-2", version: 1, content: "<p>new</p>", allow_raw_html: false });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Prepended to:");
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("AI-edited");
+  });
+});
+
+describe("Track P2 — append_to_page calls markPageUnverified", () => {
+  beforeEach(async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockReset();
+    (_rawUpdatePage as any).mockReset();
+    (markPageUnverified as any).mockClear();
+    (markPageUnverified as any).mockResolvedValue({});
+  });
+
+  it("P2-1e: append_to_page calls markPageUnverified with page id", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "ap-1", title: "Append Page", version: { number: 4 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "ap-1", title: "Append Page" }, newVersion: 5,
+    });
+
+    const handler = registeredTools.get("append_to_page")!.handler;
+    await handler({ page_id: "ap-1", version: 4, content: "<p>new</p>", allow_raw_html: false });
+
+    expect(markPageUnverified).toHaveBeenCalledWith("ap-1", expect.objectContaining({ url: expect.any(String) }));
+  });
+
+  it("P2-2e: append_to_page includes badge warning when markPageUnverified returns warning", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "ap-2", title: "Append Warn", version: { number: 2 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "ap-2", title: "Append Warn" }, newVersion: 3,
+    });
+    (markPageUnverified as any).mockResolvedValueOnce({
+      warning: "Could not apply 'AI-edited' status badge (permission denied). Provenance badge is missing for page ap-2.",
+    });
+
+    const handler = registeredTools.get("append_to_page")!.handler;
+    const result = await handler({ page_id: "ap-2", version: 2, content: "<p>new</p>", allow_raw_html: false });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Appended to:");
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("AI-edited");
+  });
+});
+
+describe("Track P2 — add_drawio_diagram calls markPageUnverified", () => {
+  beforeEach(async () => {
+    const { markPageUnverified } = await import("./provenance.js");
+    (markPageUnverified as any).mockClear();
+    (markPageUnverified as any).mockResolvedValue({});
+  });
+
+  it("P2-1f: add_drawio_diagram calls markPageUnverified with page id", async () => {
+    const { uploadAttachment, getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (uploadAttachment as any).mockResolvedValueOnce({ title: "test.drawio", id: "att-p2" });
+    (getPage as any).mockResolvedValueOnce({
+      id: "dw-1", title: "Diagram Page", version: { number: 2 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({ page: { id: "dw-1", title: "Diagram Page" }, newVersion: 3 });
+    mockMkdtemp.mockResolvedValueOnce("/tmp/drawio-p2");
+    mockWriteFile.mockResolvedValueOnce(undefined);
+    mockReadFile.mockResolvedValueOnce(Buffer.from("<mxfile/>"));
+    mockRm.mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("add_drawio_diagram")!.handler;
+    await handler({ page_id: "dw-1", diagram_xml: "<mxfile/>", diagram_name: "test.drawio", append: true });
+
+    expect(markPageUnverified).toHaveBeenCalledWith("dw-1", expect.objectContaining({ url: expect.any(String) }));
+  });
+
+  it("P2-2f: add_drawio_diagram includes badge warning when markPageUnverified returns warning", async () => {
+    const { uploadAttachment, getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (uploadAttachment as any).mockResolvedValueOnce({ title: "test.drawio", id: "att-p2b" });
+    (getPage as any).mockResolvedValueOnce({
+      id: "dw-2", title: "Diagram Warn", version: { number: 1 },
+      body: { storage: { value: "" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({ page: { id: "dw-2", title: "Diagram Warn" }, newVersion: 2 });
+    mockMkdtemp.mockResolvedValueOnce("/tmp/drawio-p2b");
+    mockWriteFile.mockResolvedValueOnce(undefined);
+    mockReadFile.mockResolvedValueOnce(Buffer.from("<mxfile/>"));
+    mockRm.mockResolvedValueOnce(undefined);
+    (markPageUnverified as any).mockResolvedValueOnce({
+      warning: "Could not apply 'AI-edited' status badge (permission denied). Provenance badge is missing for page dw-2.",
+    });
+
+    const handler = registeredTools.get("add_drawio_diagram")!.handler;
+    const result = await handler({ page_id: "dw-2", diagram_xml: "<mxfile/>", diagram_name: "test.drawio", append: false });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Diagram");
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("AI-edited");
+  });
+});
+
+describe("Track P2 — revert_page calls markPageUnverified", () => {
+  beforeEach(async () => {
+    const { getPage, _rawUpdatePage, getPageVersionBody } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (getPage as any).mockReset();
+    (_rawUpdatePage as any).mockReset();
+    (getPageVersionBody as any).mockReset();
+    (markPageUnverified as any).mockClear();
+    (markPageUnverified as any).mockResolvedValue({});
+  });
+
+  it("P2-1g: revert_page calls markPageUnverified with page id", async () => {
+    const { getPage, getPageVersionBody, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    const currentBody = "<p>" + "x".repeat(200) + "</p>";
+    const historicalBody = "<p>" + "y".repeat(200) + "</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "rv-1", title: "Revert Page", version: { number: 5 },
+      body: { storage: { value: currentBody } },
+    });
+    (getPageVersionBody as any).mockResolvedValueOnce({ title: "Revert Page", rawBody: historicalBody, version: 3 });
+    (_rawUpdatePage as any).mockResolvedValueOnce({ page: { id: "rv-1", title: "Revert Page" }, newVersion: 6 });
+
+    const handler = registeredTools.get("revert_page")!.handler;
+    await handler({ page_id: "rv-1", target_version: 3, current_version: 5 });
+
+    expect(markPageUnverified).toHaveBeenCalledWith("rv-1", expect.objectContaining({ url: expect.any(String) }));
+  });
+
+  it("P2-2g: revert_page includes badge warning when markPageUnverified returns warning", async () => {
+    const { getPage, getPageVersionBody, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    const currentBody = "<p>" + "x".repeat(200) + "</p>";
+    const historicalBody = "<p>" + "y".repeat(200) + "</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "rv-2", title: "Revert Warn", version: { number: 5 },
+      body: { storage: { value: currentBody } },
+    });
+    (getPageVersionBody as any).mockResolvedValueOnce({ title: "Revert Warn", rawBody: historicalBody, version: 3 });
+    (_rawUpdatePage as any).mockResolvedValueOnce({ page: { id: "rv-2", title: "Revert Warn" }, newVersion: 6 });
+    (markPageUnverified as any).mockResolvedValueOnce({
+      warning: "Could not apply 'AI-edited' status badge (permission denied). Provenance badge is missing for page rv-2.",
+    });
+
+    const handler = registeredTools.get("revert_page")!.handler;
+    const result = await handler({ page_id: "rv-2", target_version: 3, current_version: 5 });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Reverted:");
+    expect(result.content[0].text).toContain("⚠");
+    expect(result.content[0].text).toContain("AI-edited");
+  });
+});
+
+describe("Track P2 — excluded handlers do NOT call markPageUnverified", () => {
+  beforeEach(async () => {
+    const { markPageUnverified } = await import("./provenance.js");
+    (markPageUnverified as any).mockClear();
+    (markPageUnverified as any).mockResolvedValue({});
+  });
+
+  it("P2-5a: set_page_status does not call markPageUnverified", async () => {
+    const { setContentState } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (setContentState as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("set_page_status")!.handler;
+    await handler({ page_id: "sp-1", status_name: "In Progress", status_color: "#2684FF" });
+
+    expect(markPageUnverified).not.toHaveBeenCalled();
+  });
+
+  it("P2-5b: remove_page_status does not call markPageUnverified", async () => {
+    const { removeContentState } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (removeContentState as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("remove_page_status")!.handler;
+    await handler({ page_id: "sp-2" });
+
+    expect(markPageUnverified).not.toHaveBeenCalled();
+  });
+
+  it("P2-5c: add_label does not call markPageUnverified", async () => {
+    const { addLabels } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (addLabels as any).mockResolvedValueOnce([{ name: "mytag", prefix: "global" }]);
+
+    const handler = registeredTools.get("add_label")!.handler;
+    await handler({ page_id: "al-1", label: "mytag" });
+
+    expect(markPageUnverified).not.toHaveBeenCalled();
+  });
+
+  it("P2-5d: add_attachment does not call markPageUnverified", async () => {
+    const { uploadAttachment, getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (uploadAttachment as any).mockResolvedValueOnce({ title: "file.txt", id: "att-ex" });
+    mockReadFile.mockResolvedValueOnce(Buffer.from("data"));
+
+    const handler = registeredTools.get("add_attachment")!.handler;
+    await handler({ page_id: "aa-1", file_path: "/tmp/file.txt", filename: "file.txt" });
+
+    expect(markPageUnverified).not.toHaveBeenCalled();
+  });
+
+  it("P2-5e: create_comment does not call markPageUnverified", async () => {
+    const { createFooterComment } = await import("./confluence-client.js");
+    const { markPageUnverified } = await import("./provenance.js");
+    (createFooterComment as any).mockResolvedValueOnce({ id: "c-1" });
+
+    const handler = registeredTools.get("create_comment")!.handler;
+    await handler({ page_id: "cc-1", body: "A comment", type: "footer" });
+
+    expect(markPageUnverified).not.toHaveBeenCalled();
   });
 });

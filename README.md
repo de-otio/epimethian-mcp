@@ -93,7 +93,121 @@ epimethian-mcp profiles --set-read-write globex
 
 New profiles default to **read-only**. The `setup` command prompts "Enable writes for this profile? [y/N]" or accepts `--read-write` for non-interactive use.
 
-When a profile is read-only, all write tools (`create_page`, `update_page`, `update_page_section`, `delete_page`, `add_attachment`, `add_drawio_diagram`, `add_label`, `remove_label`, `create_comment`, `resolve_comment`, `delete_comment`, `set_page_status`, `remove_page_status`) return an error with a remediation command. Read tools work normally. The read-only flag is resolved at server startup — restart running servers after changing it.
+When a profile is read-only, write tools are **not registered** at all — the agent's tool list is truthful and contains only read tools plus `check_permissions`. The posture is resolved at server startup — restart running servers after changing it.
+
+## Read-Only Mode
+
+**Read-only is the recommended posture for most users.** It provides defense-in-depth: even if the underlying API token has write access, the MCP will not expose write tools to the agent. This protects against prompt-injection attacks, accidental mutations during exploratory sessions, and misconfigured agents.
+
+### Configuring posture
+
+Set `posture` in the profile settings (preferred):
+
+```jsonc
+// ~/.config/epimethian-mcp/profiles.json
+{
+  "profiles": {
+    "my-profile": {
+      "posture": "read-only"
+    }
+  }
+}
+```
+
+Or use the legacy environment variable (still supported):
+
+```bash
+CONFLUENCE_READ_ONLY=true
+```
+
+The `posture` setting is a tri-state:
+
+| Value | Behavior |
+|---|---|
+| `"read-only"` | Write tools are never registered, regardless of what the token can do. |
+| `"read-write"` | Write tools are always registered. Writes that fail at the API level return remediation messages. |
+| `"detect"` (default) | A startup probe infers the effective posture from the token's actual permissions. |
+
+The legacy `readOnly: boolean` profile key remains supported as an alias and is resolved to `posture: "read-only"` / `"read-write"`. Users should migrate to `posture` directly.
+
+### MCP posture is independent of token capability
+
+You can pin the MCP to read-only even when the API token has full write access. This is the "belt and suspenders" case: the Confluence permission boundary enforces one layer, and the MCP profile enforces another. The `check_permissions` tool makes the distinction visible — it reports both the configured posture and what the probe determined the token can actually do.
+
+### Startup probe (posture: "detect")
+
+When posture is `"detect"`, Epimethian runs a lightweight probe at startup to determine whether the token can write. The probe queries the Confluence permissions endpoint for the first available space and, if that is unavailable, falls back to a dry-run write attempt. The result is logged as a startup banner and drives which tools are registered for the session.
+
+Probe outcomes:
+
+- Token can write → effective posture is `read-write`; all tools registered.
+- Token is read-only → effective posture is `read-only`; write tools not registered.
+- Probe inconclusive → effective posture defaults to `read-write` with a visible warning.
+
+### Checking permissions
+
+The `check_permissions` tool is always registered, in every posture. Call it from the agent to inspect the configured posture, effective posture, probe result, and token capability. For operator diagnostics from the CLI:
+
+```bash
+CONFLUENCE_PROFILE=my-profile epimethian-mcp permissions my-profile
+```
+
+For the full posture resolution matrix and error remediation design, see [doc/design/14-api-permission-handling.md](doc/design/14-api-permission-handling.md).
+
+## Provenance: AI-Edited Badge
+
+Any page **created or modified** by this MCP is automatically tagged with a yellow "AI-edited" content-status badge. The badge appears as a colored pill in the Confluence page view and space index, signaling that the page has been touched by an AI agent and has not yet been reviewed by a human. A human can clear it in one click after review.
+
+The badge is re-applied on every body-modifying tool call (idempotent: skipped when the page already carries an equivalent badge in any supported locale, to avoid version spam). If a subsequent AI edit is made after the human clears the badge, it reappears.
+
+### Default badge
+
+- Label: `"AI-edited"` (English default)
+- Color: `#FFC400` (yellow — reads as *attention needed*)
+
+### Configuration
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `unverifiedStatus` | `true` | Master toggle. Set to `false` to disable the badge entirely. |
+| `unverifiedStatusLocale` | system locale → `en` | Language for the badge label. |
+| `unverifiedStatusName` | *(unset)* | Full label override (bypasses locale lookup). Must be ≤20 chars. |
+| `unverifiedStatusColor` | `#FFC400` | Color override. One of five Confluence-allowed values: `#FFC400`, `#2684FF`, `#57D9A3`, `#FF7452`, `#8777D9`. |
+
+Environment variable equivalents: `CONFLUENCE_UNVERIFIED_STATUS=false`, `CONFLUENCE_UNVERIFIED_STATUS_LOCALE=fr`.
+
+Disable the badge for a profile:
+
+```jsonc
+{ "posture": "read-write", "unverifiedStatus": false }
+```
+
+Custom label (e.g., for compliance workflows):
+
+```jsonc
+{ "unverifiedStatusName": "Needs legal review", "unverifiedStatusColor": "#FF7452" }
+```
+
+### Supported locales
+
+| Locale | Label |
+|---|---|
+| `en` (default) | AI-edited |
+| `fr` | Modifié par IA |
+| `de` | KI-bearbeitet |
+| `es` | Editado por IA |
+| `pt` | Editado por IA |
+| `it` | Modificato da IA |
+| `nl` | AI-bewerkt |
+| `ja` | AI編集済み |
+| `zh` | AI已编辑 |
+| `ko` | AI 편집됨 |
+
+The locale is resolved from (in order): `unverifiedStatusLocale` profile setting → `CONFLUENCE_UNVERIFIED_STATUS_LOCALE` env var → system locale (`Intl.DateTimeFormat`) → `"en"`.
+
+When the badge cannot be applied (e.g., the token lacks content-state permission), the tool call still succeeds and a warning is surfaced in the tool response instead of failing silently.
+
+For the full design — idempotency behavior, version-bump math, lifecycle diagram, and security considerations — see [doc/design/13-unverified-status.md](doc/design/13-unverified-status.md).
 
 ## Token Efficiency
 

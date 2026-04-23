@@ -210,26 +210,44 @@ export async function runSetup(profile?: string): Promise<void> {
     if (profile) {
       await addToProfileRegistry(profile);
 
-      // Determine read-only mode: --read-write opts out, otherwise default to read-only
-      const args = process.argv.slice(2);
-      const explicitReadWrite = args.includes("--read-write");
-      let enableWrites = explicitReadWrite;
+      // Prompt for MCP access posture (replaces old read-only/write binary)
+      const rl2 = readline.createInterface({ input: stdin, output: stdout });
+      try {
+        let posture: "read-only" | "read-write" | "detect" = "read-only"; // default
 
-      if (!explicitReadWrite && !args.includes("--read-only")) {
-        // Interactive prompt — default is read-only (N)
-        const rl2 = readline.createInterface({ input: stdin, output: stdout });
-        try {
-          const answer = await rl2.question("Enable writes for this profile? [y/N] ");
-          enableWrites = answer.trim().toLowerCase() === "y";
-        } finally {
-          rl2.close();
+        let validInput = false;
+        while (!validInput) {
+          const answer = (await rl2.question(
+            `MCP access mode for this profile:
+  [1] Read-only — the agent cannot modify Confluence through this profile,
+                  regardless of what the API token can do. Recommended for
+                  untrusted agents, exploratory work, and defense-in-depth.
+  [2] Read-write — the agent can create, update, and delete pages.
+  [3] Detect at startup — infer from the token's actual permissions.
+Your choice [default: 1]: `
+          )).trim();
+
+          if (answer === "" || answer === "1") {
+            posture = "read-only";
+            validInput = true;
+          } else if (answer === "2") {
+            posture = "read-write";
+            validInput = true;
+          } else if (answer === "3") {
+            posture = "detect";
+            validInput = true;
+          } else {
+            // Invalid input, loop will re-prompt
+            console.log(`Invalid choice "${answer}". Please enter 1, 2, or 3.`);
+          }
         }
+
+        await setProfileSettings(profile, { posture });
+        console.log(`Credentials saved to OS keychain (profile: ${profile}, posture: ${posture}).\n`);
+      } finally {
+        rl2.close();
       }
 
-      const readOnly = !enableWrites;
-      await setProfileSettings(profile, { readOnly });
-      const modeLabel = readOnly ? "read-only" : "read-write";
-      console.log(`Credentials saved to OS keychain (profile: ${profile}, ${modeLabel}).\n`);
     } else {
       console.log("Credentials saved to OS keychain.\n");
       console.log(

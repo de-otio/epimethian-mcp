@@ -324,7 +324,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net")
       .mockResolvedValueOnce("user@test.com")
-      .mockResolvedValueOnce("N"); // "Enable writes?" prompt
+      .mockResolvedValueOnce("1"); // posture choice
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -366,12 +366,14 @@ describe("runSetup", () => {
     expect(exitCode).toBe(1);
   });
 
-  it("defaults profile to read-only when user answers N to writes prompt", async () => {
+  // --- Track O4: Posture prompt tests ---
+
+  it("defaults to read-only posture when user presses enter without input", async () => {
     mockReadFromKeychain.mockResolvedValueOnce(null);
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net") // url
       .mockResolvedValueOnce("user@test.com") // email
-      .mockResolvedValueOnce("N"); // "Enable writes?" → No
+      .mockResolvedValueOnce(""); // posture prompt → default (empty input)
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -390,17 +392,17 @@ describe("runSetup", () => {
 
     await runSetup("acme");
 
-    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { readOnly: true });
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-only" });
 
     process.stdin.on = originalOn;
   });
 
-  it("sets profile to read-write when --read-write flag is passed", async () => {
-    process.argv = ["node", "index.js", "setup", "--profile", "acme", "--read-write"];
+  it("posture prompt appears with all three choices", async () => {
     mockReadFromKeychain.mockResolvedValueOnce(null);
     mockQuestion
-      .mockResolvedValueOnce("https://test.atlassian.net")
-      .mockResolvedValueOnce("user@test.com");
+      .mockResolvedValueOnce("https://test.atlassian.net") // url
+      .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("1"); // posture choice
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -419,22 +421,28 @@ describe("runSetup", () => {
 
     await runSetup("acme");
 
-    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { readOnly: false });
-    // Should not prompt for writes when flag is explicit
-    const writesPromptCalls = mockQuestion.mock.calls.filter(
-      (c: any[]) => typeof c[0] === "string" && c[0].includes("Enable writes")
+    // Find the posture question — should contain "[1]", "[2]", "[3]"
+    const postureQuestionCalls = mockQuestion.mock.calls.filter(
+      (c: any[]) => typeof c[0] === "string" && c[0].includes("MCP access mode")
     );
-    expect(writesPromptCalls).toHaveLength(0);
+    expect(postureQuestionCalls.length).toBeGreaterThan(0);
+    const postureQuestion = postureQuestionCalls[0][0];
+    expect(postureQuestion).toContain("[1]");
+    expect(postureQuestion).toContain("[2]");
+    expect(postureQuestion).toContain("[3]");
+    expect(postureQuestion).toContain("Read-only");
+    expect(postureQuestion).toContain("Read-write");
+    expect(postureQuestion).toContain("Detect at startup");
 
     process.stdin.on = originalOn;
   });
 
-  it("sets profile to read-only when user answers y to writes prompt", async () => {
+  it("choice 2 writes posture: read-write", async () => {
     mockReadFromKeychain.mockResolvedValueOnce(null);
     mockQuestion
-      .mockResolvedValueOnce("https://test.atlassian.net")
-      .mockResolvedValueOnce("user@test.com")
-      .mockResolvedValueOnce("y"); // "Enable writes?" → Yes
+      .mockResolvedValueOnce("https://test.atlassian.net") // url
+      .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("2"); // posture choice → read-write
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -453,7 +461,99 @@ describe("runSetup", () => {
 
     await runSetup("acme");
 
-    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { readOnly: false });
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-write" });
+
+    process.stdin.on = originalOn;
+  });
+
+  it("choice 3 writes posture: detect", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net") // url
+      .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("3"); // posture choice → detect
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("acme");
+
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "detect" });
+
+    process.stdin.on = originalOn;
+  });
+
+  it("invalid posture input re-prompts", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net") // url
+      .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("99") // invalid choice
+      .mockResolvedValueOnce("2"); // retry with valid choice
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("acme");
+
+    // Verify setProfileSettings was called with the eventual valid choice
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-write" });
+    // Verify rl.question was called 4 times (url, email, invalid, retry)
+    expect(mockQuestion).toHaveBeenCalledTimes(4);
+
+    process.stdin.on = originalOn;
+  });
+
+  it("non-numeric posture input re-prompts", async () => {
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net") // url
+      .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("foo") // invalid input
+      .mockResolvedValueOnce("1"); // retry with valid choice
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("acme");
+
+    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-only" });
 
     process.stdin.on = originalOn;
   });
@@ -470,7 +570,7 @@ describe("runSetup", () => {
       .mockResolvedValueOnce("https://globex.atlassian.net")
       .mockResolvedValueOnce("user@test.com")
       .mockResolvedValueOnce("y") // tenant confirmation
-      .mockResolvedValueOnce("y"); // Enable writes?
+      .mockResolvedValueOnce("1"); // posture choice
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -545,7 +645,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://onprem.example.com")
       .mockResolvedValueOnce("user@test.com")
-      .mockResolvedValueOnce("y"); // Enable writes? (no tenant prompt — skipped)
+      .mockResolvedValueOnce("1"); // posture choice
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,

@@ -232,10 +232,11 @@ If **the server doesn't appear after restart**:
 - Verify the `command` value is an absolute path (run `which epimethian-mcp` to confirm)
 - Check that `.mcp.json` contains valid JSON (no trailing commas, correct quoting)
 
-## Available Tools (33)
+## Available Tools (34)
 
 | Tool | Description |
 |------|-------------|
+| `check_permissions` | Report the current profile's MCP access mode and the token's capabilities |
 | `create_page` | Create a new Confluence page |
 | `get_page` | Read a page by ID (use `headings_only` to preview structure first) |
 | `get_page_by_title` | Look up a page by title (use `headings_only` to preview structure first) |

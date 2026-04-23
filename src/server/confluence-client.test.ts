@@ -43,6 +43,9 @@ import {
   toMarkdownView,
   looksLikeMarkdown,
   ConfluenceApiError,
+  ConfluenceAuthError,
+  ConfluencePermissionError,
+  ConfluenceNotFoundError,
   ConfluenceConflictError,
   getLabels,
   addLabels,
@@ -63,6 +66,10 @@ import {
   getPageVersions,
   getPageVersionBody,
   setClientLabel,
+  probeWriteCapability,
+  validateStartup,
+  ensureAttributionLabel,
+  type Config,
 } from "./confluence-client.js";
 import { pageCache } from "./page-cache.js";
 
@@ -1556,6 +1563,54 @@ describe("HTTP error handling", () => {
 });
 
 // =============================================================================
+// Error subclass branching (F1)
+// =============================================================================
+
+describe("Error subclass branching", () => {
+  it("throws ConfluenceAuthError on 401 response", async () => {
+    global.fetch = mockFetchResponse("Unauthorized", 401);
+    const err = await getPage("1", false).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceAuthError);
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect((err as ConfluenceApiError).status).toBe(401);
+  });
+
+  it("throws ConfluencePermissionError on 403 response", async () => {
+    global.fetch = mockFetchResponse("Forbidden", 403);
+    const err = await getPage("1", false).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluencePermissionError);
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect((err as ConfluenceApiError).status).toBe(403);
+  });
+
+  it("throws ConfluenceNotFoundError on 404 response", async () => {
+    global.fetch = mockFetchResponse("Not Found", 404);
+    const err = await getPage("1", false).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceNotFoundError);
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect((err as ConfluenceApiError).status).toBe(404);
+  });
+
+  it("throws plain ConfluenceApiError on 500 response", async () => {
+    global.fetch = mockFetchResponse("Internal Server Error", 500);
+    const err = await getPage("1", false).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect(err).not.toBeInstanceOf(ConfluenceAuthError);
+    expect(err).not.toBeInstanceOf(ConfluencePermissionError);
+    expect(err).not.toBeInstanceOf(ConfluenceNotFoundError);
+    expect((err as ConfluenceApiError).status).toBe(500);
+  });
+
+  it("throws ConfluenceApiError (not ConfluenceConflictError) on 409 response", async () => {
+    global.fetch = mockFetchResponse("Conflict", 409);
+    const err = await getPage("1", false).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect(err).not.toBeInstanceOf(ConfluenceConflictError);
+    expect((err as ConfluenceApiError).status).toBe(409);
+  });
+});
+
+// =============================================================================
 // Labels API
 // =============================================================================
 
@@ -2198,5 +2253,168 @@ describe("Comments", () => {
       const result = await getPageVersionBody("5", 7);
       expect(result.rawBody).toBe("<h1>Title</h1><p>Content</p>");
     });
+  });
+});
+
+// =============================================================================
+// probeWriteCapability (Track O1)
+// =============================================================================
+
+describe("probeWriteCapability", () => {
+  // Test 1: primary permission endpoint returns havePermission: true → "write"
+  it("returns 'write' when permission endpoint reports create is allowed", async () => {
+    global.fetch = mockFetchSequence([
+      // First call: GET /wiki/api/v2/spaces?limit=1 → returns one space
+      { body: { results: [{ id: "1", key: "DEV", name: "Development", type: "global" }] } },
+      // Second call: GET permission endpoint → havePermission: true
+      { body: { operation: { operation: "create", targetType: "page" }, havePermission: true } },
+    ]);
+    const result = await probeWriteCapability();
+    expect(result).toBe("write");
+  });
+
+  // Test 2: primary permission endpoint returns havePermission: false → "read-only"
+  it("returns 'read-only' when permission endpoint reports create is not allowed", async () => {
+    global.fetch = mockFetchSequence([
+      { body: { results: [{ id: "1", key: "DEV", name: "Development", type: "global" }] } },
+      { body: { operation: { operation: "create", targetType: "page" }, havePermission: false } },
+    ]);
+    const result = await probeWriteCapability();
+    expect(result).toBe("read-only");
+  });
+
+  // Test 3: permission endpoint returns 404 → falls back to dry-run; dry-run returns 404 → "write"
+  it("falls back to dry-run when permission endpoint returns 404", async () => {
+    global.fetch = mockFetchSequence([
+      // GET /spaces → returns one space
+      { body: { results: [{ id: "1", key: "DEV", name: "Development", type: "global" }] } },
+      // GET permission endpoint → 404 (endpoint unavailable)
+      { body: { message: "Not found" }, status: 404 },
+      // PUT dry-run → 404 (page not found = token can write)
+      { body: { message: "Not found" }, status: 404 },
+    ]);
+    const result = await probeWriteCapability();
+    expect(result).toBe("write");
+  });
+
+  // Test 4: dry-run fallback → 403 → "read-only"
+  it("dry-run fallback → 403 → returns 'read-only'", async () => {
+    global.fetch = mockFetchSequence([
+      // GET /spaces → returns one space
+      { body: { results: [{ id: "1", key: "DEV", name: "Development", type: "global" }] } },
+      // GET permission endpoint → 404 (unavailable)
+      { body: { message: "Not found" }, status: 404 },
+      // PUT dry-run → 403 (no write permission)
+      { body: { message: "Forbidden" }, status: 403 },
+    ]);
+    const result = await probeWriteCapability();
+    expect(result).toBe("read-only");
+  });
+
+  // Test 5: dry-run fallback → 404 → "write" (reconfirm standalone)
+  it("dry-run fallback → 404 → returns 'write' (token can write, page just missing)", async () => {
+    global.fetch = mockFetchSequence([
+      // GET /spaces → empty list (no spaces to use for primary)
+      { body: { results: [] } },
+      // PUT dry-run → 404
+      { body: { message: "Not found" }, status: 404 },
+    ]);
+    const result = await probeWriteCapability();
+    expect(result).toBe("write");
+  });
+
+  // Test 6: all strategies fail with unexpected non-4xx error → "inconclusive"
+  it("returns 'inconclusive' when all strategies fail with unexpected errors", async () => {
+    // Simulate network error on dry-run PUT (after spaces returns empty)
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ results: [] }),
+        text: () => Promise.resolve("{}"),
+      })
+      .mockRejectedValueOnce(new Error("Network error"));
+    global.fetch = fetchMock as any;
+    const result = await probeWriteCapability();
+    expect(result).toBe("inconclusive");
+  });
+
+  // Test 7: probe is NOT called when posture !== "detect" (validateStartup skips it)
+  it("probe is not called when posture is 'read-only' (validateStartup skips probe)", async () => {
+    // We spy on probeWriteCapability by checking that no permission-endpoint
+    // or dry-run calls are made. We set up fetch to track all calls.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({}),
+      text: () => Promise.resolve("{}"),
+    });
+    global.fetch = fetchMock as any;
+
+    // Mock the shared test-connection functions for validateStartup
+    const { testConnection, verifyTenantIdentity } = await import("../shared/test-connection.js");
+    vi.mocked(testConnection).mockResolvedValue({ ok: true, message: "ok" });
+    vi.mocked(verifyTenantIdentity).mockResolvedValue({ ok: true, authenticatedEmail: "user@test.com", message: "ok" });
+
+    const config: Config = {
+      url: BASE_URL,
+      email: "user@test.com",
+      profile: null,
+      readOnly: true,
+      posture: "read-only",
+      attribution: true,
+      apiV2: `${BASE_URL}/wiki/api/v2`,
+      apiV1: `${BASE_URL}/wiki/rest/api`,
+      authHeader: "Basic dXNlcjp0b2tlbg==",
+      jsonHeaders: Object.freeze({ Authorization: "Basic dXNlcjp0b2tlbg==", "Content-Type": "application/json" }),
+    };
+
+    await validateStartup(config);
+
+    // The only fetch call should be none related to the probe — validateStartup
+    // calls testConnection/verifyTenantIdentity (mocked), and skips the probe.
+    // Verify that no call was made to /user/current/permission or /pages/999999999999
+    const calls = fetchMock.mock.calls.map((c: any[]) => String(c[0]));
+    const probeCallMade = calls.some(
+      (url) => url.includes("/permission") || url.includes("999999999999")
+    );
+    expect(probeCallMade).toBe(false);
+  });
+});
+
+// =============================================================================
+// Track G — ensureAttributionLabel structured warnings
+// =============================================================================
+
+describe("ensureAttributionLabel (Track G)", () => {
+  it("returns {} on success", async () => {
+    // addLabels (POST) + getLabels (GET, no legacy label) — both succeed
+    global.fetch = mockFetchSequence([
+      { body: {}, status: 200 },                        // addLabels
+      { body: { results: [{ prefix: "global", name: "epimethian-edited", id: "1", label: "epimethian-edited" }] }, status: 200 }, // getLabels
+    ]);
+    const result = await ensureAttributionLabel("page-42");
+    expect(result).toEqual({});
+  });
+
+  it("returns { warning } on ConfluencePermissionError (403) and does not throw", async () => {
+    // addLabels returns 403 → ConfluencePermissionError
+    global.fetch = mockFetchResponse("Forbidden", 403);
+    const result = await ensureAttributionLabel("page-99");
+    expect(result.warning).toBeDefined();
+    expect(result.warning).toContain("page-99");
+    expect(result.warning).toContain("permission denied");
+    expect(result.warning).toContain("epimethian-edited");
+  });
+
+  it("re-throws on 500 (infrastructure failure must not be masked)", async () => {
+    global.fetch = mockFetchResponse("Internal Server Error", 500);
+    await expect(ensureAttributionLabel("page-1")).rejects.toThrow(ConfluenceApiError);
+    await expect(ensureAttributionLabel("page-1")).rejects.not.toThrow(ConfluencePermissionError);
+  });
+
+  it("re-throws on ConfluenceNotFoundError (404 — a missing page is a real error)", async () => {
+    global.fetch = mockFetchResponse("Not Found", 404);
+    await expect(ensureAttributionLabel("page-missing")).rejects.toThrow(ConfluenceNotFoundError);
   });
 });

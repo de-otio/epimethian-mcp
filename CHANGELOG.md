@@ -5,6 +5,95 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.1.0] - 2026-04-23 - provenance badge + permission posture
+
+### Added
+
+- **feat(provenance): default "AI-edited" status badge on pages the MCP creates or edits.**
+  Any page mutated by a body-modifying tool (`create_page`, `update_page`, `update_page_section`,
+  `append_to_page`, `prepend_to_page`, `add_drawio_diagram`, `revert_page`) is automatically
+  tagged with a yellow (#FFC400) "AI-edited" content-status badge after a successful write.
+  The badge is a provenance / review-state signal: it appears as a colored pill in the Confluence
+  page view and space index, and a human can clear it in one click after review. The badge is
+  re-applied on every edit; an idempotent skip (locale-agnostic) prevents version spam on pages
+  already carrying an equivalent badge. Design: [doc/design/13-unverified-status.md](doc/design/13-unverified-status.md).
+
+  Configuration (all profile-scoped):
+
+  | Key | Default | Purpose |
+  |---|---|---|
+  | `unverifiedStatus` | `true` | Master toggle; `false` disables the badge entirely. |
+  | `unverifiedStatusLocale` | system locale → `en` | Badge label language (10 locales: en/fr/de/es/pt/it/nl/ja/zh/ko). |
+  | `unverifiedStatusName` | *(unset)* | Full label override (≤20 chars). Bypasses locale lookup. |
+  | `unverifiedStatusColor` | `#FFC400` | Color override (one of five Confluence palette values). |
+
+  Env var equivalents: `CONFLUENCE_UNVERIFIED_STATUS=false`, `CONFLUENCE_UNVERIFIED_STATUS_LOCALE=<locale>`.
+
+- **feat(permissions): read-only posture as a first-class profile setting with auto-detection.**
+  Profile settings now accept a `posture` tri-state (`"read-only"` | `"read-write"` | `"detect"`)
+  that replaces the previous binary `readOnly` flag. When posture is `"read-only"`, write tools
+  are **not registered** at all — the agent's tool list is truthful. When posture is `"detect"`
+  (the default), a lightweight startup probe infers write capability from the token and drives
+  registration accordingly. Design: [doc/design/14-api-permission-handling.md](doc/design/14-api-permission-handling.md).
+
+  Setup CLI (`epimethian-mcp setup`) now prompts for posture during profile creation, defaulting
+  to read-only to nudge users toward the safer configuration.
+
+- **feat(permissions): `check_permissions` tool — always registered, in every posture.**
+  Reports configured posture, effective posture, probe result, token capability, and
+  human-readable notes. Lets the agent self-diagnose before attempting writes. Also accessible
+  via CLI: `epimethian-mcp permissions <profile>`.
+
+  Payload shape:
+  ```jsonc
+  {
+    "posture": { "effective": "read-only", "configured": "detect", "source": "probe" },
+    "tokenCapability": { "authenticated": true, "writePages": false, … },
+    "notes": [ "…" ]
+  }
+  ```
+
+- **feat(errors): typed error subclasses with remediation-oriented messages.**
+  `ConfluenceAuthError` (401), `ConfluencePermissionError` (403), and `ConfluenceNotFoundError`
+  (404) are now thrown instead of the generic `ConfluenceApiError` for their respective status
+  codes. Tool handlers map these to user-facing guidance:
+
+  | Error | Message |
+  |---|---|
+  | `ConfluenceAuthError` | "Your Confluence API token is invalid or expired. Reauthenticate with `epimethian-mcp login <profile>`." |
+  | `ConfluencePermissionError` | "Your token lacks permission for \<operation\> on \<resource\>. The operation was not performed." |
+  | `ConfluenceNotFoundError` | "Resource not found. Confluence returns 'not found' when a token cannot see a resource due to restrictions — verify access." |
+
+- **feat(comments): `get_comments` with `include_replies` returns partial results when some
+  replies are inaccessible.** Reply fetches now use `Promise.allSettled`; a 403 on one reply
+  thread no longer fails the entire tool call. The response includes per-comment error entries
+  for inaccessible threads and a note: `"Note: N of M reply fetches failed — partial results shown."`
+
+### Fixed
+
+- **fix(governance): loud warnings when attribution label or provenance badge cannot be applied.**
+  `ensureAttributionLabel` previously swallowed 403 errors silently, making the `epimethian-edited`
+  provenance label unreliable with no user-visible signal. It now returns a structured warning that
+  surfaces in the tool response:
+
+  ```
+  ✓ Page 12345 created.
+  ⚠ Could not apply 'epimethian-edited' label (permission denied). Provenance label is missing for page 12345.
+  ```
+
+  Similarly, `markPageUnverified` (the new badge helper) surfaces a warning in the tool response
+  when the content-state endpoint returns 403, rather than logging silently. The parent write call
+  still succeeds in both cases.
+
+### Deprecated
+
+- **`readOnly: boolean` in profile settings.** The `readOnly` key remains supported as an alias —
+  `readOnly: true` maps to `posture: "read-only"`, `readOnly: false` maps to `posture: "read-write"`.
+  When both are set, `posture` wins. Users should migrate to the `posture` key directly; the alias
+  may be removed in a future major release.
+
+---
+
 ## [6.0.1] - 2026-04-23 - confluence:// content-id link fix
 
 ### Fixed
