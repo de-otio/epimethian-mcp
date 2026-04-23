@@ -192,3 +192,34 @@ mode. The stderr banner on startup will say `(env-var mode)` instead of
 env var was not delivered to the server process.
 
 See also [06-limitations.md § Silent env-var fallback](06-limitations.md).
+
+## 8. v6.0.0: intra-tenant blast-radius limiter (`spaces` allowlist)
+
+The cloudId seal above protects against *cross-tenant* writes. Within a
+single tenant, a profile may still have more write access than any given
+session actually needs. v6.0.0 adds a per-profile `spaces` allowlist:
+
+```jsonc
+{
+  "profiles": ["acme-docs"],
+  "settings": {
+    "acme-docs": {
+      "spaces": ["DOCS", "ENG"]
+    }
+  }
+}
+```
+
+Every write-path handler resolves the target space (from the
+`space_key` argument directly, or from the page's metadata when only
+`page_id` is supplied) and rejects writes outside the list with
+`SpaceNotAllowedError`. The `page_id → space` mapping is cached for
+5 minutes; a page moved into an allowed space during the cache window
+remains the blocked-space identity until the TTL expires.
+
+Reads are intentionally NOT gated by `spaces` in this release — a
+locked-down posture against exfiltration should rely on Atlassian's
+own space permissions, which the per-tenant API token inherits.
+
+See `src/server/space-allowlist.ts` and the investigation
+`doc/design/investigations/investigate-prompt-injection-hardening/08-capability-scoping.md`.

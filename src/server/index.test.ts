@@ -5,6 +5,14 @@ vi.hoisted(() => {
   process.env.CONFLUENCE_URL = "https://test.atlassian.net";
   process.env.CONFLUENCE_EMAIL = "user@test.com";
   process.env.CONFLUENCE_API_TOKEN = "test-token";
+  // F4: disable the write budget so tests that exercise many tool handlers
+  // don't collide with the default cap.
+  process.env.EPIMETHIAN_WRITE_BUDGET_SESSION = "0";
+  process.env.EPIMETHIAN_WRITE_BUDGET_HOURLY = "0";
+  // E4: allow gated operations to proceed without elicitation in tests
+  // that do not specifically exercise the gate. Targeted elicitation
+  // tests flip this flag off within their own describe block.
+  process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES = "true";
 });
 
 // Mock keychain to prevent actual OS keychain access
@@ -87,6 +95,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     truncateStorageFormat: actual.truncateStorageFormat,
     toMarkdownView: actual.toMarkdownView,
     looksLikeMarkdown: actual.looksLikeMarkdown,
+    normalizeBodyForSubmit: actual.normalizeBodyForSubmit,
     sanitizeError: (msg: string) => msg.slice(0, 500),
     ConfluenceConflictError,
     getConfig: vi.fn().mockResolvedValue({
@@ -220,9 +229,101 @@ describe("toolResult / toolError behavior", () => {
     (deletePage as any).mockRejectedValueOnce("string error");
 
     const handler = registeredTools.get("delete_page")!.handler;
-    const result = await handler({ page_id: "1" });
+    // B1: pass version to bypass the new version-required gate; this test
+    // is about toolError's handling of non-Error throwables, not B1.
+    const result = await handler({ page_id: "1", version: 5 });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("Error: string error");
+  });
+});
+
+describe("delete_page version gating (B1)", () => {
+  it("B1: rejects delete_page when version is omitted and legacy flag is not set", async () => {
+    const { deletePage } = await import("./confluence-client.js");
+    (deletePage as any).mockClear();
+    delete process.env.EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION;
+
+    const handler = registeredTools.get("delete_page")!.handler;
+    const result = await handler({ page_id: "1" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("requires a `version`");
+    expect(deletePage).not.toHaveBeenCalled();
+  });
+
+  it("B1: accepts delete_page when version is omitted and legacy flag is set", async () => {
+    const { deletePage } = await import("./confluence-client.js");
+    (deletePage as any).mockClear();
+    (deletePage as any).mockResolvedValueOnce(undefined);
+    process.env.EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION = "true";
+
+    try {
+      const handler = registeredTools.get("delete_page")!.handler;
+      const result = await handler({ page_id: "1" });
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain("Deleted page 1");
+      expect(deletePage).toHaveBeenCalledOnce();
+      // Legacy path: no expectedVersion passed through.
+      expect((deletePage as any).mock.lastCall).toEqual(["1", undefined]);
+    } finally {
+      delete process.env.EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION;
+    }
+  });
+
+  it("B1: passes version to deletePage when provided", async () => {
+    const { deletePage } = await import("./confluence-client.js");
+    (deletePage as any).mockClear();
+    (deletePage as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("delete_page")!.handler;
+    const result = await handler({ page_id: "42", version: 17 });
+    expect(result.isError).toBeUndefined();
+    expect((deletePage as any).mock.lastCall).toEqual(["42", 17]);
+  });
+
+  it("E2: delete_page rejects source='chained_tool_output' (tool-output cannot authorise deletion)", async () => {
+    const { deletePage } = await import("./confluence-client.js");
+    (deletePage as any).mockClear();
+
+    const handler = registeredTools.get("delete_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      version: 5,
+      source: "chained_tool_output",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("chained_tool_output");
+    expect(deletePage).not.toHaveBeenCalled();
+  });
+
+  it("E2: delete_page with source='user_request' proceeds normally", async () => {
+    const { deletePage } = await import("./confluence-client.js");
+    (deletePage as any).mockClear();
+    (deletePage as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("delete_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      version: 5,
+      source: "user_request",
+    });
+    expect(result.isError).toBeUndefined();
+    expect(deletePage).toHaveBeenCalledOnce();
+  });
+
+  it("B1: surfaces ConfluenceConflictError when deletePage rejects on version mismatch", async () => {
+    const { deletePage } = await import("./confluence-client.js");
+    (deletePage as any).mockClear();
+    const conflict = new Error(
+      "Version conflict: page 42 has been modified since you last read it. " +
+        "Call get_page to fetch the latest version, then retry your update with the new version number."
+    );
+    conflict.name = "ConfluenceConflictError";
+    (deletePage as any).mockRejectedValueOnce(conflict);
+
+    const handler = registeredTools.get("delete_page")!.handler;
+    const result = await handler({ page_id: "42", version: 9 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Version conflict");
   });
 });
 
@@ -603,7 +704,7 @@ describe("update_page_section tool", () => {
     expect(updateCall[1].body).toContain("<h1>B</h1><p>keep</p>");
   });
 
-  it("returns error when section not found", async () => {
+  it("A4: returns isError=true when section not found", async () => {
     const { getPage } = await import("./confluence-client.js");
     (getPage as any).mockResolvedValueOnce({
       id: "1",
@@ -618,6 +719,9 @@ describe("update_page_section tool", () => {
       body: "<p>x</p>",
       version: 5,
     });
+    // A4: the structured isError flag must be set so agents monitoring that
+    // flag don't silently treat a typo-ed section name as success.
+    expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Section "Missing" not found');
   });
 
@@ -977,6 +1081,172 @@ describe("update_page markdown / storage routing", () => {
   });
 });
 
+describe("clientSupportsElicitation (E5)", () => {
+  it("E5: returns true when client advertises elicitation capability", async () => {
+    const { clientSupportsElicitation } = await import("./index.js");
+    const fakeServer = {
+      server: {
+        getClientCapabilities: () => ({ elicitation: {} }),
+      },
+    } as any;
+    expect(clientSupportsElicitation(fakeServer)).toBe(true);
+  });
+
+  it("E5: returns false when capabilities omit elicitation", async () => {
+    const { clientSupportsElicitation } = await import("./index.js");
+    const fakeServer = {
+      server: {
+        getClientCapabilities: () => ({ roots: {} }),
+      },
+    } as any;
+    expect(clientSupportsElicitation(fakeServer)).toBe(false);
+  });
+
+  it("E5: returns false when getClientCapabilities returns undefined (pre-init)", async () => {
+    const { clientSupportsElicitation } = await import("./index.js");
+    const fakeServer = {
+      server: { getClientCapabilities: () => undefined },
+    } as any;
+    expect(clientSupportsElicitation(fakeServer)).toBe(false);
+  });
+
+  it("E5: returns false when getClientCapabilities throws", async () => {
+    const { clientSupportsElicitation } = await import("./index.js");
+    const fakeServer = {
+      server: {
+        getClientCapabilities: () => {
+          throw new Error("not yet initialized");
+        },
+      },
+    } as any;
+    expect(clientSupportsElicitation(fakeServer)).toBe(false);
+  });
+
+  it("E5: returns false when elicitation is explicitly null", async () => {
+    const { clientSupportsElicitation } = await import("./index.js");
+    const fakeServer = {
+      server: {
+        getClientCapabilities: () => ({ elicitation: null }),
+      },
+    } as any;
+    expect(clientSupportsElicitation(fakeServer)).toBe(false);
+  });
+});
+
+describe("effectiveMaxReadLength (D4)", () => {
+  it("D4: undefined → DEFAULT_MAX_READ_BODY", async () => {
+    const { effectiveMaxReadLength, DEFAULT_MAX_READ_BODY } = await import("./index.js");
+    expect(effectiveMaxReadLength(undefined)).toBe(DEFAULT_MAX_READ_BODY);
+  });
+
+  it("D4: 0 → Infinity (explicit no-limit opt-out)", async () => {
+    const { effectiveMaxReadLength } = await import("./index.js");
+    expect(effectiveMaxReadLength(0)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("D4: explicit N → N", async () => {
+    const { effectiveMaxReadLength } = await import("./index.js");
+    expect(effectiveMaxReadLength(12345)).toBe(12345);
+  });
+});
+
+describe("get_page max_length default (D4)", () => {
+  it("D4: truncates body longer than DEFAULT_MAX_READ_BODY when max_length is omitted", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    const { DEFAULT_MAX_READ_BODY } = await import("./index.js");
+    // Craft a body larger than the default cap.
+    const longBody = "<p>" + "x".repeat(DEFAULT_MAX_READ_BODY + 1000) + "</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      body: { storage: { value: longBody } },
+    });
+    (formatPage as any).mockResolvedValueOnce("Title: T\nID: 1");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      include_body: true,
+      headings_only: false,
+      format: "storage",
+    });
+    const text = result.content[0].text;
+    expect(text).toContain("[truncated: full body is");
+    expect(text).toContain("pass max_length=0");
+  });
+
+  it("D4: max_length=0 returns the full body without truncation", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    const { DEFAULT_MAX_READ_BODY } = await import("./index.js");
+    const longBody = "<p>" + "x".repeat(DEFAULT_MAX_READ_BODY + 1000) + "</p>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      body: { storage: { value: longBody } },
+    });
+    (formatPage as any).mockResolvedValueOnce("Title: T\nID: 1");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      include_body: true,
+      headings_only: false,
+      max_length: 0,
+      format: "storage",
+    });
+    expect(result.content[0].text).not.toContain("[truncated:");
+  });
+
+  it("D4: does not truncate when body is shorter than the default cap", async () => {
+    const { getPage, formatPage } = await import("./confluence-client.js");
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      body: { storage: { value: "<p>short</p>" } },
+    });
+    (formatPage as any).mockResolvedValueOnce("Title: T\nID: 1\n\nContent:\n<p>short</p>");
+
+    const handler = registeredTools.get("get_page")!.handler;
+    const result = await handler({
+      page_id: "1",
+      include_body: true,
+      headings_only: false,
+      format: "storage",
+    });
+    expect(result.content[0].text).not.toContain("[truncated:");
+  });
+});
+
+describe("shouldEnableMutationLog (C1)", () => {
+  it("C1: returns true when env var is unset", async () => {
+    const { shouldEnableMutationLog } = await import("./index.js");
+    expect(shouldEnableMutationLog(undefined)).toBe(true);
+  });
+
+  it("C1: returns true when env var is empty string", async () => {
+    const { shouldEnableMutationLog } = await import("./index.js");
+    expect(shouldEnableMutationLog("")).toBe(true);
+  });
+
+  it("C1: returns true when env var is 'true'", async () => {
+    const { shouldEnableMutationLog } = await import("./index.js");
+    expect(shouldEnableMutationLog("true")).toBe(true);
+  });
+
+  it("C1: returns false when env var is exactly 'false'", async () => {
+    const { shouldEnableMutationLog } = await import("./index.js");
+    expect(shouldEnableMutationLog("false")).toBe(false);
+  });
+
+  it("C1: returns true on typos and other values (fail-safe toward logging)", async () => {
+    const { shouldEnableMutationLog } = await import("./index.js");
+    expect(shouldEnableMutationLog("0")).toBe(true);
+    expect(shouldEnableMutationLog("off")).toBe(true);
+    expect(shouldEnableMutationLog("FALSE")).toBe(true); // case-sensitive: only "false" disables
+    expect(shouldEnableMutationLog("fals")).toBe(true);
+  });
+});
+
 describe("writeGuard (read-only mode)", () => {
   let writeGuardFn: typeof import("./index.js")["writeGuard"];
 
@@ -1225,7 +1495,9 @@ describe("get_page_status tool", () => {
 
 describe("set_page_status tool", () => {
   it("returns success with name + color + tenant echo", async () => {
-    const { setContentState } = await import("./confluence-client.js");
+    const { setContentState, getContentState } = await import("./confluence-client.js");
+    // A2: dedup fetches current state first — return null (no existing state)
+    (getContentState as any).mockResolvedValueOnce(null);
     (setContentState as any).mockResolvedValueOnce(undefined);
 
     const handler = registeredTools.get("set_page_status")!.handler;
@@ -1234,6 +1506,40 @@ describe("set_page_status tool", () => {
     expect(result.content[0].text).toContain("Ready for review");
     expect(result.content[0].text).toContain("#57D9A3");
     expect(result.content[0].text).toContain("Tenant:");
+    expect(setContentState).toHaveBeenCalledOnce();
+  });
+
+  it("A2: short-circuits when current state matches (no PUT, returns no-op note)", async () => {
+    const { setContentState, getContentState } = await import("./confluence-client.js");
+    (setContentState as any).mockClear();
+    (getContentState as any).mockResolvedValueOnce({
+      name: "Ready for review",
+      color: "#57D9A3",
+    });
+
+    const handler = registeredTools.get("set_page_status")!.handler;
+    const result = await handler({ page_id: "123", name: "Ready for review", color: "#57D9A3" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("no-op: status unchanged");
+    expect(setContentState).not.toHaveBeenCalled();
+  });
+
+  it("A2: writes through when name matches but color differs", async () => {
+    const { setContentState, getContentState } = await import("./confluence-client.js");
+    (setContentState as any).mockClear();
+    (getContentState as any).mockResolvedValueOnce({
+      name: "Ready for review",
+      color: "#FFC400",
+    });
+    (setContentState as any).mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("set_page_status")!.handler;
+    const result = await handler({ page_id: "123", name: "Ready for review", color: "#57D9A3" });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).not.toContain("no-op");
+    expect(setContentState).toHaveBeenCalledOnce();
   });
 
   it("is blocked by writeGuard in read-only mode", async () => {
@@ -2498,11 +2804,16 @@ describe("update_page markdown path (Stream 5)", () => {
   });
 
   it("storage-format body passes through verbatim (backward compat)", async () => {
+    // NB: must differ from current body so A1 (byte-identical short-circuit)
+    // does not skip the write. The test checks that storage-format bodies
+    // pass through without markdown conversion, not that identical bodies
+    // still PUT.
     const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
-    const storageBody = "<p>Unchanged storage body</p>";
+    const currentBody = "<p>Previous storage body</p>";
+    const newBody = "<p>Updated storage body</p>";
     (getPage as any).mockResolvedValueOnce({
       id: "6", title: "T", version: { number: 6 },
-      body: { storage: { value: storageBody } },
+      body: { storage: { value: currentBody } },
     });
     (_rawUpdatePage as any).mockClear();
     (_rawUpdatePage as any).mockResolvedValueOnce({
@@ -2515,12 +2826,12 @@ describe("update_page markdown path (Stream 5)", () => {
       page_id: "6",
       title: "T",
       version: 6,
-      body: storageBody,
+      body: newBody,
     });
 
     expect(result.isError).toBeUndefined();
     const updateCall = (_rawUpdatePage as any).mock.lastCall;
-    expect(updateCall[1].body).toBe(storageBody);
+    expect(updateCall[1].body).toBe(newBody);
   });
 
   it("merges caller version_message with auto-generated deletion message", async () => {
@@ -2758,10 +3069,14 @@ describe("update_page content-safety guards (Finding 1 fix)", () => {
 describe("update_page threads previousBody to _rawUpdatePage (1F)", () => {
   it("passes currentStorage as previousBody", async () => {
     const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
-    const body = "<p>current content</p>";
+    // Use different bodies so A1 (byte-identical short-circuit) does not
+    // bypass _rawUpdatePage — this test is about previousBody threading,
+    // not the no-op short-circuit path.
+    const currentBody = "<p>current content</p>";
+    const newBody = "<p>updated content</p>";
     (getPage as any).mockResolvedValueOnce({
       id: "1", title: "T", version: { number: 5 },
-      body: { storage: { value: body } },
+      body: { storage: { value: currentBody } },
     });
     (_rawUpdatePage as any).mockClear();
     (_rawUpdatePage as any).mockResolvedValueOnce({
@@ -2770,10 +3085,10 @@ describe("update_page threads previousBody to _rawUpdatePage (1F)", () => {
     const handler = registeredTools.get("update_page")!.handler;
     await handler({
       page_id: "1", title: "T", version: 5,
-      body: body,
+      body: newBody,
     });
     const call = (_rawUpdatePage as any).mock.lastCall;
-    expect(call[1].previousBody).toBe(body);
+    expect(call[1].previousBody).toBe(currentBody);
   });
 });
 

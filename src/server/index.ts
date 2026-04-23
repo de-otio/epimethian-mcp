@@ -63,6 +63,16 @@ import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
 import { safePrepareBody, safeSubmitPage } from "./safe-write.js";
 import {
+  listDestructiveFlagsSet,
+  sourceSchema,
+  validateSource,
+} from "./source-provenance.js";
+import { writeBudget } from "./write-budget.js";
+import { gateOperation } from "./elicitation.js";
+import { resolveToolFilter } from "./tool-allowlist.js";
+import { getProfileSettings } from "../shared/profiles.js";
+import { assertSpaceAllowed } from "./space-allowlist.js";
+import {
   checkForUpdates,
   getPendingUpdate,
   clearPendingUpdate,
@@ -76,6 +86,30 @@ function getClientLabel(server: McpServer): string | undefined {
   const client = server.server.getClientVersion();
   const raw = client?.title || client?.name || undefined;
   return raw ? raw.slice(0, 80) : undefined;
+}
+
+/**
+ * Track E5: capability detection for the MCP elicitation feature.
+ *
+ * Returns true when the connected client advertised
+ * `capabilities.elicitation` in the `initialize` handshake (MCP spec
+ * 2025-06-18+). Callers — specifically the future gated-operation
+ * wrappers (Track E4) — use this to decide whether to request user
+ * confirmation or fall back to the unsupported-client posture.
+ *
+ * Returns false when:
+ *   - the client never sent capabilities (pre-handshake or malformed init),
+ *   - the capabilities object does not include an `elicitation` key,
+ *   - the elicitation value is explicitly null/undefined.
+ */
+export function clientSupportsElicitation(server: McpServer): boolean {
+  try {
+    const caps = server.server.getClientCapabilities();
+    return caps?.elicitation !== undefined && caps.elicitation !== null;
+  } catch {
+    // getClientCapabilities throws before the init handshake completes.
+    return false;
+  }
 }
 
 function escapeXml(s: string): string {
@@ -100,6 +134,32 @@ function escapeXml(s: string): string {
  */
 const READ_ONLY_MARKDOWN_MARKER =
   "<!-- epimethian:read-only-markdown — do not pass this content to update_page -->";
+
+/**
+ * Default max_length for get_page / get_page_by_title when the caller does
+ * not pass one (Track D4). Caps context-saturation prompt-injection
+ * payloads that would otherwise flood the agent's context window.
+ *
+ * 50 000 chars comfortably fits typical documentation pages and is well
+ * below any single-tool-response cost concern.
+ *
+ * Callers that genuinely need the full body can pass `max_length: 0` as
+ * an explicit opt-out (sentinel for "no limit"), or supply a larger value.
+ */
+export const DEFAULT_MAX_READ_BODY = 50_000;
+
+/**
+ * Resolve the effective max-length for a read-tool response body.
+ *
+ *   undefined → DEFAULT_MAX_READ_BODY
+ *   0         → Infinity (explicit opt-out — no limit)
+ *   N         → N
+ */
+export function effectiveMaxReadLength(raw: number | undefined): number {
+  if (raw === undefined) return DEFAULT_MAX_READ_BODY;
+  if (raw === 0) return Number.POSITIVE_INFINITY;
+  return raw;
+}
 
 function formatMarkdownWithTokens(
   markdown: string,
@@ -157,6 +217,19 @@ function tenantEcho(config: Config): string {
 }
 
 // --- Write guard (read-only mode) ---
+
+/**
+ * Decide whether the mutation log should be enabled (Track C1).
+ *
+ * Default: ON. Only `"false"` explicitly disables. Any other value
+ * (unset, empty, `"true"`, a typo, random text) results in ON — fail-safe
+ * toward "record forensics" rather than "silently drop them".
+ *
+ * Exported for unit testing so the semantics are pinned as a contract.
+ */
+export function shouldEnableMutationLog(envValue: string | undefined): boolean {
+  return envValue !== "false";
+}
 
 /** Tools that are safe to call in read-only mode. Any tool NOT in this set is blocked. */
 const READ_ONLY_TOOLS = new Set([
@@ -305,8 +378,33 @@ function formatCommentThreads(
 
 // --- Tool registration ---
 
-function registerTools(server: McpServer, config: Config): void {
+async function registerTools(server: McpServer, config: Config): Promise<void> {
   const echo = tenantEcho(config);
+
+  // F2: resolve per-tool allowlist / denylist from profile registry.
+  const settings = config.profile
+    ? await getProfileSettings(config.profile)
+    : undefined;
+  const isToolEnabled = resolveToolFilter(settings);
+
+  // F3: closure that each write handler calls before dispatching. When
+  // the profile has no `spaces` allowlist, this is effectively a no-op.
+  const allowedSpaces = settings?.spaces;
+  const checkSpaceAllowed = (opts: { spaceKey?: string; pageId?: string }) =>
+    assertSpaceAllowed({ spaces: allowedSpaces, ...opts });
+
+  // Wrap registerTool so subsequent calls transparently honour the
+  // allowlist. A single shim is vastly less error-prone than adding a
+  // guard to each of the ~34 registration sites.
+  const originalRegisterTool = server.registerTool.bind(server);
+  (server as any).registerTool = function (name: string, ...rest: unknown[]) {
+    if (!isToolEnabled(name)) {
+      // Intentionally quiet at registration time — the profile's CLI
+      // tooling surfaces the effective set. Agents never see the tool.
+      return server;
+    }
+    return (originalRegisterTool as any)(name, ...rest);
+  };
 
   // Label validation schemas
   const labelNameSchema = z.string()
@@ -434,6 +532,9 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("create_page", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist — must be checked BEFORE resolveSpaceId so
+        // a disallowed space rejects without revealing whether it exists.
+        await checkSpaceAllowed({ spaceKey: space_key });
         // Space validation is create_page-specific; stays in the handler.
         const spaceId = await resolveSpaceId(space_key);
         const cfg = await getConfig();
@@ -514,6 +615,12 @@ function registerTools(server: McpServer, config: Config): void {
           );
         }
 
+        // D4: resolve effective max_length (default 50_000 when unset;
+        // 0 → no limit sentinel).
+        const effectiveMax = effectiveMaxReadLength(max_length);
+        const truncationNote = (origLen: number) =>
+          `\n\n[truncated: full body is ${origLen} chars; pass max_length=0 for no limit or a larger explicit value]`;
+
         if (section) {
           const body = page.body?.storage?.value ?? page.body?.value ?? "";
           const sectionContent = extractSection(body, section);
@@ -522,37 +629,53 @@ function registerTools(server: McpServer, config: Config): void {
               `Section "${section}" not found. Use headings_only to see available sections.`
             );
           }
+          const origLen = sectionContent.length;
           let content = sectionContent;
-          if (max_length && content.length > max_length) {
-            content = truncateStorageFormat(content, max_length);
+          let truncated = false;
+          if (content.length > effectiveMax) {
+            content = truncateStorageFormat(content, effectiveMax);
+            truncated = true;
           }
           if (format === "markdown") {
             const { markdown, sidecar } = storageToMarkdown(content);
             const header = await formatPage(page, { includeBody: false });
+            const note = truncated ? truncationNote(origLen) : "";
             return toolResult(
-              `${header}\n\nSection: ${section}\n${formatMarkdownWithTokens(markdown, sidecar, "").slice(2)}`
+              `${header}\n\nSection: ${section}\n${formatMarkdownWithTokens(markdown, sidecar, "").slice(2)}${note}`
             );
           }
           const header = await formatPage(page, { includeBody: false });
-          return toolResult(`${header}\n\nSection: ${section}\n${content}`);
+          const note = truncated ? truncationNote(origLen) : "";
+          return toolResult(`${header}\n\nSection: ${section}\n${content}${note}`);
         }
 
         if (include_body && format === "markdown") {
           const body = page.body?.storage?.value ?? page.body?.value ?? "";
+          const origLen = body.length;
           let content = body;
-          if (max_length && content.length > max_length) {
-            content = truncateStorageFormat(content, max_length);
+          let truncated = false;
+          if (content.length > effectiveMax) {
+            content = truncateStorageFormat(content, effectiveMax);
+            truncated = true;
           }
           const { markdown, sidecar } = storageToMarkdown(content);
           const header = await formatPage(page, { includeBody: false });
-          return toolResult(formatMarkdownWithTokens(markdown, sidecar, header));
+          const note = truncated ? truncationNote(origLen) : "";
+          return toolResult(formatMarkdownWithTokens(markdown, sidecar, header) + note);
         }
 
-        if (include_body && max_length) {
+        if (include_body) {
           const body = page.body?.storage?.value ?? page.body?.value ?? "";
-          const truncated = truncateStorageFormat(body, max_length);
-          const header = await formatPage(page, { includeBody: false });
-          return toolResult(`${header}\n\nContent:\n${truncated}`);
+          const origLen = body.length;
+          if (body.length > effectiveMax) {
+            const header = await formatPage(page, { includeBody: false });
+            const truncated = truncateStorageFormat(body, effectiveMax);
+            return toolResult(
+              `${header}\n\nContent:\n${truncated}${truncationNote(origLen)}`
+            );
+          }
+          // At or under the cap — fall through to the full formatPage path
+          // (which fences the body and attaches tenant-echo downstream).
         }
 
         return toolResult(
@@ -638,13 +761,42 @@ function registerTools(server: McpServer, config: Config): void {
           .url()
           .optional()
           .describe("Override the Confluence base URL used by the link rewriter. Defaults to the configured Confluence URL."),
+        source: sourceSchema,
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, title, version, body, version_message, confirm_deletions, replace_body, confirm_shrinkage, confirm_structure_loss, allow_raw_html, confluence_base_url }) => {
+    async ({ page_id, title, version, body, version_message, confirm_deletions, replace_body, confirm_shrinkage, confirm_structure_loss, allow_raw_html, confluence_base_url, source }) => {
       const blocked = writeGuard("update_page", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist — check before any other work; resolution
+        // uses the cached page→space map.
+        await checkSpaceAllowed({ pageId: page_id });
+        // E2: validate source vs. the destructive-flag set before any work.
+        const flagsSet = listDestructiveFlagsSet({
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          confirmDeletions: confirm_deletions,
+          replaceBody: replace_body,
+        });
+        const effectiveSource = validateSource(source, flagsSet);
+
+        // E4: gate update_page when any destructive flag is set. Plain
+        // content updates (no confirm_* / replace_body) are not gated —
+        // the safety pipeline's per-call guards already protect them.
+        if (flagsSet.length > 0) {
+          await gateOperation(server, {
+            tool: "update_page",
+            summary: `Update page ${page_id} with destructive flags?`,
+            details: {
+              page_id,
+              flags: flagsSet.join(","),
+              source: effectiveSource,
+              version,
+            },
+          });
+        }
+
         const cfg = await getConfig();
         const currentPage = await getPage(page_id, true);
         const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
@@ -675,6 +827,12 @@ function registerTools(server: McpServer, config: Config): void {
           deletedTokens: prepared.deletedTokens,
           clientLabel: getClientLabel(server),
           replaceBody: replace_body,
+          // C2: surface destructive-flag usage via stderr banner.
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          confirmDeletions: confirm_deletions,
+          // E2: thread the validated source into the mutation log.
+          source: effectiveSource,
         });
 
         const isTitleOnly = prepared.finalStorage === undefined;
@@ -701,23 +859,82 @@ function registerTools(server: McpServer, config: Config): void {
     "delete_page",
     {
       description: describeWithLock(
-        withDestructiveWarning("Delete a Confluence page by ID"),
+        withDestructiveWarning(
+          "Delete a Confluence page by ID. Requires the current `version` " +
+            "from your most recent get_page call — delete is refused if the " +
+            "page has been modified since. Set " +
+            "EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION=true to restore the " +
+            "previous version-less behaviour for one release while scripts " +
+            "are migrated."
+        ),
         config
       ),
       inputSchema: {
         page_id: z.string().describe("The Confluence page ID to delete"),
+        version: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "The page version number from your most recent get_page call. " +
+              "Required unless EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION=true " +
+              "is set; omitting it under the legacy flag emits a stderr warning."
+          ),
+        source: sourceSchema,
       },
       annotations: { destructiveHint: true, idempotentHint: true },
     },
-    async ({ page_id }) => {
+    async ({ page_id, version, source }) => {
       const blocked = writeGuard("delete_page", config);
       if (blocked) return blocked;
       try {
-        await deletePage(page_id);
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
+        // E2: delete_page itself is the destructive operation — there are
+        // no `confirm_*` flags to pair with source, but a coerced agent can
+        // still be told to call delete_page from a poisoned page. Treat
+        // delete_page as destructive unconditionally for source validation.
+        const effectiveSource = validateSource(source, ["delete_page"]);
+
+        const legacyAllowed =
+          process.env.EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION === "true";
+        if (version === undefined) {
+          if (!legacyAllowed) {
+            return toolError(
+              new Error(
+                "delete_page requires a `version` parameter (from your most recent " +
+                  "get_page call). Set EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION=true " +
+                  "to opt out for one release while migrating scripts."
+              )
+            );
+          }
+          console.error(
+            `epimethian-mcp: WARNING: delete_page on page ${page_id} without a version ` +
+              `(legacy opt-out active). This opt-out will be removed in a future release.`
+          );
+        }
+        // E4: delete_page is unconditionally gated — all deletes are
+        // destructive enough to require an explicit user confirmation when
+        // the client supports elicitation.
+        await gateOperation(server, {
+          tool: "delete_page",
+          summary: `Delete page ${page_id}?`,
+          details: {
+            page_id,
+            version: version ?? "(legacy: unversioned)",
+            source: effectiveSource,
+          },
+        });
+        // F4: count delete_page against the write budget before dispatch.
+        writeBudget.consume();
+        await deletePage(page_id, version);
         logMutation({
           timestamp: new Date().toISOString(),
           operation: "delete_page",
           pageId: page_id,
+          ...(version !== undefined ? { oldVersion: version } : {}),
+          source: effectiveSource,
         });
         return toolResult(`Deleted page ${page_id}` + echo);
       } catch (err) {
@@ -765,14 +982,20 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("update_page_section", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
         const cfg = await getConfig();
         const page = await getPage(page_id, true);
         const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
 
         const currentSectionBody = extractSectionBody(fullBody, section);
         if (currentSectionBody === null) {
-          return toolResult(
-            `Section "${section}" not found. Use headings_only to see available sections.`
+          // A4: surface missing sections via isError so agents don't silently
+          // treat typos or renamed headings as success.
+          return toolError(
+            new Error(
+              `Section "${section}" not found. Use headings_only to see available sections.`
+            )
           );
         }
 
@@ -786,8 +1009,12 @@ function registerTools(server: McpServer, config: Config): void {
 
         const newFullBody = replaceSection(fullBody, section, prepared.finalStorage!);
         if (newFullBody === null) {
-          return toolResult(
-            `Section "${section}" not found. Use headings_only to see available sections.`
+          // A4: surface missing sections via isError so agents don't silently
+          // treat typos or renamed headings as success.
+          return toolError(
+            new Error(
+              `Section "${section}" not found. Use headings_only to see available sections.`
+            )
           );
         }
 
@@ -849,6 +1076,8 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("prepend_to_page", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
         const cfg = await getConfig();
         const { page, newVersion, oldLen, newLen } = await concatPageContent(
           page_id, version, content, "prepend",
@@ -890,6 +1119,8 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("append_to_page", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
         const cfg = await getConfig();
         const { page, newVersion, oldLen, newLen } = await concatPageContent(
           page_id, version, content, "append",
@@ -1196,6 +1427,8 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("add_attachment", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
         // Security: restrict file reads to the current working directory (resolve symlinks)
         const resolved = await realpath(resolve(file_path));
         const cwd = await realpath(process.cwd());
@@ -1260,6 +1493,8 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("add_drawio_diagram", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
         const filename = diagram_name.endsWith(".drawio")
           ? diagram_name
           : `${diagram_name}.drawio`;
@@ -1423,6 +1658,8 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("add_label", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
         await addLabels(page_id, labels);
         return toolResult(`Added ${labels.length} label(s) to page ${page_id}: ${labels.join(", ")}` + echo);
       } catch (err) {
@@ -1449,6 +1686,8 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("remove_label", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
         await removeLabel(page_id, label);
         return toolResult(`Removed label "${label}" from page ${page_id}` + echo);
       } catch (err) {
@@ -1531,6 +1770,18 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("set_page_status", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
+        // Dedup (Track A2): each PUT creates a Confluence version even if
+        // the status is unchanged. A loop of identical set_page_status
+        // calls would otherwise balloon version history — short-circuit
+        // when the current state already matches.
+        const current = await getContentState(page_id);
+        if (current && current.name === name && current.color === color) {
+          return toolResult(
+            `Set status on page ${page_id}: "${name}" (${color}) (no-op: status unchanged)` + echo
+          );
+        }
         await setContentState(page_id, name, color);
         return toolResult(`Set status on page ${page_id}: "${name}" (${color})` + echo);
       } catch (err) {
@@ -1558,6 +1809,8 @@ function registerTools(server: McpServer, config: Config): void {
       const blocked = writeGuard("remove_page_status", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
         await removeContentState(page_id);
         return toolResult(`Removed status from page ${page_id}` + echo);
       } catch (err) {
@@ -1665,6 +1918,8 @@ function registerTools(server: McpServer, config: Config): void {
       if (blocked) return blocked;
       setClientLabel(getClientLabel(server));
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
         let comment: CommentData;
         if (type === "inline") {
           if (!parent_comment_id && !text_selection) {
@@ -2049,6 +2304,7 @@ function registerTools(server: McpServer, config: Config): void {
           .describe(
             "Optional version comment. Defaults to 'Revert to version N'."
           ),
+        source: sourceSchema,
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
@@ -2059,10 +2315,38 @@ function registerTools(server: McpServer, config: Config): void {
       confirm_shrinkage,
       confirm_structure_loss,
       version_message,
+      source,
     }) => {
       const blocked = writeGuard("revert_page", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
+        // E2: revert_page with an attacker-controllable target_version is
+        // itself a destructive operation, as is confirm_shrinkage. Validate
+        // source against the flag set.
+        const flagsSet = listDestructiveFlagsSet({
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          targetVersion: target_version,
+        });
+        const effectiveSource = validateSource(source, flagsSet);
+
+        // E4: revert_page is always gated — reverting to an arbitrary
+        // historical version is a destructive operation that should
+        // surface to the user every time.
+        await gateOperation(server, {
+          tool: "revert_page",
+          summary: `Revert page ${page_id} to version ${target_version}?`,
+          details: {
+            page_id,
+            target_version,
+            current_version,
+            confirm_shrinkage,
+            confirm_structure_loss,
+            source: effectiveSource,
+          },
+        });
         // 1. Fetch current page for body and metadata
         const currentPage = await getPage(page_id, true);
         const currentStorage =
@@ -2106,6 +2390,11 @@ function registerTools(server: McpServer, config: Config): void {
           clientLabel: getClientLabel(server),
           operation: "revert_page",
           replaceBody: true,
+          // C2: surface destructive-flag usage via stderr banner.
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          // E2: thread validated source for the mutation log.
+          source: effectiveSource,
         });
 
         return toolResult(
@@ -2363,10 +2652,24 @@ export async function main() {
   }
   await validateStartup(config);
 
-  // Initialize mutation log if opt-in
-  if (process.env.EPIMETHIAN_MUTATION_LOG === "true") {
+  // Initialize mutation log by default (Track C1).
+  //
+  // Prior behaviour: opt-in via EPIMETHIAN_MUTATION_LOG=true.
+  // New behaviour: on by default; explicit opt-out via
+  // EPIMETHIAN_MUTATION_LOG=false.
+  //
+  // The log is metadata-only — lengths and SHA-256 hashes of bodies, flag
+  // values, operation names, client labels. Never page bodies, titles,
+  // or credentials. See doc/design/security/03-write-safety.md for the
+  // log schema. Privacy cost is low; forensic value for investigating a
+  // successful prompt-injection attack is high.
+  if (shouldEnableMutationLog(process.env.EPIMETHIAN_MUTATION_LOG)) {
     const logDir = join(homedir(), ".epimethian", "logs");
     initMutationLog(logDir);
+    console.error(
+      `epimethian-mcp: mutation log enabled (${logDir}). ` +
+        `Set EPIMETHIAN_MUTATION_LOG=false to disable.`
+    );
   }
 
   // Dynamic server name includes profile for disambiguation in multi-root workspaces
@@ -2379,7 +2682,7 @@ export async function main() {
     version: __PKG_VERSION__,
   });
 
-  registerTools(server, config);
+  await registerTools(server, config);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

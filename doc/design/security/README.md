@@ -51,6 +51,14 @@ mitigation, and whether it is a hard guarantee or best-effort.
 | Attacker-writable config directory | `~/.config/epimethian-mcp/` created `0700`, files `0600`; registry reads reject group/world-writable files | **Hard** |
 | Attacker symlink swap on mutation log | Log directory rejects symlink, logs opened with `O_EXCL + 0600` | **Hard** |
 | Credential leakage through error messages | `sanitizeError()` redacts `Basic …`, `Bearer …`, and `Authorization:` headers in all surfaced errors | **Hard** |
+| Runaway agent mass-creates/deletes pages (v6.0.0) | Write budget (F4) — 25 writes/hour, 100/session default; env-var overrides | **Hard** when enabled (on by default) |
+| Agent writes to unintended space after hijack (v6.0.0) | Per-space profile allowlist (F3) — rejected before dispatch | **Hard** when configured |
+| Agent copies a tenant-authored read response back into a write (v6.0.0) | Per-session canary + fence-marker detection (D3) — `WRITE_CONTAINS_UNTRUSTED_FENCE` | **Hard** (closes round-trip echo) |
+| Agent coerced into destructive flags by tenant content (v6.0.0) | `source: "chained_tool_output"` + destructive flag rejected unconditionally (E2); MCP elicitation surfaces every gated op (E4) | **Structural + behavioural** (E4 is hard when client supports elicitation) |
+| Prompt-injection payload hidden in Unicode tag chars / fullwidth brackets (v6.0.0) | NFKC + strip tag / bidi / zero-width / C0-C1 controls inside `fenceUntrusted` (D1) | **Hard** for known encoding tricks |
+| Tenant content contains tool names / flag names / "IGNORE ABOVE" framing (v6.0.0) | Signal-scan + `injection-signals=…` fence attribute + stderr banner + log correlation (D2) | **Behavioural** (annotation only; agent still decides) |
+| Stale-context replay deletes a page edited since read (v6.0.0) | `delete_page` requires `version`; mismatch → `ConfluenceConflictError` (B1) | **Hard** |
+| Large poisoned page saturates agent context (v6.0.0) | `get_page` default `max_length=50_000`; opt-out `max_length: 0` (D4) | **Hard** when default applies |
 
 The design does **not** defend against:
 
@@ -67,21 +75,54 @@ The design does **not** defend against:
 
 ## 3. Defense in depth at a glance
 
-Every write to Confluence crosses **seven** independent guards:
+As of **v6.0.0**, every write to Confluence crosses up to **fifteen**
+independent guards:
 
 1. **Startup: authentication** — token accepted by the tenant.
 2. **Startup: tenant identity** — `/wiki/rest/api/user/current` confirms the
    authenticated email matches what the profile expects.
 3. **Startup: tenant seal** — `/_edge/tenant_info` confirms the cloudId matches
    the one recorded at setup (prevents silent tenant swap).
-4. **Request time: read-only flag** — every write tool refuses when the
+4. **Startup: tool allowlist** (Track F2) — disallowed tools are never
+   registered; the agent does not see them.
+5. **Request time: read-only flag** — every write tool refuses when the
    profile is marked read-only.
-5. **Pre-transform: safe-prepare** — shrinkage, structural-integrity, empty-body,
-   macro-loss, and table-loss guards run before markdown → storage conversion.
-6. **Post-transform: catastrophic-reduction guard** — `safeSubmitPage` rejects
-   whitespace-only output or >90% reduction (no opt-out).
-7. **Request time: optimistic concurrency** — stale version numbers surface as
-   a 409 with a remediation message, preventing last-writer-wins overwrites.
+6. **Request time: space allowlist** (Track F3) — writes targeting a space
+   outside the profile's `spaces` list are rejected before dispatch.
+7. **Request time: write budget** (Track F4) — session and hourly caps
+   refuse further writes once exceeded.
+8. **Request time: `source` provenance** (Track E2) — destructive flags
+   set with `source: "chained_tool_output"` are rejected
+   unconditionally.
+9. **Request time: elicitation** (Track E4) — `delete_page`,
+   `revert_page`, and `update_page` with destructive flags surface to
+   the user via MCP elicitation before dispatch. Unsupported-client
+   default: refuse.
+10. **Pre-transform: input size cap** (Track A3) — `body > 2 MB` is
+    rejected before conversion.
+11. **Pre-transform: write-path fence detector** (Track D3) — bodies
+    containing the per-session canary or fence markers are rejected as
+    round-trip echo attempts.
+12. **Pre-transform: content safety** — shrinkage, structural-integrity,
+    empty-body, macro-loss, and table-loss guards run before markdown →
+    storage conversion.
+13. **Byte-identical short-circuit** (Track A1) — `update_page` whose
+    normalised body equals the normalised previous body skips the HTTP
+    PUT entirely. No version churn, no mutation-log entry.
+14. **Post-transform: catastrophic-reduction guard** — `safeSubmitPage`
+    rejects whitespace-only output or >90% reduction (no opt-out).
+15. **Request time: optimistic concurrency** — stale version numbers
+    surface as a 409 (or, for `delete_page`, a `ConfluenceConflictError`
+    from the version-gated client — Track B1).
+
+All tenant-authored reads flow through a fencing pipeline that
+includes Unicode sanitisation (Track D1), injection-signal scanning
+(Track D2), and the per-session canary embed (Track D3). All writes
+that set destructive flags emit a `[DESTRUCTIVE]` stderr banner
+(Track C2) and append `[destructive: <flags>]` to the Confluence
+version message (Track C3). The mutation log is on by default
+(Track C1) and now records `source` and `precedingSignals` alongside
+the pre-existing body-hash metadata.
 
 ## 4. Section index
 

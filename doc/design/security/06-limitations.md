@@ -226,3 +226,63 @@ If you deploy an agent against a tenant with many untrusted authors
 (large open wiki spaces, customer-editable pages), prefer a read-only
 profile for reads and a separate read-write profile gated by human
 approval for writes.
+
+## v6.0.0 — which limitations above are now materially mitigated
+
+This release (see `CHANGELOG.md` and the
+`doc/design/investigations/investigate-agent-loop-and-mass-damage/` /
+`investigate-prompt-injection-hardening/` investigations) narrows
+several of the limitations above:
+
+- **§7 Guard opt-outs put responsibility on the caller** — still true,
+  but now paired with:
+  - Track **E2** `source` parameter: `chained_tool_output` + any
+    destructive flag is rejected unconditionally, and every opt-out
+    is logged with its claimed provenance.
+  - Track **E4** elicitation: any `confirm_*` / `replace_body` on
+    `update_page`, plus every `delete_page` and `revert_page`, surfaces
+    to the user before dispatch when the client supports elicitation
+    (Claude Code, Cursor, MCP Inspector).
+- **§10 No rate limiting on guard opt-outs** — now addressed by
+  Track **F4** write budget. Defaults: 100 writes/session,
+  25 writes/rolling hour. Tunable via
+  `EPIMETHIAN_WRITE_BUDGET_SESSION` / `EPIMETHIAN_WRITE_BUDGET_HOURLY`.
+  Exhausted budget rejects the write before the HTTP call with
+  `WRITE_BUDGET_EXCEEDED`.
+- **§13 The mutation log is opt-in** — flipped to on-by-default.
+  `EPIMETHIAN_MUTATION_LOG=false` is the new opt-out. Schema gained
+  `source` (E2) and `precedingSignals` (D2) fields.
+- **§15 Prompt injection via Confluence content** — fence convention is
+  now stacked with:
+  - Track **D1** Unicode sanitisation inside `fenceUntrusted` — closes
+    fullwidth-bracket fence spoofing, tag-character steganography,
+    RTL / zero-width joiner obfuscation, ANSI escapes.
+  - Track **D2** injection-signal scanning — fence header gains
+    `injection-signals=<comma-list>`; stderr emits `[INJECTION-SIGNAL]`
+    banner; correlated into mutation-log `precedingSignals`.
+  - Track **D3** per-session canary + write-path echo detector —
+    rejects any write whose body contains the canary or fence markers
+    themselves, catching agents that paste read responses verbatim
+    into writes.
+
+## v6.0.0 — new capabilities (finer-grained scoping)
+
+- Track **F2** per-tool allowlist on profiles
+  (`allowed_tools` / `denied_tools` in `profiles.json`). Disabled
+  tools are never registered with the MCP server — invisible to the
+  agent.
+- Track **F3** per-space allowlist on profiles (`spaces` in
+  `profiles.json`). Every write-path handler resolves the target
+  space (direct or via cached page metadata) and rejects out-of-
+  allowlist targets with `SpaceNotAllowedError`. An empty array
+  (`"spaces": []`) is the explicit "no writes anywhere" posture while
+  still permitting reads.
+
+These capabilities compose: a profile with
+`"allowed_tools": [...read-only set..., "create_comment"]` plus
+`"spaces": ["TRIAGE"]` limits an agent to reading from any space but
+posting comments only in the TRIAGE space, with elicitation still
+gating each comment create under the default posture. The blast
+radius of a successful prompt injection is bounded by what the
+profile can do, not by what the agent can be coerced into asking
+for.

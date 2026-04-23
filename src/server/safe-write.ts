@@ -61,6 +61,7 @@ import {
   _rawUpdatePage,
   getPageByTitle,
   looksLikeMarkdown,
+  normalizeBodyForSubmit,
   type PageData,
 } from "./confluence-client.js";
 import { markdownToStorage } from "./converter/md-to-storage.js";
@@ -78,6 +79,9 @@ import {
   type MutationRecord,
 } from "./mutation-log.js";
 import { tokeniseStorage } from "./converter/tokeniser.js";
+import { recentSignalsTracker } from "./converter/untrusted-fence.js";
+import { detectUntrustedFenceInWrite } from "./session-canary.js";
+import { writeBudget } from "./write-budget.js";
 
 /**
  * Scope of the body being prepared. Controls which guards fire and at what
@@ -326,6 +330,31 @@ export interface SafeSubmitPageInput {
   replaceBody?: boolean;
 
   /**
+   * Forensic pass-through for the C2 destructive-flag banner. Callers may
+   * set these to true when the corresponding flag was supplied by the user
+   * on the originating tool call. safeSubmitPage emits a single stderr
+   * line naming the flags on any write where at least one is true.
+   *
+   * These are reported to mirror the agent's intent — we do not attempt
+   * to compute whether each flag *actually* suppressed a guard, because
+   * that would require replaying the guard decision tree.
+   */
+  confirmShrinkage?: boolean;
+  confirmStructureLoss?: boolean;
+  confirmDeletions?: boolean;
+
+  /**
+   * Track E2: effective source value for provenance logging. Validated by
+   * the handler via validateSource() before this call; safeSubmitPage
+   * simply threads the value into the mutation-log record.
+   */
+  source?:
+    | "user_request"
+    | "file_or_cli_input"
+    | "chained_tool_output"
+    | "inferred_user_request";
+
+  /**
    * Additive-scope invariant check. When truthy, safeSubmitPage asserts
    * `finalStorage.length >= previousBody.length` — catching handler bugs
    * where an additive op (prepend/append) produced a shrunken body instead
@@ -371,6 +400,24 @@ export const POST_TRANSFORM_BODY_REJECTED = "POST_TRANSFORM_BODY_REJECTED";
 export const READ_ONLY_MARKDOWN_ROUND_TRIP = "READ_ONLY_MARKDOWN_ROUND_TRIP";
 /** Thrown when body contains BOTH Confluence storage tags and markdown structural patterns. */
 export const MIXED_INPUT_DETECTED = "MIXED_INPUT_DETECTED";
+/** Thrown when the caller-supplied body exceeds MAX_INPUT_BODY. */
+export const INPUT_BODY_TOO_LARGE = "INPUT_BODY_TOO_LARGE";
+/** Thrown when a write body contains the per-session canary or fence markers (Track D3). */
+export const WRITE_CONTAINS_UNTRUSTED_FENCE = "WRITE_CONTAINS_UNTRUSTED_FENCE";
+
+/**
+ * Caller-supplied body size cap (Track A3). Checked at the entry of
+ * safePrepareBody, before any conversion work. Matches the combined-size
+ * cap enforced by concatPageContent in index.ts (which guards the final
+ * submitted body after concatenation); this one guards the *input*.
+ *
+ * 2 MB of markdown or storage format is already an unrealistically large
+ * page — the Confluence storage body limit is well below this. Rejecting
+ * here prevents self-inflicted OOMs during conversion of pathological
+ * inputs (e.g. a 100 MB markdown paste) before the HTTP layer would
+ * reject them anyway.
+ */
+export const MAX_INPUT_BODY = 2_000_000;
 
 // ---------------------------------------------------------------------------
 // Mixed-input detection
@@ -432,6 +479,40 @@ function detectMixedInput(body: string): string[] {
   return STRUCTURAL_MD.filter(({ re }) => re.test(stripped)).map(
     ({ name }) => name,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Destructive-flag stderr banner (Track C2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit a single stderr line naming the write operation, page, flags, and
+ * client whenever a destructive flag was effectively active on a write.
+ * Exported only so tests can exercise the formatter shape without calling
+ * into the full pipeline.
+ *
+ * The shape is deliberately grep-friendly:
+ *   epimethian-mcp: [DESTRUCTIVE] tool=<op> page=<id> flags=<list> client=<label>
+ *
+ * Flag content is metadata only — no body content, no titles. A forensic
+ * reviewer can scan for `[DESTRUCTIVE]` in MCP-server logs to find every
+ * call that bypassed a safety guard.
+ */
+export function emitDestructiveBanner(input: {
+  operation: string;
+  pageId: string | undefined;
+  flags: string[];
+  clientLabel: string | undefined;
+}): void {
+  if (input.flags.length === 0) return;
+  const parts = [
+    `epimethian-mcp: [DESTRUCTIVE]`,
+    `tool=${input.operation}`,
+    `page=${input.pageId ?? "(create)"}`,
+    `flags=${input.flags.join(",")}`,
+    `client=${input.clientLabel ?? "unknown"}`,
+  ];
+  console.error(parts.join(" "));
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +753,39 @@ export async function safePrepareBody(
     return { finalStorage: undefined, versionMessage: "", deletedTokens: [] };
   }
 
+  // 0a. Input body-size cap (Track A3). Reject pathologically-large inputs
+  //     before conversion so we don't waste CPU / memory converting content
+  //     Confluence will reject anyway. The cap is deliberately generous
+  //     (2 MB) — normal pages are well under 100 KB.
+  if (body.length > MAX_INPUT_BODY) {
+    throw new ConverterError(
+      `Input body exceeds ${MAX_INPUT_BODY.toLocaleString()} characters ` +
+        `(received ${body.length.toLocaleString()}). Refusing to convert. ` +
+        `Split the content across multiple pages or use prepend_to_page / ` +
+        `append_to_page to build up a large page incrementally.`,
+      INPUT_BODY_TOO_LARGE,
+    );
+  }
+
+  // 0b. Write-path fence / canary detector (Track D3). Catches callers who
+  //     pasted a read-tool response verbatim into a write — the response
+  //     is fenced tenant content, so the paste includes `<<<CONFLUENCE_…`
+  //     markers and the per-session canary. Round-tripping fenced content
+  //     would propagate any injection payload that rode along with the
+  //     original read.
+  const echoMarker = detectUntrustedFenceInWrite(body);
+  if (echoMarker !== undefined) {
+    throw new ConverterError(
+      `Write body contains "${echoMarker}" — this indicates the body was ` +
+        `copied from a read-tool response (which wraps tenant content in ` +
+        `fences and carries a per-session canary). Round-tripping fenced ` +
+        `content would propagate any injection payload attached to the ` +
+        `original read. Remove the fence markers and canary comments from ` +
+        `your body, or compose new content from scratch.`,
+      WRITE_CONTAINS_UNTRUSTED_FENCE,
+    );
+  }
+
   // 1. Read-only-markdown rejection — hard guard, no opt-out. Mirrors the
   //    identical check in create_page / update_page / update_page_section
   //    handlers; consolidating it here lets those handlers drop their copies.
@@ -890,12 +1004,29 @@ export async function safeSubmitPage(
     clientLabel,
     operation,
     replaceBody,
+    confirmShrinkage,
+    confirmStructureLoss,
+    confirmDeletions,
+    source,
     assertGrowth,
   } = input;
 
   const isCreate = pageId === undefined;
   const resolvedOperation: MutationRecord["operation"] =
     operation ?? (isCreate ? "create_page" : "update_page");
+
+  // C2/C3: single computation of the effective destructive-flag list,
+  // reused for both the Confluence version-message suffix (C3) and the
+  // post-success stderr banner (C2). `confirm_deletions` only counts as
+  // "effective" when deletions actually occurred — the flag being set on a
+  // no-op call is not destructive.
+  const destructiveFlags: string[] = [];
+  if (replaceBody === true) destructiveFlags.push("replace_body");
+  if (confirmShrinkage === true) destructiveFlags.push("confirm_shrinkage");
+  if (confirmStructureLoss === true) destructiveFlags.push("confirm_structure_loss");
+  if (confirmDeletions === true && deletedTokens.length > 0) {
+    destructiveFlags.push("confirm_deletions");
+  }
 
   // Title-only update: finalStorage is undefined. Valid ONLY for updates;
   // a create with no body is rejected up front so the caller gets a clear
@@ -962,6 +1093,56 @@ export async function safeSubmitPage(
     );
   }
 
+  // 2c. Byte-identical update short-circuit (Track A1).
+  //
+  // For updates where previousBody is provided, compare the normalised
+  // finalStorage (post strip-attribution, post toStorageFormat) against
+  // the normalised previousBody. If byte-identical, skip the HTTP call
+  // entirely — nothing would change on Confluence's side and a write
+  // would only bump the version number.
+  //
+  // The normalisation MUST use `normalizeBodyForSubmit` (the same helper
+  // `_rawUpdatePage` uses immediately before the PUT). If the two
+  // normalisations diverged we'd either miss legitimate no-ops or
+  // spuriously short-circuit real changes.
+  //
+  // Skipped for creates (no previousBody), title-only updates (no body
+  // to compare), and operations that explicitly want a version bump
+  // (none today, but future tools could opt out).
+  if (
+    !isCreate &&
+    !isTitleOnly &&
+    previousBody !== undefined &&
+    finalStorage !== undefined
+  ) {
+    const normalizedFinal = normalizeBodyForSubmit(finalStorage);
+    const normalizedPrev = normalizeBodyForSubmit(previousBody);
+    if (normalizedFinal === normalizedPrev) {
+      // Synthesise a PageData response from what we already know. We
+      // intentionally do NOT re-fetch via getPage — the short-circuit is
+      // supposed to save a network round-trip, not trade one. Callers
+      // rely only on `page.id`, `page.title`, and `newVersion` in the
+      // response formatting.
+      const synthesized: PageData = {
+        id: pageId!,
+        title,
+        version: { number: version! },
+      };
+      return {
+        page: synthesized,
+        newVersion: version!,
+        oldLen: previousBody.length,
+        newLen: finalStorage.length,
+        deletedTokens,
+      };
+    }
+  }
+
+  // 2d. Track F4: consume one write-budget slot BEFORE the HTTP call so
+  //     a budget breach does not count as a "failed write" in the log.
+  //     Throws WriteBudgetExceededError when over the cap.
+  writeBudget.consume();
+
   // 3. API call — wrapped in try/catch so both success and failure are
   //    mutation-logged.
   try {
@@ -993,6 +1174,7 @@ export async function safeSubmitPage(
         versionMessage,
         previousBody,
         clientLabel,
+        destructiveFlags,
       });
       page = res.page;
       newVersion = res.newVersion;
@@ -1032,7 +1214,34 @@ export async function safeSubmitPage(
     if (replaceBody === true) {
       record.replaceBody = true;
     }
+    // E2: source provenance. Only emitted when the caller threaded one
+    // through (handler validateSource() result). Absent otherwise so the
+    // log stays tidy on non-destructive writes.
+    if (source !== undefined) {
+      record.source = source;
+    }
+    // D2: preceding injection signals. Correlates "agent read a suspect
+    // page in the last 60s" with "agent then attempted this write".
+    // Forensic-only — advisory, does not block the write.
+    const preceding = recentSignalsTracker.recent();
+    if (preceding.length > 0) {
+      record.precedingSignals = preceding;
+    }
     logMutation(record);
+
+    // C2: stderr banner for destructive flag usage. Runs after the success
+    // log so the forensic record is persisted first; emission itself is
+    // best-effort (a failing stderr write should never bubble up).
+    try {
+      emitDestructiveBanner({
+        operation: resolvedOperation,
+        pageId: page.id,
+        flags: destructiveFlags,
+        clientLabel,
+      });
+    } catch {
+      // stderr write failed — never propagate.
+    }
 
     return {
       page,

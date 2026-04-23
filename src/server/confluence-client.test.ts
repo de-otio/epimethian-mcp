@@ -671,12 +671,44 @@ describe("looksLikeMarkdown", () => {
     expect(looksLikeMarkdown("# Title\n\nSome text")).toBe(true);
   });
 
-  it("detects markdown links without HTML", () => {
+  it("A5: plain-text body with inline link but no line-anchored signals falls through to 'no tag start → markdown' branch", () => {
+    // After A5 the inline `[text](url)` regex is no longer a strong-signal,
+    // so this body produces no strong match. The fallback branch checks
+    // whether the body starts with `<`; "See..." does not, so it is still
+    // treated as markdown. Same *result* as pre-A5 for plain-text bodies —
+    // the behaviour change targets bodies that start with `<` (i.e. storage
+    // HTML); see the "plain XHTML" tests below.
     expect(looksLikeMarkdown("See [this page](https://example.com)")).toBe(true);
   });
 
-  it("detects markdown bold without HTML", () => {
+  it("A5: plain-text body with inline bold but no line-anchored signals falls through to markdown", () => {
     expect(looksLikeMarkdown("This is **important**")).toBe(true);
+  });
+
+  it("A5: inline patterns PLUS structural signal still detect as markdown", () => {
+    // Callers who want inline markdown just need to include any structural
+    // signal — a heading, list marker, fenced code block, etc.
+    expect(
+      looksLikeMarkdown("# Title\n\nThis is **important** — see [here](https://example.com)"),
+    ).toBe(true);
+  });
+
+  it("A5: plain XHTML with inline-link substring passes through as storage", () => {
+    // Regression: before A5, this body was misclassified as markdown because
+    // the `[text](url)` regex matched inside the `<a>` tag's rendered content.
+    expect(
+      looksLikeMarkdown(
+        "<p>See the <a href=\"https://example.com/foo\">example</a> for details.</p>",
+      ),
+    ).toBe(false);
+  });
+
+  it("A5: plain XHTML with <strong> tag passes through as storage", () => {
+    expect(
+      looksLikeMarkdown(
+        "<p>This section is <strong>critical</strong>.</p>",
+      ),
+    ).toBe(false);
   });
 
   it("returns false for storage format HTML", () => {
@@ -929,6 +961,47 @@ describe("_rawUpdatePage", () => {
     await expect(
       _rawUpdatePage("30", { title: "T", version: 5 })
     ).rejects.toThrow("Confluence API error (500)");
+  });
+
+  it("C3: appends [destructive: ...] suffix when destructiveFlags is non-empty", async () => {
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    await _rawUpdatePage("30", {
+      title: "T",
+      version: 5,
+      body: "new body",
+      versionMessage: "Refactored",
+      destructiveFlags: ["replace_body", "confirm_shrinkage"],
+    });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.version.message).toContain("Refactored");
+    expect(putBody.version.message).toContain("[destructive: replace_body, confirm_shrinkage]");
+  });
+
+  it("C3: omits the suffix entirely when no destructive flags are passed", async () => {
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    await _rawUpdatePage("30", {
+      title: "T",
+      version: 5,
+      body: "new body",
+      versionMessage: "Ordinary edit",
+    });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.version.message).not.toContain("[destructive:");
+  });
+
+  it("C3: caps the final version message at 500 chars even when the suffix would push it over", async () => {
+    global.fetch = mockFetchResponse({ id: "30", title: "T" });
+    // Craft a long caller-provided message so total exceeds 500 chars.
+    const longMessage = "x".repeat(600);
+    await _rawUpdatePage("30", {
+      title: "T",
+      version: 5,
+      body: "new body",
+      versionMessage: longMessage,
+      destructiveFlags: ["replace_body"],
+    });
+    const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
+    expect(putBody.version.message.length).toBeLessThanOrEqual(500);
   });
 });
 
@@ -1232,6 +1305,48 @@ describe("deletePage", () => {
     const call = (global.fetch as any).mock.calls[0];
     expect(call[0]).toContain(`${API_V2}/pages/99`);
     expect(call[1].method).toBe("DELETE");
+  });
+
+  it("B1: fetches current version and compares when expectedVersion is provided (match → proceeds)", async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (!init || !init.method || init.method === "GET") {
+        return new Response(
+          JSON.stringify({ id: "99", title: "P", version: { number: 5 } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(null, { status: 204 });
+    });
+    global.fetch = fetchMock as any;
+
+    await deletePage("99", 5);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // First call: GET metadata
+    expect(fetchMock.mock.calls[0][1]?.method ?? "GET").toMatch(/^GET$|undefined/);
+    // Second call: DELETE
+    expect(fetchMock.mock.calls[1][1]?.method).toBe("DELETE");
+  });
+
+  it("B1: throws ConfluenceConflictError when expectedVersion does not match", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (!init || !init.method || init.method === "GET") {
+        return new Response(
+          JSON.stringify({ id: "99", title: "P", version: { number: 9 } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(null, { status: 204 });
+    });
+    global.fetch = fetchMock as any;
+
+    await expect(deletePage("99", 5)).rejects.toMatchObject({
+      name: "ConfluenceConflictError",
+    });
+    // DELETE must not have been issued.
+    expect(
+      fetchMock.mock.calls.filter((c) => c[1]?.method === "DELETE"),
+    ).toHaveLength(0);
   });
 });
 

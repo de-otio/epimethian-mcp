@@ -187,3 +187,151 @@ File hygiene:
 - Logs older than 30 days are auto-deleted on startup.
 
 See `src/server/mutation-log.ts`.
+
+## v6.0.0 additions
+
+Sourced from
+`doc/design/investigations/investigate-agent-loop-and-mass-damage/` and
+`doc/design/investigations/investigate-prompt-injection-hardening/`.
+
+### Input body size cap — `INPUT_BODY_TOO_LARGE` (Track A3)
+
+`safePrepareBody` rejects `body > 2 MB` before any conversion work.
+Normal pages are well under 100 KB; the cap catches pathological
+markdown pastes that would waste CPU and memory on conversion before
+the HTTP layer rejected them anyway.
+
+### Byte-identical update short-circuit (Track A1)
+
+`safeSubmitPage` compares the normalised submit body against the
+normalised previous body (both routed through `normalizeBodyForSubmit`
+for parity). Byte-identical updates skip the HTTP PUT and synthesise
+the response — zero version churn for agent loops that re-submit
+their own read-back unchanged. No mutation-log record (nothing
+mutated).
+
+### `set_page_status` dedup (Track A2)
+
+The handler calls `getContentState` first; identical `(name, color)`
+returns success with a "no-op: status unchanged" suffix without PUT.
+Kills the most prolific version-churn vector.
+
+### `update_page_section` section-not-found is `isError: true` (Track A4)
+
+Previously a text-only "section not found" message that agents
+monitoring `isError` treated as success. Now surfaces the structured
+flag.
+
+### Tightened `looksLikeMarkdown` (Track A5)
+
+Inline `**bold**` and `[text](url)` patterns are no longer strong
+markdown signals — required at least one line-anchored structural
+pattern (heading, fenced code, GFM table separator, list marker,
+GitHub alert, Pandoc container, setext underline). Fixes a round-
+trip corruption where plain XHTML bodies containing inline links
+were misclassified as markdown and re-converted.
+
+### `delete_page` requires `version` (Track B1)
+
+Mirrors `update_page`'s optimistic-concurrency check. Stale-context
+replays from long-running agent sessions cannot delete pages that
+were edited since the agent last read them. Opt-out for one release
+via `EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION=true`.
+
+### Per-session canary + write-path echo detector — `WRITE_CONTAINS_UNTRUSTED_FENCE` (Track D3)
+
+Every `fenceUntrusted` fence embeds `<!-- canary:EPI-${uuid} -->` on
+its own line before the close fence. `safePrepareBody` rejects any
+write whose body contains the canary or the fence markers
+themselves. Catches agents that paste a read response verbatim into
+a write — which would propagate any injection payload riding along
+with the original read.
+
+### Unicode sanitisation inside `fenceUntrusted` (Track D1)
+
+Applied to tenant-authored content before the ASCII fence-escape
+step:
+
+- NFKC normalisation — fullwidth `＜` → ASCII `<`.
+- Strip Unicode tag characters (U+E0000–U+E007F).
+- Strip bidi controls (U+202A–U+202E, U+2066–U+2069).
+- Strip zero-width joiners / non-joiners / spaces and word joiner.
+- Strip C0 controls except `\t`, `\n`, `\r`.
+- Strip DEL and C1 controls.
+
+Closes: fullwidth-bracket fence spoofing, tag-character
+steganography, RTL-override obfuscation, ANSI escape injection into
+terminal-visible logs.
+
+### Injection-signal scanning + fence attribute (Track D2)
+
+Before fencing, tenant content is scanned for:
+
+- Named Epimethian tools (whole-word match).
+- Named destructive flags (`confirm_shrinkage`,
+  `confirm_structure_loss`, `confirm_deletions`, `replace_body`).
+- Instruction-style framing (`IGNORE ABOVE`, `NEW INSTRUCTIONS`,
+  `<|im_start|>`, `SYSTEM:`, …).
+- References to the fence strings themselves.
+
+Fires populate `injection-signals=<comma-list>` on the fence header,
+emit the `[INJECTION-SIGNAL]` stderr line, and correlate into the
+mutation log as `precedingSignals` on subsequent writes.
+
+### `source` parameter on destructive tools (Track E2)
+
+Optional enum on `update_page`, `update_page_section`,
+`revert_page`, `delete_page`, `create_page`:
+
+```
+source: "user_request" | "file_or_cli_input" | "chained_tool_output"
+```
+
+`chained_tool_output` paired with any destructive flag is rejected
+unconditionally (`DESTRUCTIVE_FLAG_FROM_TOOL_OUTPUT`). Omitted
+`source` is inferred as `user_request` and logged as
+`inferred_user_request`. Strict mode via
+`EPIMETHIAN_REQUIRE_SOURCE=true` makes omission a hard error.
+
+### Elicitation (HITL) on gated operations (Track E4)
+
+`delete_page`, `revert_page`, and `update_page` with any destructive
+flag request user confirmation via MCP elicitation (2025-06-18
+spec). Unsupported clients default to **refuse**
+(`ELICITATION_UNSUPPORTED`). Opt-out via
+`EPIMETHIAN_ALLOW_UNGATED_WRITES=true`.
+
+### Write budget — `WRITE_BUDGET_EXCEEDED` (Track F4)
+
+In-process sliding-window counter:
+
+- Session total: 100 writes per process lifetime (default).
+- Hourly window: 25 writes per rolling hour (default).
+
+Exceeding either cap rejects the write before the HTTP call. Raise
+via `EPIMETHIAN_WRITE_BUDGET_SESSION=<n>` /
+`EPIMETHIAN_WRITE_BUDGET_HOURLY=<n>`; set either to `0` to disable
+that scope.
+
+### Per-tool + per-space profile allowlists (Tracks F2, F3)
+
+Profile registry (`~/.config/epimethian-mcp/profiles.json`) now
+accepts:
+
+```jsonc
+{
+  "settings": {
+    "acme-triage": {
+      "allowed_tools": ["get_page", "search_pages", "create_comment"],
+      "spaces": ["TRIAGE"]
+    }
+  }
+}
+```
+
+`allowed_tools` / `denied_tools` (mutually exclusive) gate
+registration at startup. `spaces` gates every write-path handler —
+`space_key` inputs are matched directly; `page_id` inputs resolve
+the page's space via a cached metadata fetch (5-min TTL). Unknown
+tool names abort startup with `InvalidToolAllowlistError`. Out-of-
+allowlist writes throw `SpaceNotAllowedError`.

@@ -145,3 +145,67 @@ message identifying the MCP client and server version, the complete change
 history is reconstructable from Confluence itself without any server-side
 logs. This is deliberate: even a user who never enables the mutation log
 retains a full, tenant-visible audit trail as long as attribution is on.
+
+## v6.0.0 changes
+
+This release (see `CHANGELOG.md` and the consolidating investigations
+`doc/design/investigations/investigate-agent-loop-and-mass-damage/` and
+`doc/design/investigations/investigate-prompt-injection-hardening/`)
+materially changes the observability surface:
+
+### Mutation log is on by default (Track C1)
+
+Prior behaviour: opt-in via `EPIMETHIAN_MUTATION_LOG=true`.
+New behaviour: enabled by default; `EPIMETHIAN_MUTATION_LOG=false`
+disables. The log remains metadata-only — lengths, SHA-256 hashes, flag
+values, client labels. Never page bodies, titles, or credentials.
+
+Startup banner now prints a second stderr line when the log is active:
+
+```
+epimethian-mcp: mutation log enabled (/Users/u/.epimethian/logs). Set EPIMETHIAN_MUTATION_LOG=false to disable.
+```
+
+### New mutation-log fields
+
+- `source` — destructive-flag provenance
+  (`user_request | file_or_cli_input | chained_tool_output |
+  inferred_user_request`). See Track E2.
+- `precedingSignals` — injection signals detected on fenced read
+  responses in the 60 s before this write. See Track D2.
+
+### Stderr `[DESTRUCTIVE]` banner (Track C2)
+
+Every write where `replace_body`, `confirm_shrinkage`,
+`confirm_structure_loss`, or effective `confirm_deletions` was set
+emits a single grep-friendly line:
+
+```
+epimethian-mcp: [DESTRUCTIVE] tool=update_page page=42 flags=replace_body,confirm_shrinkage client=claude-code
+```
+
+Lines are stderr-only — MCP clients don't forward stderr back to the
+agent, so this doesn't expand the injection surface.
+
+### Stderr `[INJECTION-SIGNAL]` banner (Track D2)
+
+Fired when a tenant-authored read contains suspect patterns (tool
+names, destructive flag names, `IGNORE ABOVE`, …):
+
+```
+epimethian-mcp: [INJECTION-SIGNAL] pageId=42 field=body signals=named-tool,instruction-frame
+```
+
+Content is never logged — only the signal classes and attribution.
+
+### Stderr `[UNGATED]` banner (Track E4)
+
+Printed whenever `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` causes a gated
+operation to proceed without elicitation on an unsupported client.
+Forensic trail for deliberate opt-outs.
+
+### Confluence version-message destructive suffix (Track C3)
+
+Destructive writes append `[destructive: <flags>]` to the Confluence
+`version.message` — surfaces flag usage in Confluence's native
+history view without dependency on the local log.

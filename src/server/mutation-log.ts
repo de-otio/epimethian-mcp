@@ -59,6 +59,17 @@ export interface MutationRecord {
   replaceBody?: boolean;
   confirmShrinkage?: boolean;
   confirmStructureLoss?: boolean;
+  /**
+   * Track E2: provenance of destructive flag values / page IDs.
+   * See doc/design/investigations/investigate-prompt-injection-hardening/03-flag-provenance.md.
+   */
+  source?: "user_request" | "file_or_cli_input" | "chained_tool_output" | "inferred_user_request";
+  /**
+   * Track D2: injection signals detected on reads that preceded this write.
+   * Populated when fenceUntrusted's signal scanner fired on any tool response
+   * the agent consumed in the last 60s before issuing this write.
+   */
+  precedingSignals?: string[];
   error?: string;
 }
 

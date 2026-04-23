@@ -5,6 +5,133 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.0.0] - 2026-04-23 - agent-safety hardening
+
+Consolidates the findings from the 2026-04-23 agent-loop / mass-damage
+investigation and the prompt-injection hardening investigation (see
+`doc/design/investigations/`). Major version bump for two breaking
+changes: `delete_page` now requires `version`, and `get_page` applies a
+default `max_length`. See "Migration" at the bottom.
+
+### Changed (breaking)
+
+- **`delete_page` now requires a `version` parameter.** Mirrors
+  `update_page`'s optimistic-concurrency check; a stale-context replay
+  cannot delete a page someone else edited since you read it.
+  - Existing behaviour restorable for one release via
+    `EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION=true` (emits a stderr
+    warning on each call). Removed in the next minor release.
+- **`get_page` / `get_page_by_title` now apply a default
+  `max_length=50_000`.** Caps context-saturation attacks where a
+  poisoned page floods the agent's context window. Callers who need the
+  full body can pass `max_length: 0` as a sentinel for "no limit", or
+  supply a larger explicit value. Responses include a
+  `[truncated: full body is N chars; pass max_length=N to see more]`
+  suffix when truncation occurs.
+
+### Changed
+
+- **Mutation log is enabled by default.** Previously opt-in via
+  `EPIMETHIAN_MUTATION_LOG=true`; now on by default with explicit
+  opt-out via `EPIMETHIAN_MUTATION_LOG=false`. The log is metadata-only
+  (lengths, SHA-256 hashes, flag values, client labels) — never page
+  bodies, titles, or credentials.
+- **`set_page_status` is now a no-op when the current state matches.**
+  Kills the version-churn pattern where an agent in a retry loop wrote
+  the same status 1000 times, each creating a Confluence version.
+- **`update_page` short-circuits when the submitted body is
+  byte-identical to the current body.** Saves a version bump on the
+  common "agent re-submits its own read-back unchanged" loop.
+- **`update_page_section` now returns `isError: true` when the section
+  is not found.** Previously returned a text-only "not found" message
+  that agents monitoring `isError` treated as success.
+- **Tightened markdown-format detection (`looksLikeMarkdown`).** Removed
+  inline `**bold**` and `[text](url)` patterns from the strong-markdown
+  signal list. Fixes a round-trip corruption where storage HTML with
+  inline links was misclassified as markdown.
+
+### Added — prompt-injection hardening
+
+See `doc/design/investigations/investigate-prompt-injection-hardening/`
+for the full threat model.
+
+- **Unicode sanitisation inside `fenceUntrusted`** (Track D1). NFKC
+  normalisation + stripping of Unicode tag characters
+  (U+E0000–U+E007F), bidi controls, zero-width joiners, and C0/C1
+  controls (preserving `\t`, `\n`, `\r`). Closes fullwidth-bracket
+  fence spoofing, tag-character steganography, and RTL-override
+  obfuscation.
+- **Injection-signal scanning on fenced content** (Track D2). Scans for
+  tool names, destructive flag names, instruction framing
+  (`IGNORE ABOVE`, `NEW INSTRUCTIONS`, `<|im_start|>`, `SYSTEM:`), and
+  fence-string references. Fence header gets
+  `injection-signals=<comma-list>`; stderr emits
+  `[INJECTION-SIGNAL]` line; correlated into mutation-log
+  `precedingSignals` field.
+- **Per-session canary + write-path echo detector** (Track D3). Every
+  fence carries a `<!-- canary:EPI-… -->` comment. Writes whose body
+  contains the canary or fence markers are rejected with
+  `WRITE_CONTAINS_UNTRUSTED_FENCE`. Catches agents that copy a read
+  response verbatim into a write.
+- **`source` parameter on destructive tools** (Track E2). Optional
+  enum (`user_request | file_or_cli_input | chained_tool_output`) on
+  `update_page`, `update_page_section`, `revert_page`, `delete_page`,
+  `create_page`. `source="chained_tool_output"` with any destructive
+  flag is rejected unconditionally. Strict mode via
+  `EPIMETHIAN_REQUIRE_SOURCE=true`.
+- **Elicitation (human-in-the-loop) on gated operations** (Track E4).
+  `delete_page`, `revert_page`, and `update_page` with destructive
+  flags request user confirmation via MCP elicitation. Unsupported
+  clients default to refuse; opt-out via
+  `EPIMETHIAN_ALLOW_UNGATED_WRITES=true`.
+
+### Added — mass-damage bounds
+
+See `doc/design/investigations/investigate-agent-loop-and-mass-damage/`.
+
+- **Session write budget** (Track F4). Defaults: 100 writes per
+  process lifetime, 25 writes per rolling hour. Raise via
+  `EPIMETHIAN_WRITE_BUDGET_SESSION=<n>` /
+  `EPIMETHIAN_WRITE_BUDGET_HOURLY=<n>`; set either to `0` to disable.
+- **Per-tool profile allowlist** (Track F2). Extend
+  `~/.config/epimethian-mcp/profiles.json` with `allowed_tools` or
+  `denied_tools` (mutually exclusive) to restrict a profile's tool
+  surface. Unknown tool names abort startup.
+- **Per-space profile allowlist** (Track F3). Extend the profile
+  settings with `spaces: string[]`; every write-path tool (create, update,
+  delete, section update, prepend/append, revert, attachment upload,
+  label add/remove, page status, comment create) verifies the target
+  space is on the list. Page-ID targets resolve the space via a cached
+  metadata fetch (5-min TTL). An empty array rejects every write
+  (paranoid no-write profile). `SpaceNotAllowedError` (code
+  `SPACE_NOT_ALLOWED`) is surfaced to the agent.
+- **Input body size cap** (Track A3). Rejects bodies larger than 2 MB
+  with `INPUT_BODY_TOO_LARGE` before any conversion work.
+
+### Added — forensics
+
+- **Destructive-flag stderr banner** (Track C2). Writes with any
+  destructive flag emit a `[DESTRUCTIVE]` stderr line naming the tool,
+  page, flags, and client.
+- **Confluence version-message destructive suffix** (Track C3).
+  Destructive writes append `[destructive: <flags>]` to the Confluence
+  `version.message`, surfaced in Confluence's native history view.
+- **`clientSupportsElicitation()` capability detection** (Track E5).
+
+### Migration
+
+1. **`delete_page`**: add a `version` argument to every call. For
+   one-off scripts, set
+   `EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION=true` temporarily.
+2. **`get_page` default `max_length`**: agents needing the full body
+   must pass `max_length: 0` explicitly.
+3. **Mutation log default on**: opt out with
+   `EPIMETHIAN_MUTATION_LOG=false` (not recommended).
+4. **Elicitation default refuse on unsupported clients**: for
+   non-interactive CI, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true`.
+5. **Write budget defaults**: raise limits via env vars rather than
+   disabling if your legitimate workflow needs more.
+
 ## [5.6.0] - 2026-04-23 - reject mixed markdown + storage input
 
 ### Changed

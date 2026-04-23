@@ -86,6 +86,29 @@ async function ensureConfigDir(): Promise<void> {
 export interface ProfileSettings {
   readOnly?: boolean;
   attribution?: boolean;
+  /**
+   * Track F2: per-tool allowlist. When set, only listed tools are
+   * registered with the MCP server on startup. Names are validated
+   * against the server's known-tool set; unknown names are rejected at
+   * startup. Mutually exclusive with `denied_tools`.
+   */
+  allowed_tools?: string[];
+  /**
+   * Track F2: per-tool denylist. When set, every tool EXCEPT the listed
+   * ones is registered. Mutually exclusive with `allowed_tools`.
+   */
+  denied_tools?: string[];
+  /**
+   * Track F3: per-space allowlist. When set, writes targeting a space
+   * (either via `space_key` input or resolved from `page_id`) are
+   * restricted to this set. Space keys are case-sensitive and must
+   * match Confluence's canonical casing.
+   *
+   * An empty array is NOT the same as undefined: `spaces: []` rejects
+   * every write (useful for paranoid no-write-anywhere profiles while
+   * still allowing reads).
+   */
+  spaces?: string[];
 }
 
 interface ProfileRegistry {

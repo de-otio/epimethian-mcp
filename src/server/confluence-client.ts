@@ -645,7 +645,7 @@ export async function _rawCreatePage(
   clientLabel?: string
 ): Promise<PageData> {
   const cfg = await getConfig();
-  const pageBody = stripAttributionFooter(toStorageFormat(body));
+  const pageBody = normalizeBodyForSubmit(body);
 
   const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
   const versionMsg = cfg.attribution && clientLabel
@@ -686,6 +686,13 @@ export async function _rawUpdatePage(
     versionMessage?: string;
     previousBody?: string;
     clientLabel?: string;
+    /**
+     * Track C3: when non-empty, a `[destructive: ...]` suffix is appended
+     * to the Confluence version message so the Confluence UI's own history
+     * view shows which destructive flags were in effect — no dependency on
+     * the local mutation log.
+     */
+    destructiveFlags?: string[];
   }
 ): Promise<{ page: PageData; newVersion: number }> {
   const cfg = await getConfig();
@@ -704,10 +711,19 @@ export async function _rawUpdatePage(
   else
     versionMessage = `Updated by ${epimethianTag}`;
 
+  // C3: append destructive-flag metadata so Confluence's version history
+  // records it too. Cap the combined length so we never exceed Confluence's
+  // 500-char version-message limit.
+  if (opts.destructiveFlags && opts.destructiveFlags.length > 0) {
+    const suffix = ` [destructive: ${opts.destructiveFlags.join(", ")}]`;
+    const combined = versionMessage + suffix;
+    versionMessage = combined.length > 500 ? combined.slice(0, 500) : combined;
+  }
+
   // Compute the cleaned body ONCE — avoids double-execution of
   // stripAttributionFooter which could diverge if regex state drifts.
   const pageBody = opts.body
-    ? stripAttributionFooter(toStorageFormat(opts.body))
+    ? normalizeBodyForSubmit(opts.body)
     : undefined;
 
   const payload: Record<string, unknown> = {
@@ -753,7 +769,30 @@ export async function _rawUpdatePage(
   return { page, newVersion };
 }
 
-export async function deletePage(pageId: string): Promise<void> {
+/**
+ * Delete a Confluence page.
+ *
+ * If `expectedVersion` is provided (Track B1), the current page version is
+ * fetched first and compared — mismatch throws ConfluenceConflictError so
+ * stale-context agent loops cannot delete pages that were edited since
+ * their last read.
+ *
+ * When `expectedVersion` is omitted, the legacy path (no version check) is
+ * taken; handler-level opt-out gates this via
+ * EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION.
+ */
+export async function deletePage(
+  pageId: string,
+  expectedVersion?: number,
+): Promise<void> {
+  if (expectedVersion !== undefined) {
+    const page = await v2Get(`/pages/${pageId}`, {});
+    const parsed = PageSchema.parse(page);
+    const actualVersion = parsed.version?.number;
+    if (actualVersion !== undefined && actualVersion !== expectedVersion) {
+      throw new ConfluenceConflictError(pageId);
+    }
+  }
   await v2Delete(`/pages/${pageId}`);
   pageCache.delete(pageId);
 }
@@ -1054,6 +1093,18 @@ function stripAttributionFooter(body: string): string {
       ""
     )
     .trimEnd();
+}
+
+/**
+ * Shared body normalization used by both `_rawCreatePage`/`_rawUpdatePage`
+ * (before submitting) and `safeSubmitPage` (for the byte-identical
+ * short-circuit). The two call sites MUST normalise via the same function
+ * so the comparison is meaningful — if they diverge, the short-circuit
+ * could incorrectly short-circuit (false negative) or falsely PUT a
+ * no-op (false positive).
+ */
+export function normalizeBodyForSubmit(body: string): string {
+  return stripAttributionFooter(toStorageFormat(body));
 }
 
 export async function getLabels(pageId: string): Promise<LabelData[]> {
@@ -1652,6 +1703,21 @@ export function looksLikeMarkdown(body: string): boolean {
   }
 
   // 2. Strong markdown signals.
+  //
+  // All line-anchored; Track A5 tightened this set by removing the inline
+  // patterns `/\*\*…\*\*/` (inline bold) and `/\[…\]\(…\)/` (inline link).
+  // Those inline signals were too forgiving — pure Confluence storage XHTML
+  // containing `<a href="...">example</a>` was classified as markdown and
+  // re-converted, corrupting legitimate content. See
+  // `doc/design/investigations/investigate-agent-loop-and-mass-damage/08-format-misdetection.md`
+  // for the analysis.
+  //
+  // Trade-off: a caller who submits plain prose like "this is **bold** text"
+  // with NO structural markdown signals now gets storage-format interpretation
+  // and a literal `**bold**` rendered in Confluence. Callers who want inline
+  // markdown must include at least one line-anchored structural signal
+  // (a heading, a list, a code fence, etc.) for the body to be detected as
+  // markdown.
   const STRONG_MARKDOWN_SIGNALS: RegExp[] = [
     /^\|[\s\-:|]+\|\s*$/m,           // GFM table separator
     /^```/m,                           // fenced code block
@@ -1662,8 +1728,6 @@ export function looksLikeMarkdown(body: string): boolean {
     /^[-*]\s+/m,                       // unordered list
     /^\d+\.\s+/m,                      // ordered list
     /^\[\d+\]:/m,                      // numbered reference
-    /\[[^\]]+\]\([^)]+\)/,            // inline link [text](url)
-    /\*\*[^*]+\*\*/,                   // inline bold **text**
   ];
 
   if (STRONG_MARKDOWN_SIGNALS.some((re) => re.test(body))) {

@@ -21,6 +21,11 @@ vi.hoisted(() => {
   process.env.CONFLUENCE_URL = "https://test.atlassian.net";
   process.env.CONFLUENCE_EMAIL = "user@test.com";
   process.env.CONFLUENCE_API_TOKEN = "test-token";
+  // F4: disable the write budget in this test suite — many tests
+  // exercise safeSubmitPage and would otherwise collectively exhaust
+  // the default budget across the suite.
+  process.env.EPIMETHIAN_WRITE_BUDGET_SESSION = "0";
+  process.env.EPIMETHIAN_WRITE_BUDGET_HOURLY = "0";
 });
 
 vi.mock("../shared/keychain.js", () => ({
@@ -35,6 +40,10 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./confluence-client.js")>();
   return {
     ...actual,
+    // `getPage` is kept as a vi.fn so the A1 short-circuit test can assert
+    // it was NOT called (the short-circuit synthesises its response and
+    // must not issue a metadata fetch).
+    getPage: vi.fn(),
     getPageByTitle: vi.fn(),
     _rawCreatePage: vi.fn(),
     _rawUpdatePage: vi.fn(),
@@ -64,16 +73,21 @@ vi.mock("./mutation-log.js", async (importOriginal) => {
 });
 
 import {
+  emitDestructiveBanner,
   safePrepareBody,
   safeSubmitPage,
   type SafePrepareBodyInput,
   type DeletedToken,
   DELETION_ACK_MISMATCH,
+  INPUT_BODY_TOO_LARGE,
+  MAX_INPUT_BODY,
   MIXED_INPUT_DETECTED,
   POST_TRANSFORM_BODY_REJECTED,
   READ_ONLY_MARKDOWN_ROUND_TRIP,
+  WRITE_CONTAINS_UNTRUSTED_FENCE,
 } from "./safe-write.js";
 import {
+  getPage,
   getPageByTitle,
   _rawCreatePage,
   _rawUpdatePage,
@@ -1184,5 +1198,281 @@ describe("safePrepareBody — deletedTokens fingerprint format", () => {
       currentBody: undefined,
     });
     expect(result.deletedTokens).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Section E: A1 — byte-identical update short-circuit
+// ---------------------------------------------------------------------------
+
+describe("safeSubmitPage — byte-identical short-circuit (A1)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("does not call _rawUpdatePage when body is byte-identical to previousBody", async () => {
+    const body = "<p>Unchanged content</p>";
+
+    const result = await safeSubmitPage({
+      pageId: "42",
+      title: "Some Page",
+      finalStorage: body,
+      previousBody: body,
+      version: 7,
+      versionMessage: "",
+      deletedTokens: [],
+      clientLabel: undefined,
+    });
+
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+    // A1 synthesises the response — it does not re-fetch.
+    expect(getPage).not.toHaveBeenCalled();
+    expect(result.newVersion).toBe(7);
+    expect(result.page.id).toBe("42");
+    expect(result.page.title).toBe("Some Page");
+    expect(result.oldLen).toBe(body.length);
+    expect(result.newLen).toBe(body.length);
+    // Mutation log is not written for no-ops — there is nothing to record.
+    expect(logMutation).not.toHaveBeenCalled();
+  });
+
+  it("still writes when body differs by a single character", async () => {
+    const prev = "<p>Unchanged content</p>";
+    const next = "<p>Unchanged content.</p>"; // added a period
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "Some Page", version: { number: 8 } },
+      newVersion: 8,
+    });
+
+    await safeSubmitPage({
+      pageId: "42",
+      title: "Some Page",
+      finalStorage: next,
+      previousBody: prev,
+      version: 7,
+      versionMessage: "",
+      deletedTokens: [],
+      clientLabel: undefined,
+    });
+
+    expect(_rawUpdatePage).toHaveBeenCalledOnce();
+  });
+
+  it("treats attribution-footer-only delta as no-op (normalisation parity)", async () => {
+    // previousBody carries a legacy attribution footer; finalStorage is the
+    // same body without it. Post-normalisation they are identical.
+    const clean = "<p>Some content</p>";
+    const withFooter =
+      clean +
+      `<p>Edited by <a href="https://github.com/de-otio/epimethian-mcp"><em>Epimethian</em></a></p>`;
+
+    await safeSubmitPage({
+      pageId: "42",
+      title: "Some Page",
+      finalStorage: clean,
+      previousBody: withFooter,
+      version: 7,
+      versionMessage: "",
+      deletedTokens: [],
+      clientLabel: undefined,
+    });
+
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("D3: rejects write body that contains the open-fence marker", async () => {
+    const body =
+      "<p>Some content</p>\n<<<CONFLUENCE_UNTRUSTED pageId=42 field=body>>>\n";
+    await expect(
+      safePrepareBody({ body, currentBody: "<p>anything</p>" }),
+    ).rejects.toMatchObject({ code: WRITE_CONTAINS_UNTRUSTED_FENCE });
+  });
+
+  it("D3: rejects write body that contains the close-fence marker", async () => {
+    const body = "<p>body</p>\n<<<END_CONFLUENCE_UNTRUSTED>>>";
+    await expect(
+      safePrepareBody({ body, currentBody: "<p>anything</p>" }),
+    ).rejects.toMatchObject({ code: WRITE_CONTAINS_UNTRUSTED_FENCE });
+  });
+
+  it("D3: rejects write body that contains the per-session canary", async () => {
+    const { getSessionCanary } = await import("./session-canary.js");
+    const canary = getSessionCanary();
+    const body = `<p>seemingly-clean body</p><!-- canary:${canary} -->`;
+    await expect(
+      safePrepareBody({ body, currentBody: "<p>anything</p>" }),
+    ).rejects.toMatchObject({ code: WRITE_CONTAINS_UNTRUSTED_FENCE });
+  });
+
+  it("D3: clean body passes through (no fence markers, no canary)", async () => {
+    const body = "<p>this is a brand new body with no fence artefacts</p>";
+    const result = await safePrepareBody({
+      body,
+      currentBody: "<p>anything</p>",
+    });
+    expect(result.finalStorage).toBeDefined();
+  });
+
+  it("A3: rejects input body exceeding MAX_INPUT_BODY with INPUT_BODY_TOO_LARGE", async () => {
+    // Use a body shape that would be classified as storage (starts with `<`)
+    // so the check hits MAX_INPUT_BODY before any converter-internal caps.
+    const oversized = "<p>" + "x".repeat(MAX_INPUT_BODY) + "</p>";
+    await expect(
+      safePrepareBody({ body: oversized, currentBody: undefined }),
+    ).rejects.toMatchObject({ code: INPUT_BODY_TOO_LARGE });
+  });
+
+  it("A3: accepts input body at or below MAX_INPUT_BODY", async () => {
+    // Exactly at the cap; storage-format-shaped so the markdown converter's
+    // stricter internal 1 MB cap doesn't apply to this path.
+    const padded = "<p>" + "x".repeat(MAX_INPUT_BODY - 7) + "</p>";
+    expect(padded.length).toBe(MAX_INPUT_BODY);
+    const result = await safePrepareBody({
+      body: padded,
+      currentBody: undefined,
+    });
+    expect(result.finalStorage).toBeDefined();
+  });
+
+  it("C2: emits destructive banner on stderr when replace_body=true", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "P", version: { number: 8 } },
+      newVersion: 8,
+    });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await safeSubmitPage({
+        pageId: "42",
+        title: "P",
+        finalStorage: "<p>new body</p>",
+        previousBody: "<p>old body</p>",
+        version: 7,
+        versionMessage: "",
+        deletedTokens: [],
+        clientLabel: "claude-code",
+        replaceBody: true,
+      });
+
+      const lines = stderrSpy.mock.calls.map((c) => String(c[0]));
+      const banner = lines.find((l) => l.includes("[DESTRUCTIVE]"));
+      expect(banner).toBeDefined();
+      expect(banner).toContain("tool=update_page");
+      expect(banner).toContain("page=42");
+      expect(banner).toContain("flags=replace_body");
+      expect(banner).toContain("client=claude-code");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("C2: emits banner when both confirm_shrinkage and confirm_structure_loss are true", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "P", version: { number: 8 } },
+      newVersion: 8,
+    });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await safeSubmitPage({
+        pageId: "42",
+        title: "P",
+        finalStorage: "<p>different body</p>",
+        previousBody: "<p>original body</p>",
+        version: 7,
+        versionMessage: "",
+        deletedTokens: [],
+        clientLabel: "cursor",
+        confirmShrinkage: true,
+        confirmStructureLoss: true,
+      });
+
+      const lines = stderrSpy.mock.calls.map((c) => String(c[0]));
+      const banner = lines.find((l) => l.includes("[DESTRUCTIVE]"));
+      expect(banner).toBeDefined();
+      expect(banner).toContain("flags=confirm_shrinkage,confirm_structure_loss");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("C2: does not emit banner on writes with no destructive flags", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "P", version: { number: 8 } },
+      newVersion: 8,
+    });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await safeSubmitPage({
+        pageId: "42",
+        title: "P",
+        finalStorage: "<p>different body</p>",
+        previousBody: "<p>original body</p>",
+        version: 7,
+        versionMessage: "",
+        deletedTokens: [],
+        clientLabel: undefined,
+      });
+
+      const lines = stderrSpy.mock.calls.map((c) => String(c[0]));
+      expect(lines.some((l) => l.includes("[DESTRUCTIVE]"))).toBe(false);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("C2: emitDestructiveBanner formatter includes all expected fields", () => {
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      emitDestructiveBanner({
+        operation: "revert_page",
+        pageId: "17",
+        flags: ["replace_body"],
+        clientLabel: "mcp-inspector",
+      });
+      expect(stderrSpy).toHaveBeenCalledOnce();
+      const line = String(stderrSpy.mock.calls[0][0]);
+      expect(line).toBe(
+        "epimethian-mcp: [DESTRUCTIVE] tool=revert_page page=17 flags=replace_body client=mcp-inspector",
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("C2: emitDestructiveBanner is a no-op when flags is empty", () => {
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      emitDestructiveBanner({
+        operation: "update_page",
+        pageId: "1",
+        flags: [],
+        clientLabel: "x",
+      });
+      expect(stderrSpy).not.toHaveBeenCalled();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("still writes on title-only updates (finalStorage undefined) — short-circuit does not apply", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "New Title", version: { number: 8 } },
+      newVersion: 8,
+    });
+
+    await safeSubmitPage({
+      pageId: "42",
+      title: "New Title",
+      finalStorage: undefined,
+      previousBody: "<p>body</p>",
+      version: 7,
+      versionMessage: "",
+      deletedTokens: [],
+      clientLabel: undefined,
+    });
+
+    expect(_rawUpdatePage).toHaveBeenCalledOnce();
   });
 });
