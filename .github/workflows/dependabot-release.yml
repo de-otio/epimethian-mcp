@@ -1,0 +1,21 @@
+# After a Dependabot PR auto-merges, bump the prerelease suffix
+# (or patch if stable), tag, and create a GitHub Release. The release
+# event then fires publish.yml, which publishes to the registry.
+
+name: Auto-release on Dependabot merge
+
+on:
+  push:
+    branches: [main, master, dev]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: |
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      (github.event.head_commit.author.username == 'dependabot[bot]' ||
+       contains(github.event.head_commit.message, 'dependabot[bot]'))
+    uses: de-otio/.github/.github/workflows/dependabot-release-on-bump.yml@main
+    secrets: inherit
