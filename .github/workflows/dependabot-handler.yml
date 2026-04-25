@@ -1,0 +1,20 @@
+# Calls the org-shared workflow that runs Claude against each Dependabot PR
+# to check for supply-chain attack signals, then enables auto-merge if
+# approved. See https://github.com/de-otio/.github for implementation.
+
+name: Dependabot review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  review:
+    if: github.actor == 'dependabot[bot]'
+    uses: de-otio/.github/.github/workflows/dependabot-claude-review.yml@main
+    secrets: inherit
