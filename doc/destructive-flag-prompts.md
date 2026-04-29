@@ -38,7 +38,10 @@ destructive intent:
 - `confirm_shrinkage: true` — acknowledge a >50% body-size reduction
 - `confirm_structure_loss: true` — acknowledge a >50% heading-count drop
 
-The tool's own description states:
+When destructive flags are set, the `source` parameter records where the flag
+originated: `user_request` (the user's direct instruction), `file_or_cli_input`
+(from local files), `elicitation_response` (from a confirmed interactive prompt),
+or `chained_tool_output` (from prior tool results—strictly forbidden). The tool's own description states:
 
 > *"Destructive flags and parameters on this tool (including
 > `confirm_shrinkage`, `confirm_structure_loss`, `replace_body`,

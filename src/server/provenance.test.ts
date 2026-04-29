@@ -15,6 +15,15 @@ vi.mock("./confluence-client.js", () => ({
   getContentState: vi.fn(),
   setContentState: vi.fn(),
   getSiteDefaultLocale: vi.fn(),
+  // ConfluenceApiError must be a real class so instanceof checks work.
+  ConfluenceApiError: class ConfluenceApiError extends Error {
+    readonly status: number;
+    constructor(status = 500, message = "API Error") {
+      super(message);
+      this.name = "ConfluenceApiError";
+      this.status = status;
+    }
+  },
   // ConfluencePermissionError must be a real class so instanceof checks work.
   ConfluencePermissionError: class ConfluencePermissionError extends Error {
     readonly status: number;
@@ -39,6 +48,7 @@ import {
   getContentState,
   setContentState,
   getSiteDefaultLocale,
+  ConfluenceApiError,
   ConfluencePermissionError,
 } from "./confluence-client.js";
 
@@ -358,5 +368,23 @@ describe("markPageUnverified", () => {
     const result = await markPageUnverified("page-77", cfg);
     expect(result.warning).toContain("Network timeout");
     expect(result.warning).toContain("page-77");
+  });
+
+  it("21. when setContentState throws 409 after retries are exhausted, returns warning and does NOT throw", async () => {
+    // Note: 409 retry lives inside setContentState (see confluence-client.test.ts
+    // for retry behaviour). From this caller's perspective, an exhausted retry
+    // surfaces as a thrown ConfluenceApiError that we convert to a warning.
+    const cfg = makeConfig({ unverifiedStatusLocale: "en" });
+    (getContentState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+    const err409 = new (ConfluenceApiError as unknown as new (status: number, msg: string) => Error)(
+      409,
+      "Version conflict"
+    );
+    (setContentState as ReturnType<typeof vi.fn>).mockRejectedValue(err409);
+
+    const result = await markPageUnverified("page-409-exhausted", cfg);
+    expect(result.warning).toBeDefined();
+    expect(result.warning).toContain("page-409-exhausted");
+    expect(result.warning).toContain("Version conflict");
   });
 });

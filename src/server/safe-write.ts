@@ -352,6 +352,7 @@ export interface SafeSubmitPageInput {
     | "user_request"
     | "file_or_cli_input"
     | "chained_tool_output"
+    | "elicitation_response"
     | "inferred_user_request";
 
   /**
@@ -386,6 +387,13 @@ export interface SafeSubmitPageOutput {
   newLen: number;
   /** Tokens removed during preparation (echoed from the input). */
   deletedTokens: DeletedToken[];
+  /**
+   * One-shot deprecation warnings drained from the write-budget singleton
+   * after a successful consume(). Handlers should push these into their
+   * WarningAccumulator so the agent sees them in the tool result.
+   * Empty array in the normal case (no deprecated env vars in use).
+   */
+  budgetWarnings: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1142,7 @@ export async function safeSubmitPage(
         oldLen: previousBody.length,
         newLen: finalStorage.length,
         deletedTokens,
+        budgetWarnings: [],
       };
     }
   }
@@ -1142,6 +1151,10 @@ export async function safeSubmitPage(
   //     a budget breach does not count as a "failed write" in the log.
   //     Throws WriteBudgetExceededError when over the cap.
   writeBudget.consume();
+  // Drain any one-shot deprecation warnings (e.g. HOURLY→ROLLING rename).
+  // These are returned in SafeSubmitPageOutput.budgetWarnings so handlers
+  // can push them into their WarningAccumulator for the tool result.
+  const budgetWarnings = writeBudget.drainPendingWarnings();
 
   // 3. API call — wrapped in try/catch so both success and failure are
   //    mutation-logged.
@@ -1249,6 +1262,7 @@ export async function safeSubmitPage(
       oldLen,
       newLen: isTitleOnly ? 0 : finalStorage!.length,
       deletedTokens,
+      budgetWarnings,
     };
   } catch (err) {
     // 5. Mutation log (failure). Reuse the current errorRecord shape; the

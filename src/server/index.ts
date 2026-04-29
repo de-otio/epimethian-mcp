@@ -657,7 +657,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "To inject a TOC macro from markdown, use YAML frontmatter at the top of the body: `---\\ntoc:\\n  maxLevel: 3\\n  minLevel: 1\\n---`. " +
           "For other macros from markdown, use directive syntax: `:info[content]`, `:mention[Name]{accountId=...}`, `:date[2026-04-23]`. " +
           "Use allow_raw_html: true to permit raw HTML inside markdown (disabled by default for security). " +
-          "Use confluence_base_url to override the base URL used by the link rewriter (defaults to the configured Confluence URL)."
+          "Use confluence_base_url to override the base URL used by the link rewriter (defaults to the configured Confluence URL). " +
+          "If the space has auto-numbering, the page version may advance silently after creation while post-processing renders the TOC and number prefixes. Re-read the page before subsequent updates."
         ),
         config
       ),
@@ -731,7 +732,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     "get_page",
     {
       description: withUntrustedNote(
-        "Read a Confluence page by ID. For large pages, use headings_only to get the page outline first, then use section to read a specific section, or max_length to limit the response size."
+        "Read a Confluence page by ID. For large pages, use headings_only to get the page outline first, then use section to read a specific section, or max_length to limit the response size. " +
+        "Note: in Confluence spaces with heading auto-numbering enabled, stored heading text contains the prefix (e.g. `1.2. Section`); the matcher accepts either the prefixed or plain form."
       ),
       inputSchema: {
         page_id: z.string().describe("The Confluence page ID"),
@@ -1119,7 +1121,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     {
       description: describeWithLock(
         withDestructiveWarning(
-          "Update a single section of a Confluence page by heading name. Only the content under the specified heading is replaced; the rest of the page is untouched. Use headings_only to find section names first."
+          "Update a single section of a Confluence page by heading name. Only the content under the specified heading is replaced; the rest of the page is untouched. Use headings_only to find section names first. " +
+          "Note: in Confluence spaces with heading auto-numbering enabled, stored heading text contains the prefix (e.g. `1.2. Section`); the matcher accepts either the prefixed or plain form."
         ),
         config
       ),
@@ -1706,12 +1709,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           : `${diagram_name}.drawio`;
 
         // Write diagram XML to a temp file and upload as attachment
+        let attachmentId: string;
         const tmpDir = await mkdtemp(join(tmpdir(), "drawio-"));
         try {
           const tmpPath = join(tmpDir, filename);
           await writeFile(tmpPath, diagram_xml, "utf-8");
           const fileData = await readFile(tmpPath);
-          await uploadAttachment(page_id, fileData, filename);
+          const uploadResult = await uploadAttachment(page_id, fileData, filename);
+          attachmentId = uploadResult.id;
         } finally {
           await rm(tmpDir, { recursive: true, force: true });
         }
@@ -1775,7 +1780,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (badgeResult.warning) warnings.push(badgeResult.warning);
 
         return toolResult(
-          appendWarnings(`Diagram "${filename}" added to page ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion})`, warnings) + echo
+          appendWarnings(`Diagram "${filename}" added to page ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, attachment ID: ${attachmentId}, macro ID: ${macroId})`, warnings) + echo
         );
       } catch (err) {
         return toolErrorWithContext(err, { operation: "add_drawio_diagram", resource: `page ${page_id}`, profile: config.profile });

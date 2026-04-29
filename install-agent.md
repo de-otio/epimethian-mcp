@@ -232,6 +232,50 @@ If **the server doesn't appear after restart**:
 - Verify the `command` value is an absolute path (run `which epimethian-mcp` to confirm)
 - Check that `.mcp.json` contains valid JSON (no trailing commas, correct quoting)
 
+## Write budget (safety cap on writes)
+
+epimethian-mcp enforces two write-rate caps per server process:
+
+- **Session cap** (default 250): total writes since the server started.
+- **Rolling cap** (default 75 per 15-minute window): catches bursts.
+
+These are local safety nets, not Confluence limits. They exist because an
+autonomous agent in a retry loop or with a bad plan can issue hundreds of writes
+very quickly, and most users would rather have a brief pause to confirm than
+discover the result an hour later.
+
+### What to do when you (the agent) hit `WRITE_BUDGET_EXCEEDED`
+
+1. **Stop and check.** Was the in-progress work user-requested and going as
+   planned? If unsure, ask the user before continuing.
+2. **Explain to the user, in your own words:**
+   - The safety budget has been hit (which scope, current vs. limit).
+   - What the budget is for: a guard against runaway agents.
+   - Whether the work-in-progress is legitimate (your judgement).
+   - The two ways forward: wait for the rolling window to reopen, or raise the cap.
+3. **If the user wants to raise the cap**, give them this snippet to add to the
+   `env` block of the epimethian-mcp entry in their MCP config (`.mcp.json` or
+   equivalent — see Step 4 above for the layout):
+
+   ```json
+   "EPIMETHIAN_WRITE_BUDGET_ROLLING": "200",
+   "EPIMETHIAN_WRITE_BUDGET_SESSION": "1000"
+   ```
+
+   Set either value to `"0"` to disable that scope. **Confirm with the user
+   before recommending a raise** — the budget exists precisely to create a
+   pause-and-check moment. The user must restart the MCP server (re-open the
+   MCP client) for changes to take effect.
+4. **If the user gets a deprecation warning** about `EPIMETHIAN_WRITE_BUDGET_HOURLY`,
+   tell them to rename it to `EPIMETHIAN_WRITE_BUDGET_ROLLING` in the same
+   config file. The old name still works but will be removed in version 7.
+
+### Operator-side defaults
+
+- **`EPIMETHIAN_WRITE_BUDGET_SESSION`** — default 250; set to "0" to disable.
+- **`EPIMETHIAN_WRITE_BUDGET_ROLLING`** — default 75 per 15-minute window; set to "0" to disable.
+- **`EPIMETHIAN_WRITE_BUDGET_HOURLY`** — deprecated alias for `EPIMETHIAN_WRITE_BUDGET_ROLLING`; will be removed in version 7.
+
 ## Available Tools (34)
 
 | Tool | Description |

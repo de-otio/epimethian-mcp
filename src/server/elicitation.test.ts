@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  ELICITATION_UNSUPPORTED,
+  ELICITATION_REQUIRED_BUT_UNAVAILABLE,
   GatedOperationError,
-  USER_DENIED_GATED_OPERATION,
+  NO_USER_RESPONSE,
+  USER_CANCELLED,
+  USER_DECLINED,
   gateOperation,
 } from "./elicitation.js";
 
@@ -40,7 +42,7 @@ describe("gateOperation (E4)", () => {
     expect(elicit).toHaveBeenCalledOnce();
   });
 
-  it("E4: throws USER_DENIED on decline", async () => {
+  it("E4: throws USER_DECLINED on decline", async () => {
     vi.mocked(clientSupportsElicitation).mockReturnValue(true);
     const elicit = vi.fn(async () => ({ action: "decline", content: undefined }));
     const server = makeFakeServer(elicit);
@@ -50,12 +52,12 @@ describe("gateOperation (E4)", () => {
       expect.unreachable();
     } catch (err) {
       expect(err).toBeInstanceOf(GatedOperationError);
-      expect((err as GatedOperationError).code).toBe(USER_DENIED_GATED_OPERATION);
+      expect((err as GatedOperationError).code).toBe(USER_DECLINED);
       expect((err as Error).message).toContain("user declined");
     }
   });
 
-  it("E4: throws USER_DENIED on cancel", async () => {
+  it("E4: throws USER_CANCELLED on cancel", async () => {
     vi.mocked(clientSupportsElicitation).mockReturnValue(true);
     const elicit = vi.fn(async () => ({ action: "cancel", content: undefined }));
     const server = makeFakeServer(elicit);
@@ -64,12 +66,12 @@ describe("gateOperation (E4)", () => {
       await gateOperation(server, { tool: "revert_page", summary: "Revert?" });
       expect.unreachable();
     } catch (err) {
-      expect((err as GatedOperationError).code).toBe(USER_DENIED_GATED_OPERATION);
+      expect((err as GatedOperationError).code).toBe(USER_CANCELLED);
       expect((err as Error).message).toContain("user cancelled");
     }
   });
 
-  it("E4: throws USER_DENIED when user accepts but confirm=false", async () => {
+  it("E4: throws NO_USER_RESPONSE when user accepts but confirm=false", async () => {
     vi.mocked(clientSupportsElicitation).mockReturnValue(true);
     const elicit = vi.fn(async () => ({
       action: "accept",
@@ -81,11 +83,12 @@ describe("gateOperation (E4)", () => {
       await gateOperation(server, { tool: "update_page", summary: "Update?" });
       expect.unreachable();
     } catch (err) {
-      expect((err as GatedOperationError).code).toBe(USER_DENIED_GATED_OPERATION);
+      // accept with confirm=false falls through to the unknown-action path
+      expect((err as GatedOperationError).code).toBe(NO_USER_RESPONSE);
     }
   });
 
-  it("E4: throws ELICITATION_UNSUPPORTED when client lacks capability and no opt-out", async () => {
+  it("E4: throws ELICITATION_REQUIRED_BUT_UNAVAILABLE when client lacks capability and no opt-out", async () => {
     vi.mocked(clientSupportsElicitation).mockReturnValue(false);
     const server = makeFakeServer(() => {
       throw new Error("should not be called");
@@ -95,7 +98,9 @@ describe("gateOperation (E4)", () => {
       await gateOperation(server, { tool: "delete_page", summary: "Delete?" });
       expect.unreachable();
     } catch (err) {
-      expect((err as GatedOperationError).code).toBe(ELICITATION_UNSUPPORTED);
+      expect((err as GatedOperationError).code).toBe(ELICITATION_REQUIRED_BUT_UNAVAILABLE);
+      expect((err as Error).message).toContain("update_page_section");
+      expect((err as Error).message).toContain("Claude Code");
     }
   });
 
@@ -111,7 +116,7 @@ describe("gateOperation (E4)", () => {
     expect(elicit).not.toHaveBeenCalled();
   });
 
-  it("E4: elicitation runtime error is treated as denial (fail-safe)", async () => {
+  it("E4: elicitation transport error yields NO_USER_RESPONSE (not USER_DECLINED)", async () => {
     vi.mocked(clientSupportsElicitation).mockReturnValue(true);
     const elicit = vi.fn(async () => {
       throw new Error("transport blew up");
@@ -122,8 +127,26 @@ describe("gateOperation (E4)", () => {
       await gateOperation(server, { tool: "delete_page", summary: "Delete?" });
       expect.unreachable();
     } catch (err) {
-      expect((err as GatedOperationError).code).toBe(USER_DENIED_GATED_OPERATION);
+      expect((err as GatedOperationError).code).toBe(NO_USER_RESPONSE);
+      expect((err as GatedOperationError).code).not.toBe(USER_DECLINED);
       expect((err as Error).message).toContain("transport blew up");
+    }
+  });
+
+  it("E4: unknown action value yields NO_USER_RESPONSE", async () => {
+    vi.mocked(clientSupportsElicitation).mockReturnValue(true);
+    const elicit = vi.fn(async () => ({
+      action: "timeout",
+      content: undefined,
+    }));
+    const server = makeFakeServer(elicit);
+
+    try {
+      await gateOperation(server, { tool: "update_page", summary: "Update?" });
+      expect.unreachable();
+    } catch (err) {
+      expect((err as GatedOperationError).code).toBe(NO_USER_RESPONSE);
+      expect((err as Error).message).toContain("action=timeout");
     }
   });
 });

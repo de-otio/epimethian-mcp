@@ -410,6 +410,14 @@ describe("add_drawio_diagram filename normalization", () => {
     expect((uploadAttachment as any).mock.lastCall[2]).toBe("arch.drawio");
     expect(result.content[0].text).toContain("arch.drawio");
 
+    // Verify attachment ID is in the return
+    expect(result.content[0].text).toContain("attachment ID: att-1");
+
+    // Verify macro ID is in the return (UUID-shaped string)
+    const macroIdMatch = result.content[0].text.match(/macro ID: ([a-f0-9-]{36})/);
+    expect(macroIdMatch).toBeTruthy();
+    expect(macroIdMatch![1]).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/);
+
     // Verify _rawUpdatePage received version and title from getPage
     const updateCall = (_rawUpdatePage as any).mock.lastCall;
     expect(updateCall[1].version).toBe(3);

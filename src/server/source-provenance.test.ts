@@ -45,6 +45,12 @@ describe("validateSource (E2)", () => {
     );
   });
 
+  it("E2: explicit elicitation_response is allowed with destructive flags (same as user_request)", () => {
+    expect(validateSource("elicitation_response", ["confirm_shrinkage"])).toBe(
+      "elicitation_response",
+    );
+  });
+
   it("E2: chained_tool_output + any destructive flag → throws DESTRUCTIVE_FLAG_FROM_TOOL_OUTPUT", () => {
     try {
       validateSource("chained_tool_output", ["confirm_shrinkage"]);

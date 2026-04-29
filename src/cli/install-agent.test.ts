@@ -152,6 +152,12 @@ describe("install-agent.md consistency", () => {
   });
 });
 
+describe("install-agent.md write budget section", () => {
+  it("contains the write budget section heading", () => {
+    expect(guideContent).toContain("Write budget (safety cap on writes)");
+  });
+});
+
 describe("install-agent.md covers manual steps and error handling", () => {
   it("explains what the user must do manually vs what the agent does", () => {
     // Agent does: install, configure .mcp.json

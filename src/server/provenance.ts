@@ -160,17 +160,19 @@ export async function markPageUnverified(
 
   if (skipSet) return {};
 
-  // --- Apply the badge ---
+  // setContentState handles 409 retry internally (up to 2 retries, 200ms
+  // backoff). This wrapper just converts the final outcome — success or
+  // exhausted-retries — into a warning string for tool output.
   try {
     await setContentState(pageId, target.name, target.color);
     return {};
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
     if (err instanceof ConfluencePermissionError) {
       return {
         warning: `Could not apply 'AI-edited' status badge (permission denied). Provenance badge is missing for page ${pageId}.`,
       };
     }
+    const message = err instanceof Error ? err.message : String(err);
     return {
       warning: `Could not apply 'AI-edited' status badge: ${message}. Provenance badge is missing for page ${pageId}.`,
     };

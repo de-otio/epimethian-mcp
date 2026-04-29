@@ -395,6 +395,23 @@ describe("extractHeadings", () => {
   it("returns fallback for empty string", () => {
     expect(extractHeadings("")).toBe("(no headings found)");
   });
+
+  it("decodes HTML entities — &uuml; renders as ü", () => {
+    const html = "<h1>Schl&uuml;ssel</h1>";
+    expect(extractHeadings(html)).toBe("1. Schlüssel");
+  });
+
+  it("does not double the prefix when stored heading text already contains the auto-number", () => {
+    // Stored as "1.2. Lesereihenfolge" — synthetic counter would also produce "1.2."
+    const html = "<h1>Einleitung</h1><h2>Ziele</h2><h2>1.2. Lesereihenfolge</h2>";
+    const result = extractHeadings(html);
+    // "1.2. Lesereihenfolge" must appear once, not "1.2. 1.2. Lesereihenfolge"
+    expect(result).toContain("  1.2. Lesereihenfolge");
+    expect(result).not.toContain("1.2. 1.2.");
+    // Other headings still get synthetic numbers
+    expect(result).toContain("1. Einleitung");
+    expect(result).toContain("  1.1. Ziele");
+  });
 });
 
 describe("extractSection", () => {
@@ -542,6 +559,75 @@ describe("replaceSection", () => {
     expect(result).toContain("<p>Do not delete</p>");
     // Other section preserved
     expect(result).toContain("<h1>Notes</h1><p>keep</p>");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B1 — Tolerant section matcher (numeric-prefix stripping)
+// ---------------------------------------------------------------------------
+describe("tolerant heading matcher (numeric-prefix stripping)", () => {
+  it("matches plain 'Lesereihenfolge' against stored '<h2>1.2. Lesereihenfolge</h2>'", () => {
+    const html =
+      "<h1>Einleitung</h1><p>intro</p>" +
+      "<h2>Ziele</h2><p>ziele text</p>" +
+      "<h2>1.2. Lesereihenfolge</h2><p>lese text</p>" +
+      "<h1>Ende</h1><p>end</p>";
+    // Caller passes bare name — should resolve via stripped fallback
+    const result = extractSection(html, "Lesereihenfolge");
+    expect(result).not.toBeNull();
+    expect(result).toContain("<h2>1.2. Lesereihenfolge</h2>");
+    expect(result).toContain("<p>lese text</p>");
+    expect(result).not.toContain("Ende");
+  });
+
+  it("matches '1.2. Lesereihenfolge' against stored '<h2>Lesereihenfolge</h2>'", () => {
+    const html =
+      "<h1>Einleitung</h1><p>intro</p>" +
+      "<h2>Ziele</h2><p>ziele text</p>" +
+      "<h2>Lesereihenfolge</h2><p>lese text</p>" +
+      "<h1>Ende</h1><p>end</p>";
+    // Caller passes prefixed form — should resolve via stripped fallback
+    const result = extractSection(html, "1.2. Lesereihenfolge");
+    expect(result).not.toBeNull();
+    expect(result).toContain("<h2>Lesereihenfolge</h2>");
+    expect(result).toContain("<p>lese text</p>");
+    expect(result).not.toContain("Ende");
+  });
+
+  it("throws an ambiguity error when two h2s share the stripped form", () => {
+    // "Notes" stored once plain and once with a numeric prefix — both strip to "notes"
+    const html =
+      "<h1>Overview</h1><p>text</p>" +
+      "<h2>1.1. Notes</h2><p>first notes</p>" +
+      "<h2>Notes</h2><p>second notes</p>" +
+      "<h1>End</h1><p>end</p>";
+    // Exact match for "Notes" hits exactly one heading ("Notes"), so no ambiguity
+    // for the exact-text caller. Test the ambiguous case: search "1.1. Notes" exact
+    // returns zero; stripped fallback finds both "1.1. Notes" and "Notes" → throw.
+    // We need a query that has no exact match but strips to something both share.
+    // Use a made-up prefix that doesn't match either stored text exactly:
+    const htmlAmbig =
+      "<h1>Overview</h1><p>text</p>" +
+      "<h2>1.1. Notes</h2><p>first notes</p>" +
+      "<h2>2.3. Notes</h2><p>second notes</p>" +
+      "<h1>End</h1><p>end</p>";
+    expect(() => extractSection(htmlAmbig, "Notes")).toThrow(
+      /Section 'Notes' is ambiguous; matched 2 headings:/
+    );
+  });
+
+  it("exact match short-circuits the stripped fallback (no false ambiguity)", () => {
+    // One heading is "Notes" (exact) and another is "1.2. Notes" (also strips to "notes").
+    // Searching for "Notes" should exact-match the first and NOT trigger ambiguity.
+    const html =
+      "<h1>Overview</h1><p>text</p>" +
+      "<h2>Notes</h2><p>correct notes</p>" +
+      "<h2>1.2. Notes</h2><p>other notes</p>" +
+      "<h1>End</h1><p>end</p>";
+    const result = extractSection(html, "Notes");
+    expect(result).not.toBeNull();
+    expect(result).toContain("<p>correct notes</p>");
+    expect(result).not.toContain("other notes");
   });
 });
 
@@ -1867,6 +1953,42 @@ describe("setContentState", () => {
   it("throws ConfluenceApiError on non-ok response", async () => {
     global.fetch = mockFetchResponse("Forbidden", 403);
     await expect(setContentState("page-42", "Draft", "#FFC400")).rejects.toThrow(ConfluenceApiError);
+  });
+
+  it("retries on 409 up to 2 times then succeeds (3 attempts total)", async () => {
+    let calls = 0;
+    global.fetch = vi.fn(async () => {
+      calls++;
+      if (calls < 3) {
+        return new Response("Version conflict", { status: 409 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await setContentState("page-409", "AI-edited", "#FFC400");
+    expect(calls).toBe(3);
+  });
+
+  it("throws ConfluenceApiError after 3 attempts of 409", async () => {
+    let calls = 0;
+    global.fetch = vi.fn(async () => {
+      calls++;
+      return new Response("Version conflict", { status: 409 });
+    }) as unknown as typeof fetch;
+
+    await expect(setContentState("page-409", "AI-edited", "#FFC400")).rejects.toThrow(ConfluenceApiError);
+    expect(calls).toBe(3);
+  });
+
+  it("does NOT retry on non-409 errors (e.g. 403)", async () => {
+    let calls = 0;
+    global.fetch = vi.fn(async () => {
+      calls++;
+      return new Response("Forbidden", { status: 403 });
+    }) as unknown as typeof fetch;
+
+    await expect(setContentState("page-403", "AI-edited", "#FFC400")).rejects.toThrow(ConfluenceApiError);
+    expect(calls).toBe(1);
   });
 });
 

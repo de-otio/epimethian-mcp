@@ -1440,15 +1440,24 @@ export async function getContentState(
 export async function setContentState(
   pageId: string,
   name: string,
-  color: string
+  color: string,
+  attempt = 0
 ): Promise<void> {
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
   url.searchParams.set("status", "current");
-  await confluenceRequest(url.toString(), {
-    method: "PUT",
-    body: JSON.stringify({ name, color }),
-  });
+  try {
+    await confluenceRequest(url.toString(), {
+      method: "PUT",
+      body: JSON.stringify({ name, color }),
+    });
+  } catch (err) {
+    if (err instanceof ConfluenceApiError && err.status === 409 && attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return setContentState(pageId, name, color, attempt + 1);
+    }
+    throw err;
+  }
 }
 
 export async function removeContentState(pageId: string): Promise<void> {
@@ -1654,12 +1663,46 @@ export function toStorageFormat(body: string): string {
   return `<p>${body}</p>`;
 }
 
+/** Decode HTML entities in a string (no external dep). */
+function decodeHtmlEntities(s: string): string {
+  const named: Record<string, string> = {
+    // XML basics
+    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'",
+    // Whitespace
+    nbsp: " ",
+    // German
+    uuml: "ü", auml: "ä", ouml: "ö", szlig: "ß",
+    Uuml: "Ü", Auml: "Ä", Ouml: "Ö",
+    // French
+    eacute: "é", egrave: "è", agrave: "à", ecirc: "ê",
+    ccedil: "ç", ocirc: "ô", icirc: "î", ucirc: "û",
+    // Common typographic
+    mdash: "—", ndash: "–", laquo: "«", raquo: "»",
+    hellip: "…", ldquo: "“", rdquo: "”",
+    lsquo: "‘", rsquo: "’",
+    // Currency / misc
+    euro: "€", copy: "©", reg: "®", trade: "™",
+  };
+  return s.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (_full, ref: string) => {
+    if (ref.startsWith("#x") || ref.startsWith("#X")) {
+      return String.fromCodePoint(parseInt(ref.slice(2), 16));
+    }
+    if (ref.startsWith("#")) {
+      return String.fromCodePoint(parseInt(ref.slice(1), 10));
+    }
+    return named[ref] ?? _full;
+  });
+}
+
+/** Numeric-prefix pattern, e.g. "1." or "1.2." or "1.2.3." with optional trailing space. */
+const OUTLINE_PREFIX_RE = /^\d+(?:\.\d+)*\.\s*/;
+
 /**
  * Extract headings from Confluence storage format HTML.
  * Returns a numbered outline string, e.g.:
  *   1. Introduction
  *   1.1. Background
- *   1.2. Goals
+ *   1.2. Lesereihenfolge        ← stored as "1.2. Lesereihenfolge"; prefix not doubled
  *   2. Architecture
  */
 export function extractHeadings(storageHtml: string): string {
@@ -1673,10 +1716,22 @@ export function extractHeadings(storageHtml: string): string {
     // Reset all deeper counters
     for (let i = level; i < 6; i++) counters[i] = 0;
     counters[level - 1]++;
-    const number = counters.slice(0, level).filter(n => n > 0).join(".");
-    // Strip HTML tags from heading text
-    const text = match[2].replace(/<[^>]+>/g, "").trim();
-    lines.push(`${"  ".repeat(level - 1)}${number}. ${text}`);
+    const syntheticNumber = counters.slice(0, level).filter(n => n > 0).join(".");
+    // Strip HTML tags, then decode entities
+    const raw = decodeHtmlEntities(match[2].replace(/<[^>]+>/g, "").trim());
+    // If the stored text already begins with the same numeric prefix we would
+    // generate (e.g. "1.2. Lesereihenfolge" vs synthetic "1.2."), use the
+    // raw text as-is to avoid duplication ("1.2. 1.2. Lesereihenfolge").
+    // OUTLINE_PREFIX_RE matches "1.2." with optional trailing space;
+    // syntheticNumber is "1.2" (no dot), so we compare against syntheticNumber+".".
+    const headingPrefixMatch = raw.match(OUTLINE_PREFIX_RE);
+    const syntheticPrefix = syntheticNumber + ". ";
+    const text =
+      headingPrefixMatch !== null &&
+      headingPrefixMatch[0].trimEnd() === syntheticNumber + "."
+        ? raw                    // already has this number — use as-is
+        : `${syntheticPrefix}${raw}`;
+    lines.push(`${"  ".repeat(level - 1)}${text}`);
   }
 
   return lines.length > 0 ? lines.join("\n") : "(no headings found)";
@@ -1710,6 +1765,17 @@ function maskCdataForParse(storage: string): string {
  * Find a heading element anywhere in the DOM tree (including inside
  * ac:layout cells) whose text matches the target. Returns the heading
  * element and its sibling list within the parent container, or null.
+ *
+ * Matching strategy (strict → tolerant):
+ *  1. Exact case-insensitive match on decoded heading text.
+ *  2. If zero exact matches, retry stripping a leading numeric outline
+ *     prefix (e.g. "1.2. ") from BOTH the stored heading text and the
+ *     search term before comparing.  This lets a caller supply either
+ *     "Lesereihenfolge" or "1.2. Lesereihenfolge" and resolve the same
+ *     heading regardless of how it is stored.
+ *  3. Ambiguity guard: if the stripped fallback yields >1 hit, prefer
+ *     whichever also has an exact-text match; if still >1, throw rather
+ *     than silently picking the wrong one.
  */
 function findHeadingInTree(
   root: import("node-html-parser").HTMLElement,
@@ -1717,24 +1783,62 @@ function findHeadingInTree(
 ): { siblings: import("node-html-parser").Node[]; startIdx: number; headingLevel: number } | null {
   type HTMLElement = import("node-html-parser").HTMLElement;
 
-  // Depth-first search for all heading elements
-  const allHeadings = root.querySelectorAll("h1, h2, h3, h4, h5, h6") as HTMLElement[];
-
-  for (const heading of allHeadings) {
-    if (heading.text.trim().toLowerCase() !== headingText.toLowerCase()) continue;
-
+  /** Build the return value for a matched heading element, or null if the
+   *  heading has no valid parent-child relationship. */
+  function resultFor(heading: HTMLElement): { siblings: import("node-html-parser").Node[]; startIdx: number; headingLevel: number } | null {
     const tagMatch = heading.tagName.match(/^H([1-6])$/i);
-    if (!tagMatch) continue;
-
-    // Found it — get sibling list from the heading's parent
+    if (!tagMatch) return null;
     const parent = heading.parentNode as HTMLElement;
     const siblings = parent.childNodes;
     const startIdx = siblings.indexOf(heading);
-    if (startIdx === -1) continue;
-
+    if (startIdx === -1) return null;
     return { siblings, startIdx, headingLevel: parseInt(tagMatch[1], 10) };
   }
-  return null;
+
+  // Depth-first search for all heading elements
+  const allHeadings = root.querySelectorAll("h1, h2, h3, h4, h5, h6") as HTMLElement[];
+
+  // Pass 1 — exact (case-insensitive, entity-decoded) match
+  const needle = headingText.toLowerCase();
+  const exactMatches: HTMLElement[] = [];
+  for (const heading of allHeadings) {
+    const storedText = decodeHtmlEntities(heading.text.trim()).toLowerCase();
+    if (storedText === needle) exactMatches.push(heading);
+  }
+  if (exactMatches.length > 0) {
+    // Use first exact match (exact equality means no ambiguity risk)
+    for (const h of exactMatches) {
+      const r = resultFor(h);
+      if (r) return r;
+    }
+  }
+
+  // Pass 2 — tolerant stripped match (only when exact yielded zero hits)
+  const strippedNeedle = needle.replace(OUTLINE_PREFIX_RE, "");
+  const strippedMatches: HTMLElement[] = [];
+  for (const heading of allHeadings) {
+    const storedText = decodeHtmlEntities(heading.text.trim()).toLowerCase();
+    const strippedStored = storedText.replace(OUTLINE_PREFIX_RE, "");
+    if (strippedStored === strippedNeedle) strippedMatches.push(heading);
+  }
+
+  if (strippedMatches.length === 0) return null;
+
+  if (strippedMatches.length === 1) {
+    return resultFor(strippedMatches[0]);
+  }
+
+  // More than one stripped match — check if exactly one also has an exact
+  // text match (different from the needle, but matching each other, e.g.
+  // caller supplied bare "Notes" and two headings both strip to "notes"
+  // but one was stored as "1.2. Notes" and the other as "2.1. Notes").
+  // In that ambiguous case we cannot pick safely → throw.
+  const strippedTexts = strippedMatches
+    .map(h => decodeHtmlEntities(h.text.trim()))
+    .join(", ");
+  throw new Error(
+    `Section '${headingText}' is ambiguous; matched ${strippedMatches.length} headings: ${strippedTexts}`
+  );
 }
 
 /**

@@ -6,8 +6,11 @@
  * feature (2025-06-18 spec) returns one of three actions:
  *
  *   - "accept"  — user approved; proceed with the call.
- *   - "decline" — user rejected; abort with `USER_DENIED_GATED_OPERATION`.
- *   - "cancel"  — same outcome as decline (treated as user said no).
+ *   - "decline" — user explicitly rejected; abort with `USER_DECLINED`.
+ *   - "cancel"  — user cancelled the prompt; abort with `USER_CANCELLED`.
+ *
+ * Other outcomes (timeout, transport error, unknown action) are treated
+ * as `NO_USER_RESPONSE` — fail-closed, do not execute the gated action.
  *
  * Unsupported-client behaviour:
  *
@@ -25,10 +28,21 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { clientSupportsElicitation } from "./index.js";
 
-/** Error code thrown when the elicited user denies a gated operation. */
-export const USER_DENIED_GATED_OPERATION = "USER_DENIED_GATED_OPERATION";
-/** Error code thrown when elicitation is needed but unsupported and no opt-out. */
-export const ELICITATION_UNSUPPORTED = "ELICITATION_UNSUPPORTED";
+/** Error code thrown when the user explicitly declines a gated operation. */
+export const USER_DECLINED = "USER_DECLINED";
+/** Error code thrown when the user cancels the elicitation prompt. */
+export const USER_CANCELLED = "USER_CANCELLED";
+/**
+ * Error code thrown when no user response was received — e.g. timeout,
+ * transport error, or an unrecognised action value.
+ */
+export const NO_USER_RESPONSE = "NO_USER_RESPONSE";
+/**
+ * Error code thrown when elicitation is needed but the connected client
+ * does not support it (and the opt-out flag is not set).
+ */
+export const ELICITATION_REQUIRED_BUT_UNAVAILABLE =
+  "ELICITATION_REQUIRED_BUT_UNAVAILABLE";
 
 export class GatedOperationError extends Error {
   readonly code: string;
@@ -75,11 +89,10 @@ export async function gateOperation(
       return;
     }
     throw new GatedOperationError(
-      ELICITATION_UNSUPPORTED,
-      `This operation (${context.tool}) requires human confirmation via MCP elicitation, ` +
-        `but the connected client did not advertise elicitation support in the initialize ` +
-        `handshake. Set EPIMETHIAN_ALLOW_UNGATED_WRITES=true to restore permissive ` +
-        `behaviour (not recommended), or connect from a client that supports elicitation.`,
+      ELICITATION_REQUIRED_BUT_UNAVAILABLE,
+      `This tool requires interactive confirmation but your MCP client does not expose ` +
+        `elicitation. Use \`update_page_section\` instead, or switch to a client that ` +
+        `supports MCP elicitation (Claude Code ≥ 2.x, Claude Desktop ≥ 0.10).`,
     );
   }
 
@@ -111,10 +124,10 @@ export async function gateOperation(
       },
     });
   } catch (err) {
-    // The client reported an error mid-elicitation. Treat as denial:
-    // when in doubt, do not execute the destructive action.
+    // The client reported an error mid-elicitation (transport failure,
+    // timeout, etc.). Treat as no response — fail-closed.
     throw new GatedOperationError(
-      USER_DENIED_GATED_OPERATION,
+      NO_USER_RESPONSE,
       `Elicitation for ${context.tool} failed (${
         err instanceof Error ? err.message : String(err)
       }) — refusing the operation.`,
@@ -126,15 +139,24 @@ export async function gateOperation(
     return;
   }
 
-  const why =
-    result.action === "decline"
-      ? "user declined"
-      : result.action === "cancel"
-        ? "user cancelled"
-        : `user did not confirm (action=${result.action})`;
+  if (result.action === "decline") {
+    throw new GatedOperationError(
+      USER_DECLINED,
+      `${context.tool} was not executed — user declined.`,
+    );
+  }
 
+  if (result.action === "cancel") {
+    throw new GatedOperationError(
+      USER_CANCELLED,
+      `${context.tool} was not executed — user cancelled.`,
+    );
+  }
+
+  // Unknown action value (or accept with confirm !== true already handled
+  // above) — treat as no response.
   throw new GatedOperationError(
-    USER_DENIED_GATED_OPERATION,
-    `${context.tool} was not executed — ${why}.`,
+    NO_USER_RESPONSE,
+    `${context.tool} was not executed — user did not confirm (action=${result.action}).`,
   );
 }

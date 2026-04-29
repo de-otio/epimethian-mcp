@@ -5,6 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.2.3] - 2026-04-28 - UX patch: live-session feedback (batch 1 of 3)
+
+First batch of fixes from the 12-page-tree build session (see
+`plans/ux-feedback-confluence-tree-build.md`). All changes are additive or
+message-only; no behaviour change for existing callers.
+
+### Added
+
+- **HTML-entity decode in `extractHeadings`** (§8). Stored heading text
+  containing `&uuml;`, `&amp;`, numeric entities, etc. is now decoded
+  before being returned by `headings_only` mode. Callers no longer need
+  to manually decode entities to use the output as a `section` parameter.
+- **Tolerant section matcher in `findHeadingInTree`** (§3). When the
+  exact match fails, the matcher retries with leading auto-numbering
+  prefixes (`1.2. `) stripped from both sides. Plain `"Lesereihenfolge"`
+  now resolves against stored `"1.2. Lesereihenfolge"`. If multiple
+  headings match the stripped form, the matcher throws a structured
+  ambiguity error instead of silently picking the first — strict by
+  default. The fallback only fires when exact match yields zero hits.
+- **`extractHeadings` no longer doubles auto-number prefixes.** When the
+  synthetic outline counter matches the prefix already present in the
+  stored heading text, the synthetic prefix is dropped. Output is
+  one number per line, not two.
+- **Auto-numbering note in `get_page`, `update_page_section`, and
+  `create_page` tool descriptions** (§9). Three sentences total; tells
+  callers that auto-numbered spaces store the prefix in the heading,
+  and that page version may advance silently after `create_page` while
+  post-processing renders the TOC.
+- **`add_drawio_diagram` returns attachment + macro IDs** (§10). The
+  return string now includes `(attachment ID: …, macro ID: …)` so a
+  follow-up "remove or replace this diagram" call can target the
+  specific macro programmatically.
+- **Heading round-trip fuzz test** (§7). New test
+  `src/server/converter/heading-roundtrip.test.ts` round-trips heading
+  text containing semicolons, German umlauts, em-dashes, German quotes,
+  parentheses, and ampersands through markdown→storage→`extractHeadings`.
+  All seven inputs round-trip cleanly — the converter is innocent. The
+  reported `"TL;DR für die GF"` truncation is a server-side
+  post-processing bug in auto-numbered Confluence spaces; the test
+  documents this as a skipped diagnostic with Confluence flagged as the
+  suspect.
+- **`elicitation_response` source value** (§10). New fourth value in
+  `sourceSchema`, treated identically to `user_request` in the policy
+  table. Lets future callers distinguish a literal user prompt from a
+  user's elicitation answer for forensics/audit.
+- **Write-budget UX overhaul** (§11):
+  - Defaults raised: session 100→250, rolling 25→75 per 15 min. Catches
+    runaway loops while accommodating realistic multi-page documentation
+    builds (~60 writes per session).
+  - Env var renamed: `EPIMETHIAN_WRITE_BUDGET_HOURLY` →
+    `EPIMETHIAN_WRITE_BUDGET_ROLLING` (the window is 15 min, not 60).
+    Old name is a deprecated alias; removal scheduled for 7.0.0. When
+    the deprecated name is in use, the first write per process attaches
+    a warning to the tool result instructing the agent to tell the user
+    to update their MCP config.
+  - `WriteBudgetExceededError` message rewritten with four sections:
+    count/scope, *why this exists* (runaway-agent guard, not a Confluence
+    rate limit), *what to tell the user*, and *how to raise or disable
+    the cap* (config snippet + restart note + ROLLING/HOURLY rename hint).
+  - New "Write budget" section in `install-agent.md` so an agent that
+    hits the limit can give the user a clear explanation in the user's
+    own context, instead of dumping the raw error.
+
+### Changed
+
+- **Elicitation error codes split** (§1). The single
+  `USER_DENIED_GATED_OPERATION` is replaced by three more specific codes:
+  `USER_DECLINED` (action=decline), `USER_CANCELLED` (action=cancel),
+  and `NO_USER_RESPONSE` (timeout, transport error, unknown action).
+  `ELICITATION_UNSUPPORTED` is renamed `ELICITATION_REQUIRED_BUT_UNAVAILABLE`
+  with an actionable hint pointing at `update_page_section` as a
+  workaround. An LLM caller can now distinguish active denial from
+  "client doesn't support elicitation" or "elicitation timed out" — all
+  three previously surfaced as "user declined".
+- **`AI-edited` badge update retries on 409** (§10). `setContentState`
+  now retries up to 2 times with a 200 ms backoff on `409 Conflict`,
+  matching the existing pattern in `resolveComment`. The retry lives
+  inside `setContentState`; `markPageUnverified` is a thin wrapper that
+  converts the final outcome into a tool-result warning.
+
+### Fixed
+
+(none — this release is the first wave of the UX-feedback fixes; the
+original report's behaviour-changing fixes ship in 6.3.0.)
+
 ## [6.2.2] - 2026-04-24 - badge locale follows tenant, not MCP process
 
 ### Fixed
