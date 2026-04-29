@@ -28,6 +28,28 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { clientSupportsElicitation } from "./index.js";
 
+/**
+ * Structured breakdown of what a confirm_deletions gate is about to remove.
+ * Counts are drawn from the post-suppression deletion set (after C1's
+ * byte-equivalent filter), so the numbers match what the user will actually
+ * lose. Categories with a zero count are omitted from the human-readable
+ * prompt.
+ */
+export interface DeletionSummary {
+  /** Number of Table-of-Contents macros being removed. */
+  tocs: number;
+  /** Number of ac:link macros being removed. */
+  links: number;
+  /** Number of non-toc, non-code structured macros being removed. */
+  structuredMacros: number;
+  /** Number of code-block macros being removed. */
+  codeMacros: number;
+  /** Number of plain elements (emoticons, etc.) being removed. */
+  plainElements: number;
+  /** Number of tokens that couldn't be classified into the above categories. */
+  other: number;
+}
+
 /** Error code thrown when the user explicitly declines a gated operation. */
 export const USER_DECLINED = "USER_DECLINED";
 /** Error code thrown when the user cancels the elicitation prompt. */
@@ -62,8 +84,12 @@ export interface GatedOperationContext {
    * Specific flags / metadata to show the user. Rendered as key=value
    * pairs below the summary. Keep values short — this is for quick
    * human inspection, not a full diff.
+   *
+   * When `deletionSummary` is present (as a `DeletionSummary` object),
+   * it is rendered as a human-readable sentence instead of key=value,
+   * e.g. "This update will remove 1 TOC macro and 8 link macros…".
    */
-  details?: Record<string, string | number | boolean | undefined>;
+  details?: Record<string, string | number | boolean | DeletionSummary | undefined>;
 }
 
 /**
@@ -101,6 +127,25 @@ export async function gateOperation(
   if (context.details) {
     for (const [k, v] of Object.entries(context.details)) {
       if (v === undefined) continue;
+      if (k === "deletionSummary" && typeof v === "object" && v !== null) {
+        // Render the structured deletion summary as human-readable text.
+        const s = v as DeletionSummary;
+        const parts: string[] = [];
+        if (s.tocs > 0) parts.push(`${s.tocs} TOC macro${s.tocs === 1 ? "" : "s"}`);
+        if (s.links > 0) parts.push(`${s.links} link macro${s.links === 1 ? "" : "s"}`);
+        if (s.codeMacros > 0) parts.push(`${s.codeMacros} code macro${s.codeMacros === 1 ? "" : "s"}`);
+        if (s.structuredMacros > 0) parts.push(`${s.structuredMacros} structured macro${s.structuredMacros === 1 ? "" : "s"}`);
+        if (s.plainElements > 0) parts.push(`${s.plainElements} plain element${s.plainElements === 1 ? "" : "s"}`);
+        if (s.other > 0) parts.push(`${s.other} other element${s.other === 1 ? "" : "s"}`);
+        if (parts.length > 0) {
+          const list =
+            parts.length === 1
+              ? parts[0]
+              : parts.slice(0, -1).join(", ") + " and " + parts[parts.length - 1];
+          lines.push(`  This update will remove ${list} that the new markdown does not regenerate. Proceed?`);
+        }
+        continue;
+      }
       lines.push(`  • ${k}: ${String(v)}`);
     }
   }

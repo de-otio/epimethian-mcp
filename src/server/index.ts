@@ -73,7 +73,9 @@ import {
   validateSource,
 } from "./source-provenance.js";
 import { writeBudget } from "./write-budget.js";
-import { gateOperation } from "./elicitation.js";
+import { gateOperation, type DeletionSummary } from "./elicitation.js";
+import { planUpdate } from "./converter/update-orchestrator.js";
+import { tokeniseStorage } from "./converter/tokeniser.js";
 import { resolveToolFilter } from "./tool-allowlist.js";
 import { getProfileSettings } from "../shared/profiles.js";
 import { assertSpaceAllowed } from "./space-allowlist.js";
@@ -195,6 +197,87 @@ function formatMarkdownWithTokens(
     body = `${READ_ONLY_MARKDOWN_MARKER}\n\n${markdown}`;
   }
   return `${header}\n\n${body}`;
+}
+
+// ---------------------------------------------------------------------------
+// Deletion summary helpers (A2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute a structured deletion summary from a list of token IDs and the
+ * page's current-body sidecar. Classifies each deleted token by inspecting
+ * its verbatim XML.
+ *
+ * Called as a forecast BEFORE the gateOperation fires — safe because
+ * planUpdate and tokeniseStorage are both pure (no HTTP calls).
+ */
+function computeDeletionSummary(
+  deletedTokenIds: readonly string[],
+  sidecar: Record<string, string>,
+): DeletionSummary {
+  const summary: DeletionSummary = { tocs: 0, links: 0, structuredMacros: 0, codeMacros: 0, plainElements: 0, other: 0 };
+  for (const id of deletedTokenIds) {
+    const xml = sidecar[id];
+    if (!xml) {
+      summary.other++;
+      continue;
+    }
+    // Classify by tag and ac:name attribute.
+    const tagMatch = xml.match(/^<([a-zA-Z][a-zA-Z0-9:_-]*)/);
+    const tag = tagMatch ? tagMatch[1] : "";
+    const acNameMatch = xml.match(/\bac:name="([^"]+)"/);
+    const acName = acNameMatch ? acNameMatch[1] : "";
+    if (tag === "ac:link") {
+      summary.links++;
+    } else if (tag === "ac:structured-macro" && acName === "toc") {
+      summary.tocs++;
+    } else if (tag === "ac:structured-macro" && acName === "code") {
+      summary.codeMacros++;
+    } else if (tag === "ac:structured-macro") {
+      summary.structuredMacros++;
+    } else if (tag === "ac:emoticon" || tag === "ri:emoticon") {
+      summary.plainElements++;
+    } else if (tag) {
+      summary.other++;
+    } else {
+      summary.other++;
+    }
+  }
+  return summary;
+}
+
+/**
+ * Attempt to compute a deletion forecast for confirm_deletions gate calls.
+ * Runs planUpdate (pure) against the current body + caller markdown.
+ * Returns null if the body is not markdown, has no existing tokens, or if
+ * planUpdate throws (e.g. INVENTED_TOKEN on a malformed call — the gate
+ * still fires, just without a summary).
+ */
+function tryForecastDeletions(
+  currentBody: string,
+  callerMarkdown: string,
+  confluenceBaseUrl?: string,
+): DeletionSummary | null {
+  // Only markdown bodies go through planUpdate; storage format is pass-through.
+  if (!callerMarkdown || !looksLikeMarkdown(callerMarkdown)) return null;
+  // Only bodies with existing tokens produce deletions worth forecasting.
+  if (!/<ac:|<ri:|<time[\s/>]/i.test(currentBody)) return null;
+  try {
+    const plan = planUpdate({
+      currentStorage: currentBody,
+      callerMarkdown,
+      confirmDeletions: true, // suppress gate-throw — we only want the list
+      ...(confluenceBaseUrl ? { converterOptions: { confluenceBaseUrl } } : {}),
+    });
+    if (plan.deletedTokens.length === 0) return null;
+    const { sidecar } = tokeniseStorage(currentBody);
+    return computeDeletionSummary(plan.deletedTokens, sidecar);
+  } catch {
+    // If planUpdate fails (e.g. INVENTED_TOKEN), return null so the gate
+    // still fires without a summary — the real error will surface later
+    // during safePrepareBody.
+    return null;
+  }
 }
 
 // --- Error-safe tool helpers ---
@@ -575,11 +658,57 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
   const pageIdSchema = z.string().regex(/^\d+$/, "Page ID must be numeric");
 
   // ---------------------------------------------------------------------------
+  // waitForPostProcessingStable — C2 helper used by create_page when the
+  // caller opts in. Polls the page version every 250 ms (up to 3 s total)
+  // and returns once two consecutive reads see the same version (the page
+  // has stabilised). On timeout returns the last seen version. We use
+  // Date.now() rather than setTimeout-arithmetic so vi.useFakeTimers() in
+  // tests can advance time deterministically.
+  // ---------------------------------------------------------------------------
+  async function waitForPostProcessingStable(
+    pageId: string,
+    initialVersion: number,
+    options: {
+      intervalMs?: number;
+      timeoutMs?: number;
+      sleep?: (ms: number) => Promise<void>;
+    } = {},
+  ): Promise<number> {
+    const intervalMs = options.intervalMs ?? 250;
+    const timeoutMs = options.timeoutMs ?? 3000;
+    const sleep =
+      options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+    let lastVersion = initialVersion;
+    const start = Date.now();
+    // Loop until we either see two consecutive reads with the same version
+    // or the timeout fires. Each iteration: sleep, then read.
+    while (Date.now() - start < timeoutMs) {
+      await sleep(intervalMs);
+      let observed: number;
+      try {
+        const page = await getPage(pageId, false);
+        observed = page.version?.number ?? lastVersion;
+      } catch {
+        // Transient failure mid-polling: keep the last observed version
+        // and try again on the next tick. We never throw from here —
+        // worst case we return the initial version unchanged.
+        continue;
+      }
+      if (observed === lastVersion) {
+        return observed;
+      }
+      lastVersion = observed;
+    }
+    return lastVersion;
+  }
+
+  // ---------------------------------------------------------------------------
   // concatPageContent — shared helper for prepend_to_page / append_to_page
   // ---------------------------------------------------------------------------
   async function concatPageContent(
     page_id: string,
-    version: number,
+    version: number | "current",
     newContent: string,
     position: "prepend" | "append",
     opts: {
@@ -592,6 +721,17 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     const currentPage = await getPage(page_id, true);
     const currentStorage: string =
       currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
+
+    // C2: resolve `version: "current"` against the live page metadata.
+    const resolvedVersion =
+      version === "current"
+        ? (currentPage.version?.number ?? 0)
+        : version;
+    if (resolvedVersion <= 0) {
+      throw new Error(
+        `Could not resolve current version for page ${page_id} (server returned no version metadata)`
+      );
+    }
 
     // Determine separator before prepare (default depends on markdown detection).
     const isMarkdown = looksLikeMarkdown(newContent);
@@ -635,7 +775,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       title: currentPage.title,
       finalStorage: newBody,
       previousBody: currentStorage,
-      version,
+      version: resolvedVersion,
       versionMessage: opts.versionMessage ?? prepared.versionMessage,
       deletedTokens: prepared.deletedTokens,
       clientLabel: getClientLabel(server),
@@ -658,7 +798,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "For other macros from markdown, use directive syntax: `:info[content]`, `:mention[Name]{accountId=...}`, `:date[2026-04-23]`. " +
           "Use allow_raw_html: true to permit raw HTML inside markdown (disabled by default for security). " +
           "Use confluence_base_url to override the base URL used by the link rewriter (defaults to the configured Confluence URL). " +
-          "If the space has auto-numbering, the page version may advance silently after creation while post-processing renders the TOC and number prefixes. Re-read the page before subsequent updates."
+          "If the space has auto-numbering, the page version may advance silently after creation while post-processing renders the TOC and number prefixes. Re-read the page before subsequent updates. " +
+          "Set wait_for_post_processing=true to poll until the version stabilises (recommended when the next operation will be an update — addresses post-processing churn without resorting to version=\"current\")."
         ),
         config
       ),
@@ -682,10 +823,23 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .url()
           .optional()
           .describe("Override the Confluence base URL used by the link rewriter. Defaults to the configured Confluence URL."),
+        wait_for_post_processing: z
+          .boolean()
+          .default(false)
+          .optional()
+          .describe(
+            "When true, after creating the page poll its version every 250 ms " +
+            "(up to 3 s total) and return once two consecutive reads see the " +
+            "same version (the page has stabilised). If the timeout fires " +
+            "before stabilisation, the last-seen version is returned. " +
+            "Recommended when the next operation will be an update_page on " +
+            "the new page — avoids the post-processing churn that otherwise " +
+            "forces callers to use version=\"current\"."
+          ),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ title, space_key, body, parent_id, allow_raw_html, confluence_base_url }) => {
+    async ({ title, space_key, body, parent_id, allow_raw_html, confluence_base_url, wait_for_post_processing }) => {
       const blocked = writeGuard("create_page", config);
       if (blocked) return blocked;
       try {
@@ -720,7 +874,25 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         const badgeResult = await markPageUnverified(submitted.page.id, cfg);
         if (badgeResult.warning) warnings.push(badgeResult.warning);
 
-        return toolResult(appendWarnings((await formatPage(submitted.page, false)), warnings) + echo);
+        // C2: optional post-processing wait. The created page can have its
+        // version silently advanced by Confluence as the TOC, numbering
+        // and other post-processors render. Polling here gives the caller
+        // a stable version to use in a subsequent update_page without
+        // needing to use version="current" (which bypasses concurrency).
+        let stabilisedPage: typeof submitted.page = submitted.page;
+        if (wait_for_post_processing) {
+          const initial = submitted.page.version?.number ?? submitted.newVersion ?? 1;
+          const stableVersion = await waitForPostProcessingStable(
+            submitted.page.id,
+            initial,
+          );
+          stabilisedPage = {
+            ...submitted.page,
+            version: { ...(submitted.page.version ?? {}), number: stableVersion },
+          };
+        }
+
+        return toolResult(appendWarnings((await formatPage(stabilisedPage, false)), warnings) + echo);
       } catch (err) {
         return toolErrorWithContext(err, { operation: "create_page", resource: `space ${space_key}`, profile: config.profile });
       }
@@ -882,10 +1054,19 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .string()
           .describe("Page title (use the title from get_page if unchanged)"),
         version: z
-          .number()
-          .int()
-          .positive()
-          .describe("The page version number from your most recent get_page call"),
+          .union([z.number().int().positive(), z.literal("current")])
+          .describe(
+            "The page version number from your most recent get_page call. " +
+            "Pass the literal string \"current\" to skip the read and apply " +
+            "this update on top of whatever the latest version is right now. " +
+            "WARNING: \"current\" deliberately bypasses optimistic concurrency — " +
+            "it is NOT a conflict-resolution strategy. If a coworker (or another " +
+            "agent) writes between our read and submit, the API will still 409 " +
+            "and we propagate the conflict. Use a numeric version when you want " +
+            "the \"don't overwrite my coworker's changes\" guard. Use \"current\" " +
+            "only as a shortcut to skip the get_page round-trip when concurrent " +
+            "writes are not a concern (e.g. immediately after create_page)."
+          ),
         body: z
           .string()
           .optional()
@@ -945,10 +1126,25 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         });
         const effectiveSource = validateSource(source, flagsSet);
 
+        // A2: fetch the current page BEFORE the gate so we can compute a
+        // deletion forecast for the confirm_deletions prompt. getPage is
+        // read-only and has no side effects. The forecast runs planUpdate
+        // (pure) against the current body + caller markdown.
+        const cfg = await getConfig();
+        const currentPage = await getPage(page_id, true);
+        const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
+
         // E4: gate update_page when any destructive flag is set. Plain
         // content updates (no confirm_* / replace_body) are not gated —
         // the safety pipeline's per-call guards already protect them.
         if (flagsSet.length > 0) {
+          // A2: for confirm_deletions, compute a forecast so the gate prompt
+          // can describe what will be removed. Other destructive flags
+          // (confirm_shrinkage, replace_body) don't produce a deletion list.
+          const deletionSummary =
+            confirm_deletions && body
+              ? tryForecastDeletions(currentStorage, body, confluence_base_url ?? cfg.url)
+              : null;
           await gateOperation(server, {
             tool: "update_page",
             summary: `Update page ${page_id} with destructive flags?`,
@@ -957,13 +1153,23 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
               flags: flagsSet.join(","),
               source: effectiveSource,
               version,
+              ...(deletionSummary ? { deletionSummary } : {}),
             },
           });
         }
 
-        const cfg = await getConfig();
-        const currentPage = await getPage(page_id, true);
-        const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
+        // C2: resolve `version: "current"` against the live page metadata.
+        // The caller is explicitly opting out of optimistic concurrency —
+        // we still 409 if a write lands between this read and the submit.
+        const resolvedVersion =
+          version === "current"
+            ? (currentPage.version?.number ?? 0)
+            : version;
+        if (resolvedVersion <= 0) {
+          throw new Error(
+            `Could not resolve current version for page ${page_id} (server returned no version metadata)`
+          );
+        }
 
         const prepared = await safePrepareBody({
           body: body ?? undefined,
@@ -986,7 +1192,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           title,
           finalStorage: prepared.finalStorage,
           previousBody: currentStorage,
-          version,
+          version: resolvedVersion,
           versionMessage: mergedVersionMessage,
           deletedTokens: prepared.deletedTokens,
           clientLabel: getClientLabel(server),
@@ -1135,10 +1341,17 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .string()
           .describe("New content for this section — GFM markdown or Confluence storage format. Markdown is auto-detected and converted via the token-aware write path, which preserves existing macros and emoticons within the section. The heading itself is preserved; only content under it is replaced. Do not mix the two: inlining <ac:.../> macros inside a markdown body is rejected with MIXED_INPUT_DETECTED. For macros from markdown use directive syntax (:info[...], :mention[...]{...})."),
         version: z
-          .number()
-          .int()
-          .positive()
-          .describe("The page version number from your most recent get_page call"),
+          .union([z.number().int().positive(), z.literal("current")])
+          .describe(
+            "The page version number from your most recent get_page call. " +
+            "Pass the literal string \"current\" to skip the read and apply " +
+            "this update on top of whatever the latest version is right now. " +
+            "WARNING: \"current\" deliberately bypasses optimistic concurrency — " +
+            "it is NOT a conflict-resolution strategy. If a coworker (or another " +
+            "agent) writes between our read and submit, the API will still 409. " +
+            "Use a numeric version when you want the \"don't overwrite my " +
+            "coworker's changes\" guard."
+          ),
         version_message: z
           .string()
           .optional()
@@ -1160,6 +1373,18 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         const page = await getPage(page_id, true);
         const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
 
+        // C2: resolve `version: "current"`. The caller has explicitly
+        // opted out of optimistic concurrency for this submission.
+        const resolvedVersion =
+          version === "current"
+            ? (page.version?.number ?? 0)
+            : version;
+        if (resolvedVersion <= 0) {
+          throw new Error(
+            `Could not resolve current version for page ${page_id} (server returned no version metadata)`
+          );
+        }
+
         const currentSectionBody = extractSectionBody(fullBody, section);
         if (currentSectionBody === null) {
           // A4: surface missing sections via isError so agents don't silently
@@ -1169,6 +1394,24 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
               `Section "${section}" not found. Use headings_only to see available sections.`
             )
           );
+        }
+
+        // E4/A2: gate when confirm_deletions is set, with a deletion forecast
+        // describing what the section update will remove. The section body and
+        // caller markdown are both available here, so we can compute the
+        // forecast purely (planUpdate has no side effects).
+        if (confirm_deletions) {
+          const deletionSummary = tryForecastDeletions(currentSectionBody, body, cfg.url);
+          await gateOperation(server, {
+            tool: "update_page_section",
+            summary: `Update section "${section}" in page ${page_id} with confirm_deletions?`,
+            details: {
+              page_id,
+              section,
+              source: "confirm_deletions",
+              ...(deletionSummary ? { deletionSummary } : {}),
+            },
+          });
         }
 
         const prepared = await safePrepareBody({
@@ -1200,7 +1443,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           title: page.title,
           finalStorage: newFullBody,
           previousBody: fullBody,
-          version,
+          version: resolvedVersion,
           versionMessage: mergedVersionMessage,
           deletedTokens: prepared.deletedTokens,
           operation: "update_page_section",
@@ -1241,7 +1484,15 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       ),
       inputSchema: {
         page_id: z.string().describe("The Confluence page ID"),
-        version: z.number().int().positive().describe("Page version from your most recent get_page call"),
+        version: z
+          .union([z.number().int().positive(), z.literal("current")])
+          .describe(
+            "Page version from your most recent get_page call. Pass the literal " +
+            "string \"current\" to skip the read and apply on top of whatever " +
+            "the latest version is right now. WARNING: \"current\" bypasses " +
+            "optimistic concurrency — it does not protect against concurrent " +
+            "writes; the API can still 409 between our read and submit."
+          ),
         content: z.string().describe("Content to insert before the existing body. GFM markdown or storage format (auto-detected)."),
         separator: z.string().optional().describe("Separator between new and existing content. Max 100 chars, no XML tags. Defaults to blank line (markdown) or empty (storage)."),
         version_message: z.string().optional().describe("Optional version comment"),
@@ -1289,7 +1540,15 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       ),
       inputSchema: {
         page_id: z.string().describe("The Confluence page ID"),
-        version: z.number().int().positive().describe("Page version from your most recent get_page call"),
+        version: z
+          .union([z.number().int().positive(), z.literal("current")])
+          .describe(
+            "Page version from your most recent get_page call. Pass the literal " +
+            "string \"current\" to skip the read and apply on top of whatever " +
+            "the latest version is right now. WARNING: \"current\" bypasses " +
+            "optimistic concurrency — it does not protect against concurrent " +
+            "writes; the API can still 409 between our read and submit."
+          ),
         content: z.string().describe("Content to insert after the existing body. GFM markdown or storage format (auto-detected)."),
         separator: z.string().optional().describe("Separator between existing and new content. Max 100 chars, no XML tags. Defaults to blank line (markdown) or empty (storage)."),
         version_message: z.string().optional().describe("Optional version comment"),

@@ -78,6 +78,7 @@ import {
   safeSubmitPage,
   type SafePrepareBodyInput,
   type DeletedToken,
+  type RegeneratedTokenPair,
   DELETION_ACK_MISMATCH,
   INPUT_BODY_TOO_LARGE,
   MAX_INPUT_BODY,
@@ -86,6 +87,10 @@ import {
   READ_ONLY_MARKDOWN_ROUND_TRIP,
   WRITE_CONTAINS_UNTRUSTED_FENCE,
 } from "./safe-write.js";
+import {
+  canonicaliseToken,
+  _resetOpaqueCounterForTests,
+} from "./safe-write-canonicaliser.js";
 import {
   getPage,
   getPageByTitle,
@@ -1474,5 +1479,655 @@ describe("safeSubmitPage — byte-identical short-circuit (A1)", () => {
     });
 
     expect(_rawUpdatePage).toHaveBeenCalledOnce();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Section F: C1 — byte-equivalent macro suppression
+// ---------------------------------------------------------------------------
+//
+// Track C1 reframes the deletion-tracking pipeline to distinguish between
+// *genuinely* deleted tokens and tokens whose deletion was paired with a
+// freshly-emitted byte-equivalent regeneration. This whole feature lives
+// behind the EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS env var for one
+// release (6.3.0): the flag is OFF by default, so the existing
+// confirm_deletions gate fires for every token-id deletion exactly as
+// before. With the flag ON, deletions whose canonical key matches a
+// freshly-emitted token are moved into `regeneratedTokens` and bypass the
+// gate. Every suppression is recorded in the success-path mutation log so
+// a postmortem can reconstruct what was bypassed.
+//
+// DATA-LOSS RISK MITIGATIONS verified by these tests:
+//   1. The default rules are *strict*: any input the canonicaliser cannot
+//      interpret returns a unique opaque key that never matches anything.
+//   2. The feature flag must be explicitly set to "true" or "1"; an unset
+//      / false / arbitrary value leaves the existing behaviour intact.
+//   3. The audit-log entry on every suppressed pair carries enough info
+//      (oldId, newId, kind) for an operator to replay the suppression.
+// ---------------------------------------------------------------------------
+
+describe("safe-write-canonicaliser — strict-by-default rules", () => {
+  beforeEach(() => {
+    _resetOpaqueCounterForTests();
+  });
+
+  it("equivalent ac:link with reordered attributes share a canonical key", () => {
+    const a =
+      `<ac:link ac:anchor="sec1">` +
+      `<ri:page ri:space-key="ETD" ri:content-title="Home"/>` +
+      `<ac:plain-text-link-body><![CDATA[Click]]></ac:plain-text-link-body>` +
+      `</ac:link>`;
+    // Same logical link with attributes flipped.
+    const b =
+      `<ac:link ac:anchor="sec1">` +
+      `<ri:page ri:content-title="Home" ri:space-key="ETD"/>` +
+      `<ac:plain-text-link-body><![CDATA[Click]]></ac:plain-text-link-body>` +
+      `</ac:link>`;
+    const ka = canonicaliseToken(a);
+    const kb = canonicaliseToken(b);
+    expect(ka.kind).toBe("ac:link");
+    expect(kb.kind).toBe("ac:link");
+    expect(ka.key).toBe(kb.key);
+  });
+
+  it("ac:links to different page targets get different keys", () => {
+    const a =
+      `<ac:link><ri:page ri:content-id="111"/>` +
+      `<ac:plain-text-link-body><![CDATA[X]]></ac:plain-text-link-body>` +
+      `</ac:link>`;
+    const b =
+      `<ac:link><ri:page ri:content-id="222"/>` +
+      `<ac:plain-text-link-body><![CDATA[X]]></ac:plain-text-link-body>` +
+      `</ac:link>`;
+    expect(canonicaliseToken(a).key).not.toBe(canonicaliseToken(b).key);
+  });
+
+  it("ac:links with the same target but different display text get different keys", () => {
+    const a =
+      `<ac:link><ri:page ri:content-id="111"/>` +
+      `<ac:plain-text-link-body><![CDATA[Click here]]></ac:plain-text-link-body>` +
+      `</ac:link>`;
+    const b =
+      `<ac:link><ri:page ri:content-id="111"/>` +
+      `<ac:plain-text-link-body><![CDATA[Read more]]></ac:plain-text-link-body>` +
+      `</ac:link>`;
+    expect(canonicaliseToken(a).key).not.toBe(canonicaliseToken(b).key);
+  });
+
+  it("ac:links with rich link-body fall through to opaque (strict default)", () => {
+    // Rich body comparison is not implemented; equality is refused so the
+    // gate fires. The two links are otherwise identical.
+    const a =
+      `<ac:link><ri:page ri:content-id="111"/>` +
+      `<ac:link-body><strong>X</strong></ac:link-body>` +
+      `</ac:link>`;
+    const b =
+      `<ac:link><ri:page ri:content-id="111"/>` +
+      `<ac:link-body><strong>X</strong></ac:link-body>` +
+      `</ac:link>`;
+    const ka = canonicaliseToken(a);
+    const kb = canonicaliseToken(b);
+    expect(ka.kind).toBe("ac:link");
+    expect(kb.kind).toBe("ac:link");
+    // Two opaque sentinels never compare equal — strict-by-default.
+    expect(ka.key).not.toBe(kb.key);
+  });
+
+  it("TOC macros with the same parameter set in different order share a key", () => {
+    const a =
+      `<ac:structured-macro ac:name="toc">` +
+      `<ac:parameter ac:name="maxLevel">3</ac:parameter>` +
+      `<ac:parameter ac:name="minLevel">1</ac:parameter>` +
+      `</ac:structured-macro>`;
+    const b =
+      `<ac:structured-macro ac:name="toc">` +
+      `<ac:parameter ac:name="minLevel">1</ac:parameter>` +
+      `<ac:parameter ac:name="maxLevel">3</ac:parameter>` +
+      `</ac:structured-macro>`;
+    const ka = canonicaliseToken(a);
+    const kb = canonicaliseToken(b);
+    expect(ka.kind).toBe("ac:structured-macro:toc");
+    expect(ka.key).toBe(kb.key);
+  });
+
+  it("TOC macro with maxLevel=3 vs maxLevel=4 get different keys", () => {
+    const a =
+      `<ac:structured-macro ac:name="toc">` +
+      `<ac:parameter ac:name="maxLevel">3</ac:parameter>` +
+      `</ac:structured-macro>`;
+    const b =
+      `<ac:structured-macro ac:name="toc">` +
+      `<ac:parameter ac:name="maxLevel">4</ac:parameter>` +
+      `</ac:structured-macro>`;
+    expect(canonicaliseToken(a).key).not.toBe(canonicaliseToken(b).key);
+  });
+
+  it("generic structured-macro: name + sorted params + CDATA body equal → same key", () => {
+    const a =
+      `<ac:structured-macro ac:name="code">` +
+      `<ac:parameter ac:name="language">ts</ac:parameter>` +
+      `<ac:plain-text-body><![CDATA[const x = 1;]]></ac:plain-text-body>` +
+      `</ac:structured-macro>`;
+    const b =
+      `<ac:structured-macro ac:name="code">` +
+      `<ac:plain-text-body><![CDATA[const x = 1;]]></ac:plain-text-body>` +
+      `<ac:parameter ac:name="language">ts</ac:parameter>` +
+      `</ac:structured-macro>`;
+    expect(canonicaliseToken(a).key).toBe(canonicaliseToken(b).key);
+  });
+
+  it("structured-macro with rich-text-body falls through to opaque (strict)", () => {
+    // Rich text bodies are NOT compared (they could contain anything);
+    // the canonicaliser refuses to assert equivalence.
+    const a =
+      `<ac:structured-macro ac:name="info">` +
+      `<ac:rich-text-body><p>I</p></ac:rich-text-body>` +
+      `</ac:structured-macro>`;
+    const b =
+      `<ac:structured-macro ac:name="info">` +
+      `<ac:rich-text-body><p>I</p></ac:rich-text-body>` +
+      `</ac:structured-macro>`;
+    expect(canonicaliseToken(a).key).not.toBe(canonicaliseToken(b).key);
+  });
+
+  it("plain ac:emoticon: byte-equal after attribute sort", () => {
+    const a = `<ac:emoticon ac:name="smile" ac:emoji-id="1f600"/>`;
+    const b = `<ac:emoticon ac:emoji-id="1f600" ac:name="smile"/>`;
+    expect(canonicaliseToken(a).key).toBe(canonicaliseToken(b).key);
+  });
+
+  it("missing meaningful attribute → not equivalent", () => {
+    const a = `<ac:emoticon ac:name="smile" ac:emoji-id="1f600"/>`;
+    const b = `<ac:emoticon ac:name="smile"/>`;
+    expect(canonicaliseToken(a).key).not.toBe(canonicaliseToken(b).key);
+  });
+
+  it("malformed XML → opaque (each call unique)", () => {
+    // Empty / undefined / garbage all produce opaque sentinels that don't
+    // compare equal.
+    expect(canonicaliseToken(undefined).kind).toBe("opaque");
+    expect(canonicaliseToken("").kind).toBe("opaque");
+    const a = canonicaliseToken("not even xml");
+    const b = canonicaliseToken("not even xml");
+    expect(a.key).not.toBe(b.key);
+  });
+});
+
+describe("safePrepareBody — C1 byte-equivalent suppression (feature-flag gated)", () => {
+  // Toggle the env var per test rather than at module level; the helper
+  // function reads process.env on every call so this works.
+  let originalFlag: string | undefined;
+  beforeEach(() => {
+    originalFlag = process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS;
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    if (originalFlag === undefined) {
+      delete process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS;
+    } else {
+      process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS = originalFlag;
+    }
+  });
+
+  /**
+   * Build a stored-body fragment containing N <ac:link> macros pointing to
+   * pages "Page-1" through "Page-N" in space "ETD".
+   *
+   * IMPORTANT: emit attributes in `content-title, space-key` order — the
+   * markdown converter's canonical form for `confluence://SPACE/Title` is
+   * the opposite (`space-key, content-title`). Forcing different attribute
+   * orders between the stored XML and the converter output is what
+   * exercises the canonicaliser; if both byte-strings were already
+   * identical the test would pass trivially.
+   */
+  function buildStoredLinks(n: number): string {
+    const parts: string[] = [];
+    for (let i = 1; i <= n; i++) {
+      parts.push(
+        `<ac:link>` +
+          `<ri:page ri:content-title="Page-${i}" ri:space-key="ETD"/>` +
+          `<ac:plain-text-link-body><![CDATA[Page ${i}]]></ac:plain-text-link-body>` +
+          `</ac:link>`,
+      );
+    }
+    return `<p>${parts.join(" ")}</p>`;
+  }
+
+  /**
+   * Build the markdown that would re-emit the same N `<ac:link>` macros
+   * via the converter's confluence:// scheme handler. We pass the same
+   * stored body as currentBody, so planUpdate sees N preserved tokens get
+   * deleted (because the markdown contains no [[epi:T####]] references)
+   * AND N freshly emitted ac:link macros in the converted output.
+   */
+  function buildLinksMarkdown(n: number): string {
+    const lines: string[] = [];
+    for (let i = 1; i <= n; i++) {
+      lines.push(`- [Page ${i}](confluence://ETD/Page-${i})`);
+    }
+    return lines.join("\n") + "\n\n" + "filler text. ".repeat(80);
+  }
+
+  it("flag ON: re-submitting 8 byte-equivalent ac:link macros produces 0 deleted, 8 regenerated", async () => {
+    process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS = "true";
+
+    const N = 8;
+    const currentBody = `${buildStoredLinks(N)}<p>${"x".repeat(800)}</p>`;
+    const markdownBody = buildLinksMarkdown(N);
+
+    const result = await safePrepareBody({
+      body: markdownBody,
+      currentBody,
+      // Flag-ON behaviour is the whole point: no confirmDeletions needed
+      // because there are no genuine deletions.
+      confirmShrinkage: true,
+      confirmStructureLoss: true,
+    });
+
+    expect(result.deletedTokens).toEqual([]);
+    expect(result.regeneratedTokens).toHaveLength(N);
+    for (const pair of result.regeneratedTokens) {
+      expect(pair.kind).toBe("ac:link");
+      expect(pair.oldId).toMatch(/^T\d{4}$/);
+      expect(pair.newId).toMatch(/^T\d{4}$/);
+    }
+  });
+
+  it("flag OFF (default): same scenario produces 8 deletions (legacy behaviour preserved)", async () => {
+    delete process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS;
+
+    const N = 8;
+    const currentBody = `${buildStoredLinks(N)}<p>${"x".repeat(800)}</p>`;
+    const markdownBody = buildLinksMarkdown(N);
+
+    // With the flag off, the gate fires: confirm_deletions is required.
+    let thrown: ConverterError | undefined;
+    try {
+      await safePrepareBody({
+        body: markdownBody,
+        currentBody,
+        confirmShrinkage: true,
+        confirmStructureLoss: true,
+      });
+    } catch (e) {
+      thrown = e as ConverterError;
+    }
+    expect(thrown).toBeDefined();
+    expect(thrown!.code).toBe("DELETIONS_NOT_CONFIRMED");
+    expect(thrown!.message).toMatch(/8 preserved elements/);
+
+    // Now ack and verify the 8 IDs end up in deletedTokens (not regenerated).
+    const result = await safePrepareBody({
+      body: markdownBody,
+      currentBody,
+      confirmShrinkage: true,
+      confirmStructureLoss: true,
+      confirmDeletions: true,
+    });
+    expect(result.deletedTokens).toHaveLength(N);
+    expect(result.regeneratedTokens).toEqual([]);
+  });
+
+  it("flag set to a non-truthy value behaves as OFF", async () => {
+    process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS = "no";
+
+    const N = 2;
+    const currentBody = `${buildStoredLinks(N)}<p>${"x".repeat(400)}</p>`;
+    const markdownBody = buildLinksMarkdown(N);
+
+    let thrown: ConverterError | undefined;
+    try {
+      await safePrepareBody({
+        body: markdownBody,
+        currentBody,
+        confirmShrinkage: true,
+        confirmStructureLoss: true,
+      });
+    } catch (e) {
+      thrown = e as ConverterError;
+    }
+    expect(thrown?.code).toBe("DELETIONS_NOT_CONFIRMED");
+  });
+
+  it("flag ON: removing one link and rewriting the other 7 produces exactly 1 deletion", async () => {
+    process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS = "true";
+
+    const currentBody = `${buildStoredLinks(8)}<p>${"x".repeat(800)}</p>`;
+    // Re-emit links 1, 2, 3, 4, 5, 6, 7 — drop link 8.
+    const markdownBody =
+      [1, 2, 3, 4, 5, 6, 7]
+        .map((i) => `- [Page ${i}](confluence://ETD/Page-${i})`)
+        .join("\n") + "\n\n" + "filler. ".repeat(80);
+
+    // Without an ack, the gate fires for the genuine deletion.
+    let thrown: ConverterError | undefined;
+    try {
+      await safePrepareBody({
+        body: markdownBody,
+        currentBody,
+        confirmShrinkage: true,
+        confirmStructureLoss: true,
+      });
+    } catch (e) {
+      thrown = e as ConverterError;
+    }
+    expect(thrown).toBeDefined();
+    expect(thrown!.code).toBe("DELETIONS_NOT_CONFIRMED");
+    // The error message names exactly one deletion — *not* eight.
+    expect(thrown!.message).toMatch(/1 preserved element/);
+    expect(thrown!.message).not.toMatch(/8 preserved elements/);
+
+    // Now ack the one deletion and confirm the rest are regenerated.
+    const result = await safePrepareBody({
+      body: markdownBody,
+      currentBody,
+      confirmShrinkage: true,
+      confirmStructureLoss: true,
+      confirmDeletions: true,
+    });
+    expect(result.deletedTokens).toHaveLength(1);
+    expect(result.regeneratedTokens).toHaveLength(7);
+    // The deletion's fingerprint should describe an ac:link.
+    expect(result.deletedTokens[0].tag).toBe("ac:link");
+  });
+
+  it("flag ON: TOC parameter change (maxLevel 3 → 4) is NOT byte-equivalent — gate fires", async () => {
+    process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS = "true";
+
+    // currentBody has a TOC macro with maxLevel=3.
+    const oldToc =
+      `<ac:structured-macro ac:name="toc" ac:macro-id="t-1">` +
+      `<ac:parameter ac:name="maxLevel">3</ac:parameter>` +
+      `<ac:parameter ac:name="minLevel">1</ac:parameter>` +
+      `</ac:structured-macro>`;
+    const currentBody = `${oldToc}<h1>Heading</h1><p>${"x".repeat(800)}</p>`;
+    // YAML frontmatter renders to a TOC macro with maxLevel=4 — a real
+    // change.
+    const markdownBody =
+      "---\n" +
+      "toc:\n" +
+      "  maxLevel: 4\n" +
+      "  minLevel: 1\n" +
+      "---\n\n" +
+      "# Heading\n\n" +
+      "Body content. ".repeat(80);
+
+    let thrown: ConverterError | undefined;
+    try {
+      await safePrepareBody({
+        body: markdownBody,
+        currentBody,
+        confirmShrinkage: true,
+        confirmStructureLoss: true,
+      });
+    } catch (e) {
+      thrown = e as ConverterError;
+    }
+    expect(thrown).toBeDefined();
+    expect(thrown!.code).toBe("DELETIONS_NOT_CONFIRMED");
+    expect(thrown!.message).toMatch(/1 preserved element/);
+
+    // With ack, the result has 1 deletion and 0 regenerated.
+    const result = await safePrepareBody({
+      body: markdownBody,
+      currentBody,
+      confirmShrinkage: true,
+      confirmStructureLoss: true,
+      confirmDeletions: true,
+    });
+    expect(result.deletedTokens).toHaveLength(1);
+    expect(result.regeneratedTokens).toEqual([]);
+  });
+
+  it("flag ON: property test — 50 random TOC parameter permutations always classify as regenerated", () => {
+    process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS = "true";
+
+    // Build a deterministic-but-shuffled TOC macro and assert the canonical
+    // key matches the canonical (sorted) form across N permutations.
+    const params = [
+      ["maxLevel", "3"],
+      ["minLevel", "1"],
+      ["type", "list"],
+      ["printable", "true"],
+      ["outline", "false"],
+    ];
+
+    const canonical =
+      `<ac:structured-macro ac:name="toc">` +
+      params
+        .map(
+          ([k, v]) =>
+            `<ac:parameter ac:name="${k}">${v}</ac:parameter>`,
+        )
+        .join("") +
+      `</ac:structured-macro>`;
+    const canonicalKey = canonicaliseToken(canonical).key;
+
+    // Linear-congruential PRNG (no external deps; deterministic across runs).
+    let seed = 0xc0ffee;
+    const rnd = () => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 0x1_0000_0000;
+    };
+
+    for (let trial = 0; trial < 50; trial++) {
+      const shuffled = params.slice();
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(rnd() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      const xml =
+        `<ac:structured-macro ac:name="toc">` +
+        shuffled
+          .map(
+            ([k, v]) =>
+              `<ac:parameter ac:name="${k}">${v}</ac:parameter>`,
+          )
+          .join("") +
+        `</ac:structured-macro>`;
+      expect(canonicaliseToken(xml).key).toBe(canonicalKey);
+    }
+  });
+
+  it("flag ON: property test — 50 random ac:link attribute permutations always classify as regenerated", () => {
+    process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS = "true";
+
+    // The two attribute orderings of <ri:page>: space-key first vs
+    // content-title first. Plus the optional ac:anchor on the outer link.
+    let seed = 0xbadf00d;
+    const rnd = () => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 0x1_0000_0000;
+    };
+
+    const target = { spaceKey: "ETD", contentTitle: "Home" };
+    const anchor = "section";
+    const body = "Click";
+
+    const canonicalForm =
+      `<ac:link ac:anchor="${anchor}">` +
+      `<ri:page ri:space-key="${target.spaceKey}" ri:content-title="${target.contentTitle}"/>` +
+      `<ac:plain-text-link-body><![CDATA[${body}]]></ac:plain-text-link-body>` +
+      `</ac:link>`;
+    const canonicalKey = canonicaliseToken(canonicalForm).key;
+
+    for (let trial = 0; trial < 50; trial++) {
+      const flipOuter = rnd() < 0.5;
+      const flipInner = rnd() < 0.5;
+      const linkOpenAttrs = `ac:anchor="${anchor}"`;
+      const innerAttrs = flipInner
+        ? `ri:content-title="${target.contentTitle}" ri:space-key="${target.spaceKey}"`
+        : `ri:space-key="${target.spaceKey}" ri:content-title="${target.contentTitle}"`;
+      // flipOuter would change attribute order on the link element itself,
+      // but ac:link only has one attr here so it's a no-op for this test;
+      // the variation is in the inner ri:page only.
+      void flipOuter;
+      const xml =
+        `<ac:link ${linkOpenAttrs}>` +
+        `<ri:page ${innerAttrs}/>` +
+        `<ac:plain-text-link-body><![CDATA[${body}]]></ac:plain-text-link-body>` +
+        `</ac:link>`;
+      expect(canonicaliseToken(xml).key).toBe(canonicalKey);
+    }
+  });
+});
+
+describe("safeSubmitPage — C1 audit log for regenerated tokens", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("records regeneratedTokens on the success-path mutation log entry", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "P", version: { number: 5 } },
+      newVersion: 5,
+    });
+
+    const regeneratedTokens: RegeneratedTokenPair[] = [
+      { oldId: "T0001", newId: "T0001", kind: "ac:link" },
+      { oldId: "T0002", newId: "T0002", kind: "ac:link" },
+      { oldId: "T0003", newId: "T0003", kind: "ac:structured-macro:toc" },
+    ];
+
+    await safeSubmitPage({
+      pageId: "42",
+      title: "P",
+      finalStorage: "<p>different body content here for thresholds</p>",
+      previousBody: "<p>previous body content here</p>",
+      version: 4,
+      versionMessage: "",
+      deletedTokens: [],
+      regeneratedTokens,
+      clientLabel: "claude-code",
+    });
+
+    expect(logMutation).toHaveBeenCalledTimes(1);
+    const record = (logMutation as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    expect(record.regeneratedTokens).toBeDefined();
+    expect(record.regeneratedTokens).toHaveLength(3);
+    // Every entry has the three required fields and nothing else leaks.
+    for (const entry of record.regeneratedTokens) {
+      expect(entry).toHaveProperty("oldId");
+      expect(entry).toHaveProperty("newId");
+      expect(entry).toHaveProperty("kind");
+      expect(typeof entry.oldId).toBe("string");
+      expect(typeof entry.newId).toBe("string");
+      expect(typeof entry.kind).toBe("string");
+    }
+  });
+
+  it("omits regeneratedTokens from the mutation log when none were suppressed", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "P", version: { number: 5 } },
+      newVersion: 5,
+    });
+
+    await safeSubmitPage({
+      pageId: "42",
+      title: "P",
+      finalStorage: "<p>different body content here for thresholds</p>",
+      previousBody: "<p>previous body content here</p>",
+      version: 4,
+      versionMessage: "",
+      deletedTokens: [],
+      // regeneratedTokens deliberately omitted (defaults to []).
+      clientLabel: "claude-code",
+    });
+
+    const record = (logMutation as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    expect(record.regeneratedTokens).toBeUndefined();
+  });
+
+  it("end-to-end (prepare → submit): suppressed pairs land in the mutation log", async () => {
+    // Restore the env flag for this single test (subsequent tests in this
+    // describe restore via beforeEach as needed).
+    process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS = "true";
+    try {
+      const N = 3;
+      const storedLinks = [];
+      for (let i = 1; i <= N; i++) {
+        storedLinks.push(
+          `<ac:link>` +
+            `<ri:page ri:content-title="Page-${i}" ri:space-key="ETD"/>` +
+            `<ac:plain-text-link-body><![CDATA[Page ${i}]]></ac:plain-text-link-body>` +
+            `</ac:link>`,
+        );
+      }
+      const currentBody = `<p>${storedLinks.join(" ")}</p><p>${"x".repeat(400)}</p>`;
+      const markdownBody =
+        [1, 2, 3]
+          .map((i) => `- [Page ${i}](confluence://ETD/Page-${i})`)
+          .join("\n") +
+        "\n\n" +
+        "filler text. ".repeat(80);
+
+      const prepared = await safePrepareBody({
+        body: markdownBody,
+        currentBody,
+        confirmShrinkage: true,
+        confirmStructureLoss: true,
+      });
+      // Pre-condition: byte-equivalent suppression actually fired.
+      expect(prepared.regeneratedTokens.length).toBe(N);
+      expect(prepared.deletedTokens).toEqual([]);
+
+      (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+        page: { id: "777", title: "T", version: { number: 9 } },
+        newVersion: 9,
+      });
+
+      await safeSubmitPage({
+        pageId: "777",
+        title: "T",
+        finalStorage: prepared.finalStorage,
+        previousBody: currentBody,
+        version: 8,
+        versionMessage: prepared.versionMessage,
+        deletedTokens: prepared.deletedTokens,
+        regeneratedTokens: prepared.regeneratedTokens,
+        clientLabel: "claude-code",
+      });
+
+      const record = (logMutation as unknown as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
+      // Audit-log invariant: every regenerated pair surfaces in the mutation
+      // log so a postmortem can reconstruct what was suppressed.
+      expect(record.regeneratedTokens).toBeDefined();
+      expect(record.regeneratedTokens).toHaveLength(N);
+      for (const entry of record.regeneratedTokens) {
+        expect(entry.kind).toBe("ac:link");
+        expect(entry.oldId).toMatch(/^T\d{4}$/);
+        expect(entry.newId).toMatch(/^T\d{4}$/);
+      }
+    } finally {
+      delete process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS;
+    }
+  });
+
+  it("echoes regeneratedTokens through to SafeSubmitPageOutput", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "42", title: "P", version: { number: 5 } },
+      newVersion: 5,
+    });
+
+    const regeneratedTokens: RegeneratedTokenPair[] = [
+      { oldId: "T0001", newId: "T0007", kind: "ac:link" },
+    ];
+
+    const result = await safeSubmitPage({
+      pageId: "42",
+      title: "P",
+      finalStorage: "<p>different body content here for thresholds</p>",
+      previousBody: "<p>previous body content here</p>",
+      version: 4,
+      versionMessage: "",
+      deletedTokens: [],
+      regeneratedTokens,
+      clientLabel: "claude-code",
+    });
+
+    expect(result.regeneratedTokens).toEqual(regeneratedTokens);
   });
 });

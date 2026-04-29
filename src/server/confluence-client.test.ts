@@ -48,6 +48,7 @@ import {
   ConfluencePermissionError,
   ConfluenceNotFoundError,
   ConfluenceConflictError,
+  parseConflictCurrentVersion,
   getLabels,
   addLabels,
   removeLabel,
@@ -157,6 +158,70 @@ describe("sanitizeError", () => {
 
 // D4 — Zod schemas
 // =============================================================================
+
+describe("parseConflictCurrentVersion (C2)", () => {
+  it("extracts version from errors[].detail with 'current version is N'", () => {
+    const body = JSON.stringify({
+      errors: [{ detail: "The current version is 7; you submitted 5." }],
+    });
+    expect(parseConflictCurrentVersion(body)).toBe(7);
+  });
+
+  it("extracts version from a top-level message field", () => {
+    const body = JSON.stringify({ message: "current version: 12" });
+    expect(parseConflictCurrentVersion(body)).toBe(12);
+  });
+
+  it("extracts version from raw text when JSON parsing fails", () => {
+    const body = "Conflict — current version is 42, retry.";
+    expect(parseConflictCurrentVersion(body)).toBe(42);
+  });
+
+  it("returns undefined when no version pattern matches", () => {
+    expect(parseConflictCurrentVersion(JSON.stringify({ message: "Conflict" }))).toBeUndefined();
+    expect(parseConflictCurrentVersion("opaque error string")).toBeUndefined();
+  });
+
+  it("returns undefined for empty body", () => {
+    expect(parseConflictCurrentVersion("")).toBeUndefined();
+  });
+
+  it("rejects non-positive version numbers", () => {
+    // Pathological — a 0/negative version is not a real Confluence
+    // version. Our caller treats undefined as 'fall back to getPage'.
+    const body = JSON.stringify({ message: "current version is 0" });
+    expect(parseConflictCurrentVersion(body)).toBeUndefined();
+  });
+});
+
+describe("ConfluenceConflictError (C2)", () => {
+  it("includes both versions in the message when both are provided", () => {
+    const err = new ConfluenceConflictError("123", { currentVersion: 7, attemptedVersion: 5 });
+    expect(err.currentVersion).toBe(7);
+    expect(err.attemptedVersion).toBe(5);
+    expect(err.pageId).toBe("123");
+    expect(err.message).toContain("page 123");
+    expect(err.message).toContain("version 7");
+    expect(err.message).toContain("you sent version 5");
+    expect(err.message).toContain("retry your update with version 7");
+  });
+
+  it("includes only currentVersion when attemptedVersion is omitted", () => {
+    const err = new ConfluenceConflictError("123", { currentVersion: 7 });
+    expect(err.currentVersion).toBe(7);
+    expect(err.attemptedVersion).toBeUndefined();
+    expect(err.message).toContain("version 7");
+    expect(err.message).not.toContain("you sent");
+  });
+
+  it("uses the legacy phrasing when neither version is provided", () => {
+    const err = new ConfluenceConflictError("123");
+    expect(err.currentVersion).toBeUndefined();
+    expect(err.attemptedVersion).toBeUndefined();
+    expect(err.message).toContain("has been modified");
+    expect(err.message).toContain("get_page");
+  });
+});
 
 describe("Zod schemas", () => {
   describe("PageSchema", () => {
@@ -1119,6 +1184,87 @@ describe("_rawUpdatePage", () => {
     await expect(
       _rawUpdatePage("30", { title: "T", version: 5 })
     ).rejects.toThrow(/get_page/);
+  });
+
+  it("C2: ConfluenceConflictError.currentVersion is set when the API conflict body is parseable", async () => {
+    // Confluence Cloud's 409 body sometimes embeds the current version in
+    // an `errors[].detail` message; we extract it best-effort.
+    const body = {
+      errors: [
+        {
+          status: 409,
+          code: "VERSION_MISMATCH",
+          title: "Version mismatch",
+          detail: "The current version is 7; you submitted version 5.",
+        },
+      ],
+    };
+    global.fetch = mockFetchResponse(body, 409);
+    let caught: unknown = undefined;
+    try {
+      await _rawUpdatePage("30", { title: "T", version: 5 });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ConfluenceConflictError);
+    const conflict = caught as ConfluenceConflictError;
+    expect(conflict.currentVersion).toBe(7);
+    expect(conflict.attemptedVersion).toBe(5);
+    expect(conflict.message).toContain("version 7");
+    expect(conflict.message).toContain("you sent version 5");
+  });
+
+  it("C2: ConfluenceConflictError.currentVersion falls back to a follow-up getPage when body is not parseable", async () => {
+    // First call: PUT returns 409 with no parseable version. Second call:
+    // GET /pages/{id} succeeds and returns version 9.
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (method === "PUT") {
+        return new Response(JSON.stringify({ message: "Conflict" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      // Fallback GET — returns the current version.
+      return new Response(
+        JSON.stringify({ id: "30", title: "T", version: { number: 9 } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    global.fetch = fetchMock as any;
+
+    let caught: unknown = undefined;
+    try {
+      await _rawUpdatePage("30", { title: "T", version: 5 });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ConfluenceConflictError);
+    const conflict = caught as ConfluenceConflictError;
+    expect(conflict.currentVersion).toBe(9);
+    expect(conflict.attemptedVersion).toBe(5);
+    expect(conflict.message).toContain("version 9");
+  });
+
+  it("C2: ConfluenceConflictError.currentVersion is undefined when both parsing and follow-up GET fail", async () => {
+    // Every call returns a 409 with no version info; the follow-up GET
+    // also fails. currentVersion should be undefined and the message
+    // should fall back to the legacy phrasing.
+    global.fetch = mockFetchResponse({ message: "Conflict" }, 409);
+    let caught: unknown = undefined;
+    try {
+      await _rawUpdatePage("30", { title: "T", version: 5 });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ConfluenceConflictError);
+    const conflict = caught as ConfluenceConflictError;
+    expect(conflict.currentVersion).toBeUndefined();
+    expect(conflict.attemptedVersion).toBe(5);
+    // Falls back to the original "has been modified" phrasing when no
+    // current version is available.
+    expect(conflict.message).toContain("has been modified");
+    expect(conflict.message).toContain("get_page");
   });
 
   it("rethrows non-409 errors unchanged", async () => {

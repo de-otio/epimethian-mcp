@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DESTRUCTIVE_FLAG_FROM_TOOL_OUTPUT,
+  SOURCE_POLICY_BLOCKED,
   SOURCE_REQUIRED,
   listDestructiveFlagsSet,
   validateSource,
@@ -21,15 +22,17 @@ describe("validateSource (E2)", () => {
     );
   });
 
-  it("E2: omitted source + destructive flags + EPIMETHIAN_REQUIRE_SOURCE=true → throws SOURCE_REQUIRED", () => {
+  it("E2: omitted source + destructive flags + EPIMETHIAN_REQUIRE_SOURCE=true → throws SOURCE_POLICY_BLOCKED", () => {
     process.env.EPIMETHIAN_REQUIRE_SOURCE = "true";
     expect(() => validateSource(undefined, ["replace_body"])).toThrow(
-      /EPIMETHIAN_REQUIRE_SOURCE/,
+      /blocked by source policy/,
     );
     try {
       validateSource(undefined, ["replace_body"]);
     } catch (err) {
-      expect((err as { code?: string }).code).toBe(SOURCE_REQUIRED);
+      expect((err as { code?: string }).code).toBe(SOURCE_POLICY_BLOCKED);
+      // SOURCE_REQUIRED is no longer used for this case.
+      expect((err as { code?: string }).code).not.toBe(SOURCE_REQUIRED);
     }
   });
 
@@ -51,18 +54,18 @@ describe("validateSource (E2)", () => {
     );
   });
 
-  it("E2: chained_tool_output + any destructive flag → throws DESTRUCTIVE_FLAG_FROM_TOOL_OUTPUT", () => {
+  it("E2: chained_tool_output + any destructive flag → throws SOURCE_POLICY_BLOCKED", () => {
     try {
       validateSource("chained_tool_output", ["confirm_shrinkage"]);
       expect.unreachable("should have thrown");
     } catch (err) {
-      expect((err as { code?: string }).code).toBe(
-        DESTRUCTIVE_FLAG_FROM_TOOL_OUTPUT,
-      );
+      expect((err as { code?: string }).code).toBe(SOURCE_POLICY_BLOCKED);
+      // Also assert the old code is NOT used (regression guard).
+      expect((err as { code?: string }).code).not.toBe(DESTRUCTIVE_FLAG_FROM_TOOL_OUTPUT);
     }
   });
 
-  it("E2: chained_tool_output rejection lists the specific destructive flags in the message", () => {
+  it("E2: chained_tool_output rejection message says 'blocked by source policy'", () => {
     try {
       validateSource("chained_tool_output", [
         "confirm_shrinkage",
@@ -71,8 +74,21 @@ describe("validateSource (E2)", () => {
       expect.unreachable("should have thrown");
     } catch (err) {
       const msg = (err as Error).message;
+      expect(msg).toContain("blocked by source policy");
       expect(msg).toContain("confirm_shrinkage");
       expect(msg).toContain("replace_body");
+    }
+  });
+
+  it("E2: chained_tool_output + confirm_deletions → SOURCE_POLICY_BLOCKED with source policy message", () => {
+    try {
+      validateSource("chained_tool_output", ["confirm_deletions"]);
+      expect.unreachable("should have thrown");
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe(SOURCE_POLICY_BLOCKED);
+      const msg = (err as Error).message;
+      expect(msg).toContain("blocked by source policy");
+      expect(msg).toContain("source=chained_tool_output");
     }
   });
 

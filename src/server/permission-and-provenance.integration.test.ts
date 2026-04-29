@@ -682,6 +682,82 @@ describe("Scenario 10: get_comments partial replies — one 403 in N=3 top-level
 });
 
 // ---------------------------------------------------------------------------
+// Scenario 11: confirm_deletions gate — elicitation prompt contains deletion summary
+// ---------------------------------------------------------------------------
+describe("Scenario 11: confirm_deletions gate message includes structured deletion summary", () => {
+  it("gateOperation message contains macro category description when deletionSummary provided", async () => {
+    // Test gateOperation directly by calling it with a DeletionSummary.
+    // The fake server exposes elicitation capability so clientSupportsElicitation
+    // (the real implementation) returns true, and elicitInput is captured.
+    const { gateOperation } = await import("./elicitation.js");
+    const capturedMessages: string[] = [];
+    const elicitMock = vi.fn(async ({ message }: { message: string }) => {
+      capturedMessages.push(message);
+      return { action: "accept", content: { confirm: true } };
+    });
+    const fakeServer = {
+      server: {
+        getClientVersion: () => ({ name: "test-client", version: "1.0.0" }),
+        getClientCapabilities: () => ({ elicitation: {} }),
+        elicitInput: elicitMock,
+      },
+    } as unknown as import("@modelcontextprotocol/sdk/server/mcp.js").McpServer;
+
+    await gateOperation(fakeServer, {
+      tool: "update_page",
+      summary: "Update page 99 with destructive flags?",
+      details: {
+        page_id: "99",
+        flags: "confirm_deletions",
+        source: "user_request",
+        deletionSummary: { tocs: 1, links: 8, structuredMacros: 0, codeMacros: 0, plainElements: 0, other: 0 },
+      },
+    });
+
+    expect(capturedMessages).toHaveLength(1);
+    const msg = capturedMessages[0]!;
+    // The message must describe the deletion in human-readable terms.
+    expect(msg).toContain("1 TOC macro");
+    expect(msg).toContain("8 link macros");
+    expect(msg).toContain("will remove");
+    // Categories with zero count must be absent.
+    expect(msg).not.toContain("code macro");
+    expect(msg).not.toContain("structured macro");
+  });
+
+  it("gateOperation message pluralises correctly for single items", async () => {
+    const { gateOperation } = await import("./elicitation.js");
+    const capturedMessages: string[] = [];
+    const elicitMock = vi.fn(async ({ message }: { message: string }) => {
+      capturedMessages.push(message);
+      return { action: "accept", content: { confirm: true } };
+    });
+    const fakeServer = {
+      server: {
+        getClientVersion: () => ({ name: "test-client", version: "1.0.0" }),
+        getClientCapabilities: () => ({ elicitation: {} }),
+        elicitInput: elicitMock,
+      },
+    } as unknown as import("@modelcontextprotocol/sdk/server/mcp.js").McpServer;
+
+    await gateOperation(fakeServer, {
+      tool: "update_page",
+      summary: "Update page 99 with destructive flags?",
+      details: {
+        deletionSummary: { tocs: 0, links: 1, structuredMacros: 1, codeMacros: 0, plainElements: 0, other: 0 },
+      },
+    });
+
+    const msg = capturedMessages[0]!;
+    // Singular forms
+    expect(msg).toContain("1 link macro");
+    expect(msg).not.toContain("1 link macros");
+    expect(msg).toContain("1 structured macro");
+    expect(msg).not.toContain("1 structured macros");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Scenario bonus: appendWarnings helper directly (exported from index.ts)
 // ---------------------------------------------------------------------------
 describe("appendWarnings helper", () => {

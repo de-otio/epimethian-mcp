@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.3.0] - 2026-04-28 - UX feedback: behaviour changes (batch 2 of 3)
+
+Second batch of fixes from the live-session UX feedback. Each change has
+a defensive default so existing callers see identical behaviour.
+
+### Added
+
+- **`version: "current"` accepted by `update_page`, `update_page_section`,
+  `prepend_to_page`, `append_to_page`** (§5). When passed, the handler
+  fetches the latest version internally and submits the update against
+  it — saves the caller a `get_page` round-trip after `create_page`'s
+  invisible post-processing churn. This is a "skip the read" shortcut,
+  NOT a conflict-resolution strategy: a concurrent write from another
+  user still produces a `409` and is propagated unchanged. `delete_page`
+  and `revert_page` deliberately remain numeric-only — those tools rely
+  on optimistic locking as a guard against destroying someone else's
+  work, and accepting `"current"` would defeat that guard. Default
+  remains a positive integer; `"current"` is opt-in.
+- **`ConfluenceConflictError.currentVersion` populated when available**
+  (§5). On 409 from `update_page` / `delete_page`, the server's response
+  body is parsed (best-effort regex over `errors[]`, `detail`, `message`)
+  to extract the page's current version. If the body is opaque, a
+  follow-up `getPage` fills it in. Callers can retry without needing a
+  separate `get_page` round-trip — the new version is in
+  `error.currentVersion` and in the error message text.
+- **`create_page({ wait_for_post_processing: true })`** (§5). Optional
+  flag (default `false`) that polls the page version every 250 ms up to
+  3 s and returns when two consecutive reads agree. Addresses the
+  original "version: 1 returned, but page silently advanced to v4 by
+  the time you call update_page" pain point WITHOUT introducing the
+  concurrency hazard of `version: "current"`. Recommended when the next
+  operation will be an update.
+- **Byte-equivalent macro suppression for `confirm_deletions`** (§2),
+  behind a feature flag. The deletion-tracking pipeline now classifies
+  every token-deletion + token-creation pair: if the pair canonicalises
+  to byte-equal XML (same `<ac:link>` target + display + anchor; same
+  `<ac:structured-macro>` name + sorted parameters + CDATA body; etc.)
+  it is recorded as `regenerated` rather than `deleted`. Only `deleted`
+  entries reach the `confirm_deletions` gate. Set
+  `EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS=true` to opt in for one
+  release; default for 6.3.0 is OFF (existing strict behaviour). The
+  canonicaliser is strict by default — anything it cannot interpret is
+  treated as non-equivalent (gate fires). Every `regenerated` pair is
+  logged to the mutation log with `{ oldId, newId, kind }` for
+  postmortem.
+- **Deletion summary in elicitation prompts** (§6). When the
+  `confirm_deletions` gate fires, the elicitation prompt now reads
+  *"This update will remove 1 TOC macro and 8 link macros that the new
+  markdown does not regenerate. Proceed?"* instead of just naming the
+  flag. Categories with zero count are omitted; pluralisation is
+  correct. Implemented by computing a structured `DeletionSummary`
+  from the (post-suppression) `deletedTokens` set before the gate
+  fires; the diff plan computation is pure, so this adds no extra
+  write traffic.
+- **`SOURCE_POLICY_BLOCKED` error code** (§6). When `validateSource`
+  rejects a destructive flag before elicitation can run, the error
+  now carries this distinct code with an explicit message:
+  *"...blocked by source policy: source=chained_tool_output, but
+  tool-chained outputs cannot authorise content deletion. Confirm
+  interactively or rephrase request."*. Replaces the older generic
+  `DESTRUCTIVE_FLAG_FROM_TOOL_OUTPUT` / `SOURCE_REQUIRED` codes for
+  these cases. Lets an LLM caller distinguish "user said no" from
+  "source policy blocked you before the user even saw a prompt."
+
+### Changed
+
+- **`ConfluenceConflictError` message format**: now includes the current
+  page version when known: *"Version conflict: page X is at version N;
+  you sent version M. Call get_page to fetch the latest content..."*
+  (Was: a generic message asking the caller to re-read.)
+
+### Internal
+
+- New helper `partitionByEquivalence()` and `safe-write-canonicaliser.ts`
+  module backing the byte-equivalent suppression. CDATA-aware: handles
+  `<ac:plain-text-link-body><![CDATA[...]]>` correctly via byte-offset
+  masking (node-html-parser has no native CDATA support).
+- `create_page` post-processing wait uses `Date.now()`-based budgeting
+  so vitest fake timers can advance deterministically; transient
+  `getPage` failures during polling are swallowed (worst case: return
+  the initial version).
+
 ## [6.2.3] - 2026-04-28 - UX patch: live-session feedback (batch 1 of 3)
 
 First batch of fixes from the 12-page-tree build session (see

@@ -721,10 +721,18 @@ export function sanitizeError(message: string): string {
 
 export class ConfluenceApiError extends Error {
   status: number;
+  /**
+   * Raw response body (untruncated) — preserved so callers (e.g. the 409
+   * handler in `_rawUpdatePage`) can parse fields like the current page
+   * version out of the response. The user-facing message uses
+   * `sanitizeError` to truncate, but downstream parsing should use this.
+   */
+  rawBody: string;
   constructor(status: number, body: string) {
     super(`Confluence API error (${status}): ${sanitizeError(body)}`);
     this.name = "ConfluenceApiError";
     this.status = status;
+    this.rawBody = body;
   }
 }
 
@@ -734,13 +742,94 @@ export class ConfluencePermissionError extends ConfluenceApiError {}  // 403
 
 export class ConfluenceNotFoundError extends ConfluenceApiError {}    // 404
 
+/**
+ * Best-effort extraction of the current page version from a Confluence
+ * 409 response body. The Cloud API does not document a stable shape for
+ * the current version in the conflict body; we look for common patterns.
+ * Returns `undefined` if no version can be parsed — callers should fall
+ * back to a follow-up `getPage` call.
+ */
+export function parseConflictCurrentVersion(body: string): number | undefined {
+  if (!body) return undefined;
+  // Try JSON parse first — Cloud sometimes returns
+  // { errors: [{ detail: "current version is 7" }] } or similar.
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    const candidates: string[] = [];
+    if (parsed && typeof parsed === "object") {
+      const obj = parsed as Record<string, unknown>;
+      if (typeof obj.message === "string") candidates.push(obj.message);
+      if (typeof obj.detail === "string") candidates.push(obj.detail);
+      if (Array.isArray(obj.errors)) {
+        for (const e of obj.errors) {
+          if (e && typeof e === "object") {
+            const ee = e as Record<string, unknown>;
+            if (typeof ee.title === "string") candidates.push(ee.title);
+            if (typeof ee.detail === "string") candidates.push(ee.detail);
+            if (typeof ee.message === "string") candidates.push(ee.message);
+          }
+        }
+      }
+    }
+    for (const text of candidates) {
+      const m = text.match(/current\s+version[^\d]{0,20}(\d+)/i)
+        ?? text.match(/version\s+(?:is\s+now\s+|is\s+)(\d+)/i)
+        ?? text.match(/expected\s+version\s+\d+,?\s+(?:got|but)\s+(\d+)/i);
+      if (m) {
+        const n = Number(m[1]);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+    }
+  } catch {
+    // Not JSON — fall through to a regex against the raw text.
+  }
+  const m = body.match(/current\s+version[^\d]{0,20}(\d+)/i)
+    ?? body.match(/version\s+(?:is\s+now\s+|is\s+)(\d+)/i);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return undefined;
+}
+
 export class ConfluenceConflictError extends Error {
-  constructor(pageId: string) {
-    super(
-      `Version conflict: page ${pageId} has been modified since you last read it. ` +
-      `Call get_page to fetch the latest version, then retry your update with the new version number.`
-    );
+  /**
+   * Current server-side version of the page at the moment the conflict
+   * was detected, when known. The handler can use this to retry without a
+   * follow-up `get_page` round-trip. `undefined` if the response body
+   * could not be parsed and the follow-up `getPage` lookup also failed.
+   */
+  readonly currentVersion?: number;
+  /**
+   * The version the caller attempted to write (not bumped). Useful for
+   * agent-facing error messages and structured retry logic.
+   */
+  readonly attemptedVersion?: number;
+  readonly pageId: string;
+
+  constructor(pageId: string, opts: { currentVersion?: number; attemptedVersion?: number } = {}) {
+    const { currentVersion, attemptedVersion } = opts;
+    let message: string;
+    if (currentVersion !== undefined && attemptedVersion !== undefined) {
+      message =
+        `Version conflict: page ${pageId} is at version ${currentVersion}; ` +
+        `you sent version ${attemptedVersion}. Call get_page to fetch the latest ` +
+        `content, then retry your update with version ${currentVersion}.`;
+    } else if (currentVersion !== undefined) {
+      message =
+        `Version conflict: page ${pageId} is at version ${currentVersion}. ` +
+        `Call get_page to fetch the latest content, then retry your update with ` +
+        `version ${currentVersion}.`;
+    } else {
+      message =
+        `Version conflict: page ${pageId} has been modified since you last read it. ` +
+        `Call get_page to fetch the latest version, then retry your update with the new version number.`;
+    }
+    super(message);
     this.name = "ConfluenceConflictError";
+    this.pageId = pageId;
+    this.currentVersion = currentVersion;
+    this.attemptedVersion = attemptedVersion;
   }
 }
 
@@ -959,7 +1048,23 @@ export async function _rawUpdatePage(
     raw = await v2Put(`/pages/${pageId}`, payload);
   } catch (err) {
     if (err instanceof ConfluenceApiError && err.status === 409) {
-      throw new ConfluenceConflictError(pageId);
+      // C2: best-effort extraction of the current server version so the
+      // caller can retry without an extra get_page round-trip. If the
+      // response body doesn't expose it, fall back to a follow-up GET.
+      let currentVersion = parseConflictCurrentVersion(err.rawBody);
+      if (currentVersion === undefined) {
+        try {
+          const refresh = await v2Get(`/pages/${pageId}`, {});
+          const parsed = PageSchema.parse(refresh);
+          currentVersion = parsed.version?.number;
+        } catch {
+          // Swallow — currentVersion stays undefined.
+        }
+      }
+      throw new ConfluenceConflictError(pageId, {
+        currentVersion,
+        attemptedVersion: opts.version,
+      });
     }
     throw err;
   }
@@ -997,7 +1102,10 @@ export async function deletePage(
     const parsed = PageSchema.parse(page);
     const actualVersion = parsed.version?.number;
     if (actualVersion !== undefined && actualVersion !== expectedVersion) {
-      throw new ConfluenceConflictError(pageId);
+      throw new ConfluenceConflictError(pageId, {
+        currentVersion: actualVersion,
+        attemptedVersion: expectedVersion,
+      });
     }
   }
   await v2Delete(`/pages/${pageId}`);

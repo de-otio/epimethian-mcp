@@ -70,6 +70,22 @@ export interface MutationRecord {
    * the agent consumed in the last 60s before issuing this write.
    */
   precedingSignals?: string[];
+  /**
+   * Track C1: byte-equivalent deletion suppressions. Each entry records a
+   * (deleted, created) token pair whose post-canonicalisation XML compared
+   * equal — meaning the agent regenerated identical content with different
+   * attribute ordering / whitespace. Emitted only when the
+   * EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS feature flag is enabled and
+   * at least one pair was suppressed; absent otherwise.
+   *
+   * This is the audit-log mitigation called out in the C1 plan: a buggy
+   * canonicaliser would let genuinely lost content slip past the deletion
+   * gate, so every suppression must be observable for postmortem.
+   *
+   * The fields carry NO content: only the pre-existing deletion-side token
+   * ID, the freshly-emitted creation-side token ID, and the macro kind.
+   */
+  regeneratedTokens?: Array<{ oldId: string; newId: string; kind: string }>;
   error?: string;
 }
 

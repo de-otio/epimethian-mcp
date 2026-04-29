@@ -82,6 +82,10 @@ import { tokeniseStorage } from "./converter/tokeniser.js";
 import { recentSignalsTracker } from "./converter/untrusted-fence.js";
 import { detectUntrustedFenceInWrite } from "./session-canary.js";
 import { writeBudget } from "./write-budget.js";
+import {
+  canonicaliseToken,
+  type MacroKind,
+} from "./safe-write-canonicaliser.js";
 
 /**
  * Scope of the body being prepared. Controls which guards fire and at what
@@ -114,6 +118,56 @@ export interface DeletedToken {
    * See the top-of-file comment for the exact derivation rule.
    */
   fingerprint: string;
+}
+
+/**
+ * Track C1: a (deleted, created) token pair whose post-canonicalisation XML
+ * is byte-equivalent. Surfaced when
+ * EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS=true and the deletion-tracking
+ * pipeline detected the same macro re-emitted with different attribute
+ * ordering (or other canonical-form-preserving changes).
+ *
+ * The user-confirmation gate (assertDeletionAckMatches) treats these pairs
+ * as no-ops: the agent didn't lose anything, just re-rendered the same
+ * macro. The audit log records the suppression so a postmortem can
+ * reconstruct what was bypassed.
+ *
+ * Carries no content: only the pre-existing-side token ID, the freshly
+ * emitted token ID, and the macro kind classification.
+ */
+export interface RegeneratedTokenPair {
+  /** Token ID that existed in the page before the update (sidecar A). */
+  oldId: TokenId;
+  /** Token ID emitted by the converter for the regenerated equivalent (sidecar B). */
+  newId: TokenId;
+  /** Macro kind classification — e.g. "ac:link", "ac:structured-macro:toc". */
+  kind: MacroKind;
+}
+
+/**
+ * Feature flag for byte-equivalent deletion suppression (Track C1).
+ *
+ * When OFF (default for 6.3.0): the deletion-tracking pipeline behaves
+ * exactly as it did before — every token-id deletion counts as a semantic
+ * deletion and the user-confirmation gate fires for them all.
+ *
+ * When ON (`EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS=true`): each deletion
+ * is paired against any "newly created" token whose canonical key matches.
+ * Matched pairs become {@link RegeneratedTokenPair}s, are removed from the
+ * deletion set passed to the gate, and are recorded in the audit log.
+ *
+ * Strict-by-default safety:
+ *   - The canonicaliser refuses to interpret unknown shapes (every such
+ *     token gets a unique opaque key, so it cannot match anything else).
+ *   - Two tokens are equivalent ONLY when every meaningful attribute
+ *     matches. See safe-write-canonicaliser.ts for the per-kind rules.
+ *
+ * Resolved at call time, not at module load, so test suites can toggle
+ * the flag with `process.env`.
+ */
+function suppressEquivalentDeletionsEnabled(): boolean {
+  const v = process.env.EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS;
+  return v === "true" || v === "1";
 }
 
 /**
@@ -231,8 +285,28 @@ export interface SafePrepareBodyOutput {
   /**
    * Preserved tokens removed by this preparation; empty when nothing was
    * removed. Threaded through safeSubmitPage to the final tool response.
+   *
+   * When `EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS=true`, this list excludes
+   * any tokens whose deletion was paired with a byte-equivalent
+   * regeneration — those move into {@link regeneratedTokens}. With the flag
+   * off (default for 6.3.0), every token-id deletion appears here, exactly
+   * as before.
    */
   deletedTokens: DeletedToken[];
+
+  /**
+   * Track C1: (deleted, created) token pairs whose post-canonicalisation
+   * XML is byte-equivalent. Always present; empty when:
+   *   - the feature flag `EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS` is unset
+   *     or false (default for 6.3.0), or
+   *   - no deleted token had a matching regenerated counterpart.
+   *
+   * The user-confirmation gate (`assertDeletionAckMatches`) is checked
+   * against `deletedTokens` only — entries here never reach the gate.
+   * safeSubmitPage records them in the success-path mutation log so a
+   * postmortem can reconstruct what was suppressed.
+   */
+  regeneratedTokens: RegeneratedTokenPair[];
 }
 
 /**
@@ -302,6 +376,14 @@ export interface SafeSubmitPageInput {
    * consolidated object to format for the tool response.
    */
   deletedTokens: DeletedToken[];
+
+  /**
+   * Track C1: (deleted, created) token pairs whose post-canonicalisation
+   * XML is byte-equivalent. Defaults to an empty list. When non-empty,
+   * safeSubmitPage emits a `regeneratedTokens` field on the success-path
+   * mutation log entry so a postmortem can reconstruct what was suppressed.
+   */
+  regeneratedTokens?: RegeneratedTokenPair[];
 
   /**
    * Client label (e.g. "claude-code@3.2.1") for attribution and
@@ -387,6 +469,13 @@ export interface SafeSubmitPageOutput {
   newLen: number;
   /** Tokens removed during preparation (echoed from the input). */
   deletedTokens: DeletedToken[];
+  /**
+   * Track C1: (deleted, created) regenerated token pairs (echoed from the
+   * input). Empty in the normal case; populated only when
+   * EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS is enabled and the
+   * canonicaliser detected at least one equivalence.
+   */
+  regeneratedTokens: RegeneratedTokenPair[];
   /**
    * One-shot deprecation warnings drained from the write-budget singleton
    * after a successful consume(). Handlers should push these into their
@@ -653,6 +742,108 @@ function buildDeletedTokens(
   });
 }
 
+/**
+ * Track C1: split a deletion set into "genuine deletions" and
+ * "regenerated equivalents".
+ *
+ * STRATEGY. After planUpdate produces `finalStorage`, re-tokenise the new
+ * body and pull aside any tokens whose verbatim XML is *not* present in
+ * the original sidecar — those are the freshly-emitted candidates for
+ * matching against deletions. Compute a canonical key for every deletion
+ * and every candidate; pair them up.
+ *
+ * STRICT-BY-DEFAULT. The canonicaliser returns a unique opaque sentinel for
+ * any input it cannot interpret with confidence (see
+ * safe-write-canonicaliser.ts). Two opaque keys never compare equal, so
+ * unknown shapes always fall through to "genuine deletion" — the gate
+ * fires.
+ *
+ * INVARIANTS:
+ *   - Every input deletion ends up in EXACTLY one of the two output lists.
+ *   - Each candidate matches at most one deletion (1:1 pairing). If two
+ *     deletions share a canonical key with one candidate, only one is
+ *     paired; the other remains a deletion. (This is the safe choice — a
+ *     duplicate emission of one macro is legitimately one deletion + one
+ *     creation, not two equivalences.)
+ *   - The function is pure: it does not modify `sidecarA` or `sidecarB`.
+ */
+function partitionByEquivalence(
+  deletions: DeletedToken[],
+  sidecarA: TokenSidecar,
+  finalStorage: string,
+): {
+  deleted: DeletedToken[];
+  regenerated: RegeneratedTokenPair[];
+} {
+  if (deletions.length === 0) {
+    return { deleted: [], regenerated: [] };
+  }
+
+  // Re-tokenise the new body. Tokens whose verbatim XML is also a value in
+  // sidecarA are preserved tokens (already-existing macros that were
+  // carried through the update); tokens whose XML is not in sidecarA are
+  // freshly emitted by the converter — candidates for equivalence pairing.
+  let sidecarB: TokenSidecar;
+  try {
+    sidecarB = tokeniseStorage(finalStorage).sidecar;
+  } catch {
+    // If we can't tokenise the new body, treat every deletion as genuine.
+    // This matches the strict-by-default safety posture.
+    return { deleted: deletions.slice(), regenerated: [] };
+  }
+
+  // Build a set of preserved verbatim XMLs from sidecarA so we can filter
+  // them out of the candidate list. A token in sidecarB whose XML is also
+  // in sidecarA is a preserved (carried-through) token, not a fresh emission.
+  const preservedXmls = new Set<string>();
+  for (const id of Object.keys(sidecarA)) {
+    preservedXmls.add(sidecarA[id]!);
+  }
+
+  // Candidate map: canonical key → list of newly-emitted token IDs (with
+  // their kind, in document order). A list (not a single value) so we can
+  // pair 1:1 in the multi-candidate case.
+  const candidates: Map<
+    string,
+    Array<{ newId: TokenId; kind: MacroKind }>
+  > = new Map();
+  for (const newId of Object.keys(sidecarB)) {
+    const xml = sidecarB[newId]!;
+    if (preservedXmls.has(xml)) continue; // preserved, not freshly emitted
+    const { key, kind } = canonicaliseToken(xml);
+    const list = candidates.get(key);
+    if (list) list.push({ newId, kind });
+    else candidates.set(key, [{ newId, kind }]);
+  }
+
+  const stillDeleted: DeletedToken[] = [];
+  const regenerated: RegeneratedTokenPair[] = [];
+
+  for (const d of deletions) {
+    const oldXml = sidecarA[d.id];
+    if (!oldXml) {
+      // No sidecar entry — should not happen, but stay strict.
+      stillDeleted.push(d);
+      continue;
+    }
+    const { key } = canonicaliseToken(oldXml);
+    const list = candidates.get(key);
+    if (list && list.length > 0) {
+      // Pop the first available candidate to enforce 1:1 pairing.
+      const match = list.shift()!;
+      regenerated.push({ oldId: d.id, newId: match.newId, kind: match.kind });
+      // Tidy up the map entry so a subsequent iteration sees an empty list.
+      if (list.length === 0) {
+        candidates.delete(key);
+      }
+    } else {
+      stillDeleted.push(d);
+    }
+  }
+
+  return { deleted: stillDeleted, regenerated };
+}
+
 // ---------------------------------------------------------------------------
 // confirm_deletions handling
 // ---------------------------------------------------------------------------
@@ -758,7 +949,12 @@ export async function safePrepareBody(
         "MISSING_BODY_FOR_CREATE",
       );
     }
-    return { finalStorage: undefined, versionMessage: "", deletedTokens: [] };
+    return {
+      finalStorage: undefined,
+      versionMessage: "",
+      deletedTokens: [],
+      regeneratedTokens: [],
+    };
   }
 
   // 0a. Input body-size cap (Track A3). Reject pathologically-large inputs
@@ -857,6 +1053,7 @@ export async function safePrepareBody(
   let finalStorage: string;
   let versionMessage = "";
   let deletedTokens: DeletedToken[] = [];
+  let regeneratedTokens: RegeneratedTokenPair[] = [];
 
   if (scope === "additive") {
     // Token diff doesn't make sense for additive ops (the current body
@@ -878,10 +1075,20 @@ export async function safePrepareBody(
       // caller's responsibility via assertDeletionAckMatches below.
       // planUpdate still *reports* the deletion list, so we can build the
       // itemised diff from its result.
+      //
+      // Track C1: when the byte-equivalent suppression flag is ON, we ALSO
+      // need planUpdate to defer its gate — the partition step below may
+      // turn some "deletions" into byte-equivalent regenerations, in which
+      // case planUpdate's gate would have fired prematurely on a deletion
+      // set that no longer reflects what the caller is actually losing.
+      // Default behaviour (flag off) is unchanged: planUpdate's gate
+      // fires exactly as before whenever confirmDeletions is unset.
+      const c1Enabled = suppressEquivalentDeletionsEnabled();
       const plan = planUpdate({
         currentStorage: currentBody,
         callerMarkdown: body,
-        confirmDeletions: confirmDeletions !== undefined, // any ack form → plan doesn't re-raise
+        confirmDeletions:
+          confirmDeletions !== undefined || c1Enabled, // any ack form OR flag → plan doesn't re-raise
         replaceBody: replaceBody === true,
         converterOptions,
       });
@@ -893,6 +1100,33 @@ export async function safePrepareBody(
       // keeps the module boundary clean.)
       const { sidecar } = tokeniseStorage(currentBody);
       deletedTokens = buildDeletedTokens(plan.deletedTokens, sidecar);
+
+      // Track C1: byte-equivalent macro suppression. Strict-by-default,
+      // gated behind the EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS env var
+      // for one release (6.3.0). When the flag is OFF (default), behaviour
+      // is identical to before — every token-id deletion appears in
+      // `deletedTokens` and the gate fires. When ON, deletions whose
+      // canonical key matches a freshly-emitted token in finalStorage are
+      // moved into `regeneratedTokens` instead, where they bypass the gate
+      // but are recorded in the audit log by safeSubmitPage.
+      //
+      // DATA-LOSS RISK: a buggy equivalence test would let genuinely lost
+      // content slip past the gate. Mitigations: (1) strict canonicaliser
+      // (unknown shapes produce unique opaque keys that never compare
+      // equal); (2) feature flag OFF by default for 6.3.0; (3) every
+      // suppressed pair is logged in the success-path MutationRecord.
+      if (
+        suppressEquivalentDeletionsEnabled() &&
+        deletedTokens.length > 0
+      ) {
+        const partitioned = partitionByEquivalence(
+          deletedTokens,
+          sidecar,
+          finalStorage,
+        );
+        deletedTokens = partitioned.deleted;
+        regeneratedTokens = partitioned.regenerated;
+      }
     } else {
       // No preservation needed — plain markdown conversion.
       //
@@ -984,7 +1218,7 @@ export async function safePrepareBody(
   // on the spliced full body to catch catastrophic post-concat damage.
   assertPostTransformBody(body.length, finalStorage);
 
-  return { finalStorage, versionMessage, deletedTokens };
+  return { finalStorage, versionMessage, deletedTokens, regeneratedTokens };
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,6 +1243,7 @@ export async function safeSubmitPage(
     version,
     versionMessage,
     deletedTokens,
+    regeneratedTokens = [],
     clientLabel,
     operation,
     replaceBody,
@@ -1142,6 +1377,7 @@ export async function safeSubmitPage(
         oldLen: previousBody.length,
         newLen: finalStorage.length,
         deletedTokens,
+        regeneratedTokens,
         budgetWarnings: [],
       };
     }
@@ -1240,6 +1476,19 @@ export async function safeSubmitPage(
     if (preceding.length > 0) {
       record.precedingSignals = preceding;
     }
+    // C1: byte-equivalent deletion suppressions. Recorded only when the
+    // canonicaliser actually paired one or more (deleted, created) tokens.
+    // No content leaks: each entry carries the pre-existing token ID, the
+    // freshly-emitted token ID, and the macro kind classification. A
+    // postmortem can replay the IDs against the historical sidecar to
+    // verify the suppression was correct.
+    if (regeneratedTokens.length > 0) {
+      record.regeneratedTokens = regeneratedTokens.map((p) => ({
+        oldId: p.oldId,
+        newId: p.newId,
+        kind: p.kind,
+      }));
+    }
     logMutation(record);
 
     // C2: stderr banner for destructive flag usage. Runs after the success
@@ -1262,6 +1511,7 @@ export async function safeSubmitPage(
       oldLen,
       newLen: isTitleOnly ? 0 : finalStorage!.length,
       deletedTokens,
+      regeneratedTokens,
       budgetWarnings,
     };
   } catch (err) {

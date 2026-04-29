@@ -54,9 +54,24 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
   class ConfluencePermissionError extends ConfluenceApiError {}
   class ConfluenceNotFoundError extends ConfluenceApiError {}
   class ConfluenceConflictError extends Error {
-    constructor(pageId: string) {
-      super(`Version conflict: page ${pageId} has been modified since you last read it. Call get_page to fetch the latest version, then retry your update with the new version number.`);
+    readonly currentVersion?: number;
+    readonly attemptedVersion?: number;
+    readonly pageId: string;
+    constructor(pageId: string, opts: { currentVersion?: number; attemptedVersion?: number } = {}) {
+      const { currentVersion, attemptedVersion } = opts;
+      let message: string;
+      if (currentVersion !== undefined && attemptedVersion !== undefined) {
+        message = `Version conflict: page ${pageId} is at version ${currentVersion}; you sent version ${attemptedVersion}. Call get_page to fetch the latest content, then retry your update with version ${currentVersion}.`;
+      } else if (currentVersion !== undefined) {
+        message = `Version conflict: page ${pageId} is at version ${currentVersion}. Call get_page to fetch the latest content, then retry your update with version ${currentVersion}.`;
+      } else {
+        message = `Version conflict: page ${pageId} has been modified since you last read it. Call get_page to fetch the latest version, then retry your update with the new version number.`;
+      }
+      super(message);
       this.name = "ConfluenceConflictError";
+      this.pageId = pageId;
+      this.currentVersion = currentVersion;
+      this.attemptedVersion = attemptedVersion;
     }
   }
   return {
@@ -4574,5 +4589,278 @@ describe("Track P2 — excluded handlers do NOT call markPageUnverified", () => 
     await handler({ page_id: "cc-1", body: "A comment", type: "footer" });
 
     expect(markPageUnverified).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// C2 — version: "current" support
+// =============================================================================
+
+describe("update_page version: \"current\" (C2)", () => {
+  it("resolves \"current\" via the page returned from getPage and submits with that version", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (getPage as any).mockClear();
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "p1",
+      title: "T",
+      version: { number: 9 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "p1", title: "T" },
+      newVersion: 10,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "p1",
+      title: "T",
+      version: "current",
+      body: "<p>updated</p>",
+    });
+
+    // The handler must have submitted with version: 9 (the currentPage
+    // version), not "current". safe-write computes newVersion = version + 1
+    // internally; we assert against what the handler passed in.
+    expect(getPage).toHaveBeenCalledTimes(1);
+    expect(_rawUpdatePage).toHaveBeenCalledTimes(1);
+    const updateCall = (_rawUpdatePage as any).mock.calls[0];
+    // _rawUpdatePage(pageId, opts)
+    expect(updateCall[1].version).toBe(9);
+    expect(result.isError).toBeUndefined();
+  });
+
+  it("preserves numeric-version behaviour: literal int version is passed through unchanged", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (getPage as any).mockClear();
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "p2",
+      title: "T",
+      version: { number: 9 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "p2", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "p2",
+      title: "T",
+      version: 5,
+      body: "<p>updated</p>",
+    });
+
+    // Even though getPage reports version 9, with an explicit numeric
+    // version the handler must use 5 (optimistic concurrency preserved).
+    const updateCall = (_rawUpdatePage as any).mock.calls[0];
+    expect(updateCall[1].version).toBe(5);
+    expect(result.isError).toBeUndefined();
+  });
+
+  it("rejects when server returns no version metadata for \"current\"", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (getPage as any).mockClear();
+    (_rawUpdatePage as any).mockClear();
+    // A pathological page with no version metadata at all.
+    (getPage as any).mockResolvedValueOnce({
+      id: "p3",
+      title: "T",
+      body: { storage: { value: "<p>x</p>" } },
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+    const result = await handler({
+      page_id: "p3",
+      title: "T",
+      version: "current",
+      body: "<p>y</p>",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Could not resolve current version");
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+});
+
+describe("update_page_section version: \"current\" (C2)", () => {
+  it("resolves \"current\" via the page returned from getPage", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (getPage as any).mockClear();
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "ps1",
+      title: "T",
+      version: { number: 11 },
+      body: { storage: { value: "<h1>A</h1><p>old</p><h1>B</h1><p>keep</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "ps1", title: "T" },
+      newVersion: 12,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "ps1",
+      section: "A",
+      body: "<p>new</p>",
+      version: "current",
+    });
+
+    expect(_rawUpdatePage).toHaveBeenCalledTimes(1);
+    const updateCall = (_rawUpdatePage as any).mock.calls[0];
+    expect(updateCall[1].version).toBe(11);
+    expect(result.isError).toBeUndefined();
+  });
+
+  it("preserves numeric-version behaviour for update_page_section", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (getPage as any).mockClear();
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "ps2",
+      title: "T",
+      version: { number: 11 },
+      body: { storage: { value: "<h1>A</h1><p>old</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "ps2", title: "T" },
+      newVersion: 4,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    await handler({
+      page_id: "ps2",
+      section: "A",
+      body: "<p>new</p>",
+      version: 3,
+    });
+
+    const updateCall = (_rawUpdatePage as any).mock.calls[0];
+    expect(updateCall[1].version).toBe(3);
+  });
+});
+
+describe("create_page wait_for_post_processing (C2)", () => {
+  it("default behaviour: does NOT poll — submitted version is used directly", async () => {
+    const { resolveSpaceId, _rawCreatePage, getPage, formatPage } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (_rawCreatePage as any).mockClear();
+    (getPage as any).mockClear();
+    (_rawCreatePage as any).mockResolvedValueOnce({
+      id: "new-1", title: "P", version: { number: 1 },
+    });
+    (formatPage as any).mockReturnValueOnce("Title: P\nID: new-1");
+
+    const handler = registeredTools.get("create_page")!.handler;
+    const result = await handler({
+      title: "P",
+      space_key: "DEV",
+      body: "<p>x</p>",
+    });
+
+    expect(result.isError).toBeUndefined();
+    // No follow-up getPage when wait_for_post_processing is omitted.
+    expect(getPage).not.toHaveBeenCalled();
+  });
+
+  it("wait_for_post_processing=true polls until two consecutive reads agree (1 → 3 → 4 → 4 returns 4)", async () => {
+    const { resolveSpaceId, _rawCreatePage, getPage, formatPage } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (_rawCreatePage as any).mockClear();
+    (getPage as any).mockClear();
+    (_rawCreatePage as any).mockResolvedValueOnce({
+      id: "new-2", title: "P", version: { number: 1 },
+    });
+    // Successive getPage calls return 3, 4, 4 — the polling helper returns
+    // 4 once it sees the same version twice in a row (after the second 4).
+    (getPage as any)
+      .mockResolvedValueOnce({ id: "new-2", title: "P", version: { number: 3 } })
+      .mockResolvedValueOnce({ id: "new-2", title: "P", version: { number: 4 } })
+      .mockResolvedValueOnce({ id: "new-2", title: "P", version: { number: 4 } });
+    let formattedPage: any = undefined;
+    (formatPage as any).mockImplementationOnce((p: any) => {
+      formattedPage = p;
+      return `Title: ${p.title}\nID: ${p.id}\nVersion: ${p.version?.number}`;
+    });
+
+    // Use fake timers so we don't actually wait 250ms × 3 ≈ 750ms.
+    vi.useFakeTimers();
+    try {
+      const handler = registeredTools.get("create_page")!.handler;
+      const promise = handler({
+        title: "P",
+        space_key: "DEV",
+        body: "<p>x</p>",
+        wait_for_post_processing: true,
+      });
+      // Advance past the 3-iteration polling window.
+      await vi.advanceTimersByTimeAsync(1000);
+      const result = await promise;
+      expect(result.isError).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // The polling stopped on the second consecutive 4. We expect 3
+    // getPage calls (1→3, 2→4, 3→4 — stable).
+    expect(getPage).toHaveBeenCalledTimes(3);
+    // The page passed to formatPage carries the stabilised version.
+    expect(formattedPage?.version?.number).toBe(4);
+  });
+
+  it("wait_for_post_processing=true returns the last-seen version when the timeout fires", async () => {
+    const { resolveSpaceId, _rawCreatePage, getPage, formatPage } = await import("./confluence-client.js");
+    (resolveSpaceId as any).mockResolvedValueOnce("SPACE-ID");
+    (_rawCreatePage as any).mockClear();
+    (getPage as any).mockClear();
+    (_rawCreatePage as any).mockResolvedValueOnce({
+      id: "new-3", title: "P", version: { number: 1 },
+    });
+    // Every getPage call bumps the version — the polling helper never
+    // sees two consecutive equal reads and must give up at the timeout.
+    let v = 2;
+    (getPage as any).mockImplementation(async () => ({
+      id: "new-3",
+      title: "P",
+      version: { number: v++ },
+    }));
+    let formattedPage: any = undefined;
+    (formatPage as any).mockImplementationOnce((p: any) => {
+      formattedPage = p;
+      return `Title: ${p.title}`;
+    });
+
+    vi.useFakeTimers();
+    try {
+      const handler = registeredTools.get("create_page")!.handler;
+      const promise = handler({
+        title: "P",
+        space_key: "DEV",
+        body: "<p>x</p>",
+        wait_for_post_processing: true,
+      });
+      // Advance past the 3-second timeout — should give up and return
+      // the last-seen version. We need to advance enough virtual time
+      // past 3000ms with intermediate microtask flushes so each await
+      // sleep completes and the next getPage runs.
+      await vi.advanceTimersByTimeAsync(4000);
+      const result = await promise;
+      expect(result.isError).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // Should have polled at most ~12 times (3000ms / 250ms) — assert at
+    // least one to confirm polling happened, and confirm formattedPage
+    // carries the last-seen (non-stable) version.
+    expect((getPage as any).mock.calls.length).toBeGreaterThan(0);
+    expect(formattedPage?.version?.number).toBeGreaterThan(1);
+
+    // Clean up the persistent mockImplementation so it doesn't leak.
+    (getPage as any).mockReset();
   });
 });
