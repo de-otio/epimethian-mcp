@@ -1052,7 +1052,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "- confluence_base_url: override the URL used by the link rewriter.\n\n" +
           "replace_body skips all safety nets (token preservation, deletion confirmation). " +
           "When delegating update_page to a subagent, ensure the agent includes the full existing body — " +
-          "replace_body replaces ALL content with only what you provide."
+          "replace_body replaces ALL content with only what you provide.\n\n" +
+          "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
         ),
         config
       ),
@@ -1250,7 +1251,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "page has been modified since. Set " +
             "EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION=true to restore the " +
             "previous version-less behaviour for one release while scripts " +
-            "are migrated."
+            "are migrated.\n\n" +
+            "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
         ),
         config
       ),
@@ -1336,7 +1338,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       description: describeWithLock(
         withDestructiveWarning(
           "Update a single section of a Confluence page by heading name. Only the content under the specified heading is replaced; the rest of the page is untouched. Use headings_only to find section names first. " +
-          "Note: in Confluence spaces with heading auto-numbering enabled, stored heading text contains the prefix (e.g. `1.2. Section`); the matcher accepts either the prefixed or plain form."
+          "Note: in Confluence spaces with heading auto-numbering enabled, stored heading text contains the prefix (e.g. `1.2. Section`); the matcher accepts either the prefixed or plain form.\n\n" +
+          "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
         ),
         config
       ),
@@ -1601,7 +1604,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "with heading auto-numbering enabled, stored heading text contains " +
           "the prefix (e.g. `1.2. Section`); the matcher accepts either the " +
           "prefixed or plain form. Section names must be unique within the " +
-          "input list."
+          "input list.\n\n" +
+          "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
         ),
         config
       ),
@@ -1804,7 +1808,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "Insert content at the beginning of an existing Confluence page. " +
             "The caller provides only the new content — the server fetches the existing body and handles concatenation. " +
             "Safer than update_page with replace_body for additive operations.\n\n" +
-            "Content can be GFM markdown or Confluence storage format (auto-detected)."
+            "Content can be GFM markdown or Confluence storage format (auto-detected).\n\n" +
+            "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
         ),
         config,
       ),
@@ -1860,7 +1865,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "Insert content at the end of an existing Confluence page. " +
             "The caller provides only the new content — the server fetches the existing body and handles concatenation. " +
             "Safer than update_page with replace_body for additive operations.\n\n" +
-            "Content can be GFM markdown or Confluence storage format (auto-detected)."
+            "Content can be GFM markdown or Confluence storage format (auto-detected).\n\n" +
+            "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
         ),
         config,
       ),
@@ -3096,7 +3102,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "unlike reading get_page_version (which returns sanitized markdown) and passing it " +
           "to update_page, this preserves all macros, formatting, and rich elements exactly.\n\n" +
           "The shrinkage guard applies: if the reverted content is significantly smaller than the " +
-          "current content, you will be asked to confirm."
+          "current content, you will be asked to confirm.\n\n" +
+          "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt \u2014 but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
         ),
         config,
       ),

@@ -6,8 +6,10 @@ async function run(): Promise<void> {
   if (command === "setup") {
     const idx = process.argv.indexOf("--profile");
     const profile = idx > -1 ? process.argv[idx + 1] : undefined;
+    const clientIdx = process.argv.indexOf("--client");
+    const clientId = clientIdx > -1 ? process.argv[clientIdx + 1] : undefined;
     const { runSetup } = await import("./setup.js");
-    await runSetup(profile);
+    await runSetup(profile, clientId);
   } else if (command === "profiles") {
     const { runProfiles } = await import("./profiles.js");
     await runProfiles();

@@ -72,7 +72,7 @@ describe("CLI entry point", () => {
     await import("./index.js");
 
     await new Promise((r) => setTimeout(r, 10));
-    expect(mockRunSetup).toHaveBeenCalledWith("globex");
+    expect(mockRunSetup).toHaveBeenCalledWith("globex", undefined);
   });
 
   it("calls runProfiles when 'profiles' argument is provided", async () => {

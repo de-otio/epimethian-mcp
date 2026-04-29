@@ -1,5 +1,6 @@
 import * as readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
+import { execSync } from "node:child_process";
 import { testConnection, fetchTenantInfo } from "../shared/test-connection.js";
 import {
   saveToKeychain,
@@ -7,6 +8,32 @@ import {
   PROFILE_NAME_RE,
 } from "../shared/keychain.js";
 import { addToProfileRegistry, setProfileSettings } from "../shared/profiles.js";
+import { renderConfigSnippet, knownClientIds } from "./client-configs.js";
+
+/** Resolve the absolute path to the running epimethian-mcp binary. */
+function resolveBinPath(): string {
+  // Prefer the argv[1] path when it's absolute (covers `node /abs/path/to/cli.js`
+  // as well as the compiled binary shebang invocations).
+  const argv1 = process.argv[1];
+  if (argv1 && argv1.startsWith("/")) {
+    return argv1;
+  }
+
+  // Fall back to `which epimethian-mcp` for the case where the user has the
+  // package installed globally and argv[1] is a relative path or undefined.
+  try {
+    const result = execSync("which epimethian-mcp", { encoding: "utf8" }).trim();
+    if (result) return result;
+  } catch {
+    // ignore — fall through to placeholder
+  }
+
+  process.stderr.write(
+    "Warning: could not determine absolute path to epimethian-mcp. " +
+      "Replace <absolute path to epimethian-mcp> in the snippet below with the correct path.\n"
+  );
+  return "<absolute path to epimethian-mcp>";
+}
 
 const TOOLS = [
   "create_page",
@@ -57,13 +84,23 @@ function readPassword(prompt: string): Promise<string> {
   });
 }
 
-export async function runSetup(profile?: string): Promise<void> {
+export async function runSetup(profile?: string, clientId?: string): Promise<void> {
   if (!stdin.isTTY) {
     console.error(
       "Error: setup requires an interactive terminal.\n" +
         "For non-interactive environments, set CONFLUENCE_URL, CONFLUENCE_EMAIL, and CONFLUENCE_API_TOKEN as environment variables."
     );
     process.exit(1);
+  }
+
+  if (clientId !== undefined) {
+    const validIds = knownClientIds();
+    if (!validIds.includes(clientId)) {
+      console.error(
+        `Error: Unknown --client "${clientId}". Valid IDs are: ${validIds.join(", ")}`
+      );
+      process.exit(1);
+    }
   }
 
   if (profile !== undefined && !PROFILE_NAME_RE.test(profile)) {
@@ -260,6 +297,23 @@ Your choice [default: 1]: `
     console.log(
       "\nSetup complete. Restart your MCP client to use the new credentials."
     );
+
+    // Print config snippet(s) for the requested client (or all clients if omitted).
+    const binPath = resolveBinPath();
+    const effectiveProfile = profile ?? "default";
+    const clientsToShow = clientId ? [clientId] : knownClientIds();
+
+    for (const id of clientsToShow) {
+      const entry = (await import("./client-configs.js")).CLIENT_CONFIGS.find(
+        (c) => c.id === id
+      )!;
+      const { snippet, warning } = renderConfigSnippet(id, effectiveProfile, binPath);
+      console.log(`\n--- ${entry.displayName} config (${entry.configFileHint}) ---`);
+      console.log(snippet);
+      if (warning) {
+        console.log(`\nNote: ${warning}`);
+      }
+    }
   } finally {
     rl.close();
   }

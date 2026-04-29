@@ -675,4 +675,138 @@ describe("runSetup", () => {
 
     process.stdin.on = originalOn;
   });
+
+  // --- --client flag tests ---
+
+  it("exits with error when --client ID is unknown", async () => {
+    await expect(runSetup(undefined, "nonexistent-client")).rejects.toThrow(
+      "process.exit(1)"
+    );
+    expect(exitCode).toBe(1);
+  });
+
+  it("prints opencode config snippet after successful save with --client opencode", async () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockFetchTenantInfo.mockResolvedValueOnce({
+      ok: false,
+      message: "not tested",
+    });
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net")
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("1"); // posture choice
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("globex", "opencode");
+
+    const allOutput = consoleSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    // Snippet should contain substituted profile and the opencode shape
+    expect(allOutput).toContain("globex");
+    expect(allOutput).toContain('"type": "local"');
+    expect(allOutput).toContain("EPIMETHIAN_ALLOW_UNGATED_WRITES");
+    // Warning should be printed
+    expect(allOutput).toContain("OpenCode does not yet support MCP elicitation");
+
+    consoleSpy.mockRestore();
+    process.stdin.on = originalOn;
+  });
+
+  it("prints all client snippets when --client is absent", async () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockFetchTenantInfo.mockResolvedValueOnce({
+      ok: false,
+      message: "not tested",
+    });
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net")
+      .mockResolvedValueOnce("user@test.com");
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    // No profile, no clientId → runs without profile-specific flow (no posture prompt)
+    await runSetup(undefined, undefined);
+
+    const allOutput = consoleSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    // Should see headings for all seven clients
+    expect(allOutput).toContain("Claude Code");
+    expect(allOutput).toContain("Claude Desktop");
+    expect(allOutput).toContain("Cursor");
+    expect(allOutput).toContain("Windsurf");
+    expect(allOutput).toContain("Zed");
+    expect(allOutput).toContain("OpenCode");
+
+    consoleSpy.mockRestore();
+    process.stdin.on = originalOn;
+  });
+
+  it("prints only the specified client snippet when --client cursor is used", async () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    mockReadFromKeychain.mockResolvedValueOnce(null);
+    mockFetchTenantInfo.mockResolvedValueOnce({
+      ok: false,
+      message: "not tested",
+    });
+    mockQuestion
+      .mockResolvedValueOnce("https://test.atlassian.net")
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("1"); // posture choice
+
+    mockTestConnection.mockResolvedValueOnce({
+      ok: true,
+      message: "Connected successfully.",
+    });
+
+    const originalOn = process.stdin.on;
+    process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+      if (event === "data") {
+        setTimeout(() => { cb("t"); cb("\n"); }, 0);
+      }
+      return process.stdin;
+    }) as any;
+    process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+    process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+
+    await runSetup("acme", "cursor");
+
+    const allOutput = consoleSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(allOutput).toContain("Cursor");
+    expect(allOutput).toContain("acme");
+    // Should NOT show opencode-specific content
+    expect(allOutput).not.toContain("EPIMETHIAN_ALLOW_UNGATED_WRITES");
+
+    consoleSpy.mockRestore();
+    process.stdin.on = originalOn;
+  });
 });

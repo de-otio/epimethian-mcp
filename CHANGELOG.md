@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.5.0] - 2026-04-29 - per-client setup CLI + tool-description awareness (OpenCode prep, phase 1 of 2)
+
+First half of the OpenCode-compatibility work specified in
+`plans/opencode-compatibility-implementation.md` and analysed in
+`doc/design/investigations/investigate-opencode-compatibility.md`.
+Pure additive: existing setup flow unchanged; existing tool
+descriptions extended.
+
+### Added
+
+- **`epimethian-mcp setup --client <id>`** — after credential save, the
+  setup CLI prints a ready-to-paste config snippet for the user's MCP
+  host. Supported IDs: `claude-code`, `claude-desktop`,
+  `claude-code-vscode`, `cursor`, `windsurf`, `zed`, `opencode`. Each
+  template substitutes `{{PROFILE}}` (from `--profile`) and `{{BIN}}`
+  (resolved from `process.argv[1]` or `which epimethian-mcp`). The
+  OpenCode entry uses the `mcp` block shape with `type: "local"` and
+  `environment` (not `mcpServers`/`env`), and includes a warning that
+  `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` is required for destructive
+  operations until v6.6.0 ships soft elicitation. The Claude Code VS
+  Code extension entry warns about the v2.1.123-and-earlier
+  fake-elicitation bug and points at `EPIMETHIAN_BYPASS_ELICITATION`.
+  Without `--client`, the CLI prints all known snippets in sequence
+  (preserves the previous "show me everything" behaviour).
+- **New module `src/cli/client-configs.ts`** with the seven config
+  templates and the `renderConfigSnippet` / `knownClientIds` helpers,
+  per the §3.1 frozen contract in the implementation plan.
+- **Tool-description awareness on the seven gated tools** (`update_page`,
+  `update_page_section`, `update_page_sections`, `delete_page`,
+  `revert_page`, `prepend_to_page`, `append_to_page`). Appended
+  sentence: *"If your MCP client does not support in-protocol
+  confirmation, destructive flag use will be mediated through your
+  agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set
+  `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the
+  confirmation prompt — but you (the agent) MUST still ask the user
+  before invoking this tool with destructive flags."* This frontloads
+  the responsibility model so that an agent encountering an
+  elicitation-less client doesn't silently bypass the gate.
+- **install-agent.md Step 4** now points first at
+  `epimethian-mcp setup --client <id>` for getting the right config
+  snippet, with the existing hand-typed `.mcp.json` and
+  `opencode.json` examples retained as fallback.
+
+### Internal
+
+- New tests in `src/cli/client-configs.test.ts` (16 tests, snapshot
+  per client + substitution + error case + structural checks) and
+  extended `src/cli/setup.test.ts` (4 new tests for `--client`
+  handling).
+- Coverage on `src/cli/client-configs.ts`: 100%.
+
 ## [6.4.1] - 2026-04-29 - escape hatch for clients that fake elicitation support
 
 ### Added

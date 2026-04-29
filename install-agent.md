@@ -44,6 +44,8 @@ Ask the user for:
 
 ## Step 4: Write MCP configuration
 
+Run `epimethian-mcp setup --profile <name> --client <client-id>` after Step 5 (credential setup) — it prints the exact config snippet for your MCP host. Supported clients: `claude-code`, `claude-desktop`, `claude-code-vscode`, `cursor`, `windsurf`, `zed`, `opencode`. Keep the fallback hand-typed examples below for cases where the CLI is unavailable.
+
 Add the server to the user's MCP client config. The exact file and shape depend on the client:
 
 **Claude Code, Claude Desktop, Cursor, Windsurf, Zed** — `.mcp.json` (or the
