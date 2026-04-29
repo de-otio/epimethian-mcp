@@ -44,7 +44,10 @@ Ask the user for:
 
 ## Step 4: Write MCP configuration
 
-Add the server to `.mcp.json` (or the equivalent config file for the user's MCP client):
+Add the server to the user's MCP client config. The exact file and shape depend on the client:
+
+**Claude Code, Claude Desktop, Cursor, Windsurf, Zed** — `.mcp.json` (or the
+equivalent client-specific config). The standard `mcpServers` shape:
 
 ```json
 {
@@ -59,7 +62,35 @@ Add the server to `.mcp.json` (or the equivalent config file for the user's MCP 
 }
 ```
 
-**IMPORTANT:** The only env var needed is `CONFLUENCE_PROFILE`. The URL, email, and API token are stored securely in the OS keychain — they should NOT appear in config files.
+**OpenCode** — `opencode.json` at the project root or
+`~/.config/opencode/opencode.json`. Different shape (`mcp` block, `type:
+"local"`, `command` is an array, `environment` not `env`):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "confluence": {
+      "type": "local",
+      "command": ["<absolute path from Step 2>"],
+      "enabled": true,
+      "environment": {
+        "CONFLUENCE_PROFILE": "<profile name from Step 3>",
+        "EPIMETHIAN_ALLOW_UNGATED_WRITES": "true"
+      }
+    }
+  }
+}
+```
+
+OpenCode does not support MCP elicitation (the in-protocol confirmation
+prompts), so write tools that fire the elicitation gate fail unless
+`EPIMETHIAN_ALLOW_UNGATED_WRITES=true` is set. See "MCP client
+compatibility" below for the trade-off.
+
+**IMPORTANT:** The only required env var is `CONFLUENCE_PROFILE`. The URL,
+email, and API token are stored securely in the OS keychain — they should
+NOT appear in config files.
 
 ## Step 5: Credential setup
 
@@ -275,6 +306,82 @@ discover the result an hour later.
 - **`EPIMETHIAN_WRITE_BUDGET_SESSION`** — default 250; set to "0" to disable.
 - **`EPIMETHIAN_WRITE_BUDGET_ROLLING`** — default 75 per 15-minute window; set to "0" to disable.
 - **`EPIMETHIAN_WRITE_BUDGET_HOURLY`** — deprecated alias for `EPIMETHIAN_WRITE_BUDGET_ROLLING`; will be removed in version 7.
+
+## MCP client compatibility
+
+epimethian-mcp uses MCP **elicitation** (the in-protocol confirmation
+prompt added to MCP in 2025) as the human-in-the-loop gate for destructive
+operations. Different MCP clients support elicitation differently — some
+fully, some not at all, and some advertise the capability without honouring
+it. The compatibility matrix below tells you which env-var workaround to
+recommend, if any.
+
+| Client | Elicitation? | What to do |
+|---|---|---|
+| **Claude Code (CLI)** | Yes — full support | No special config needed. |
+| **Claude Desktop** | Yes — full support | No special config needed. |
+| **Claude Code VS Code extension ≤ 2.1.123** | Fakes it | Set `EPIMETHIAN_BYPASS_ELICITATION=true` (see below). |
+| **Claude Code VS Code extension ≥ 2.1.124** | Likely fixed (verify) | If write tools fail with `NO_USER_RESPONSE`, fall back to `EPIMETHIAN_BYPASS_ELICITATION=true`. |
+| **OpenCode** | No — capability not advertised | Set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` or use only read tools / additive writes that don't trigger the gate. No tracking issue at sst/opencode yet (as of v6.4.1); a feature request would be needed for real elicitation support. |
+| **Cursor / Windsurf / Zed / others** | Varies | If write tools fail with `ELICITATION_REQUIRED_BUT_UNAVAILABLE`, the client doesn't advertise the capability — use `EPIMETHIAN_ALLOW_UNGATED_WRITES=true`. If write tools fail with `NO_USER_RESPONSE` despite the client claiming support, the client fakes it — use `EPIMETHIAN_BYPASS_ELICITATION=true`. |
+
+### Difference between the two bypass env vars
+
+These are **not** interchangeable. Pick the one that matches the failure mode:
+
+- **`EPIMETHIAN_ALLOW_UNGATED_WRITES=true`** — for clients that *don't
+  advertise* elicitation during the MCP handshake. The server detects the
+  absence and (with this flag) lets writes proceed. OpenCode falls in this
+  category.
+- **`EPIMETHIAN_BYPASS_ELICITATION=true`** — for clients that *advertise*
+  elicitation but never actually honour the request (the SDK transport
+  silently returns `{action: "decline"}`). The Claude Code VS Code
+  extension ≤ 2.1.123 falls in this category. This flag is unconditional —
+  it bypasses elicitation even when the client claims to support it.
+
+### Trade-off: what you give up by setting either flag
+
+Both flags **disable the in-protocol confirmation gate**. Writes still go
+through the harness's tool allow-list (so users can still block the tool
+in their permission settings) and through every server-side guard
+(provenance, source-policy, write-budget, byte-equivalence) — but the user
+no longer gets a UI prompt before each destructive operation. Recommend
+this only when:
+
+1. The user is aware of and accepts the trade-off, AND
+2. The user's MCP client provides some other interaction model where they
+   can intervene (e.g. they review tool calls before approval), OR
+3. The work is read-mostly and only occasional, additive writes happen.
+
+**Do NOT set either flag silently.** If you (the agent) need to recommend
+one, explain to the user what the gate is for, why their client can't
+honour it, and what alternative protections remain.
+
+## Other operator-side environment variables
+
+These are off by default and only relevant in specific scenarios:
+
+- **`EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS`** — opt-in (default OFF).
+  When set to `true`, suppresses the `confirm_deletions` gate for token
+  deletion+creation pairs that canonicalise to byte-equivalent XML
+  (e.g. re-rendering the same `<ac:link>` macros with different attribute
+  order, or regenerating an `<ac:structured-macro>` whose parameters and
+  CDATA body are identical after sort). Genuine semantic deletions still
+  fire the gate. Every suppressed pair is recorded in the mutation log
+  for postmortem. Useful for spaces with lots of cross-link rewrites
+  where the gate fires repeatedly on no-op churn.
+- **`EPIMETHIAN_REQUIRE_SOURCE`** — opt-in (default OFF). When `true`,
+  every write tool call must include a `source` parameter (one of
+  `user_request` / `file_or_cli_input` / `chained_tool_output` /
+  `elicitation_response`). Calls without an explicit source are rejected
+  with `SOURCE_POLICY_BLOCKED`. Useful in audit-heavy environments where
+  every write must declare provenance.
+- **`EPIMETHIAN_AUTO_UPGRADE`** — opt-in (default OFF). When `true`, the
+  server checks for and applies updates on startup. Useful for managed
+  fleets; usually you want explicit `epimethian-mcp upgrade` runs instead.
+- **`CONFLUENCE_READ_ONLY`** — opt-in (default OFF). When `true`, all
+  write tools are disabled regardless of MCP client config. Useful for
+  read-only profiles or sandbox environments.
 
 ## Available Tools (35)
 

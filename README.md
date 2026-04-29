@@ -6,6 +6,8 @@
 
 A security-focused [MCP](https://modelcontextprotocol.io/) server that gives AI agents safe, multi-tenant access to Confluence Cloud. It provides some features not available in the official MCP server, like support for draw.io diagrams, macros, etc.
 
+**What's new (v6.4.1):** Atomic multi-section updates (`update_page_sections`), find-replace mode for section edits, `version: "current"` shortcut, write-budget UX overhaul, and an escape hatch for MCP clients that fake elicitation support. See [CHANGELOG.md](CHANGELOG.md) for v6.2.2–6.4.1.
+
 ## Why use this?
 
 The official [Atlassian MCP server](https://github.com/atlassian/atlassian-mcp-server) covers basic Confluence and Jira access. Epimethian targets gaps that matter for consultants, power users, and teams with strict security requirements:
@@ -215,6 +217,9 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 
 - **Drill-down pattern** — Use `headings_only` to get a page outline (~500 tokens), then `section` to read just the part you need in storage format. No need to fetch the full page body.
 - **Section-level editing** — `update_page_section` replaces content under a single heading. The rest of the page is never touched, eliminating the need to send the full body on updates.
+- **Multi-section atomic updates** — `update_page_sections` (v6.4.0+) updates multiple sections in one version bump, eliminating version conflicts and intermediate reads during tree-building workflows.
+- **Find-replace mode** — `update_page_section` and `update_page_sections` accept optional `find_replace: [{find, replace}, ...]` (v6.4.0+) for literal-string substitutions without resending section bodies. Macro-safe: substitutions cannot match inside macro boundaries.
+- **Skip-read shortcut** — `update_page`, `update_page_section`, and `update_page_sections` accept `version: "current"` to skip the read of the latest version when the next operation will be an update (v6.3.0+).
 - **Page cache** — An in-memory, version-keyed cache eliminates redundant API calls during iterative editing. After updating a page, subsequent reads serve from cache (~90% fewer tokens on repeated reads).
 - **Search excerpts** — Search results include content previews so the agent can triage results without calling `get_page` on each one.
 - **Markdown view** — `format: "markdown"` returns a compact read-only rendering where macros become `[macro: name]` placeholders. The server rejects any attempt to write markdown back — storage format is the only accepted write format.
@@ -229,6 +234,7 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `get_page_by_title`   | Look up a page by title (same options as `get_page`)                   |
 | `update_page`         | Update an existing page                                                |
 | `update_page_section` | Update a single section by heading name                                |
+| `update_page_sections` | Update multiple sections atomically in one version bump                |
 | `delete_page`         | Delete a page                                                          |
 | `list_pages`          | List pages in a space                                                  |
 | `get_page_children`   | Get child pages                                                        |
@@ -256,6 +262,25 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `lookup_user`         | Search for Atlassian users by name or email                            |
 | `resolve_page_link`   | Resolve a page title + space key to a stable page ID and URL           |
 | `get_version`         | Return the server version                                              |
+
+## Environment Variables
+
+Configuration via environment variables (all optional; sensible defaults provided):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONFLUENCE_PROFILE` | *(required)* | Active profile name (e.g., `my-profile`). Credentials are loaded from OS keychain. |
+| `EPIMETHIAN_WRITE_BUDGET_ROLLING` | 75 writes per 15 min | Rolling-window write limit (per-scope: session, profile, global). Set to `0` to disable. Replaces deprecated `EPIMETHIAN_WRITE_BUDGET_HOURLY` (removed in v7.0); the old name still works as an alias. |
+| `EPIMETHIAN_WRITE_BUDGET_SESSION` | 250 writes | Session-scoped write limit. |
+| `EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS` | `false` | Opt-in feature flag. When `true`, suppress `confirm_deletions` for macro byte-equivalent round-trips (e.g. re-rendered `<ac:link>` with reordered attributes). |
+| `EPIMETHIAN_BYPASS_ELICITATION` | `false` | Escape hatch for MCP clients that advertise elicitation support but never honour it. When `true`, skips the in-protocol confirmation prompt. The harness's permission allow-list still gates writes. |
+| `EPIMETHIAN_MUTATION_LOG` | `false` | Opt-in logging. Write JSONL records to `~/.epimethian/logs/` for every write operation. |
+| `EPIMETHIAN_AUTO_UPGRADE` | `check-only` | Set to `patches` for automatic patch-version installs (same npm provenance verification). |
+| `CONFLUENCE_READ_ONLY` | *(deprecated)* | Legacy alias for `posture: "read-only"` in profile settings. Use the profile config instead. |
+| `CONFLUENCE_UNVERIFIED_STATUS` | `true` | Master toggle for AI-edited badge. Set to `false` to disable. |
+| `CONFLUENCE_UNVERIFIED_STATUS_LOCALE` | Confluence site default → `en` | Language for the badge label (10 locales: en/fr/de/es/pt/it/nl/ja/zh/ko). |
+
+For CI/headless environments without OS keychain, set all three: `CONFLUENCE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`.
 
 ## Content Safety
 

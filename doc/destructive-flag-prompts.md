@@ -41,7 +41,9 @@ destructive intent:
 When destructive flags are set, the `source` parameter records where the flag
 originated: `user_request` (the user's direct instruction), `file_or_cli_input`
 (from local files), `elicitation_response` (from a confirmed interactive prompt),
-or `chained_tool_output` (from prior tool results—strictly forbidden). The tool's own description states:
+or `chained_tool_output` (from prior tool results—strictly forbidden).
+`elicitation_response` is treated identically to `user_request` in policy decisions;
+the distinction is for forensics and audit. The tool's own description states:
 
 > *"Destructive flags and parameters on this tool (including
 > `confirm_shrinkage`, `confirm_structure_loss`, `replace_body`,
@@ -56,10 +58,21 @@ the tool-name allowlist — the allowlist already approved invocation
 of the tool; this is about approving the destructive intent of *this
 specific call*.
 
-If the confirmation prompt isn't visible to the user (UI focus, modal
-hidden behind another window, IDE auto-decline behaviour, prompt
-timeout, etc.), the call returns as `"user declined"` even though the
-user never knowingly declined anything.
+**Exception:** If `validateSource` rejects a destructive flag *before*
+elicitation can run (e.g. `source === "chained_tool_output"` paired with
+`confirm_deletions`), the server throws `SOURCE_POLICY_BLOCKED` with an
+explicit message: *"...blocked by source policy: source=chained_tool_output,
+but tool-chained outputs cannot authorise content deletion. Confirm
+interactively or rephrase request."* This is distinct from "user declined" —
+the prompt never reaches the user.
+
+If the confirmation prompt isn't visible or the user doesn't respond to it,
+the call returns with one of four codes: `USER_DECLINED` (explicit decline
+or "no" response), `USER_CANCELLED` (dismissed without choosing), `NO_USER_RESPONSE`
+(timeout, transport error, or client never honoured the elicitation capability),
+or `ELICITATION_REQUIRED_BUT_UNAVAILABLE` (client didn't advertise elicitation
+at MCP init time; try `update_page_section`, `EPIMETHIAN_ALLOW_UNGATED_WRITES`,
+or `EPIMETHIAN_BYPASS_ELICITATION` as workarounds).
 
 ## The two layers, as a chain
 
@@ -76,6 +89,13 @@ Claude calls update_page with replace_body: true
   │       └─► Prompt times out or is hidden   →  "user declined"
 ```
 
+## Deletion summary in confirmation prompts
+
+When `confirm_deletions: true` triggers elicitation, the prompt displays
+a human-readable summary like *"This update will remove 1 TOC macro and
+8 link macros that the new markdown does not regenerate. Proceed?"*
+instead of naming the bare flag.
+
 ## Why `update_page_section` mostly avoids this
 
 `update_page_section` does not have a `replace_body` flag. As long as
@@ -91,6 +111,12 @@ macro, pad the new section body with substantive content so the new
 size stays above 50% of the old size — that keeps `confirm_shrinkage`
 out of play, and a lone `confirm_deletions: true` typically does not
 trigger the layer-2 prompt.
+
+Note: when `EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS=true` (opt-in in v6.3.0),
+deletion+creation pairs that canonicalise to byte-equivalent XML do NOT
+trigger the `confirm_deletions` gate (e.g. re-rendering the same `<ac:link>`
+macros in a different attribute order). The audit log still records every
+suppressed pair for postmortem.
 
 ## How to debug a "user declined" you didn't intend to send
 
