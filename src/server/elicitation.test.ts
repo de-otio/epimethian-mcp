@@ -25,6 +25,7 @@ function makeFakeServer(elicitInput: (...args: unknown[]) => unknown): any {
 describe("gateOperation (E4)", () => {
   afterEach(() => {
     delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+    delete process.env.EPIMETHIAN_BYPASS_ELICITATION;
     vi.mocked(clientSupportsElicitation).mockReturnValue(false);
   });
 
@@ -107,6 +108,20 @@ describe("gateOperation (E4)", () => {
   it("E4: opt-out flag lets unsupported-client path proceed silently", async () => {
     vi.mocked(clientSupportsElicitation).mockReturnValue(false);
     process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES = "true";
+    const elicit = vi.fn();
+    const server = makeFakeServer(elicit);
+
+    await expect(
+      gateOperation(server, { tool: "delete_page", summary: "Delete?" }),
+    ).resolves.toBeUndefined();
+    expect(elicit).not.toHaveBeenCalled();
+  });
+
+  it("E4: EPIMETHIAN_BYPASS_ELICITATION skips the gate even when the client claims support", async () => {
+    // Models the Claude Code VS Code extension bug: the client advertises
+    // elicitation capability but auto-declines every prompt without UI.
+    vi.mocked(clientSupportsElicitation).mockReturnValue(true);
+    process.env.EPIMETHIAN_BYPASS_ELICITATION = "true";
     const elicit = vi.fn();
     const server = makeFakeServer(elicit);
 

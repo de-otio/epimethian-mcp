@@ -103,6 +103,23 @@ export async function gateOperation(
   server: McpServer,
   context: GatedOperationContext,
 ): Promise<void> {
+  // Escape hatch for clients that falsely advertise elicitation support but
+  // auto-decline every request without showing a UI. Observed in the
+  // Claude Code VS Code extension (≤ 2.1.123): its native CLI subprocess
+  // sets `capabilities.elicitation = {}` during the MCP initialize
+  // handshake, but the extension layer never registers an `onElicitation`
+  // callback with the agent SDK, so every elicitation request is silently
+  // rejected with `{action: "decline"}`. The default
+  // EPIMETHIAN_ALLOW_UNGATED_WRITES path doesn't help here because the
+  // client *does* (falsely) advertise support, so this gate path is taken.
+  if (process.env.EPIMETHIAN_BYPASS_ELICITATION === "true") {
+    console.error(
+      `epimethian-mcp: [UNGATED] tool=${context.tool} — bypassing elicitation gate; ` +
+        `proceeding because EPIMETHIAN_BYPASS_ELICITATION=true.`,
+    );
+    return;
+  }
+
   const supported = clientSupportsElicitation(server);
 
   if (!supported) {

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.4.1] - 2026-04-29 - escape hatch for clients that fake elicitation support
+
+### Added
+
+- **`EPIMETHIAN_BYPASS_ELICITATION=true` env var.** Unconditionally skips
+  the elicitation gate, even when the client claims to support
+  elicitation. Distinct from `EPIMETHIAN_ALLOW_UNGATED_WRITES`, which
+  only fires when `clientSupportsElicitation()` returns false.
+
+  Why this exists: the Claude Code VS Code extension (≤ 2.1.123)
+  advertises `capabilities.elicitation = {}` during the MCP handshake
+  via its native CLI subprocess, but the extension layer never
+  registers an `onElicitation` callback with the agent SDK. The agent
+  SDK transport returns `{action: "decline"}` when no handler is
+  registered, so every elicitation request is silently rejected without
+  ever surfacing a UI prompt. From the server's side this looks
+  identical to the user clicking "decline" — the existing
+  `EPIMETHIAN_ALLOW_UNGATED_WRITES` opt-out doesn't help because the
+  unsupported-client branch is never reached.
+
+  Set `EPIMETHIAN_BYPASS_ELICITATION=true` only when you've confirmed
+  your client is affected by this kind of bug. The harness's allow-list
+  is still in force, so this isn't "no permission check" — it's "skip
+  the in-protocol confirmation that nobody can answer."
+
 ## [6.4.0] - 2026-04-28 - UX feedback: new tool surface (batch 3 of 3)
 
 Final batch from `plans/ux-feedback-confluence-tree-build.md`. Adds two
