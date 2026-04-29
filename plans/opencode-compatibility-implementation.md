@@ -149,6 +149,8 @@ export const DEFAULT_SOFT_CONFIRM_TTL_MS: number;
 /** Hard caps to bound abuse and memory use. */
 export const MAX_OUTSTANDING_TOKENS = 50;       // FIFO-evict on overflow
 export const MAX_MINTS_PER_15_MIN = 100;        // window matches write-budget rolling window
+                                                 // overridable via env EPIMETHIAN_SOFT_CONFIRM_MINT_LIMIT
+                                                 // ("0" = disable cap)
 
 /**
  * Mint a fresh token bound to the given context. Throws
@@ -413,6 +415,111 @@ existing mutation-log infrastructure (see [src/server/mutation-log.ts](../src/se
 Add a new `softConfirm?: AuditMintMeta | AuditValidateMeta` field to
 the mutation-record schema; populate from the hook callbacks.
 
+### 3.7 Extended `GatedOperationContext` (Phase 2)
+
+The current shape in [src/server/elicitation.ts](../src/server/elicitation.ts)
+is:
+
+```ts
+export interface GatedOperationContext {
+  tool: string;
+  summary: string;
+  details?: Record<string, string | number | boolean | DeletionSummary | undefined>;
+}
+```
+
+Phase 2 extends it with the four fields required for soft-mode mint:
+
+```ts
+export interface GatedOperationContext {
+  tool: string;
+  summary: string;
+  details?: Record<string, string | number | boolean | DeletionSummary | undefined>;
+
+  /** ──── Soft-elicitation fields (all optional; required as a SET when soft-mode triggers) ──── */
+  /** Confluence cloudId of the tenant the operation runs under. Sourced from `cfg.sealedCloudId`. */
+  cloudId?: string;
+  /** Page ID the operation will affect. */
+  pageId?: string;
+  /** version.number of the page at the time the diff was computed. */
+  pageVersion?: number;
+  /**
+   * SHA-256 hex of the canonical post-prepare storage XML, computed via
+   * `computeDiffHash(canonicalXml, pageVersion)` from confirmation-tokens.ts.
+   */
+  diffHash?: string;
+}
+```
+
+When the four soft-mode fields are all present AND the §3.4 trigger
+fires, `gateOperation` mints a token bound to the matching
+`ConfirmationContext`. When ANY of the four is absent and soft-mode
+would otherwise trigger, the gate falls through to the legacy
+`ELICITATION_REQUIRED_BUT_UNAVAILABLE` throw (fail-closed; do not
+silently bypass).
+
+### 3.8 `cloudId` and `pageVersion` sources (call-site contract)
+
+Every call site that passes the new fields uses the same two sources:
+
+- **`cloudId`:** read from `cfg.sealedCloudId` after `await getConfig()`.
+  Defined at [src/server/confluence-client.ts:78](../src/server/confluence-client.ts#L78)
+  on the `Config` interface; populated from the keychain entry at
+  startup. The value is verified live against the tenant's
+  `_edge/tenant_info` response by `validate-startup.ts` (the tenant
+  seal). For env-var-mode profiles or pre-seal legacy profiles
+  `sealedCloudId` may be `undefined` — in that case soft-mode does
+  NOT trigger (the four-field requirement above is unmet), and the
+  legacy `ELICITATION_REQUIRED_BUT_UNAVAILABLE` throw fires. Document
+  this limit in install-agent.md "Soft confirmation": *"Pre-seal
+  profiles upgraded from versions before v5.5.0 must run
+  `epimethian-mcp setup` once to acquire a sealed cloudId before
+  soft confirmation is available."*
+- **`pageVersion`:** read from the `getPage()` result that every
+  gated handler already calls — `page.version?.number`. The Phase 2
+  edits in §5.3 / §5.4 assert that `pageVersion` is non-zero before
+  passing it through; zero indicates a server returned a stub
+  response and the operation should fail with the existing
+  "no version metadata" error rather than silently mint an
+  unbindable token.
+
+These two sources are stable today and do not require new helpers in
+`confluence-client.ts`.
+
+### 3.9 Multi-process deployments
+
+Tokens are process-local in-memory (§3.2 note 3). Operators running
+**multiple MCP server processes for one tenant** (e.g. a
+load-balanced fleet, separate processes per IDE window) will see
+soft confirmations fail in this shape: agent issues call A → server
+process P1 mints token T → agent retries with T → load balancer
+routes the retry to process P2 → P2 has never seen T → returns
+`CONFIRMATION_TOKEN_INVALID`.
+
+This is **not a bug** — it's the safe failure mode for a
+process-local store — but the user-facing behaviour is "soft
+confirmation always fails on retry". Mitigations, in order of
+preference:
+
+1. Pin a single MCP server process per agent / per IDE window.
+   The MCP transport in most clients is stdio, which is naturally
+   one-process-per-spawn; load-balancing typically requires the
+   user to opt into it deliberately.
+2. Set `EPIMETHIAN_DISABLE_SOFT_CONFIRM=true` and fall back to
+   `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` (or `BYPASS_ELICITATION`
+   for fake-advertise clients).
+3. Future work (out of scope for 6.6.0): a Redis-backed token
+   store under `EPIMETHIAN_SOFT_CONFIRM_BACKEND=redis://...`. The
+   API contract in §3.2 is shaped to allow this without breaking
+   changes — `mintToken`/`validateToken` are already async, the
+   store is hidden behind the module's exports.
+
+The setup CLI emits a one-line note when `--client opencode` is
+chosen: *"Soft confirmation tokens are process-local in this version.
+If you run multiple MCP servers for this tenant simultaneously,
+confirmation retries may fail; in that case, set
+EPIMETHIAN_ALLOW_UNGATED_WRITES=true and document the trade-off."*
+
 ---
 
 ## 4. Phase 1 — Setup CLI + tool descriptions (target: 6.5.0)
@@ -555,8 +662,8 @@ new assertion that "setup --client" appears.
        2.A     2.B     2.C       2.D       2.E    2.F     2.G
        opus    opus    sonnet    sonnet    sonnet haiku   haiku
        ─────   ─────   ─────     ─────     ─────  ─────   ─────
-       token   gate    schema    result    inval. agent   tool
-       store   branch  + handler shape     hook   guide   desc
+       token   gate    schema +  result    inval. tool    agent
+       store   branch  handler   shape     hook   desc    guide
 
                                   │
                           (all complete)
@@ -573,6 +680,14 @@ disjoint regions of `src/server/index.ts` and can run concurrently
 once §3 is frozen. **2.H runs last** because it asserts the integrated
 behaviour end-to-end.
 
+**Pre-flight contract check.** Before dispatching any agent, confirm
+that §§3.1–3.9 are stable (no further amendments). Two of the seven
+tasks (2.A, 2.B) are **opus** because they own the trust-boundary
+logic; the other five are **sonnet** or **haiku** because they
+follow the contracts mechanically. If any agent proposes deviating
+from a §3 contract during implementation, that agent stops and
+escalates rather than merging an inconsistent change.
+
 ### 5.2 Task 2.A — Token store
 
 **Model:** opus
@@ -584,21 +699,74 @@ behaviour end-to-end.
 persistence. Tokens generated via `crypto.randomUUID()` (Node 18+) or
 `crypto.randomBytes(24).toString("base64url")`.
 
-**Tests (must cover, not exhaustive):**
-- Mint then validate immediately → `"ok"`. Validate again → `"unknown"`
-  (single-use).
-- Mint, then `invalidateForPage(samePageId)` → next validate is
-  `"stale"`.
-- Mint, then advance fake time past TTL → validate is `"expired"`.
-- Mint with `{tool: A}`, validate with `{tool: B}` → `"mismatch"`.
+**Tests (must cover, not exhaustive — note the public API now returns
+`Promise<"ok" | "invalid">` only; the fine-grained reason is asserted
+via the `onValidate` audit hook, NOT the return value):**
+
+External-API tests (assert `await validateToken(...)` return value):
+- Mint then validate immediately → `"ok"`. Second validate of the
+  same token → `"invalid"` (single-use; audit shows `"unknown"`).
+- Mint with `{cloudId: "abc"}`, validate with `{cloudId: "xyz"}` →
+  `"invalid"` (audit shows `"mismatch"`). **Multi-tenant guard.**
+- Mint with `{tool: A}`, validate with `{tool: B}` → `"invalid"`
+  (audit shows `"mismatch"`).
+- Mint with `{pageId: 1}`, validate with `{pageId: 2}` → `"invalid"`
+  (audit shows `"mismatch"`).
+- Mint with `{pageVersion: 7}`, validate with `{pageVersion: 8}` →
+  `"invalid"` (audit shows `"mismatch"`).
 - Mint with `{diffHash: X}`, validate with `{diffHash: Y}` →
-  `"mismatch"`.
-- Mint with `{pageId: 1}`, validate with `{pageId: 2}` → `"mismatch"`.
-- Validate a never-minted token → `"unknown"`.
-- 1000 mints + 1000 validates: no leaked tokens (memory test —
-  validate that consumed/expired tokens are removed from the
-  internal map).
+  `"invalid"` (audit shows `"mismatch"`).
+- Mint, advance fake time past TTL, validate → `"invalid"` (audit
+  shows `"expired"`).
+- Mint, `invalidateForPage(cloudId, samePageId)`, validate →
+  `"invalid"` (audit shows `"stale"`).
+- Validate a never-minted token → `"invalid"` (audit shows
+  `"unknown"`).
+- **TOCTOU test** (the new sibling-invalidation in §3.2 note 7):
+  mint two tokens T1 and T2 against the same `{cloudId, pageId}` but
+  different `diffHash`. `validateToken(T1, ctx1)` → `"ok"`.
+  Immediately afterward, `validateToken(T2, ctx2)` → `"invalid"`
+  (audit shows `"stale"`).
+
+Resource / abuse-cap tests:
+- 51st `mintToken` after 50 outstanding: oldest is FIFO-evicted; the
+  evicted token's subsequent validate → `"invalid"` (audit shows
+  `"unknown"` since the token is no longer in the store).
+- 101st `mintToken` within 15 min: throws `SOFT_CONFIRM_RATE_LIMITED`.
+  Advance fake time past 15 min; next mint succeeds.
+- `EPIMETHIAN_SOFT_CONFIRM_MINT_LIMIT="0"` disables the rate cap;
+  1000 mints in 1 second succeed (subject only to FIFO eviction
+  at 50 outstanding).
+- `EPIMETHIAN_SOFT_CONFIRM_MINT_LIMIT="200"` lifts the rate cap to
+  200 / 15 min.
+- TTL clamp: pass `ttlMs=10_000` (under floor) → `expiresAt` is
+  60 s after mint (clamped up). Pass `ttlMs=99_999_999_999` (over
+  ceiling) → `expiresAt` is 900 s after mint (clamped down).
+- `EPIMETHIAN_SOFT_CONFIRM_TTL_MS=10000` (under floor) → minted
+  tokens default to 60 s; over-ceiling values clamp to 900 s.
+
+Timing-floor test:
+- Compare wall-time of a hit-path validate vs a miss-path validate
+  (using `performance.now()` × 100 iterations each). Assert the
+  difference is < 1 ms — proves the 5 ms minimum-response floor
+  removed the timing-side-channel.
+
+Audit-hook tests:
+- `onMint` fires exactly once per `mintToken` call; payload
+  contains `auditId`, `tool`, `cloudId`, `pageId`, `pageVersion`,
+  `expiresAt`, `outstanding`. NEVER contains the token itself.
+- `onValidate` fires exactly once per `validateToken` call; payload
+  contains the actual `outcome` (one of `"ok"` / `"unknown"` /
+  `"expired"` / `"stale"` / `"mismatch"`); never the token; the
+  `auditId` matches the original mint when applicable.
+
+Memory & cleanliness:
+- 1000 mints + 1000 validates: outstanding-token map is empty (or at
+  most 50 if FIFO eviction is engaged); no leaked entries.
 - `_resetForTest()` clears state between tests.
+
+The `_peekToken` API is GONE (security-review item 8); do not write
+tests for it.
 
 **Data-loss risk:** **HIGH if the store has a bug.** A token-store
 bug could let a stale or wrong-page token validate as `"ok"` and
@@ -620,54 +788,84 @@ bypass the gate. Mitigations:
 **Model:** opus
 **Files:**
 - [src/server/elicitation.ts](../src/server/elicitation.ts) at the
-  unsupported-client branch (~line 122–140) — add the soft-mode
-  branch per §3.4.
+  unsupported-client branch (~line 122–140) — implement the §3.4
+  precedence table.
+- Same file — extend `GatedOperationContext` per §3.7 (add
+  optional `cloudId`, `pageId`, `pageVersion`, `diffHash` fields).
 - Same file — add the new `SOFT_CONFIRMATION_REQUIRED` error code
-  and `SoftConfirmationRequiredError` subclass (per §3.3).
+  and `SoftConfirmationRequiredError` subclass per §3.3.
+- Same file — add the startup-time warning per §3.4 ("BYPASS set
+  against a non-faking client").
 - [src/server/elicitation.test.ts](../src/server/elicitation.test.ts)
-  — extend.
+  — extend with the matrix tests below.
 
-**Change:** When all four soft-mode trigger conditions in §3.4 are
-met:
-1. Compute `diffHash` from the prepared storage XML — caller
-   responsibility (passed in via the `GatedOperationContext`); see
-   2.D for the call-site changes.
-2. Build a human summary from `context.details.deletionSummary` (if
-   present) or the bare flag list (fallback).
-3. Mint a token via `mintToken({tool, pageId, diffHash})`.
-4. Throw `SoftConfirmationRequiredError(token, expiresAt,
-   humanSummary, retryHint)`.
+**Change.** Replace the existing single-branch unsupported-client
+check with the six-row precedence table from §3.4. Branch 4 (soft
+mode) does:
+
+1. Verify all four soft-mode fields (`cloudId`, `pageId`,
+   `pageVersion`, `diffHash`) are present on the context. If any is
+   missing, fall through to branch 5 (legacy throw).
+2. Build a human summary from `context.details.deletionSummary`
+   (the structured `DeletionSummary` shape from A2). If absent,
+   fall back to `context.summary` — but DO NOT interpolate any
+   field of `context.details` other than `deletionSummary`'s
+   numeric counts (security-review §3.5 invariant).
+3. Mint a token via `mintToken({tool, cloudId, pageId, pageVersion,
+   diffHash})`. The mint call may itself throw
+   `SOFT_CONFIRM_RATE_LIMITED`; let that propagate as an
+   `isError: true` tool result with no token.
+4. Throw `SoftConfirmationRequiredError(token, auditId, expiresAt,
+   humanSummary, retryHint, pageId)`.
+
+The `humanSummary` template is a pure function of the
+`DeletionSummary` counts: `"This update will remove ${tocs ? `${tocs}
+TOC macro${tocs===1?'':'s'}` : ''}{...and ${links} link macros}…"` —
+short, human, no page content. Implement once in a helper
+`renderDeletionSummary(s: DeletionSummary): string`; reuse from §3.5
+result formatting and from this branch.
 
 When the trigger conditions are NOT met (existing client supports
-elicitation, OR allow/bypass/disable env var is set), behaviour is
+elicitation, OR an earlier env-var branch fired), behaviour is
 unchanged from 6.5.0.
 
-**`GatedOperationContext` extension:** add two optional fields:
-```ts
-pageId?: string;     // required for soft mode; undefined disables soft mode
-diffHash?: string;   // required for soft mode
-```
-If soft-mode triggers but `pageId` or `diffHash` is missing, fall
-through to the existing `ELICITATION_REQUIRED_BUT_UNAVAILABLE` throw
-(safer fail-closed).
-
 **Tests:**
-- Soft mode triggers and throws `SoftConfirmationRequiredError` with
-  a valid token.
-- `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` short-circuits before soft
-  mode (existing behaviour preserved).
-- `EPIMETHIAN_DISABLE_SOFT_CONFIRM=true` falls through to legacy
-  `ELICITATION_REQUIRED_BUT_UNAVAILABLE` throw.
-- Missing `pageId` or `diffHash` → legacy throw.
-- Token returned in the error matches what the store has.
+- **Branch 4 happy path:** soft mode triggers and throws
+  `SoftConfirmationRequiredError` with a valid token, an `auditId`,
+  the right `expiresAt`, and a `humanSummary` derived purely from
+  the deletion counts.
+- **Branch 5 fail-closed:** soft mode would otherwise fire but
+  `cloudId` / `pageId` / `pageVersion` / `diffHash` is missing →
+  legacy `ELICITATION_REQUIRED_BUT_UNAVAILABLE` throw.
+- **§3.4 precedence matrix:** all 16 combinations of the four env
+  vars, with `clientSupportsElicitation` mocked both ways. Each
+  combo asserts the expected branch fires (use the row number from
+  the table as the test description).
+- **Startup-warning test:** with `BYPASS_ELICITATION=true` and
+  `clientSupportsElicitation()` returning false, the next
+  `gateOperation` invocation calls `console.error` with the §3.4
+  warning text exactly once per process (use a `firedOnce` flag in
+  the implementation; assert the warning is silent on the second
+  call).
+- **`SOFT_CONFIRM_RATE_LIMITED` propagation:** mock `mintToken` to
+  throw the rate-limit error; assert it bubbles as
+  `SOFT_CONFIRM_RATE_LIMITED` with no token in the result.
+- **`humanSummary` exfil resistance:** invoke `gateOperation` with a
+  context whose `details` map contains attacker-shaped strings under
+  every other key (not under `deletionSummary`). Assert that none
+  of those values appears in the resulting `humanSummary` —
+  `humanSummary` is built solely from `DeletionSummary` numeric
+  fields.
 
-**Data-loss risk:** Inherits from 2.A. Additionally: a buggy soft-mode
-trigger that fires for clients that DO support elicitation would
-silently downgrade safety. Mitigation: trigger condition explicitly
-requires `!clientSupportsElicitation()` AND every other guard env var
-to be unset. Test fixtures cover the matrix.
+**Data-loss risk:** Inherits from 2.A. Additionally: a buggy
+soft-mode trigger that fires for clients that DO support elicitation
+would silently downgrade safety. Mitigation: branch 4's condition
+includes `!clientSupportsElicitation(server)` as the first AND of
+the SET test; test fixtures cover the precedence matrix; the
+startup-warning surfaces the most common misconfiguration without
+changing behaviour.
 
-### 5.4 Task 2.C — `confirm_token` parameter on gated tools
+### 5.4 Task 2.C — `confirm_token` parameter on gated tools + handler plumbing
 
 **Model:** sonnet
 **Files:**
@@ -675,39 +873,116 @@ to be unset. Test fixtures cover the matrix.
   schema of these tools to add `confirm_token: z.string().optional()`:
   `update_page`, `update_page_section`, `update_page_sections`,
   `delete_page`, `revert_page`, `prepend_to_page`, `append_to_page`.
-- Same file — in each handler, BEFORE calling `gateOperation`:
-  - If `confirm_token` is present:
-    - Compute the `diffHash` exactly as 2.B will (same canonical
-      XML hash function).
-    - Call `validateToken(confirm_token, {tool, pageId, diffHash})`.
-    - On `"ok"`: skip `gateOperation` entirely (token consumed).
-    - On `"stale"`: throw `CONFIRMATION_TOKEN_STALE` with message
-      "the page has been modified since this token was minted; mint
-      a new one by retrying without the token".
-    - On `"expired"`: throw `CONFIRMATION_TOKEN_EXPIRED` with TTL
-      info.
-    - On `"mismatch"` / `"unknown"`: throw
-      `CONFIRMATION_TOKEN_INVALID` with no further detail (avoid
-      info-leak).
-  - If `confirm_token` is absent: pass `pageId` and the computed
-    `diffHash` into `GatedOperationContext` so 2.B can mint a token.
+- Same file — in each gated handler, do the work outlined below
+  BEFORE the existing `gateOperation` call.
 
-**`diffHash` computation:** import a stable hash helper (sha256 of
-the canonical post-prepare storage string, hex-encoded). Place the
-helper in `src/server/confirmation-tokens.ts` as
-`computeDiffHash(canonicalXml: string): string` so 2.B and 2.C share
-one implementation.
+**Change. Each gated handler grows a small, identical preamble.**
+The structure is:
+
+```ts
+// In every gated handler, after `await getPage(...)` and after the
+// post-prepare canonical storage XML is in hand:
+const cloudId = cfg.sealedCloudId;
+const pageVersion = page.version?.number ?? 0;
+const diffHash = (cloudId && pageVersion > 0)
+  ? computeDiffHash(canonicalStorageXml, pageVersion)
+  : undefined;
+
+if (confirm_token !== undefined && cloudId && pageVersion > 0 && diffHash) {
+  const outcome = await validateToken(confirm_token, {
+    tool: <this tool's name>,
+    cloudId,
+    pageId: page_id,
+    pageVersion,
+    diffHash,
+  });
+  if (outcome === "ok") {
+    // Token consumed; skip the gate entirely. Proceed to write.
+  } else {
+    // outcome === "invalid" — single bucket per §3.5.
+    throw new ConverterError(
+      `The confirmation token is no longer valid. Mint a new one by ` +
+      `re-calling this tool without confirm_token, ask the user again, ` +
+      `then retry with the new token.`,
+      "CONFIRMATION_TOKEN_INVALID"
+    );
+  }
+} else {
+  // No token, or required context unavailable — fall through to
+  // gateOperation, which (per §3.7) receives cloudId / pageVersion /
+  // diffHash via GatedOperationContext and mints a token if the
+  // soft-mode trigger fires (branch 4 of §3.4).
+  await gateOperation(server, {
+    tool: <this tool's name>,
+    summary: <existing summary>,
+    details: { ..., deletionSummary },
+    cloudId,
+    pageId: page_id,
+    pageVersion,
+    diffHash,
+  });
+}
+```
+
+**Important invariants for the implementer:**
+
+1. The handler MUST NOT call `gateOperation` after a successful
+   `validateToken` returns `"ok"`. The token is the gate; calling the
+   gate again would either no-op (elicitation-capable client) or
+   double-mint (soft-mode client). The branching above enforces this.
+2. `validateToken` is `async` (returns `Promise<...>`) — the handler
+   must `await`. TypeScript will catch this at compile time given the
+   contract in §3.2; tests must cover the await behaviour.
+3. Pass `cloudId`, `pageVersion`, and `diffHash` into
+   `GatedOperationContext` whenever they are computable, even when
+   the connecting client supports elicitation. The fields are no-ops
+   on the elicitation path; supplying them keeps the soft-mode
+   trigger correct if a future client downgrades capabilities.
+4. When `cfg.sealedCloudId` is `undefined` (env-var-mode profile or
+   pre-seal legacy profile), DO NOT mint or validate tokens. The
+   handler's behaviour is identical to v6.5.0 in that case (gate
+   throws legacy `ELICITATION_REQUIRED_BUT_UNAVAILABLE` when soft
+   mode would otherwise have fired).
+
+**`diffHash` computation:** use the shared helper
+`computeDiffHash(canonicalXml: string, pageVersion: number)` exported
+from `src/server/confirmation-tokens.ts`. The handler computes
+`canonicalStorageXml` from the prepared body — for `update_page` /
+`update_page_section`, this is `prepared.finalStorage`; for
+`update_page_sections`, the aggregated `prepared.finalStorage`; for
+`delete_page` / `revert_page`, where there is no body diff, pass an
+empty string and rely on `pageVersion` for binding.
 
 **Tests:** unit tests in `index.test.ts` per gated tool:
-- Valid token short-circuits `gateOperation` (it is not called).
-- Stale/expired/invalid token returns the matching error code.
-- Token reuse → second call returns `CONFIRMATION_TOKEN_INVALID`.
+- Valid token short-circuits the gate (assert `gateOperation` is not
+  called and the write succeeds).
+- Token reuse → second call returns `CONFIRMATION_TOKEN_INVALID`
+  (single-use).
+- Cross-tool token: mint via `update_page`, retry on `delete_page`
+  → `CONFIRMATION_TOKEN_INVALID`.
+- Cross-page token: mint for pageId X, retry on pageId Y →
+  `CONFIRMATION_TOKEN_INVALID`.
+- Different diff: mint with body A, retry with token + body B →
+  `CONFIRMATION_TOKEN_INVALID`.
+- Different page version: mint at version 7, server advances to 8,
+  retry → `CONFIRMATION_TOKEN_INVALID`.
+- Different tenant (cloudId): simulate by calling validate with a
+  different `cfg.sealedCloudId` than the mint context (mock
+  `getConfig`) → `CONFIRMATION_TOKEN_INVALID`. **Multi-tenant
+  guard.**
+- Pre-seal profile (cloudId undefined): handler does not call
+  `validateToken` even when `confirm_token` is provided; falls
+  through to `gateOperation` with no `cloudId`; gate throws legacy
+  `ELICITATION_REQUIRED_BUT_UNAVAILABLE`.
 
 **Data-loss risk:** Same as 2.A — the validate path is the trust
 boundary. The implementation is mechanical (delegate to the store);
-the safety lives in 2.A's strict ctx equality. Verify that NO handler
-calls `gateOperation` after a successful validate (token consumption
-must be the only confirmation needed).
+the safety lives in 2.A's strict 5-field ctx equality. The handler
+preamble is identical across all 7 gated tools — extract a
+`maybeConsumeConfirmToken(handler-args, pre-prepared-state)` helper
+into [src/server/safe-write.ts](../src/server/safe-write.ts) so the
+preamble lives in ONE place. Verify that NO handler calls
+`gateOperation` after a successful validate.
 
 ### 5.5 Task 2.D — Tool-result shape for `SOFT_CONFIRMATION_REQUIRED`
 
@@ -1016,7 +1291,7 @@ npm run build
    token → `CONFIRMATION_TOKEN_INVALID`.
 3. Mint a token for an `update_page`, manually `update_page` the
    same page from another session, retry with the token →
-   `CONFIRMATION_TOKEN_STALE`.
+   `CONFIRMATION_TOKEN_INVALID` (audit log shows `outcome: "stale"`).
 
 **CHANGELOG entries** for each version, in the existing voice (terse,
 "why" before "what"). Link the source investigation file from each
