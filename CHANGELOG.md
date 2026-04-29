@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.2.2] - 2026-04-24 - badge locale follows tenant, not MCP process
+
+### Fixed
+
+- **`markPageUnverified` badge label now follows the Confluence site's default
+  language instead of the MCP process's system locale.** The v6.1.0 resolver
+  fell back to `Intl.DateTimeFormat().resolvedOptions().locale`, which reads
+  `LANG` / OS locale on the machine running the MCP — meaningless for a
+  server-stored badge shown to every viewer of the page. A user whose
+  browser was English would see `"KI-bearbeitet"` if their MCP happened to
+  run on a German-locale machine. The resolver now probes
+  `GET /wiki/rest/api/settings/systemInfo` once per tenant (cached for the
+  process lifetime) and uses `defaultLocale` from that response. Explicit
+  `unverifiedStatusLocale` / `CONFLUENCE_UNVERIFIED_STATUS_LOCALE` overrides
+  still take precedence; the final fallback is now `"en"` (not the process
+  locale). Probe failures (missing `read:confluence-settings` scope, network
+  errors, malformed payload) silently fall back to `"en"` — never throw.
+
+  New resolution order: profile → env → Confluence site default → `"en"`.
+
 ## [6.2.1] - 2026-04-23 - bugfix: CDATA-aware section splicing
 
 ### Fixed

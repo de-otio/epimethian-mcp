@@ -158,6 +158,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     getCommentReplies: mockGetCommentReplies,
     getContentState: mockGetContentState,
     setContentState: mockSetContentState,
+    getSiteDefaultLocale: vi.fn().mockResolvedValue(undefined),
     removeContentState: vi.fn().mockResolvedValue(undefined),
     ensureAttributionLabel: mockEnsureAttributionLabel,
     _rawCreatePage: vi.fn().mockResolvedValue({

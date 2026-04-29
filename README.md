@@ -170,7 +170,7 @@ The badge is re-applied on every body-modifying tool call (idempotent: skipped w
 | Setting | Default | Purpose |
 |---|---|---|
 | `unverifiedStatus` | `true` | Master toggle. Set to `false` to disable the badge entirely. |
-| `unverifiedStatusLocale` | system locale → `en` | Language for the badge label. |
+| `unverifiedStatusLocale` | Confluence site default → `en` | Language for the badge label. |
 | `unverifiedStatusName` | *(unset)* | Full label override (bypasses locale lookup). Must be ≤20 chars. |
 | `unverifiedStatusColor` | `#FFC400` | Color override. One of five Confluence-allowed values: `#FFC400`, `#2684FF`, `#57D9A3`, `#FF7452`, `#8777D9`. |
 
@@ -203,7 +203,7 @@ Custom label (e.g., for compliance workflows):
 | `zh` | AI已编辑 |
 | `ko` | AI 편집됨 |
 
-The locale is resolved from (in order): `unverifiedStatusLocale` profile setting → `CONFLUENCE_UNVERIFIED_STATUS_LOCALE` env var → system locale (`Intl.DateTimeFormat`) → `"en"`.
+The locale is resolved from (in order): `unverifiedStatusLocale` profile setting → `CONFLUENCE_UNVERIFIED_STATUS_LOCALE` env var → Confluence site default language (probed once per tenant via `GET /wiki/rest/api/settings/systemInfo`) → `"en"`. The MCP process's own OS locale is intentionally NOT consulted — the badge is a server-stored string shown to every viewer of the page, so it must follow the tenant, not whoever happens to run the agent.
 
 When the badge cannot be applied (e.g., the token lacks content-state permission), the tool call still succeeds and a warning is surfaced in the tool response instead of failing silently.
 

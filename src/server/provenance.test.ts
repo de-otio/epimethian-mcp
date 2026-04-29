@@ -14,6 +14,7 @@ import type { Config } from "./confluence-client.js";
 vi.mock("./confluence-client.js", () => ({
   getContentState: vi.fn(),
   setContentState: vi.fn(),
+  getSiteDefaultLocale: vi.fn(),
   // ConfluencePermissionError must be a real class so instanceof checks work.
   ConfluencePermissionError: class ConfluencePermissionError extends Error {
     readonly status: number;
@@ -37,6 +38,7 @@ import {
 import {
   getContentState,
   setContentState,
+  getSiteDefaultLocale,
   ConfluencePermissionError,
 } from "./confluence-client.js";
 
@@ -73,6 +75,9 @@ beforeEach(() => {
   (getContentState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
   // Default: setContentState succeeds.
   (setContentState as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+  // Default: site-locale probe returns undefined (no tenant default).
+  // Individual tests override to simulate a configured site default language.
+  (getSiteDefaultLocale as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -114,32 +119,63 @@ describe("module-load assertion", () => {
 // Tests 3–4 — pickLocale
 // ---------------------------------------------------------------------------
 describe("pickLocale", () => {
-  it("3. profile setting wins over env, Intl, and 'en'", () => {
+  it("3. profile setting wins over env, site default, and 'en'", async () => {
     process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE = "de";
+    (getSiteDefaultLocale as ReturnType<typeof vi.fn>).mockResolvedValue("es");
     const cfg = makeConfig({ unverifiedStatusLocale: "fr" });
-    expect(pickLocale(cfg)).toBe("fr");
+    expect(await pickLocale(cfg)).toBe("fr");
+    expect(getSiteDefaultLocale).not.toHaveBeenCalled();
   });
 
-  it("3b. env wins over Intl and 'en' when profile not set", () => {
+  it("3b. env wins over site default and 'en' when profile not set", async () => {
     process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE = "de";
+    (getSiteDefaultLocale as ReturnType<typeof vi.fn>).mockResolvedValue("es");
     const cfg = makeConfig({ unverifiedStatusLocale: undefined });
-    expect(pickLocale(cfg)).toBe("de");
+    expect(await pickLocale(cfg)).toBe("de");
+    expect(getSiteDefaultLocale).not.toHaveBeenCalled();
   });
 
-  it("3c. Intl wins over 'en' when profile and env not set", () => {
+  it("3c. site default wins over 'en' when profile and env not set", async () => {
     delete process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE;
-    // We can only verify this returns a non-empty string; the system locale varies.
+    (getSiteDefaultLocale as ReturnType<typeof vi.fn>).mockResolvedValue("ja");
     const cfg = makeConfig({ unverifiedStatusLocale: undefined });
-    const locale = pickLocale(cfg);
-    expect(typeof locale).toBe("string");
-    expect(locale.length).toBeGreaterThan(0);
-    // Must not contain a hyphen (should be split).
-    expect(locale).not.toContain("-");
+    expect(await pickLocale(cfg)).toBe("ja");
   });
 
-  it("4. 'fr-FR' resolves to 'fr'", () => {
+  it("3d. falls back to 'en' when profile, env, and site default are all absent", async () => {
+    delete process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE;
+    (getSiteDefaultLocale as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    const cfg = makeConfig({ unverifiedStatusLocale: undefined });
+    expect(await pickLocale(cfg)).toBe("en");
+  });
+
+  it("3e. does NOT consult Intl.DateTimeFormat — process locale must not leak into the tenant-visible badge", async () => {
+    delete process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE;
+    // Simulate a German-locale MCP process.
+    const spy = vi
+      .spyOn(Intl, "DateTimeFormat")
+      .mockImplementation(() => ({
+        resolvedOptions: () => ({ locale: "de-DE" }) as Intl.ResolvedDateTimeFormatOptions,
+      }) as unknown as Intl.DateTimeFormat);
+    (getSiteDefaultLocale as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    try {
+      const cfg = makeConfig({ unverifiedStatusLocale: undefined });
+      expect(await pickLocale(cfg)).toBe("en");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("4. 'fr-FR' resolves to 'fr'", async () => {
     const cfg = makeConfig({ unverifiedStatusLocale: "fr-FR" });
-    expect(pickLocale(cfg)).toBe("fr");
+    expect(await pickLocale(cfg)).toBe("fr");
+  });
+
+  it("4b. site-default 'de_DE' (underscore form) resolves to 'de'", async () => {
+    delete process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE;
+    (getSiteDefaultLocale as ReturnType<typeof vi.fn>).mockResolvedValue("de");
+    const cfg = makeConfig({ unverifiedStatusLocale: undefined });
+    expect(await pickLocale(cfg)).toBe("de");
   });
 });
 
@@ -147,48 +183,58 @@ describe("pickLocale", () => {
 // Tests 5–9 — resolveUnverifiedStatus
 // ---------------------------------------------------------------------------
 describe("resolveUnverifiedStatus", () => {
-  it("5. returns { 'AI-edited', '#FFC400' } for 'en' with no overrides", () => {
+  it("5. returns { 'AI-edited', '#FFC400' } for 'en' with no overrides", async () => {
     const cfg = makeConfig({ unverifiedStatusLocale: "en" });
-    expect(resolveUnverifiedStatus(cfg)).toEqual({
+    expect(await resolveUnverifiedStatus(cfg)).toEqual({
       name: "AI-edited",
       color: UNVERIFIED_COLOR,
     });
   });
 
-  it("6. returns the French label for locale 'fr'", () => {
+  it("6. returns the French label for locale 'fr'", async () => {
     const cfg = makeConfig({ unverifiedStatusLocale: "fr" });
-    expect(resolveUnverifiedStatus(cfg)).toEqual({
+    expect(await resolveUnverifiedStatus(cfg)).toEqual({
       name: "Modifié par IA",
       color: UNVERIFIED_COLOR,
     });
   });
 
-  it("7. falls back to 'en' for an unknown locale 'xx'", () => {
+  it("7. falls back to 'en' for an unknown locale 'xx'", async () => {
     const cfg = makeConfig({ unverifiedStatusLocale: "xx" });
-    expect(resolveUnverifiedStatus(cfg)).toEqual({
+    expect(await resolveUnverifiedStatus(cfg)).toEqual({
       name: "AI-edited",
       color: UNVERIFIED_COLOR,
     });
   });
 
-  it("8. honors unverifiedStatusName and bypasses locale table", () => {
+  it("8. honors unverifiedStatusName and bypasses locale table", async () => {
     const cfg = makeConfig({
       unverifiedStatusLocale: "fr",
       unverifiedStatusName: "Needs legal review",
     });
-    const result = resolveUnverifiedStatus(cfg);
+    const result = await resolveUnverifiedStatus(cfg);
     expect(result.name).toBe("Needs legal review");
     expect(result.color).toBe(UNVERIFIED_COLOR);
   });
 
-  it("9. honors unverifiedStatusColor override", () => {
+  it("9. honors unverifiedStatusColor override", async () => {
     const cfg = makeConfig({
       unverifiedStatusLocale: "en",
       unverifiedStatusColor: "#FF7452",
     });
-    expect(resolveUnverifiedStatus(cfg)).toEqual({
+    expect(await resolveUnverifiedStatus(cfg)).toEqual({
       name: "AI-edited",
       color: "#FF7452",
+    });
+  });
+
+  it("9b. uses site-default locale when no overrides present", async () => {
+    delete process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE;
+    (getSiteDefaultLocale as ReturnType<typeof vi.fn>).mockResolvedValue("de");
+    const cfg = makeConfig({ unverifiedStatusLocale: undefined });
+    expect(await resolveUnverifiedStatus(cfg)).toEqual({
+      name: "KI-bearbeitet",
+      color: UNVERIFIED_COLOR,
     });
   });
 });

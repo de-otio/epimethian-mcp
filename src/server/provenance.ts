@@ -10,6 +10,7 @@ import {
   type Config,
   ConfluencePermissionError,
   getContentState,
+  getSiteDefaultLocale,
   setContentState,
 } from "./confluence-client.js";
 
@@ -66,18 +67,25 @@ export function isKnownUnverifiedLabel(name: string, customOverride?: string): b
  * Resolution order:
  *   1. cfg.unverifiedStatusLocale (profile-level explicit override)
  *   2. process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE
- *   3. Intl.DateTimeFormat().resolvedOptions().locale (system locale)
+ *   3. Confluence site default language (GET /settings/systemInfo)
  *   4. "en" (fallback)
  *
- * The locale string is split on "-" and lowercased so that e.g. "fr-FR" → "fr".
+ * The badge is a server-stored string shown to every viewer, so the MCP
+ * process's own system locale (Intl.DateTimeFormat) is NOT consulted — it
+ * reflects who happens to run the agent, not the tenant being edited.
+ *
+ * The locale string is split on "-"/"_" and lowercased so that e.g.
+ * "fr-FR" → "fr".
  */
-export function pickLocale(cfg: Config): string {
-  const raw =
-    cfg.unverifiedStatusLocale ||
-    process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE ||
-    Intl.DateTimeFormat().resolvedOptions().locale ||
-    "en";
-  return raw.split("-")[0].toLowerCase();
+export async function pickLocale(cfg: Config): Promise<string> {
+  const explicit =
+    cfg.unverifiedStatusLocale || process.env.CONFLUENCE_UNVERIFIED_STATUS_LOCALE;
+  if (explicit) return explicit.split(/[_-]/)[0].toLowerCase();
+
+  const siteLocale = await getSiteDefaultLocale(cfg);
+  if (siteLocale) return siteLocale;
+
+  return "en";
 }
 
 /**
@@ -87,14 +95,16 @@ export function pickLocale(cfg: Config): string {
  * Otherwise the name is looked up via pickLocale() with "en" as the final
  * fallback.  Color always defaults to UNVERIFIED_COLOR if not overridden.
  */
-export function resolveUnverifiedStatus(cfg: Config): { name: string; color: string } {
+export async function resolveUnverifiedStatus(
+  cfg: Config
+): Promise<{ name: string; color: string }> {
   const color = cfg.unverifiedStatusColor ?? UNVERIFIED_COLOR;
 
   if (cfg.unverifiedStatusName) {
     return { name: cfg.unverifiedStatusName, color };
   }
 
-  const locale = pickLocale(cfg);
+  const locale = await pickLocale(cfg);
   const name = UNVERIFIED_LABELS[locale] ?? UNVERIFIED_LABELS["en"];
   return { name, color };
 }
@@ -123,7 +133,7 @@ export async function markPageUnverified(
     return {};
   }
 
-  const target = resolveUnverifiedStatus(cfg);
+  const target = await resolveUnverifiedStatus(cfg);
 
   // --- Idempotency check via getContentState ---
   let skipSet = false;
