@@ -309,6 +309,83 @@ discover the result an hour later.
 - **`EPIMETHIAN_WRITE_BUDGET_ROLLING`** — default 75 per 15-minute window; set to "0" to disable.
 - **`EPIMETHIAN_WRITE_BUDGET_HOURLY`** — deprecated alias for `EPIMETHIAN_WRITE_BUDGET_ROLLING`; will be removed in version 7.
 
+## Soft confirmation (clients without elicitation)
+
+Some MCP clients (currently OpenCode, plus others) don't implement the in-protocol
+confirmation prompt. Starting in v6.6.0, epimethian-mcp routes those confirmations
+through your agent's normal chat surface instead.
+
+### What you (the agent) see
+
+When a destructive write is requested against a client without elicitation, the
+tool returns an error with a confirmation token:
+
+```
+isError: true
+structuredContent:
+  {
+    "confirm_token": "<opaque token>",
+    "audit_id": "<UUID for correlation>",
+    "expires_at": "<ISO timestamp>",
+    "page_id": "<pageId>",
+    ...
+  }
+content[0].text:
+  ⚠️  Confirmation required (SOFT_CONFIRMATION_REQUIRED)
+
+  {humanSummary}
+
+  Please ask the user before retrying. If approved, re-call with:
+  "confirm_token": from structuredContent.
+
+  Expires at {timestamp}; invalidated by competing writes.
+```
+
+### What to do
+
+1. STOP. Don't retry blindly.
+2. Show the user, in their language, what's about to happen (use the
+   `humanSummary` field from the result).
+3. Ask the user explicitly. Wait for their answer.
+4. If approved: re-call the tool with the SAME parameters plus
+   `confirm_token` from the structuredContent.
+5. If denied: tell the user the operation has been cancelled.
+
+### Token semantics
+
+- Single-use: a successful retry consumes the token. Replays fail.
+- 5-minute TTL by default.
+- Invalidated by any competing write to the same page (stale).
+- Bound to the specific diff and tenant: changing the body, page version, or
+  tenant invalidates the token.
+
+### Operator opt-outs
+
+These environment variables control soft confirmation behavior:
+
+- **`EPIMETHIAN_ALLOW_UNGATED_WRITES=true`** — bypasses soft confirmation
+  entirely (no prompt; useful for headless / CI).
+- **`EPIMETHIAN_DISABLE_SOFT_CONFIRM=true`** — keeps the legacy
+  `ELICITATION_REQUIRED_BUT_UNAVAILABLE` failure mode for clients without
+  elicitation support.
+- **`EPIMETHIAN_SOFT_CONFIRM_TTL_MS=300000`** — override the default 5-minute
+  TTL (clamped to 60 seconds minimum, 15 minutes maximum).
+- **`EPIMETHIAN_SOFT_CONFIRM_MINT_LIMIT=100`** — override the per-15-minute
+  mint cap (default 100; "0" disables the cap entirely).
+
+### Multi-process deployments
+
+Tokens are process-local in-memory. If you're running multiple MCP server
+processes for one tenant (e.g. a load-balanced fleet or separate processes
+per IDE window), a soft confirmation minted by process P1 will fail validation
+in process P2 (the load balancer routes the retry to a different process).
+This is not a bug — it's the safe failure mode — but it means the user needs
+to mint a new token if the retry lands on a different process.
+
+**Recommendation:** Pin a single MCP server process per agent or IDE window.
+Pre-seal profiles upgraded from versions before v5.5.0 must run `epimethian-mcp
+setup` once to acquire a sealed cloudId before soft confirmation is available.
+
 ## MCP client compatibility
 
 epimethian-mcp uses MCP **elicitation** (the in-protocol confirmation

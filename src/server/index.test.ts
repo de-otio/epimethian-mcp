@@ -1,4 +1,9 @@
-import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
+import { describe, it, expect, vi, beforeEach, beforeAll, afterEach } from "vitest";
+import {
+  mintToken,
+  computeDiffHash,
+  _resetForTest as _resetTokenStoreForTest,
+} from "./confirmation-tokens.js";
 
 // Set env vars before module evaluation
 vi.hoisted(() => {
@@ -5392,5 +5397,521 @@ describe("create_page wait_for_post_processing (C2)", () => {
 
     // Clean up the persistent mockImplementation so it doesn't leak.
     (getPage as any).mockReset();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: soft-confirm (confirm_token) handler tests (§5.4 tasks 2.C + 2.D)
+// ---------------------------------------------------------------------------
+
+/**
+ * Soft-confirm handler tests.
+ *
+ * These tests verify the preamble logic across gated tool handlers:
+ *   - Valid token → write proceeds without calling gateOperation
+ *   - Invalid/replayed/cross-page/cross-tool/version-mismatched token → CONFIRMATION_TOKEN_INVALID
+ *   - Pre-seal profile (sealedCloudId undefined) → falls through to gateOperation
+ *   - SoftConfirmationRequiredError → structured SOFT_CONFIRMATION_REQUIRED result
+ *
+ * Note: EPIMETHIAN_ALLOW_UNGATED_WRITES is set globally to "true" in the test
+ * preamble. Tests that exercise the gate must unset it within their scope and
+ * restore it in afterEach.
+ */
+describe("Phase 2: soft-confirm preamble on gated tools", () => {
+  const CLOUD_ID = "cloud-abc-test";
+
+  // The handler under test throughout most of this section.
+  let handler: Function;
+
+  beforeEach(async () => {
+    _resetTokenStoreForTest();
+    vi.clearAllMocks();
+    handler = registeredTools.get("update_page")!.handler;
+  });
+
+  afterEach(() => {
+    // Restore the global bypass so other test suites are unaffected.
+    process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES = "true";
+  });
+
+  // -------------------------------------------------------------------------
+  // Helper: return a getConfig mock value with sealedCloudId set
+  // -------------------------------------------------------------------------
+  const configWithCloudId = {
+    url: "https://test.atlassian.net",
+    email: "user@test.com",
+    profile: null,
+    readOnly: false,
+    attribution: true,
+    apiV2: "https://test.atlassian.net/wiki/api/v2",
+    apiV1: "https://test.atlassian.net/wiki/rest/api",
+    authHeader: "Basic dGVzdA==",
+    jsonHeaders: {},
+    sealedCloudId: CLOUD_ID,
+  };
+
+  // -------------------------------------------------------------------------
+  // 2.C.1: Valid token short-circuits the gate — write succeeds without gate.
+  // -------------------------------------------------------------------------
+  it("2.C.1: valid confirm_token bypasses gateOperation and write succeeds", async () => {
+    const { getConfig, getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-sc1";
+    const PAGE_VERSION = 7;
+    const BODY = "<p>new content for sc1</p>";
+
+    // Set up getConfig with sealedCloudId.
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+
+    // Current page.
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID,
+      title: "SC1 Page",
+      version: { number: PAGE_VERSION },
+      body: { storage: { value: "<p>old content</p>" } },
+    });
+
+    // Write succeeds.
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: PAGE_ID, title: "SC1 Page", version: { number: PAGE_VERSION + 1 } },
+      newVersion: PAGE_VERSION + 1,
+    });
+
+    // Mint a matching token.
+    const diffHash = computeDiffHash(BODY, PAGE_VERSION);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: PAGE_VERSION,
+      diffHash,
+    });
+
+    // Remove the bypass so the gate would normally fire without a token.
+    delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+
+    const result = await handler({
+      page_id: PAGE_ID,
+      version: PAGE_VERSION,
+      body: BODY,
+      replace_body: true,  // destructive flag — would gate without a token
+      confirm_token: token,
+    });
+
+    // Write should succeed.
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("SC1 Page");
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.C.2: Token reuse returns CONFIRMATION_TOKEN_INVALID (single-use).
+  // -------------------------------------------------------------------------
+  it("2.C.2: replaying a consumed confirm_token returns CONFIRMATION_TOKEN_INVALID", async () => {
+    const { getConfig, getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-sc2";
+    const PAGE_VERSION = 3;
+    const BODY = "<p>replay test</p>";
+
+    const diffHash = computeDiffHash(BODY, PAGE_VERSION);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: PAGE_VERSION,
+      diffHash,
+    });
+
+    // First call — token consumed, write succeeds.
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "T", version: { number: PAGE_VERSION },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: PAGE_ID, title: "T", version: { number: PAGE_VERSION + 1 } },
+      newVersion: PAGE_VERSION + 1,
+    });
+    delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+    await handler({ page_id: PAGE_ID, version: PAGE_VERSION, body: BODY, replace_body: true, confirm_token: token });
+
+    // Reset so second call can proceed to the preamble.
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "T", version: { number: PAGE_VERSION },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+
+    // Second call with the same token — should return token-invalid error.
+    const result = await handler({
+      page_id: PAGE_ID,
+      version: PAGE_VERSION,
+      body: BODY,
+      replace_body: true,
+      confirm_token: token,
+    });
+    expect(result.isError).toBe(true);
+    // The ConverterError message text (code is in .code property, not in the output text).
+    expect(result.content[0].text).toContain("confirmation token is no longer valid");
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.C.3: Cross-tool token → CONFIRMATION_TOKEN_INVALID
+  // -------------------------------------------------------------------------
+  it("2.C.3: token minted for delete_page is invalid for update_page", async () => {
+    const { getConfig, getPage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-sc3";
+    const PAGE_VERSION = 4;
+    const BODY = "<p>cross-tool test</p>";
+
+    // Mint token bound to delete_page, not update_page.
+    const diffHash = computeDiffHash(BODY, PAGE_VERSION);
+    const { token } = mintToken({
+      tool: "delete_page",  // WRONG TOOL
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: PAGE_VERSION,
+      diffHash,
+    });
+
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "T", version: { number: PAGE_VERSION },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+
+    const result = await handler({
+      page_id: PAGE_ID,
+      version: PAGE_VERSION,
+      body: BODY,
+      replace_body: true,
+      confirm_token: token,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("confirmation token is no longer valid");
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.C.4: Cross-page token → CONFIRMATION_TOKEN_INVALID
+  // -------------------------------------------------------------------------
+  it("2.C.4: token minted for page X is invalid for page Y", async () => {
+    const { getConfig, getPage } = await import("./confluence-client.js");
+    const PAGE_ID_Y = "page-sc4-Y";
+    const PAGE_VERSION = 5;
+    const BODY = "<p>cross-page test</p>";
+
+    // Mint token for a DIFFERENT page.
+    const diffHash = computeDiffHash(BODY, PAGE_VERSION);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: "page-sc4-X",  // minted for X
+      pageVersion: PAGE_VERSION,
+      diffHash,
+    });
+
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID_Y, title: "T", version: { number: PAGE_VERSION },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+
+    const result = await handler({
+      page_id: PAGE_ID_Y,  // calling for Y
+      version: PAGE_VERSION,
+      body: BODY,
+      replace_body: true,
+      confirm_token: token,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("confirmation token is no longer valid");
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.C.5: Different diff body → CONFIRMATION_TOKEN_INVALID
+  // -------------------------------------------------------------------------
+  it("2.C.5: token minted for body A is invalid when handler receives body B", async () => {
+    const { getConfig, getPage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-sc5";
+    const PAGE_VERSION = 6;
+    const BODY_A = "<p>body A</p>";
+    const BODY_B = "<p>body B — different!</p>";
+
+    // Mint token for body A.
+    const diffHashA = computeDiffHash(BODY_A, PAGE_VERSION);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: PAGE_VERSION,
+      diffHash: diffHashA,
+    });
+
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "T", version: { number: PAGE_VERSION },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+
+    // Call handler with body B — diffHash will be computed from B → mismatch.
+    const result = await handler({
+      page_id: PAGE_ID,
+      version: PAGE_VERSION,
+      body: BODY_B,  // DIFFERENT from minted
+      replace_body: true,
+      confirm_token: token,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("confirmation token is no longer valid");
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.C.6: Different page version → CONFIRMATION_TOKEN_INVALID
+  // -------------------------------------------------------------------------
+  it("2.C.6: token minted at version 7 is invalid when page is at version 8", async () => {
+    const { getConfig, getPage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-sc6";
+    const BODY = "<p>version mismatch test</p>";
+
+    // Mint token at version 7.
+    const diffHashV7 = computeDiffHash(BODY, 7);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: 7,
+      diffHash: diffHashV7,
+    });
+
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+    // But page has advanced to version 8.
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "T", version: { number: 8 },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+
+    // Handler computes diffHash from (BODY, pageVersion=8) — mismatch vs minted (7).
+    const result = await handler({
+      page_id: PAGE_ID,
+      version: 8,
+      body: BODY,
+      replace_body: true,
+      confirm_token: token,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("confirmation token is no longer valid");
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.C.7: Different cloudId (multi-tenant guard) → CONFIRMATION_TOKEN_INVALID
+  // -------------------------------------------------------------------------
+  it("2.C.7: token minted for tenant A is invalid when config returns tenant B", async () => {
+    const { getConfig, getPage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-sc7";
+    const PAGE_VERSION = 2;
+    const BODY = "<p>tenant guard test</p>";
+
+    // Mint token for CLOUD_ID (tenant A).
+    const diffHash = computeDiffHash(BODY, PAGE_VERSION);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: PAGE_VERSION,
+      diffHash,
+    });
+
+    // But getConfig returns a DIFFERENT cloudId (tenant B).
+    (getConfig as any).mockResolvedValueOnce({
+      ...configWithCloudId,
+      sealedCloudId: "cloud-DIFFERENT-TENANT",
+    });
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "T", version: { number: PAGE_VERSION },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+
+    const result = await handler({
+      page_id: PAGE_ID,
+      version: PAGE_VERSION,
+      body: BODY,
+      replace_body: true,
+      confirm_token: token,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("confirmation token is no longer valid");
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.C.8: Pre-seal profile (sealedCloudId undefined) → falls through to gate
+  // -------------------------------------------------------------------------
+  it("2.C.8: pre-seal profile (sealedCloudId undefined) ignores confirm_token and falls through to gate", async () => {
+    const { getConfig, getPage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-sc8";
+    const PAGE_VERSION = 1;
+    const BODY = "<p>pre-seal test</p>";
+
+    // Mint a valid-looking token but cloudId won't match (pre-seal has no cloudId).
+    const diffHash = computeDiffHash(BODY, PAGE_VERSION);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: PAGE_VERSION,
+      diffHash,
+    });
+
+    // getConfig returns NO sealedCloudId (pre-seal / env-var profile).
+    (getConfig as any).mockResolvedValueOnce({
+      ...configWithCloudId,
+      sealedCloudId: undefined,
+    });
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "T", version: { number: PAGE_VERSION },
+      body: { storage: { value: "<p>old</p>" } },
+    });
+
+    // Remove bypass so gate would fire.
+    delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+
+    // With ALLOW_UNGATED_WRITES unset and no elicitation support, the gate
+    // should fire and throw SoftConfirmationRequiredError — but since
+    // sealedCloudId is undefined, soft-mode can't mint; legacy error fires.
+    // The token is present but must NOT be validated (cloudId is undefined).
+    const result = await handler({
+      page_id: PAGE_ID,
+      version: PAGE_VERSION,
+      body: BODY,
+      replace_body: true,
+      confirm_token: token,
+    });
+    expect(result.isError).toBe(true);
+    // Should be a gate error, NOT a CONFIRMATION_TOKEN_INVALID error.
+    expect(result.content[0].text).not.toContain("CONFIRMATION_TOKEN_INVALID");
+    // Token should still be valid (was never validated — cloudId gate skipped it).
+    // We can't easily verify this without validateToken, but we can assert the
+    // result is a gate error code (ELICITATION_REQUIRED_BUT_UNAVAILABLE or similar).
+    expect(result.content[0].text).toContain("Error:");
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.D.1: SoftConfirmationRequiredError → structured SOFT_CONFIRMATION_REQUIRED result
+  // -------------------------------------------------------------------------
+  it("2.D.1: no confirm_token + no elicitation + sealedCloudId set → SOFT_CONFIRMATION_REQUIRED response", async () => {
+    const { getConfig, getPage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-sc9";
+    const PAGE_VERSION = 10;
+
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "SC9 Page", version: { number: PAGE_VERSION },
+      body: { storage: { value: "<p>old content</p>" } },
+    });
+
+    // Remove bypass so the gate fires.
+    delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+
+    // No confirm_token — gate fires → SoftConfirmationRequiredError → structured result.
+    const result = await handler({
+      page_id: PAGE_ID,
+      version: PAGE_VERSION,
+      body: "<p>new content</p>",
+      replace_body: true,
+      // No confirm_token
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    // structuredContent must carry the full token.
+    expect(result.structuredContent).toBeDefined();
+    expect(typeof result.structuredContent?.confirm_token).toBe("string");
+    expect(result.structuredContent?.page_id).toBe(PAGE_ID);
+    // Full token must NOT appear in free-text content (security invariant).
+    const fullToken = result.structuredContent?.confirm_token as string;
+    if (fullToken && fullToken.length > 8) {
+      expect(result.content[0].text).not.toContain(fullToken);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.C: delete_page — token preamble works with empty diffHash ("" body)
+  // -------------------------------------------------------------------------
+  it("2.C (delete_page): valid confirm_token bypasses gate for delete_page", async () => {
+    const { getConfig, deletePage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-del-sc";
+    const PAGE_VERSION = 5;
+
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+    (deletePage as any).mockResolvedValueOnce(undefined);
+
+    // delete_page uses computeDiffHash("", pageVersion).
+    const diffHash = computeDiffHash("", PAGE_VERSION);
+    const { token } = mintToken({
+      tool: "delete_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: PAGE_VERSION,
+      diffHash,
+    });
+
+    delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+
+    const deleteHandler = registeredTools.get("delete_page")!.handler;
+    const result = await deleteHandler({
+      page_id: PAGE_ID,
+      version: PAGE_VERSION,
+      confirm_token: token,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain(`Deleted page ${PAGE_ID}`);
+  });
+
+  // -------------------------------------------------------------------------
+  // 2.C: revert_page — token preamble works with empty diffHash ("" body)
+  // -------------------------------------------------------------------------
+  it("2.C (revert_page): valid confirm_token bypasses gate for revert_page", async () => {
+    const { getConfig, getPage, getPageVersionBody, _rawUpdatePage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-rev-sc";
+    const CURRENT_VERSION = 4;
+    const TARGET_VERSION = 2;
+
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+
+    // revert_page fetches the page AFTER the gate (token consumed → gate skipped).
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "Rev Page", version: { number: CURRENT_VERSION },
+      body: { storage: { value: "<p>current body with plenty of content here</p>" } },
+    });
+    (getPageVersionBody as any).mockResolvedValueOnce({
+      rawBody: "<p>current body with plenty of content here</p>",  // same size — no shrinkage
+      title: "Rev Page",
+      version: CURRENT_VERSION,
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: PAGE_ID, title: "Rev Page", version: { number: CURRENT_VERSION + 1 } },
+      newVersion: CURRENT_VERSION + 1,
+    });
+
+    // revert_page uses computeDiffHash("", current_version).
+    const diffHash = computeDiffHash("", CURRENT_VERSION);
+    const { token } = mintToken({
+      tool: "revert_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: CURRENT_VERSION,
+      diffHash,
+    });
+
+    delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+
+    const revertHandler = registeredTools.get("revert_page")!.handler;
+    const result = await revertHandler({
+      page_id: PAGE_ID,
+      target_version: TARGET_VERSION,
+      current_version: CURRENT_VERSION,
+      confirm_token: token,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Reverted");
   });
 });

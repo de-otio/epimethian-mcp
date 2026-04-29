@@ -72,6 +72,8 @@ import {
   safePrepareBody,
   safePrepareMultiSectionBody,
   safeSubmitPage,
+  maybeConsumeConfirmToken,
+  formatSoftConfirmationResult,
   type FindReplacePair,
 } from "./safe-write.js";
 import {
@@ -80,7 +82,15 @@ import {
   validateSource,
 } from "./source-provenance.js";
 import { writeBudget } from "./write-budget.js";
-import { gateOperation, type DeletionSummary } from "./elicitation.js";
+import {
+  gateOperation,
+  type DeletionSummary,
+  SoftConfirmationRequiredError,
+} from "./elicitation.js";
+import {
+  computeDiffHash,
+  invalidateForPage,
+} from "./confirmation-tokens.js";
 import { planUpdate } from "./converter/update-orchestrator.js";
 import { tokeniseStorage } from "./converter/tokeniser.js";
 import { resolveToolFilter } from "./tool-allowlist.js";
@@ -292,6 +302,8 @@ function tryForecastDeletions(
 type ToolResult = {
   content: { type: "text"; text: string }[];
   isError?: boolean;
+  // Phase 2 §3.5: structured output for SOFT_CONFIRMATION_REQUIRED
+  structuredContent?: Record<string, unknown>;
 };
 
 /**
@@ -724,6 +736,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       versionMessage?: string;
       allowRawHtml?: boolean;
       confluenceBaseUrl?: string;
+      /** 2.E: cloudId for post-write token invalidation. */
+      cloudId?: string;
     } = {}
   ): Promise<{ page: { id: string; title: string }; newVersion: number; oldLen: number; newLen: number }> {
     const currentPage = await getPage(page_id, true);
@@ -789,6 +803,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       clientLabel: getClientLabel(server),
       operation: position === "prepend" ? "prepend_to_page" : "append_to_page",
       assertGrowth: true,
+      // 2.E: defense-in-depth invalidation.
+      cloudId: opts.cloudId,
     });
 
     return { page: submitted.page, newVersion: submitted.newVersion, oldLen: currentStorage.length, newLen: newBody.length };
@@ -1053,7 +1069,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "replace_body skips all safety nets (token preservation, deletion confirmation). " +
           "When delegating update_page to a subagent, ensure the agent includes the full existing body — " +
           "replace_body replaces ALL content with only what you provide.\n\n" +
-          "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
+          "If your MCP client does not support in-protocol confirmation, this tool returns `SOFT_CONFIRMATION_REQUIRED` on the first call when destructive flags are set. STOP and ask the user before retrying. If the user approves, re-call this tool with the same parameters plus `confirm_token` from the first response. The token expires after 5 minutes and is invalidated by competing writes. See the 'Soft confirmation' section of `install-agent.md` for the full protocol."
         ),
         config
       ),
@@ -1116,10 +1132,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .optional()
           .describe("Override the Confluence base URL used by the link rewriter. Defaults to the configured Confluence URL."),
         source: sourceSchema,
+        confirm_token: z
+          .string()
+          .optional()
+          .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and page version."),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, title, version, body, version_message, confirm_deletions, replace_body, confirm_shrinkage, confirm_structure_loss, allow_raw_html, confluence_base_url, source }) => {
+    async ({ page_id, title, version, body, version_message, confirm_deletions, replace_body, confirm_shrinkage, confirm_structure_loss, allow_raw_html, confluence_base_url, source, confirm_token }) => {
       const blocked = writeGuard("update_page", config);
       if (blocked) return blocked;
       try {
@@ -1140,8 +1160,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         // read-only and has no side effects. The forecast runs planUpdate
         // (pure) against the current body + caller markdown.
         const cfg = await getConfig();
+        const cloudId = cfg.sealedCloudId;
         const currentPage = await getPage(page_id, true);
         const currentStorage = currentPage.body?.storage?.value ?? currentPage.body?.value ?? "";
+        const pageVersion = currentPage.version?.number ?? 0;
 
         // E4: gate update_page when any destructive flag is set. Plain
         // content updates (no confirm_* / replace_body) are not gated —
@@ -1154,17 +1176,48 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             confirm_deletions && body
               ? tryForecastDeletions(currentStorage, body, confluence_base_url ?? cfg.url)
               : null;
-          await gateOperation(server, {
+
+          // 2.C preamble — resolve confirm_token before reaching gateOperation.
+          // For update_page, diffHash is bound to the caller's body content
+          // (or currentStorage for title-only updates) + pageVersion.
+          const diffHash = (cloudId && pageVersion > 0)
+            ? computeDiffHash(body ?? currentStorage, pageVersion)
+            : undefined;
+
+          const tokenResult = await maybeConsumeConfirmToken({
+            confirm_token,
             tool: "update_page",
-            summary: `Update page ${page_id} with destructive flags?`,
-            details: {
-              page_id,
-              flags: flagsSet.join(","),
-              source: effectiveSource,
-              version,
-              ...(deletionSummary ? { deletionSummary } : {}),
-            },
+            cloudId,
+            pageId: page_id,
+            pageVersion,
+            diffHash,
           });
+
+          if (tokenResult === "invalid") {
+            throw new ConverterError(
+              "The confirmation token is no longer valid. Mint a new one by " +
+              "re-calling this tool without confirm_token, ask the user again, " +
+              "then retry with the new token.",
+              "CONFIRMATION_TOKEN_INVALID",
+            );
+          } else if (tokenResult === "no_token") {
+            await gateOperation(server, {
+              tool: "update_page",
+              summary: `Update page ${page_id} with destructive flags?`,
+              details: {
+                page_id,
+                flags: flagsSet.join(","),
+                source: effectiveSource,
+                version,
+                ...(deletionSummary ? { deletionSummary } : {}),
+              },
+              cloudId,
+              pageId: page_id,
+              pageVersion,
+              diffHash,
+            });
+          }
+          // tokenResult === "ok": token consumed; skip gate entirely.
         }
 
         // C2: resolve `version: "current"` against the live page metadata.
@@ -1212,6 +1265,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           confirmDeletions: confirm_deletions,
           // E2: thread the validated source into the mutation log.
           source: effectiveSource,
+          // 2.E: defense-in-depth invalidation.
+          cloudId,
         });
 
         const isTitleOnly = prepared.finalStorage === undefined;
@@ -1235,6 +1290,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           appendWarnings(`Updated: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, body: ${submitted.oldLen}\u2192${submitted.newLen} chars${removalNote})`, warnings) + echo
         );
       } catch (err) {
+        // 2.D: SoftConfirmationRequiredError \u2192 structured token response.
+        if (err instanceof SoftConfirmationRequiredError) {
+          return formatSoftConfirmationResult(err, { pageId: page_id });
+        }
         return toolErrorWithContext(err, { operation: "update_page", resource: `page ${page_id}`, profile: config.profile });
       }
     }
@@ -1252,7 +1311,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "EPIMETHIAN_LEGACY_DELETE_WITHOUT_VERSION=true to restore the " +
             "previous version-less behaviour for one release while scripts " +
             "are migrated.\n\n" +
-            "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
+            "If your MCP client does not support in-protocol confirmation, this tool returns `SOFT_CONFIRMATION_REQUIRED` on the first call when destructive flags are set. STOP and ask the user before retrying. If the user approves, re-call this tool with the same parameters plus `confirm_token` from the first response. The token expires after 5 minutes and is invalidated by competing writes. See the 'Soft confirmation' section of `install-agent.md` for the full protocol."
         ),
         config
       ),
@@ -1269,10 +1328,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
               "is set; omitting it under the legacy flag emits a stderr warning."
           ),
         source: sourceSchema,
+        confirm_token: z
+          .string()
+          .optional()
+          .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact page version."),
       },
       annotations: { destructiveHint: true, idempotentHint: true },
     },
-    async ({ page_id, version, source }) => {
+    async ({ page_id, version, source, confirm_token }) => {
       const blocked = writeGuard("delete_page", config);
       if (blocked) return blocked;
       try {
@@ -1301,21 +1364,59 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
               `(legacy opt-out active). This opt-out will be removed in a future release.`
           );
         }
-        // E4: delete_page is unconditionally gated — all deletes are
-        // destructive enough to require an explicit user confirmation when
-        // the client supports elicitation.
-        await gateOperation(server, {
+
+        // 2.C preamble — for delete_page, no body diff; use empty string for
+        // canonical XML (the version alone provides sufficient binding).
+        const cfg = await getConfig();
+        const cloudId = cfg.sealedCloudId;
+        const pageVersion = version ?? 0;
+        const diffHash = (cloudId && pageVersion > 0)
+          ? computeDiffHash("", pageVersion)
+          : undefined;
+
+        const tokenResult = await maybeConsumeConfirmToken({
+          confirm_token,
           tool: "delete_page",
-          summary: `Delete page ${page_id}?`,
-          details: {
-            page_id,
-            version: version ?? "(legacy: unversioned)",
-            source: effectiveSource,
-          },
+          cloudId,
+          pageId: page_id,
+          pageVersion,
+          diffHash,
         });
+
+        if (tokenResult === "invalid") {
+          throw new ConverterError(
+            "The confirmation token is no longer valid. Mint a new one by " +
+            "re-calling this tool without confirm_token, ask the user again, " +
+            "then retry with the new token.",
+            "CONFIRMATION_TOKEN_INVALID",
+          );
+        } else if (tokenResult === "no_token") {
+          // E4: delete_page is unconditionally gated — all deletes are
+          // destructive enough to require an explicit user confirmation when
+          // the client supports elicitation.
+          await gateOperation(server, {
+            tool: "delete_page",
+            summary: `Delete page ${page_id}?`,
+            details: {
+              page_id,
+              version: version ?? "(legacy: unversioned)",
+              source: effectiveSource,
+            },
+            cloudId,
+            pageId: page_id,
+            pageVersion,
+            diffHash,
+          });
+        }
+        // tokenResult === "ok": token consumed; skip gate.
+
         // F4: count delete_page against the write budget before dispatch.
         writeBudget.consume();
         await deletePage(page_id, version);
+        // 2.E: invalidate outstanding soft-confirmation tokens for this page.
+        if (cloudId !== undefined) {
+          invalidateForPage(cloudId, page_id);
+        }
         logMutation({
           timestamp: new Date().toISOString(),
           operation: "delete_page",
@@ -1325,6 +1426,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         });
         return toolResult(`Deleted page ${page_id}` + echo);
       } catch (err) {
+        // 2.D: SoftConfirmationRequiredError → structured token response.
+        if (err instanceof SoftConfirmationRequiredError) {
+          return formatSoftConfirmationResult(err, { pageId: page_id });
+        }
         logMutation(errorRecord("delete_page", page_id, err));
         return toolErrorWithContext(err, { operation: "delete_page", resource: `page ${page_id}`, profile: config.profile });
       }
@@ -1339,7 +1444,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         withDestructiveWarning(
           "Update a single section of a Confluence page by heading name. Only the content under the specified heading is replaced; the rest of the page is untouched. Use headings_only to find section names first. " +
           "Note: in Confluence spaces with heading auto-numbering enabled, stored heading text contains the prefix (e.g. `1.2. Section`); the matcher accepts either the prefixed or plain form.\n\n" +
-          "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
+          "If your MCP client does not support in-protocol confirmation, this tool returns `SOFT_CONFIRMATION_REQUIRED` on the first call when destructive flags are set. STOP and ask the user before retrying. If the user approves, re-call this tool with the same parameters plus `confirm_token` from the first response. The token expires after 5 minutes and is invalidated by competing writes. See the 'Soft confirmation' section of `install-agent.md` for the full protocol."
         ),
         config
       ),
@@ -1413,10 +1518,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .boolean()
           .default(false)
           .describe("Set to true to acknowledge that your markdown removes preserved macros, emoticons, or rich elements from this section. Required when any preserved element would be deleted."),
+        confirm_token: z
+          .string()
+          .optional()
+          .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and page version."),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, section, body, find_replace, version, version_message, confirm_deletions }) => {
+    async ({ page_id, section, body, find_replace, version, version_message, confirm_deletions, confirm_token }) => {
       const blocked = writeGuard("update_page_section", config);
       if (blocked) return blocked;
       try {
@@ -1441,8 +1550,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         // F3: space allowlist.
         await checkSpaceAllowed({ pageId: page_id });
         const cfg = await getConfig();
+        const cloudId = cfg.sealedCloudId;
         const page = await getPage(page_id, true);
         const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
+        const pageVersion = page.version?.number ?? 0;
 
         // C2: resolve `version: "current"`. The caller has explicitly
         // opted out of optimistic concurrency for this submission.
@@ -1494,6 +1605,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             deletedTokens: [],
             operation: "update_page_section",
             clientLabel: getClientLabel(server),
+            cloudId,
           });
           const warnings: WarningAccumulator = [];
           const labelResult = await ensureAttributionLabel(submitted.page.id);
@@ -1517,16 +1629,45 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         // forecast purely (planUpdate has no side effects).
         if (confirm_deletions) {
           const deletionSummary = tryForecastDeletions(currentSectionBody, body!, cfg.url);
-          await gateOperation(server, {
+
+          // 2.C preamble — diffHash from the caller's body + pageVersion.
+          const diffHash = (cloudId && pageVersion > 0)
+            ? computeDiffHash(body ?? currentSectionBody, pageVersion)
+            : undefined;
+
+          const tokenResult = await maybeConsumeConfirmToken({
+            confirm_token,
             tool: "update_page_section",
-            summary: `Update section "${section}" in page ${page_id} with confirm_deletions?`,
-            details: {
-              page_id,
-              section,
-              source: "confirm_deletions",
-              ...(deletionSummary ? { deletionSummary } : {}),
-            },
+            cloudId,
+            pageId: page_id,
+            pageVersion,
+            diffHash,
           });
+
+          if (tokenResult === "invalid") {
+            throw new ConverterError(
+              "The confirmation token is no longer valid. Mint a new one by " +
+              "re-calling this tool without confirm_token, ask the user again, " +
+              "then retry with the new token.",
+              "CONFIRMATION_TOKEN_INVALID",
+            );
+          } else if (tokenResult === "no_token") {
+            await gateOperation(server, {
+              tool: "update_page_section",
+              summary: `Update section "${section}" in page ${page_id} with confirm_deletions?`,
+              details: {
+                page_id,
+                section,
+                source: "confirm_deletions",
+                ...(deletionSummary ? { deletionSummary } : {}),
+              },
+              cloudId,
+              pageId: page_id,
+              pageVersion,
+              diffHash,
+            });
+          }
+          // tokenResult === "ok": token consumed; skip gate.
         }
 
         const prepared = await safePrepareBody({
@@ -1563,6 +1704,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           deletedTokens: prepared.deletedTokens,
           operation: "update_page_section",
           clientLabel: getClientLabel(server),
+          cloudId,
         });
 
         const warnings: WarningAccumulator = [];
@@ -1579,6 +1721,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           appendWarnings(`Updated section "${section}" in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}${removalNote})`, warnings) + echo
         );
       } catch (err) {
+        // 2.D: SoftConfirmationRequiredError → structured token response.
+        if (err instanceof SoftConfirmationRequiredError) {
+          return formatSoftConfirmationResult(err, { pageId: page_id });
+        }
         return toolErrorWithContext(err, { operation: "update_page_section", resource: `page ${page_id}`, profile: config.profile });
       }
     }
@@ -1605,7 +1751,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "the prefix (e.g. `1.2. Section`); the matcher accepts either the " +
           "prefixed or plain form. Section names must be unique within the " +
           "input list.\n\n" +
-          "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
+          "If your MCP client does not support in-protocol confirmation, this tool returns `SOFT_CONFIRMATION_REQUIRED` on the first call when destructive flags are set. STOP and ask the user before retrying. If the user approves, re-call this tool with the same parameters plus `confirm_token` from the first response. The token expires after 5 minutes and is invalidated by competing writes. See the 'Soft confirmation' section of `install-agent.md` for the full protocol."
         ),
         config
       ),
@@ -1633,6 +1779,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "deletion-summary gate fires once on the AGGREGATE — a caller " +
             "cannot bypass the gate by spreading deletions across sections."
           ),
+        confirm_token: z
+          .string()
+          .optional()
+          .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and page version."),
         sections: z
           .array(
             z.object({
@@ -1659,15 +1809,17 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, version, version_message, confirm_deletions, sections }) => {
+    async ({ page_id, version, version_message, confirm_deletions, sections, confirm_token }) => {
       const blocked = writeGuard("update_page_sections", config);
       if (blocked) return blocked;
       try {
         // F3: space allowlist.
         await checkSpaceAllowed({ pageId: page_id });
         const cfg = await getConfig();
+        const cloudId = cfg.sealedCloudId;
         const page = await getPage(page_id, true);
         const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
+        const pageVersion = page.version?.number ?? 0;
 
         // C2: resolve `version: "current"`.
         const resolvedVersion =
@@ -1723,16 +1875,47 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
               any = true;
             }
           }
-          await gateOperation(server, {
+
+          // 2.C preamble — for update_page_sections, diffHash is bound to
+          // the aggregate of all sections' bodies joined (deterministic).
+          const aggregateBody = sections.map((s) => s.body).join("\n");
+          const diffHash = (cloudId && pageVersion > 0)
+            ? computeDiffHash(aggregateBody, pageVersion)
+            : undefined;
+
+          const tokenResult = await maybeConsumeConfirmToken({
+            confirm_token,
             tool: "update_page_sections",
-            summary: `Update ${sections.length} section${sections.length === 1 ? "" : "s"} in page ${page_id} with confirm_deletions?`,
-            details: {
-              page_id,
-              section_count: sections.length,
-              source: "confirm_deletions",
-              ...(any ? { deletionSummary: summed } : {}),
-            },
+            cloudId,
+            pageId: page_id,
+            pageVersion,
+            diffHash,
           });
+
+          if (tokenResult === "invalid") {
+            throw new ConverterError(
+              "The confirmation token is no longer valid. Mint a new one by " +
+              "re-calling this tool without confirm_token, ask the user again, " +
+              "then retry with the new token.",
+              "CONFIRMATION_TOKEN_INVALID",
+            );
+          } else if (tokenResult === "no_token") {
+            await gateOperation(server, {
+              tool: "update_page_sections",
+              summary: `Update ${sections.length} section${sections.length === 1 ? "" : "s"} in page ${page_id} with confirm_deletions?`,
+              details: {
+                page_id,
+                section_count: sections.length,
+                source: "confirm_deletions",
+                ...(any ? { deletionSummary: summed } : {}),
+              },
+              cloudId,
+              pageId: page_id,
+              pageVersion,
+              diffHash,
+            });
+          }
+          // tokenResult === "ok": token consumed; skip gate.
         }
 
         // Atomic multi-section prepare — throws MultiSectionError on any
@@ -1766,6 +1949,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           operation: "update_page_section",
           clientLabel: getClientLabel(server),
           confirmDeletions: confirm_deletions,
+          cloudId,
         });
 
         const warnings: WarningAccumulator = [];
@@ -1788,6 +1972,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           ) + echo,
         );
       } catch (err) {
+        // 2.D: SoftConfirmationRequiredError → structured token response.
+        if (err instanceof SoftConfirmationRequiredError) {
+          return formatSoftConfirmationResult(err, { pageId: page_id });
+        }
         // MultiSectionError surfaces the full per-section failure list — a
         // single "Error:" line carries all of them. Fall through to the
         // common context wrapper which formats the error for the tool result.
@@ -1809,7 +1997,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "The caller provides only the new content — the server fetches the existing body and handles concatenation. " +
             "Safer than update_page with replace_body for additive operations.\n\n" +
             "Content can be GFM markdown or Confluence storage format (auto-detected).\n\n" +
-            "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
+            "If your MCP client does not support in-protocol confirmation, this tool returns `SOFT_CONFIRMATION_REQUIRED` on the first call when destructive flags are set. STOP and ask the user before retrying. If the user approves, re-call this tool with the same parameters plus `confirm_token` from the first response. The token expires after 5 minutes and is invalidated by competing writes. See the 'Soft confirmation' section of `install-agent.md` for the full protocol."
         ),
         config,
       ),
@@ -1829,6 +2017,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         version_message: z.string().optional().describe("Optional version comment"),
         allow_raw_html: z.boolean().default(false).describe("Allow raw HTML inside markdown content (default false)."),
         confluence_base_url: z.string().url().optional().describe("Override the Confluence base URL used by the link rewriter."),
+        confirm_token: z
+          .string()
+          .optional()
+          .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and page version."),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
@@ -1841,7 +2033,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         const cfg = await getConfig();
         const { page, newVersion, oldLen, newLen } = await concatPageContent(
           page_id, version, content, "prepend",
-          { separator, versionMessage: version_message ?? "Prepend content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url },
+          { separator, versionMessage: version_message ?? "Prepend content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url, cloudId: cfg.sealedCloudId },
         );
         // Mutation logging is handled inside safeSubmitPage (via concatPageContent).
         const warnings: WarningAccumulator = [];
@@ -1851,6 +2043,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (badgeResult.warning) warnings.push(badgeResult.warning);
         return toolResult(appendWarnings(`Prepended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)`, warnings) + echo);
       } catch (err) {
+        // 2.D: SoftConfirmationRequiredError \u2192 structured token response.
+        if (err instanceof SoftConfirmationRequiredError) {
+          return formatSoftConfirmationResult(err, { pageId: page_id });
+        }
         return toolErrorWithContext(err, { operation: "prepend_to_page", resource: `page ${page_id}`, profile: config.profile });
       }
     },
@@ -1866,7 +2062,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "The caller provides only the new content — the server fetches the existing body and handles concatenation. " +
             "Safer than update_page with replace_body for additive operations.\n\n" +
             "Content can be GFM markdown or Confluence storage format (auto-detected).\n\n" +
-            "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt — but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
+            "If your MCP client does not support in-protocol confirmation, this tool returns `SOFT_CONFIRMATION_REQUIRED` on the first call when destructive flags are set. STOP and ask the user before retrying. If the user approves, re-call this tool with the same parameters plus `confirm_token` from the first response. The token expires after 5 minutes and is invalidated by competing writes. See the 'Soft confirmation' section of `install-agent.md` for the full protocol."
         ),
         config,
       ),
@@ -1886,6 +2082,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         version_message: z.string().optional().describe("Optional version comment"),
         allow_raw_html: z.boolean().default(false).describe("Allow raw HTML inside markdown content (default false)."),
         confluence_base_url: z.string().url().optional().describe("Override the Confluence base URL used by the link rewriter."),
+        confirm_token: z
+          .string()
+          .optional()
+          .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and page version."),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
@@ -1898,7 +2098,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         const cfg = await getConfig();
         const { page, newVersion, oldLen, newLen } = await concatPageContent(
           page_id, version, content, "append",
-          { separator, versionMessage: version_message ?? "Append content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url },
+          { separator, versionMessage: version_message ?? "Append content", allowRawHtml: allow_raw_html, confluenceBaseUrl: confluence_base_url ?? cfg.url, cloudId: cfg.sealedCloudId },
         );
         // Mutation logging is handled inside safeSubmitPage (via concatPageContent).
         const warnings: WarningAccumulator = [];
@@ -1908,6 +2108,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (badgeResult.warning) warnings.push(badgeResult.warning);
         return toolResult(appendWarnings(`Appended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)`, warnings) + echo);
       } catch (err) {
+        // 2.D: SoftConfirmationRequiredError \u2192 structured token response.
+        if (err instanceof SoftConfirmationRequiredError) {
+          return formatSoftConfirmationResult(err, { pageId: page_id });
+        }
         return toolErrorWithContext(err, { operation: "append_to_page", resource: `page ${page_id}`, profile: config.profile });
       }
     },
@@ -3103,7 +3307,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "to update_page, this preserves all macros, formatting, and rich elements exactly.\n\n" +
           "The shrinkage guard applies: if the reverted content is significantly smaller than the " +
           "current content, you will be asked to confirm.\n\n" +
-          "If your MCP client does not support in-protocol confirmation, destructive flag use will be mediated through your agent's normal chat surface in v6.6.0+. In v6.5.0 and earlier, set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` to proceed without the confirmation prompt \u2014 but you (the agent) MUST still ask the user before invoking this tool with destructive flags."
+          "If your MCP client does not support in-protocol confirmation, this tool returns `SOFT_CONFIRMATION_REQUIRED` on the first call when destructive flags are set. STOP and ask the user before retrying. If the user approves, re-call this tool with the same parameters plus `confirm_token` from the first response. The token expires after 5 minutes and is invalidated by competing writes. See the 'Soft confirmation' section of `install-agent.md` for the full protocol."
         ),
         config,
       ),
@@ -3142,6 +3346,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "Optional version comment. Defaults to 'Revert to version N'."
           ),
         source: sourceSchema,
+        confirm_token: z
+          .string()
+          .optional()
+          .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact page version."),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
@@ -3153,6 +3361,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       confirm_structure_loss,
       version_message,
       source,
+      confirm_token,
     }) => {
       const blocked = writeGuard("revert_page", config);
       if (blocked) return blocked;
@@ -3169,21 +3378,54 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         });
         const effectiveSource = validateSource(source, flagsSet);
 
-        // E4: revert_page is always gated — reverting to an arbitrary
-        // historical version is a destructive operation that should
-        // surface to the user every time.
-        await gateOperation(server, {
+        // 2.C preamble — for revert_page, no body diff; use empty string for
+        // canonical XML (the version alone provides sufficient binding).
+        const cfg = await getConfig();
+        const cloudId = cfg.sealedCloudId;
+        const pageVersion = current_version;
+        const diffHash = (cloudId && pageVersion > 0)
+          ? computeDiffHash("", pageVersion)
+          : undefined;
+
+        const tokenResult = await maybeConsumeConfirmToken({
+          confirm_token,
           tool: "revert_page",
-          summary: `Revert page ${page_id} to version ${target_version}?`,
-          details: {
-            page_id,
-            target_version,
-            current_version,
-            confirm_shrinkage,
-            confirm_structure_loss,
-            source: effectiveSource,
-          },
+          cloudId,
+          pageId: page_id,
+          pageVersion,
+          diffHash,
         });
+
+        if (tokenResult === "invalid") {
+          throw new ConverterError(
+            "The confirmation token is no longer valid. Mint a new one by " +
+            "re-calling this tool without confirm_token, ask the user again, " +
+            "then retry with the new token.",
+            "CONFIRMATION_TOKEN_INVALID",
+          );
+        } else if (tokenResult === "no_token") {
+          // E4: revert_page is always gated — reverting to an arbitrary
+          // historical version is a destructive operation that should
+          // surface to the user every time.
+          await gateOperation(server, {
+            tool: "revert_page",
+            summary: `Revert page ${page_id} to version ${target_version}?`,
+            details: {
+              page_id,
+              target_version,
+              current_version,
+              confirm_shrinkage,
+              confirm_structure_loss,
+              source: effectiveSource,
+            },
+            cloudId,
+            pageId: page_id,
+            pageVersion,
+            diffHash,
+          });
+        }
+        // tokenResult === "ok": token consumed; skip gate.
+
         // 1. Fetch current page for body and metadata
         const currentPage = await getPage(page_id, true);
         const currentStorage =
@@ -3232,6 +3474,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           confirmStructureLoss: confirm_structure_loss,
           // E2: thread validated source for the mutation log.
           source: effectiveSource,
+          // 2.E: defense-in-depth token invalidation after successful write.
+          cloudId,
         });
 
         const warnings: WarningAccumulator = [];
@@ -3248,6 +3492,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           ) + echo
         );
       } catch (err) {
+        // 2.D: SoftConfirmationRequiredError \u2192 structured token response.
+        if (err instanceof SoftConfirmationRequiredError) {
+          return formatSoftConfirmationResult(err, { pageId: page_id });
+        }
         return toolErrorWithContext(err, { operation: "revert_page", resource: `page ${page_id}`, profile: config.profile });
       }
     }

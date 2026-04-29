@@ -66,6 +66,10 @@ import {
   normalizeBodyForSubmit,
   type PageData,
 } from "./confluence-client.js";
+import {
+  validateToken,
+  invalidateForPage,
+} from "./confirmation-tokens.js";
 import { markdownToStorage } from "./converter/md-to-storage.js";
 import { planUpdate } from "./converter/update-orchestrator.js";
 import { enforceContentSafetyGuards } from "./converter/content-safety-guards.js";
@@ -451,6 +455,19 @@ export interface SafeSubmitPageInput {
    * called safePrepareBody with `scope: "additive"`.
    */
   assertGrowth?: boolean;
+
+  /**
+   * Phase 2 (2.E defense-in-depth): Confluence cloudId of the tenant this
+   * write targets. When present, safeSubmitPage calls
+   * `invalidateForPage(cloudId, pageId)` after a successful PUT so that
+   * any outstanding soft-confirmation tokens for this page are atomically
+   * invalidated — even if the write bypassed `validateToken` (e.g. via
+   * `EPIMETHIAN_ALLOW_UNGATED_WRITES`).
+   *
+   * Sourced from `cfg.sealedCloudId`. Omit (leave undefined) when
+   * `sealedCloudId` is not available (env-var-mode or pre-seal profiles).
+   */
+  cloudId?: string;
 }
 
 /**
@@ -515,6 +532,158 @@ export const MULTI_SECTION_FAILED = "MULTI_SECTION_FAILED";
  * section body (after tokenising). No silent no-op — the page is not modified.
  */
 export const FIND_REPLACE_MATCH_FAILED = "FIND_REPLACE_MATCH_FAILED";
+
+// ---------------------------------------------------------------------------
+// confirm_token helpers (Phase 2 / v6.6.0)
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared helper that checks a `confirm_token` against the token store.
+ * Returns:
+ *  - `"ok"`       — token valid and consumed; caller should skip gateOperation.
+ *  - `"invalid"`  — token present but failed validation; caller should throw
+ *                   CONFIRMATION_TOKEN_INVALID.
+ *  - `"no_token"` — no token or required context missing; caller should call
+ *                   gateOperation (fail-closed: soft-mode unavailable for this
+ *                   call if cloudId/pageVersion/diffHash are absent).
+ *
+ * The function returns `"no_token"` when ANY of the following is true:
+ *   - `confirm_token` is undefined.
+ *   - `cloudId` is undefined (env-var-mode or pre-seal profile).
+ *   - `pageVersion` is 0 (server returned a stub — token semantics unsound).
+ *   - `diffHash` is undefined.
+ *
+ * DATA-LOSS NOTE: This is the call-site trust boundary. A bug here could
+ * let a stale token bypass the gate OR call the gate after a successful
+ * validate (defeating single-use semantics). The helper extracts the
+ * preamble so it lives in ONE auditable place instead of being duplicated
+ * seven times across the gated tool handlers.
+ */
+export async function maybeConsumeConfirmToken(args: {
+  confirm_token?: string;
+  tool: string;
+  cloudId: string | undefined;
+  pageId: string;
+  pageVersion: number;
+  diffHash: string | undefined;
+}): Promise<"ok" | "invalid" | "no_token"> {
+  const { confirm_token, tool, cloudId, pageId, pageVersion, diffHash } = args;
+
+  // Bindings required for token semantics: any absent field → no_token.
+  if (
+    confirm_token === undefined ||
+    cloudId === undefined ||
+    pageVersion <= 0 ||
+    diffHash === undefined
+  ) {
+    return "no_token";
+  }
+
+  const outcome = await validateToken(confirm_token, {
+    tool,
+    cloudId,
+    pageId,
+    pageVersion,
+    diffHash,
+  });
+  return outcome; // "ok" | "invalid"
+}
+
+/**
+ * Format a `SoftConfirmationRequiredError` as the structured tool result
+ * defined in §3.5 of the opencode-compatibility plan.
+ *
+ * The full token lives in `structuredContent.confirm_token` — NOT in the
+ * free-text content — so it stays out of the agent's scratchpad. The
+ * visible message shows only the last 8 chars of the token for human
+ * reference.
+ *
+ * A deletion_summary with numeric counts only is included in structuredContent
+ * when the error carries one via `deletionSummary`.
+ */
+export function formatSoftConfirmationResult(
+  err: {
+    token: string;
+    auditId: string;
+    expiresAt: number;
+    humanSummary: string;
+    pageId: string;
+  },
+  params: {
+    pageId: string;
+    deletionSummary?: {
+      tocs: number;
+      links: number;
+      structuredMacros: number;
+      codeMacros: number;
+      plainElements: number;
+      other: number;
+    } | null;
+  },
+): {
+  content: { type: "text"; text: string }[];
+  isError: true;
+  structuredContent: {
+    confirm_token: string;
+    audit_id: string;
+    expires_at: string;
+    page_id: string;
+    deletion_summary?: {
+      tocs: number;
+      links: number;
+      structuredMacros: number;
+      codeMacros: number;
+      plainElements: number;
+      other: number;
+    };
+  };
+} {
+  const last8 = err.token.slice(-8);
+  const isoExpires = new Date(err.expiresAt).toISOString();
+
+  const text =
+    `⚠️  Confirmation required (SOFT_CONFIRMATION_REQUIRED)\n\n` +
+    `${err.humanSummary}\n\n` +
+    `Your MCP client does not support in-protocol elicitation. This\n` +
+    `confirmation is being routed through you (the agent). Please ASK\n` +
+    `THE USER before retrying. If the user approves, re-call this tool\n` +
+    `with the same parameters plus the \`confirm_token\` from\n` +
+    `structuredContent.\n\n` +
+    `Token tail: ...${last8}    Expires: ${isoExpires}    Audit ID: ${err.auditId}\n\n` +
+    `The token is single-use, bound to this exact diff and page version,\n` +
+    `and invalidated by any competing write to this page. If validation\n` +
+    `fails, mint a new one by re-calling without \`confirm_token\`.`;
+
+  const structuredContent: {
+    confirm_token: string;
+    audit_id: string;
+    expires_at: string;
+    page_id: string;
+    deletion_summary?: {
+      tocs: number;
+      links: number;
+      structuredMacros: number;
+      codeMacros: number;
+      plainElements: number;
+      other: number;
+    };
+  } = {
+    confirm_token: err.token,
+    audit_id: err.auditId,
+    expires_at: isoExpires,
+    page_id: params.pageId,
+  };
+
+  if (params.deletionSummary) {
+    structuredContent.deletion_summary = params.deletionSummary;
+  }
+
+  return {
+    content: [{ type: "text", text }],
+    isError: true,
+    structuredContent,
+  };
+}
 
 /**
  * Caller-supplied body size cap (Track A3). Checked at the entry of
@@ -1266,6 +1435,7 @@ export async function safeSubmitPage(
     confirmDeletions,
     source,
     assertGrowth,
+    cloudId,
   } = input;
 
   const isCreate = pageId === undefined;
@@ -1517,6 +1687,16 @@ export async function safeSubmitPage(
       });
     } catch {
       // stderr write failed — never propagate.
+    }
+
+    // 2.E defense-in-depth: invalidate all soft-confirmation tokens for this
+    // page after any successful write — even writes that bypassed validateToken
+    // (e.g. EPIMETHIAN_ALLOW_UNGATED_WRITES or creates). This is the secondary
+    // TOCTOU guard; the primary lives inside validateToken itself (which
+    // atomically invalidates siblings on "ok"). This hook covers residual
+    // paths. Skipped when cloudId is undefined (pre-seal or env-var profiles).
+    if (cloudId !== undefined && pageId !== undefined) {
+      invalidateForPage(cloudId, pageId);
     }
 
     return {

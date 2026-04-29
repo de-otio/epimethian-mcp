@@ -91,6 +91,8 @@ import {
   POST_TRANSFORM_BODY_REJECTED,
   READ_ONLY_MARKDOWN_ROUND_TRIP,
   WRITE_CONTAINS_UNTRUSTED_FENCE,
+  maybeConsumeConfirmToken,
+  formatSoftConfirmationResult,
 } from "./safe-write.js";
 import {
   canonicaliseToken,
@@ -104,6 +106,14 @@ import {
 } from "./confluence-client.js";
 import { logMutation, errorRecord } from "./mutation-log.js";
 import { ConverterError } from "./converter/types.js";
+import {
+  mintToken,
+  validateToken,
+  invalidateForPage,
+  computeDiffHash,
+  onValidate,
+  _resetForTest,
+} from "./confirmation-tokens.js";
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -2515,5 +2525,337 @@ describe("findReplaceInSection (D2)", () => {
     expect(() =>
       findReplaceInSection(body, [{ find: "anything", replace: "x" }])
     ).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Section E: maybeConsumeConfirmToken (§5.6 — task 2.C helper)
+// ---------------------------------------------------------------------------
+
+describe("maybeConsumeConfirmToken", () => {
+  beforeEach(() => {
+    _resetForTest();
+  });
+
+  it("returns 'no_token' when confirm_token is undefined", async () => {
+    const result = await maybeConsumeConfirmToken({
+      confirm_token: undefined,
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "123",
+      pageVersion: 5,
+      diffHash: computeDiffHash("<p>body</p>", 5),
+    });
+    expect(result).toBe("no_token");
+  });
+
+  it("returns 'no_token' when cloudId is undefined (pre-seal / env-var profile)", async () => {
+    const hash = computeDiffHash("<p>body</p>", 5);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "123",
+      pageVersion: 5,
+      diffHash: hash,
+    });
+    const result = await maybeConsumeConfirmToken({
+      confirm_token: token,
+      tool: "update_page",
+      cloudId: undefined,
+      pageId: "123",
+      pageVersion: 5,
+      diffHash: hash,
+    });
+    // validateToken is NOT called; token is untouched.
+    expect(result).toBe("no_token");
+  });
+
+  it("returns 'no_token' when pageVersion is 0", async () => {
+    const hash = computeDiffHash("<p>body</p>", 5);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "123",
+      pageVersion: 5,
+      diffHash: hash,
+    });
+    const result = await maybeConsumeConfirmToken({
+      confirm_token: token,
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "123",
+      pageVersion: 0,
+      diffHash: hash,
+    });
+    expect(result).toBe("no_token");
+  });
+
+  it("returns 'no_token' when diffHash is undefined", async () => {
+    const hash = computeDiffHash("<p>body</p>", 5);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "123",
+      pageVersion: 5,
+      diffHash: hash,
+    });
+    const result = await maybeConsumeConfirmToken({
+      confirm_token: token,
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "123",
+      pageVersion: 5,
+      diffHash: undefined,
+    });
+    expect(result).toBe("no_token");
+  });
+
+  it("returns 'ok' when a valid token is presented with matching context", async () => {
+    const hash = computeDiffHash("<p>body</p>", 7);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "page-42",
+      pageVersion: 7,
+      diffHash: hash,
+    });
+    const result = await maybeConsumeConfirmToken({
+      confirm_token: token,
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "page-42",
+      pageVersion: 7,
+      diffHash: hash,
+    });
+    expect(result).toBe("ok");
+  });
+
+  it("returns 'invalid' when a token is replayed (single-use enforcement)", async () => {
+    const hash = computeDiffHash("<p>body</p>", 3);
+    const { token } = mintToken({
+      tool: "delete_page",
+      cloudId: "cloud-abc",
+      pageId: "page-1",
+      pageVersion: 3,
+      diffHash: hash,
+    });
+    // First use — ok.
+    await maybeConsumeConfirmToken({
+      confirm_token: token,
+      tool: "delete_page",
+      cloudId: "cloud-abc",
+      pageId: "page-1",
+      pageVersion: 3,
+      diffHash: hash,
+    });
+    // Replay — invalid.
+    const result = await maybeConsumeConfirmToken({
+      confirm_token: token,
+      tool: "delete_page",
+      cloudId: "cloud-abc",
+      pageId: "page-1",
+      pageVersion: 3,
+      diffHash: hash,
+    });
+    expect(result).toBe("invalid");
+  });
+
+  it("returns 'invalid' when the underlying validateToken returns invalid (mismatched context)", async () => {
+    const hash = computeDiffHash("<p>body</p>", 5);
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "page-99",
+      pageVersion: 5,
+      diffHash: hash,
+    });
+    // Use with a different pageId — mismatch.
+    const result = await maybeConsumeConfirmToken({
+      confirm_token: token,
+      tool: "update_page",
+      cloudId: "cloud-abc",
+      pageId: "page-DIFFERENT",
+      pageVersion: 5,
+      diffHash: hash,
+    });
+    expect(result).toBe("invalid");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Section F: safeSubmitPage — invalidateForPage defense-in-depth (§5.6 / 2.E)
+// ---------------------------------------------------------------------------
+
+describe("safeSubmitPage — invalidateForPage defense-in-depth (2.E)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetForTest();
+  });
+
+  it("invalidates outstanding tokens for the page after a successful PUT", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "page-x", title: "Page X", version: { number: 8 } },
+      newVersion: 8,
+    });
+
+    const CLOUD_ID = "cloud-tenant-x";
+    const PAGE_ID = "page-x";
+    const hash = computeDiffHash("<p>content</p>", 7);
+
+    // Mint a token before the write.
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: 7,
+      diffHash: hash,
+    });
+
+    // Register audit hook to capture all validate outcomes in order.
+    const capturedOutcomes: string[] = [];
+    onValidate((meta) => { capturedOutcomes.push(meta.outcome); });
+
+    // Perform the write through safeSubmitPage (non-gated path — cloudId supplied).
+    await safeSubmitPage({
+      pageId: PAGE_ID,
+      title: "Page X",
+      finalStorage: "<p>after</p>",
+      previousBody: "<p>before</p>",
+      version: 7,
+      versionMessage: "test",
+      deletedTokens: [],
+      cloudId: CLOUD_ID,
+      clientLabel: "test-client",
+    });
+
+    // invalidateForPage fires the onValidate hook with outcome "stale" as it
+    // removes the token. Then validateToken below fires again with "unknown"
+    // (token was already deleted). We assert both events.
+    const validateResult = await validateToken(token, {
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: 7,
+      diffHash: hash,
+    });
+    expect(validateResult).toBe("invalid");
+    // First hook call: invalidateForPage emits "stale".
+    expect(capturedOutcomes[0]).toBe("stale");
+    // Second hook call: validateToken finds the token gone → "unknown".
+    expect(capturedOutcomes[1]).toBe("unknown");
+  });
+
+  it("does NOT call invalidateForPage when cloudId is undefined", async () => {
+    (_rawUpdatePage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      page: { id: "page-y", title: "Page Y", version: { number: 2 } },
+      newVersion: 2,
+    });
+
+    const CLOUD_ID = "cloud-tenant-y";
+    const PAGE_ID = "page-y";
+    const hash = computeDiffHash("<p>stuff</p>", 1);
+
+    // Mint a token.
+    const { token } = mintToken({
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: 1,
+      diffHash: hash,
+    });
+
+    // Submit WITHOUT cloudId — no invalidation should happen.
+    await safeSubmitPage({
+      pageId: PAGE_ID,
+      title: "Page Y",
+      finalStorage: "<p>new</p>",
+      previousBody: "<p>old</p>",
+      version: 1,
+      versionMessage: "test",
+      deletedTokens: [],
+      clientLabel: "test-client",
+      // cloudId intentionally omitted.
+    });
+
+    // Token should still be valid (no invalidation occurred).
+    const validateResult = await validateToken(token, {
+      tool: "update_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: 1,
+      diffHash: hash,
+    });
+    expect(validateResult).toBe("ok");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Section G: formatSoftConfirmationResult shape (§5.5)
+// ---------------------------------------------------------------------------
+
+describe("formatSoftConfirmationResult", () => {
+  it("returns isError: true with SOFT_CONFIRMATION_REQUIRED in text content", () => {
+    const fakeErr = {
+      token: "abcdefgh12345678TAIL1234",
+      auditId: "audit-uuid-001",
+      expiresAt: Date.now() + 300_000,
+      humanSummary: "This update will remove 2 TOC macros.",
+      pageId: "page-42",
+    };
+    const result = formatSoftConfirmationResult(fakeErr, { pageId: "page-42" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(result.content[0].text).toContain("This update will remove 2 TOC macros.");
+    // Full token must NOT appear in free text.
+    expect(result.content[0].text).not.toContain(fakeErr.token);
+    // Last 8 chars appear as the tail.
+    expect(result.content[0].text).toContain("TAIL1234");
+  });
+
+  it("puts the full token in structuredContent.confirm_token", () => {
+    const fakeErr = {
+      token: "FULL_TOKEN_VALUE_HERE_12345678",
+      auditId: "audit-uuid-002",
+      expiresAt: Date.now() + 300_000,
+      humanSummary: "Confirmation needed.",
+      pageId: "page-7",
+    };
+    const result = formatSoftConfirmationResult(fakeErr, { pageId: "page-7" });
+    expect(result.structuredContent.confirm_token).toBe("FULL_TOKEN_VALUE_HERE_12345678");
+    expect(result.structuredContent.audit_id).toBe("audit-uuid-002");
+    expect(result.structuredContent.page_id).toBe("page-7");
+    expect(typeof result.structuredContent.expires_at).toBe("string");
+  });
+
+  it("includes deletion_summary in structuredContent when provided", () => {
+    const fakeErr = {
+      token: "tok",
+      auditId: "audit-003",
+      expiresAt: Date.now() + 300_000,
+      humanSummary: "Will remove macros.",
+      pageId: "page-1",
+    };
+    const deletionSummary = {
+      tocs: 1,
+      links: 2,
+      structuredMacros: 3,
+      codeMacros: 0,
+      plainElements: 0,
+      other: 0,
+    };
+    const result = formatSoftConfirmationResult(fakeErr, { pageId: "page-1", deletionSummary });
+    expect(result.structuredContent.deletion_summary).toEqual(deletionSummary);
+  });
+
+  it("omits deletion_summary from structuredContent when not provided", () => {
+    const fakeErr = {
+      token: "tok",
+      auditId: "audit-004",
+      expiresAt: Date.now() + 300_000,
+      humanSummary: "Summary.",
+      pageId: "page-2",
+    };
+    const result = formatSoftConfirmationResult(fakeErr, { pageId: "page-2" });
+    expect(result.structuredContent.deletion_summary).toBeUndefined();
   });
 });

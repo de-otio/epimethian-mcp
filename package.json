@@ -1,7 +1,7 @@
 {
   "name": "@de-otio/epimethian-mcp",
   "description": "Confluence Cloud tools for AI assistants via the Model Context Protocol",
-  "version": "6.5.0",
+  "version": "6.6.0",
   "license": "MIT",
   "repository": {
     "type": "git",

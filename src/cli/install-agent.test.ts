@@ -158,6 +158,12 @@ describe("install-agent.md write budget section", () => {
   });
 });
 
+describe("install-agent.md soft confirmation section", () => {
+  it("contains the soft confirmation section heading", () => {
+    expect(guideContent).toContain("Soft confirmation (clients without elicitation)");
+  });
+});
+
 describe("install-agent.md covers manual steps and error handling", () => {
   it("explains what the user must do manually vs what the agent does", () => {
     // Agent does: install, configure .mcp.json

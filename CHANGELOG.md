@@ -5,6 +5,152 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.6.0] - 2026-04-29 - soft elicitation for clients without in-protocol confirmation (OpenCode, phase 2 of 2)
+
+Phase 2 of the OpenCode-compatibility work specified in
+`plans/opencode-compatibility-implementation.md`. Closes the gap that
+left elicitation-less clients (OpenCode, Cursor / Windsurf / Zed in
+some configurations, custom in-house hosts) unable to use destructive
+write tools without setting `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` —
+which removed the human confirmation entirely.
+
+### Added — soft elicitation
+
+When the connecting MCP client does not advertise the `elicitation`
+capability AND none of the legacy bypass / disable env vars are set,
+epimethian-mcp now returns a structured `SOFT_CONFIRMATION_REQUIRED`
+tool result containing a single-use confirmation token. The agent
+asks the user via its normal chat surface and re-calls the tool with
+`confirm_token` from the result. The token is bound to the exact
+diff, page version, tenant cloudId, and tool — so a token cannot
+replay across pages, tenants, tools, or after the page advances.
+
+The trade-off compared to in-protocol elicitation: the prompt goes
+through the agent's chat surface instead of a dedicated UI channel.
+The compensating controls — token binding, single-use semantics,
+TTL, sibling-invalidation on competing writes, mint-rate ceiling,
+audit log — are designed to make agent-mediated confirmation as
+trustworthy as the in-protocol path.
+
+### Token security model
+
+- **Single-use:** a successful retry consumes the token. Replay
+  returns `CONFIRMATION_TOKEN_INVALID`.
+- **5-minute TTL** by default; clamped to `[60_000, 900_000]` ms via
+  `EPIMETHIAN_SOFT_CONFIRM_TTL_MS`.
+- **5-field binding:** `{tool, cloudId, pageId, pageVersion, diffHash}`.
+  Mismatch on any field → invalid. The `cloudId` field protects
+  against a multi-tenant replay vector where a token minted for
+  tenant A is presented after the server is reconfigured for tenant B.
+- **Validate-time sibling-invalidation:** on a successful validate,
+  every other outstanding token for the same `{cloudId, pageId}` is
+  invalidated atomically before the validate returns `"ok"`. Closes
+  the concurrent-retries TOCTOU window.
+- **Defense-in-depth:** `safeSubmitPage` also calls
+  `invalidateForPage` on the post-PUT success path for any write that
+  reached Confluence, even if it didn't go through the soft path.
+- **Single external error code** (`CONFIRMATION_TOKEN_INVALID`)
+  collapses the `unknown` / `expired` / `stale` / `mismatch` outcomes
+  into one bucket, preventing a token-state oracle. The specific
+  reason flows only into the `onValidate` audit hook.
+- **5 ms minimum response-time floor** on `validateToken` regardless
+  of outcome, removing the timing side-channel that would otherwise
+  distinguish hit / miss paths.
+- **`MAX_OUTSTANDING_TOKENS = 50`** (FIFO-evict) and
+  **`MAX_MINTS_PER_15_MIN = 100`** (overridable via
+  `EPIMETHIAN_SOFT_CONFIRM_MINT_LIMIT`; "0" disables) bound abuse and
+  memory use.
+- **Tokens never appear** in stderr, mutation log, telemetry, or any
+  tool-result `text` field — only in `structuredContent.confirm_token`.
+  The visible message shows only the last 8 chars; correlation in
+  the audit log is via a per-mint UUID `auditId`.
+- **`humanSummary` in the tool result is derived solely from
+  `DeletionSummary` numeric counts** — never interpolates page
+  content. Closes the prompt-injection exfil channel that an
+  attacker who plants malicious storage XML would otherwise have.
+- **Process-local in-memory store.** A server restart invalidates
+  every outstanding token. Operators running multiple MCP server
+  processes for one tenant simultaneously (load-balanced fleets)
+  will see retries fail; pin a single process per agent / per IDE
+  window, or fall back to `EPIMETHIAN_ALLOW_UNGATED_WRITES`.
+
+### Trigger precedence (binding order)
+
+`gateOperation` evaluates in this order; first matching branch wins:
+
+1. `EPIMETHIAN_BYPASS_ELICITATION=true` → bypass (existing — for
+   clients that fake elicitation support).
+2. `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` AND client lacks
+   elicitation → bypass (existing operator opt-out).
+3. `EPIMETHIAN_DISABLE_SOFT_CONFIRM=true` AND client lacks
+   elicitation → throw `ELICITATION_REQUIRED_BUT_UNAVAILABLE`
+   (NEW: legacy-mode opt-out for users who explicitly want the
+   v6.5.0 behaviour).
+4. Client lacks elicitation AND all four soft-mode fields are
+   present → mint token, throw `SOFT_CONFIRMATION_REQUIRED`
+   (NEW: the soft-elicitation path).
+5. Client lacks elicitation AND any required soft-mode field is
+   missing → throw `ELICITATION_REQUIRED_BUT_UNAVAILABLE`
+   (fail-closed — refuse rather than silently bypass).
+6. Client supports elicitation → real elicitation request
+   (existing).
+
+A startup-time warning fires the first time `gateOperation` runs
+with `BYPASS_ELICITATION=true` against a client that does NOT
+advertise elicitation — that combination is the most common
+misconfiguration (BYPASS is meant for fake-advertise clients, not
+the don't-advertise case).
+
+### Other added
+
+- **`confirm_token` parameter** on the seven gated write tools
+  (`update_page`, `update_page_section`, `update_page_sections`,
+  `delete_page`, `revert_page`, `prepend_to_page`, `append_to_page`).
+  The handler preamble is shared via a new helper
+  `maybeConsumeConfirmToken` exported from `safe-write.ts`.
+- **`SoftConfirmationRequiredError`** class in `elicitation.ts`,
+  carrying token, auditId, expiresAt, humanSummary, retryHint, pageId.
+- **`onMint` / `onValidate` audit hooks** in
+  `confirmation-tokens.ts`. Write-only — there is no public
+  introspection API. Audit metadata flows into the existing
+  mutation log via these hooks.
+- **`computeDiffHash(canonicalStorageXml, pageVersion)`** — SHA-256
+  hex helper shared between the gate and the handler preamble.
+- **`renderDeletionSummary(s: DeletionSummary)`** — pure function
+  that builds the `humanSummary` from numeric counts only. Reused
+  in both the soft-mode error and the existing live-elicitation
+  prompt.
+- **install-agent.md "Soft confirmation" section** — explains the
+  protocol to agents (the result shape, the 5-step action checklist,
+  the four operator opt-out env vars, and the multi-process
+  limitation).
+- **`EPIMETHIAN_DISABLE_SOFT_CONFIRM`**, **`EPIMETHIAN_SOFT_CONFIRM_TTL_MS`**,
+  and **`EPIMETHIAN_SOFT_CONFIRM_MINT_LIMIT`** environment variables.
+
+### Changed
+
+- **Tool descriptions on the seven gated tools** updated from the
+  v6.5.0 wording to the v6.6.0 wording, which now references the
+  soft-elicitation protocol explicitly. v6.5.0's "set
+  `EPIMETHIAN_ALLOW_UNGATED_WRITES=true`" advice is gone — soft
+  elicitation supersedes it.
+
+### Internal
+
+- New `src/server/confirmation-tokens.ts` (430 lines) and
+  `src/server/confirmation-tokens.test.ts` (24 unit tests; 98.75%
+  line / 93.05% branch coverage; threshold tightened to ≥ 90% in
+  `vitest.config.ts`).
+- New `src/server/soft-elicitation.integration.test.ts` (18 real
+  tests + 5 it.todo placeholders covering the §5.9 scenario list).
+- 32-cell precedence matrix test in `elicitation.test.ts`.
+- Per-file coverage thresholds added for both new modules.
+
+Net test delta vs v6.5.0: +99 (1716 → 1815 passing, 1 skipped, 5 todo,
+59 test files). 26 pre-existing tsc errors (one new top-level-await
+in elicitation.test.ts mirroring the existing pattern; not impacting
+build or runtime).
+
 ## [6.5.0] - 2026-04-29 - per-client setup CLI + tool-description awareness (OpenCode prep, phase 1 of 2)
 
 First half of the OpenCode-compatibility work specified in

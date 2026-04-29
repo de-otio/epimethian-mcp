@@ -20,6 +20,13 @@ export default defineConfig({
         "src/server/converter/tokeniser.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
         "src/server/converter/restore.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
         "src/server/converter/diff.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        // Trust-boundary module for soft-elicitation (v6.6.0). Tightened to
+        // 90% — coverage gaps here mean untested states where a wrong-page
+        // or replayed token could validate. See plan §7 + §3.2 note 1.
+        "src/server/confirmation-tokens.ts": { lines: 90, branches: 90, functions: 90, statements: 90 },
+        // Per-client config templates for the setup CLI (v6.5.0). Mechanical
+        // templating; 85% threshold per plan §7.
+        "src/cli/client-configs.ts": { lines: 85, branches: 85, functions: 85, statements: 85 },
         "src/server/**": {
           lines: 80,
           branches: 80,
