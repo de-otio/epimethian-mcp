@@ -276,7 +276,7 @@ discover the result an hour later.
 - **`EPIMETHIAN_WRITE_BUDGET_ROLLING`** — default 75 per 15-minute window; set to "0" to disable.
 - **`EPIMETHIAN_WRITE_BUDGET_HOURLY`** — deprecated alias for `EPIMETHIAN_WRITE_BUDGET_ROLLING`; will be removed in version 7.
 
-## Available Tools (34)
+## Available Tools (35)
 
 | Tool | Description |
 |------|-------------|
@@ -285,7 +285,8 @@ discover the result an hour later.
 | `get_page` | Read a page by ID (use `headings_only` to preview structure first) |
 | `get_page_by_title` | Look up a page by title (use `headings_only` to preview structure first) |
 | `update_page` | Update an existing page |
-| `update_page_section` | Update a single section by heading name |
+| `update_page_section` | Update a single section by heading name (supports `body` replacement OR `find_replace` literal substitutions) |
+| `update_page_sections` | Atomically update multiple sections in one version bump (all-or-nothing) |
 | `prepend_to_page` | Insert content at the beginning of an existing page (additive, safe) |
 | `append_to_page` | Insert content at the end of an existing page (additive, safe) |
 | `delete_page` | Delete a page |

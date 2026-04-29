@@ -195,6 +195,7 @@ describe("MCP server index", () => {
       "get_page",
       "update_page",
       "update_page_section",
+      "update_page_sections",
       "delete_page",
       "search_pages",
       "list_pages",
@@ -964,6 +965,534 @@ describe("update_page_section token-aware preservation", () => {
     const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
     expect(submittedBody).toContain("ac:emoticon");
     expect(submittedBody).toContain("new content");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D2 — update_page_section find_replace mode
+// ---------------------------------------------------------------------------
+//
+// Verified here:
+//   - Cross-link replacement: bold text → bold link, other content unchanged.
+//   - find string not found → isError=true, _rawUpdatePage NOT called.
+//   - Multiple find/replace pairs applied in order (chaining works).
+//   - find string inside a macro attribute → NOT replaced (macro-safe guard).
+//   - Schema: both body AND find_replace → rejected.
+//   - Schema: neither body NOR find_replace → rejected.
+// ---------------------------------------------------------------------------
+
+describe("update_page_section find_replace mode (D2)", () => {
+  it("D2-1: cross-link pass — replaces bold text with bold link, other content byte-identical", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    // Section with a bold cross-reference and some surrounding content.
+    const fullPage = {
+      id: "42",
+      title: "Doc",
+      body: {
+        storage: {
+          value:
+            "<h2>Links</h2>" +
+            "<p>See <strong>1. Overview</strong> for background.</p>" +
+            "<p>Unrelated paragraph stays.</p>" +
+            "<h2>Other</h2><p>keep this</p>",
+        },
+      },
+    };
+    (getPage as any).mockResolvedValueOnce(fullPage);
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "42", title: "Doc" },
+      newVersion: 3,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "42",
+      section: "Links",
+      find_replace: [
+        {
+          find: "<strong>1. Overview</strong>",
+          replace:
+            '<strong><ac:link><ri:page ri:content-title="1. Overview"/><ac:plain-text-link-body><![CDATA[1. Overview]]></ac:plain-text-link-body></ac:link></strong>',
+        },
+      ],
+      version: 2,
+    });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain('Updated section "Links"');
+    expect(result.content[0].text).toContain("version: 3");
+    expect(result.content[0].text).toContain("1 find/replace substitution");
+
+    const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
+    // The link replacement should be in place.
+    expect(submittedBody).toContain("ri:page");
+    expect(submittedBody).toContain("1. Overview");
+    // The original <strong>1. Overview</strong> (without a link) should be gone.
+    expect(submittedBody).not.toMatch(/<strong>1\. Overview<\/strong>/);
+    // Unrelated paragraph must be byte-identical.
+    expect(submittedBody).toContain("<p>Unrelated paragraph stays.</p>");
+    // Other section must be untouched.
+    expect(submittedBody).toContain("<h2>Other</h2><p>keep this</p>");
+  });
+
+  it("D2-2: find string not found → isError=true, _rawUpdatePage NOT called", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "42",
+      title: "Doc",
+      body: {
+        storage: {
+          value: "<h2>A</h2><p>Hello world.</p><h2>B</h2><p>keep</p>",
+        },
+      },
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "42",
+      section: "A",
+      find_replace: [{ find: "DOES NOT EXIST", replace: "anything" }],
+      version: 1,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("DOES NOT EXIST");
+    // Page must NOT have been modified.
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("D2-3: multiple pairs applied in order (chaining)", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "42",
+      title: "Doc",
+      body: {
+        storage: {
+          value: "<h2>Glossary</h2><p>alpha bravo charlie</p>",
+        },
+      },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "42", title: "Doc" },
+      newVersion: 2,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "42",
+      section: "Glossary",
+      find_replace: [
+        { find: "alpha", replace: "ALPHA" },
+        { find: "bravo", replace: "BRAVO" },
+        // Third pair references result of second (BRAVO, not bravo).
+        { find: "BRAVO charlie", replace: "BRAVO-CHARLIE" },
+      ],
+      version: 1,
+    });
+    expect(result.isError).toBeUndefined();
+
+    const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
+    expect(submittedBody).toContain("ALPHA");
+    expect(submittedBody).toContain("BRAVO-CHARLIE");
+    expect(submittedBody).not.toContain("alpha");
+    expect(submittedBody).not.toContain("bravo");
+    expect(submittedBody).not.toContain("charlie");
+  });
+
+  it("D2-4: find inside macro attribute is NOT replaced (macro-safe guard)", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    // Section contains an ac:link whose ri:page content-title is "X" and whose
+    // visible body text is also "X". find_replace on "X" should only touch the
+    // link body text (if it appears outside the token), but NOT the attribute.
+    // With tokenisation, the whole <ac:link> element becomes an opaque token,
+    // so "X" inside it (attribute OR body) is NOT visible to find_replace.
+    // The "X" in the surrounding <p> text IS replaced.
+    const AC_LINK =
+      '<ac:link><ri:page ri:content-title="X"/>' +
+      "<ac:plain-text-link-body><![CDATA[X]]></ac:plain-text-link-body>" +
+      "</ac:link>";
+    (getPage as any).mockResolvedValueOnce({
+      id: "42",
+      title: "Doc",
+      body: {
+        storage: {
+          value: `<h2>Section</h2><p>See ${AC_LINK} for details. Also X here.</p>`,
+        },
+      },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "42", title: "Doc" },
+      newVersion: 2,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "42",
+      section: "Section",
+      find_replace: [{ find: "X", replace: "Y" }],
+      version: 1,
+    });
+    expect(result.isError).toBeUndefined();
+
+    const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
+    // The plain-text "X here" should become "Y here".
+    expect(submittedBody).toContain("Y here");
+    // The macro itself must be preserved byte-for-byte (attribute and CDATA unchanged).
+    expect(submittedBody).toContain('ri:content-title="X"');
+    expect(submittedBody).toContain("<![CDATA[X]]>");
+  });
+
+  it("D2-5 schema: both body AND find_replace → rejected", async () => {
+    const { _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    // No getPage mock queued — schema rejection runs before any HTTP call.
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "42",
+      section: "A",
+      body: "<p>replacement</p>",
+      find_replace: [{ find: "text", replace: "new" }],
+      version: 1,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("exactly one of");
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("D2-6 schema: neither body NOR find_replace → rejected", async () => {
+    const { _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    // No getPage mock queued — schema rejection runs before any HTTP call.
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "42",
+      section: "A",
+      // no body, no find_replace
+      version: 1,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("exactly one of");
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D1 — update_page_sections (atomic multi-section update)
+// ---------------------------------------------------------------------------
+//
+// Atomicity contract verified here:
+//   - 4 sections at once → ONE _rawUpdatePage call with N+1 (not N+4) version.
+//   - Any per-section failure (missing/ambiguous/duplicate) → call rejected,
+//     _rawUpdatePage NEVER called, page unchanged.
+//   - Sections matched against the ORIGINAL page (not cumulative state).
+//   - Single-section call degrades to the same outcome as update_page_section.
+//   - confirm_deletions gate fires ONCE on the aggregated deletion list.
+// ---------------------------------------------------------------------------
+
+describe("update_page_sections tool (D1)", () => {
+  const FOUR_SECTION_PAGE = {
+    id: "10",
+    title: "MultiPage",
+    version: { number: 7 },
+    body: {
+      storage: {
+        value:
+          "<h2>Intro</h2><p>old intro</p>" +
+          "<h2>Setup</h2><p>old setup</p>" +
+          "<h2>Usage</h2><p>old usage</p>" +
+          "<h2>Notes</h2><p>old notes</p>",
+      },
+    },
+  };
+
+  it("applies 4 sections atomically with ONE version bump (N→N+1, not N+4)", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce(FOUR_SECTION_PAGE);
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "10", title: "MultiPage" },
+      newVersion: 8,
+    });
+
+    const handler = registeredTools.get("update_page_sections")!.handler;
+    const result = await handler({
+      page_id: "10",
+      version: 7,
+      sections: [
+        { section: "Intro", body: "<p>new intro</p>" },
+        { section: "Setup", body: "<p>new setup</p>" },
+        { section: "Usage", body: "<p>new usage</p>" },
+        { section: "Notes", body: "<p>new notes</p>" },
+      ],
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("version: 8");
+    expect(result.content[0].text).toContain("Updated 4 sections");
+    // Exactly ONE _rawUpdatePage call — N+1, not N+4 version bumps.
+    expect(_rawUpdatePage).toHaveBeenCalledTimes(1);
+    const submitted = (_rawUpdatePage as any).mock.calls[0][1].body;
+    // All four bodies present in the merged document.
+    expect(submitted).toContain("<h2>Intro</h2><p>new intro</p>");
+    expect(submitted).toContain("<h2>Setup</h2><p>new setup</p>");
+    expect(submitted).toContain("<h2>Usage</h2><p>new usage</p>");
+    expect(submitted).toContain("<h2>Notes</h2><p>new notes</p>");
+    // Old bodies gone.
+    expect(submitted).not.toContain("old intro");
+    expect(submitted).not.toContain("old setup");
+    expect(submitted).not.toContain("old usage");
+    expect(submitted).not.toContain("old notes");
+  });
+
+  it("ALL-fail-on-one-bad: a single missing heading rejects the entire call (no PUT sent)", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce(FOUR_SECTION_PAGE);
+
+    const handler = registeredTools.get("update_page_sections")!.handler;
+    const result = await handler({
+      page_id: "10",
+      version: 7,
+      sections: [
+        { section: "Intro", body: "<p>new intro</p>" },
+        { section: "Setup", body: "<p>new setup</p>" },
+        { section: "DoesNotExist", body: "<p>x</p>" },
+        { section: "Notes", body: "<p>new notes</p>" },
+      ],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("DoesNotExist");
+    expect(result.content[0].text).toContain("missing");
+    // CRITICAL: _rawUpdatePage must NOT have been called — page unchanged.
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("ambiguous heading rejects the entire call", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    // Two H2s both stripping to "Notes" — B1's tolerant matcher refuses.
+    (getPage as any).mockResolvedValueOnce({
+      id: "11",
+      title: "Ambig",
+      version: { number: 1 },
+      body: {
+        storage: {
+          value:
+            "<h2>1.2. Notes</h2><p>n1</p>" +
+            "<h2>2.3. Notes</h2><p>n2</p>",
+        },
+      },
+    });
+
+    const handler = registeredTools.get("update_page_sections")!.handler;
+    const result = await handler({
+      page_id: "11",
+      version: 1,
+      sections: [{ section: "Notes", body: "<p>x</p>" }],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("ambiguous");
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("duplicate section names in input list are rejected", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce(FOUR_SECTION_PAGE);
+
+    const handler = registeredTools.get("update_page_sections")!.handler;
+    const result = await handler({
+      page_id: "10",
+      version: 7,
+      sections: [
+        { section: "Intro", body: "<p>v1</p>" },
+        { section: "Intro", body: "<p>v2</p>" },
+      ],
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("duplicate");
+    expect(result.content[0].text).toContain("Intro");
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("sections with overlapping content: matcher runs against ORIGINAL page (deterministic)", async () => {
+    // The first section's NEW body contains the heading text "Section B".
+    // If matching ran against the cumulative state, the second section's
+    // search would resolve to the inserted text — wrong target. Because
+    // matching runs against the ORIGINAL page, this is harmless.
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "12",
+      title: "Overlap",
+      version: { number: 1 },
+      body: {
+        storage: {
+          value:
+            "<h2>Section A</h2><p>old A</p>" +
+            "<h2>Section B</h2><p>old B</p>",
+        },
+      },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "12", title: "Overlap" },
+      newVersion: 2,
+    });
+
+    const handler = registeredTools.get("update_page_sections")!.handler;
+    const result = await handler({
+      page_id: "12",
+      version: 1,
+      sections: [
+        // A's new body mentions "Section B" — would confuse a naïve impl.
+        { section: "Section A", body: "<p>new A discusses Section B</p>" },
+        { section: "Section B", body: "<p>new B</p>" },
+      ],
+    });
+    expect(result.isError).toBeUndefined();
+    const submitted = (_rawUpdatePage as any).mock.calls[0][1].body;
+    expect(submitted).toContain(
+      "<h2>Section A</h2><p>new A discusses Section B</p>",
+    );
+    expect(submitted).toContain("<h2>Section B</h2><p>new B</p>");
+    expect(submitted).not.toContain("old A");
+    expect(submitted).not.toContain("old B");
+  });
+
+  it("single-section call degrades gracefully (same outcome as update_page_section)", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "13",
+      title: "Single",
+      version: { number: 4 },
+      body: { storage: { value: "<h1>A</h1><p>old</p><h1>B</h1><p>keep</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "13", title: "Single" },
+      newVersion: 5,
+    });
+
+    const handler = registeredTools.get("update_page_sections")!.handler;
+    const result = await handler({
+      page_id: "13",
+      version: 4,
+      sections: [{ section: "A", body: "<p>new</p>" }],
+    });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("version: 5");
+    const submitted = (_rawUpdatePage as any).mock.calls[0][1].body;
+    expect(submitted).toContain("<h1>A</h1><p>new</p>");
+    expect(submitted).toContain("<h1>B</h1><p>keep</p>");
+  });
+
+  it("version: 'current' resolves to the live page version (C2 carry-over)", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce({
+      id: "14",
+      title: "T",
+      version: { number: 12 },
+      body: { storage: { value: "<h2>A</h2><p>old</p>" } },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "14", title: "T" },
+      newVersion: 13,
+    });
+
+    const handler = registeredTools.get("update_page_sections")!.handler;
+    const result = await handler({
+      page_id: "14",
+      version: "current",
+      sections: [{ section: "A", body: "<p>new</p>" }],
+    });
+    expect(result.isError).toBeUndefined();
+    const versionPassed = (_rawUpdatePage as any).mock.calls[0][1].version;
+    expect(versionPassed).toBe(12); // resolved from getPage
+  });
+
+  it("blocks the entire call when ANY section requires confirm_deletions and it is false", async () => {
+    // Section A has an emoticon; the markdown removes it. Section B is
+    // benign. confirm_deletions is false → the per-section prepare for A
+    // throws DELETIONS_NOT_CONFIRMED and the whole call rejects. Page must
+    // remain unchanged.
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    const EMOTICON = `<ac:emoticon ac:name="warning"/>`;
+    (getPage as any).mockResolvedValueOnce({
+      id: "15",
+      title: "T",
+      version: { number: 2 },
+      body: {
+        storage: {
+          value:
+            `<h2>A</h2><p>note ${EMOTICON}</p>` +
+            `<h2>B</h2><p>plain</p>`,
+        },
+      },
+    });
+
+    const handler = registeredTools.get("update_page_sections")!.handler;
+    const result = await handler({
+      page_id: "15",
+      version: 2,
+      sections: [
+        { section: "A", body: "note without macro" },
+        { section: "B", body: "still plain" },
+      ],
+      // confirm_deletions: false (default)
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("confirm_deletions");
+    // Aggregated multi-section error names the offending section.
+    expect(result.content[0].text).toContain("\"A\"");
+    // Page unchanged — no submit.
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("confirm_deletions: true allows aggregated deletions across multiple sections", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    const EM_A = `<ac:emoticon ac:name="warning"/>`;
+    const EM_B = `<ac:emoticon ac:name="info"/>`;
+    (getPage as any).mockResolvedValueOnce({
+      id: "16",
+      title: "T",
+      version: { number: 3 },
+      body: {
+        storage: {
+          value:
+            `<h2>A</h2><p>note ${EM_A}</p>` +
+            `<h2>B</h2><p>tip ${EM_B}</p>`,
+        },
+      },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "16", title: "T" },
+      newVersion: 4,
+    });
+
+    const handler = registeredTools.get("update_page_sections")!.handler;
+    const result = await handler({
+      page_id: "16",
+      version: 3,
+      sections: [
+        { section: "A", body: "note without macro" },
+        { section: "B", body: "tip without macro" },
+      ],
+      confirm_deletions: true,
+    });
+    expect(result.isError).toBeUndefined();
+    // Tool result mentions the removed macros, aggregated.
+    expect(result.content[0].text).toContain("removed 2 preserved macros");
+    // ONE submit, both emoticons gone.
+    expect(_rawUpdatePage).toHaveBeenCalledTimes(1);
+    const submitted = (_rawUpdatePage as any).mock.calls[0][1].body;
+    expect(submitted).not.toContain("ac:emoticon");
   });
 });
 
@@ -3983,11 +4512,12 @@ describe("Track O2 — Conditional tool registration", () => {
     }
   });
 
-  it("O2-7: WRITE_TOOLS set contains exactly the 16 expected write tools", async () => {
+  it("O2-7: WRITE_TOOLS set contains exactly the 17 expected write tools", async () => {
     const { WRITE_TOOLS } = await import("./index.js");
     const expected = new Set([
       "create_page", "update_page", "append_to_page", "prepend_to_page",
-      "update_page_section", "delete_page", "add_drawio_diagram", "revert_page",
+      "update_page_section", "update_page_sections",
+      "delete_page", "add_drawio_diagram", "revert_page",
       "add_attachment", "add_label", "remove_label", "create_comment",
       "delete_comment", "resolve_comment", "set_page_status", "remove_page_status",
     ]);

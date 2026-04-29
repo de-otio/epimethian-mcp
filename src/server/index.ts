@@ -66,7 +66,14 @@ import { fenceUntrusted } from "./converter/untrusted-fence.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
 import { markPageUnverified } from "./provenance.js";
-import { safePrepareBody, safeSubmitPage } from "./safe-write.js";
+import {
+  MultiSectionError,
+  findReplaceInSection,
+  safePrepareBody,
+  safePrepareMultiSectionBody,
+  safeSubmitPage,
+  type FindReplacePair,
+} from "./safe-write.js";
 import {
   listDestructiveFlagsSet,
   sourceSchema,
@@ -438,6 +445,7 @@ export const WRITE_TOOLS = new Set([
   "append_to_page",
   "prepend_to_page",
   "update_page_section",
+  "update_page_sections",
   "delete_page",
   "add_drawio_diagram",
   "revert_page",
@@ -1339,7 +1347,49 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .describe("Heading text identifying the section to replace (case-insensitive)"),
         body: z
           .string()
-          .describe("New content for this section — GFM markdown or Confluence storage format. Markdown is auto-detected and converted via the token-aware write path, which preserves existing macros and emoticons within the section. The heading itself is preserved; only content under it is replaced. Do not mix the two: inlining <ac:.../> macros inside a markdown body is rejected with MIXED_INPUT_DETECTED. For macros from markdown use directive syntax (:info[...], :mention[...]{...})."),
+          .optional()
+          .describe(
+            "New content for this section — GFM markdown or Confluence storage format. " +
+            "Markdown is auto-detected and converted via the token-aware write path, which " +
+            "preserves existing macros and emoticons within the section. The heading itself " +
+            "is preserved; only content under it is replaced. Do not mix the two: inlining " +
+            "<ac:.../> macros inside a markdown body is rejected with MIXED_INPUT_DETECTED. " +
+            "For macros from markdown use directive syntax (:info[...], :mention[...]{...}). " +
+            "Exactly one of `body` or `find_replace` must be provided."
+          ),
+        find_replace: z
+          .array(
+            z.object({
+              find: z
+                .string()
+                .describe(
+                  "Literal string to find inside the section body (not a regex). " +
+                  "Matching is exact, byte-for-byte. The find string is only compared " +
+                  "against text content — it cannot match inside macro attribute values " +
+                  "or CDATA bodies (those are opaque to find/replace)."
+                ),
+              replace: z
+                .string()
+                .describe(
+                  "Replacement string. May contain Confluence storage syntax (e.g. " +
+                  "<ac:link>...</ac:link>). The caller is responsible for valid XML. " +
+                  "This is NOT markdown — no auto-conversion is applied."
+                ),
+            })
+          )
+          .min(1)
+          .optional()
+          .describe(
+            "Alternative to `body`: apply literal string substitutions inside the " +
+            "section's storage XML instead of replacing the whole section. Each entry's " +
+            "`find` is searched for and replaced with `replace`. Pairs are applied in " +
+            "input order; each subsequent `find` searches the partially-substituted body, " +
+            "so chained substitutions work as expected. If a `find` string is not found, " +
+            "the call fails with FIND_REPLACE_MATCH_FAILED — no silent no-op. " +
+            "Substitutions are ONLY applied to text outside macro boundaries (attribute " +
+            "values and CDATA bodies are protected). Exactly one of `body` or `find_replace` " +
+            "must be provided."
+          ),
         version: z
           .union([z.number().int().positive(), z.literal("current")])
           .describe(
@@ -1363,10 +1413,28 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, section, body, version, version_message, confirm_deletions }) => {
+    async ({ page_id, section, body, find_replace, version, version_message, confirm_deletions }) => {
       const blocked = writeGuard("update_page_section", config);
       if (blocked) return blocked;
       try {
+        // D2: schema-level enforcement — exactly one of body / find_replace.
+        const hasBody = body !== undefined;
+        const hasFindReplace = find_replace !== undefined && find_replace.length > 0;
+        if (hasBody && hasFindReplace) {
+          return toolError(
+            new Error(
+              "update_page_section: provide exactly one of `body` or `find_replace`, not both."
+            )
+          );
+        }
+        if (!hasBody && !hasFindReplace) {
+          return toolError(
+            new Error(
+              "update_page_section: provide exactly one of `body` or `find_replace` (neither was provided)."
+            )
+          );
+        }
+
         // F3: space allowlist.
         await checkSpaceAllowed({ pageId: page_id });
         const cfg = await getConfig();
@@ -1396,12 +1464,56 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           );
         }
 
+        // D2: find_replace mode — apply literal substitutions to the current
+        // section body. No markdown conversion, no token diff, no deletion gate.
+        // findReplaceInSection tokenises first so substitutions cannot touch
+        // macro attribute values or CDATA bodies.
+        if (hasFindReplace) {
+          const newSectionBody = findReplaceInSection(
+            currentSectionBody,
+            find_replace as FindReplacePair[],
+          );
+          const newFullBody = replaceSection(fullBody, section, newSectionBody);
+          if (newFullBody === null) {
+            return toolError(
+              new Error(
+                `Section "${section}" not found. Use headings_only to see available sections.`
+              )
+            );
+          }
+          const submitted = await safeSubmitPage({
+            pageId: page_id,
+            title: page.title,
+            finalStorage: newFullBody,
+            previousBody: fullBody,
+            version: resolvedVersion,
+            versionMessage: version_message ?? "",
+            deletedTokens: [],
+            operation: "update_page_section",
+            clientLabel: getClientLabel(server),
+          });
+          const warnings: WarningAccumulator = [];
+          const labelResult = await ensureAttributionLabel(submitted.page.id);
+          if (labelResult.warning) warnings.push(labelResult.warning);
+          const badgeResult = await markPageUnverified(submitted.page.id, cfg);
+          if (badgeResult.warning) warnings.push(badgeResult.warning);
+          const pairCount = (find_replace as FindReplacePair[]).length;
+          return toolResult(
+            appendWarnings(
+              `Updated section "${section}" in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}; applied ${pairCount} find/replace substitution${pairCount === 1 ? "" : "s"})`,
+              warnings,
+            ) + echo
+          );
+        }
+
+        // body mode (original path):
+
         // E4/A2: gate when confirm_deletions is set, with a deletion forecast
         // describing what the section update will remove. The section body and
         // caller markdown are both available here, so we can compute the
         // forecast purely (planUpdate has no side effects).
         if (confirm_deletions) {
-          const deletionSummary = tryForecastDeletions(currentSectionBody, body, cfg.url);
+          const deletionSummary = tryForecastDeletions(currentSectionBody, body!, cfg.url);
           await gateOperation(server, {
             tool: "update_page_section",
             summary: `Update section "${section}" in page ${page_id} with confirm_deletions?`,
@@ -1465,6 +1577,220 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         );
       } catch (err) {
         return toolErrorWithContext(err, { operation: "update_page_section", resource: `page ${page_id}`, profile: config.profile });
+      }
+    }
+  );
+
+  // update_page_sections (D1) — atomic multi-section update.
+  server.registerTool(
+    "update_page_sections",
+    {
+      description: describeWithLock(
+        withDestructiveWarning(
+          "Update multiple sections of a Confluence page atomically in a " +
+          "single version bump. Either every section applies or none do — " +
+          "if any section's heading is missing, ambiguous, or its body fails " +
+          "to convert, the whole call is rejected and the page is left " +
+          "unchanged. Use this when you need to update 4+ sections in one go " +
+          "without 4 separate version bumps.\n\n" +
+          "Sections are matched against the ORIGINAL page contents (not the " +
+          "cumulative-edited state) and applied in input order; sections " +
+          "cannot reference content introduced by an earlier section in the " +
+          "same call.\n\n" +
+          "Use headings_only to find section names first. Note: in spaces " +
+          "with heading auto-numbering enabled, stored heading text contains " +
+          "the prefix (e.g. `1.2. Section`); the matcher accepts either the " +
+          "prefixed or plain form. Section names must be unique within the " +
+          "input list."
+        ),
+        config
+      ),
+      inputSchema: {
+        page_id: z.string().describe("The Confluence page ID"),
+        version: z
+          .union([z.number().int().positive(), z.literal("current")])
+          .describe(
+            "The page version number from your most recent get_page call. " +
+            "Pass the literal string \"current\" to skip the read and apply " +
+            "this update on top of whatever the latest version is right now. " +
+            "WARNING: \"current\" deliberately bypasses optimistic concurrency."
+          ),
+        version_message: z
+          .string()
+          .optional()
+          .describe("Optional version comment for the single resulting revision"),
+        confirm_deletions: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Set to true to acknowledge that the aggregated set of sections " +
+            "removes preserved macros, emoticons, or rich elements. Required " +
+            "when ANY section would delete a preserved element. The " +
+            "deletion-summary gate fires once on the AGGREGATE — a caller " +
+            "cannot bypass the gate by spreading deletions across sections."
+          ),
+        sections: z
+          .array(
+            z.object({
+              section: z
+                .string()
+                .describe("Heading text identifying the section to replace"),
+              body: z
+                .string()
+                .describe(
+                  "New content for this section — GFM markdown or Confluence " +
+                  "storage format (auto-detected). Same conversion rules as " +
+                  "update_page_section."
+                ),
+            })
+          )
+          .min(1)
+          .describe(
+            "List of sections to update. Section names must be unique within " +
+            "this list. Order matters only for the version-message ordering " +
+            "in the audit log; matching is performed against the original " +
+            "page so reordering does not change which heading each section " +
+            "resolves to."
+          ),
+      },
+      annotations: { destructiveHint: false, idempotentHint: false },
+    },
+    async ({ page_id, version, version_message, confirm_deletions, sections }) => {
+      const blocked = writeGuard("update_page_sections", config);
+      if (blocked) return blocked;
+      try {
+        // F3: space allowlist.
+        await checkSpaceAllowed({ pageId: page_id });
+        const cfg = await getConfig();
+        const page = await getPage(page_id, true);
+        const fullBody = page.body?.storage?.value ?? page.body?.value ?? "";
+
+        // C2: resolve `version: "current"`.
+        const resolvedVersion =
+          version === "current"
+            ? (page.version?.number ?? 0)
+            : version;
+        if (resolvedVersion <= 0) {
+          throw new Error(
+            `Could not resolve current version for page ${page_id} (server returned no version metadata)`
+          );
+        }
+
+        // E4/A2: gate when confirm_deletions is set, with an aggregated
+        // deletion forecast across all sections. Each section's forecast is
+        // computed independently against its own current body (planUpdate is
+        // pure — no side effects), then summed into one DeletionSummary.
+        // The gate fires ONCE on the aggregate; a caller cannot bypass the
+        // gate by spreading deletions across many sections.
+        if (confirm_deletions) {
+          const summed: DeletionSummary = {
+            tocs: 0,
+            links: 0,
+            structuredMacros: 0,
+            codeMacros: 0,
+            plainElements: 0,
+            other: 0,
+          };
+          let any = false;
+          for (const s of sections) {
+            // Use extractSectionBody against the original body. If the
+            // section is missing or ambiguous, the forecast is skipped — the
+            // real failure surfaces (with a structured error) inside
+            // safePrepareMultiSectionBody.
+            let currentSectionBody: string | null = null;
+            try {
+              currentSectionBody = extractSectionBody(fullBody, s.section);
+            } catch {
+              currentSectionBody = null;
+            }
+            if (currentSectionBody === null) continue;
+            const summary = tryForecastDeletions(
+              currentSectionBody,
+              s.body,
+              cfg.url,
+            );
+            if (summary !== null) {
+              summed.tocs += summary.tocs;
+              summed.links += summary.links;
+              summed.structuredMacros += summary.structuredMacros;
+              summed.codeMacros += summary.codeMacros;
+              summed.plainElements += summary.plainElements;
+              summed.other += summary.other;
+              any = true;
+            }
+          }
+          await gateOperation(server, {
+            tool: "update_page_sections",
+            summary: `Update ${sections.length} section${sections.length === 1 ? "" : "s"} in page ${page_id} with confirm_deletions?`,
+            details: {
+              page_id,
+              section_count: sections.length,
+              source: "confirm_deletions",
+              ...(any ? { deletionSummary: summed } : {}),
+            },
+          });
+        }
+
+        // Atomic multi-section prepare — throws MultiSectionError on any
+        // per-section failure (missing heading, ambiguous, duplicate name,
+        // or sub-prepare error). No splice is committed unless every section
+        // succeeds.
+        const prepared = await safePrepareMultiSectionBody({
+          currentStorage: fullBody,
+          sections,
+          confirmDeletions: confirm_deletions,
+          confluenceBaseUrl: cfg.url,
+        });
+
+        const mergedVersionMessage =
+          prepared.versionMessage && version_message
+            ? `${version_message}; ${prepared.versionMessage}`
+            : prepared.versionMessage || version_message || "";
+
+        // ONE submit, ONE version bump. The deletion gate already fired (if
+        // applicable) on the aggregate; safeSubmitPage owns the rest of the
+        // safety pipeline.
+        const submitted = await safeSubmitPage({
+          pageId: page_id,
+          title: page.title,
+          finalStorage: prepared.finalStorage,
+          previousBody: fullBody,
+          version: resolvedVersion,
+          versionMessage: mergedVersionMessage,
+          deletedTokens: prepared.aggregatedDeletedTokens,
+          regeneratedTokens: prepared.aggregatedRegeneratedTokens,
+          operation: "update_page_section",
+          clientLabel: getClientLabel(server),
+          confirmDeletions: confirm_deletions,
+        });
+
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(submitted.page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(submitted.page.id, cfg);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+
+        const removalNote =
+          submitted.deletedTokens.length > 0
+            ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`
+            : "";
+        const sectionList = prepared.perSectionResults
+          .map((r) => `"${r.section}"`)
+          .join(", ");
+        return toolResult(
+          appendWarnings(
+            `Updated ${prepared.perSectionResults.length} section${prepared.perSectionResults.length === 1 ? "" : "s"} (${sectionList}) in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}${removalNote})`,
+            warnings,
+          ) + echo,
+        );
+      } catch (err) {
+        // MultiSectionError surfaces the full per-section failure list — a
+        // single "Error:" line carries all of them. Fall through to the
+        // common context wrapper which formats the error for the tool result.
+        if (err instanceof MultiSectionError) {
+          return toolError(err);
+        }
+        return toolErrorWithContext(err, { operation: "update_page_sections", resource: `page ${page_id}`, profile: config.profile });
       }
     }
   );

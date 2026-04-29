@@ -59,6 +59,8 @@
 import {
   _rawCreatePage,
   _rawUpdatePage,
+  extractSection,
+  extractSectionBody,
   getPageByTitle,
   looksLikeMarkdown,
   normalizeBodyForSubmit,
@@ -501,6 +503,18 @@ export const MIXED_INPUT_DETECTED = "MIXED_INPUT_DETECTED";
 export const INPUT_BODY_TOO_LARGE = "INPUT_BODY_TOO_LARGE";
 /** Thrown when a write body contains the per-session canary or fence markers (Track D3). */
 export const WRITE_CONTAINS_UNTRUSTED_FENCE = "WRITE_CONTAINS_UNTRUSTED_FENCE";
+/**
+ * Thrown by safePrepareMultiSectionBody when one or more sections in an
+ * `update_page_sections` (D1) call cannot be applied — heading missing,
+ * ambiguous, duplicate name, or a sub-prepare failed. The whole call is
+ * rejected; no partial writes.
+ */
+export const MULTI_SECTION_FAILED = "MULTI_SECTION_FAILED";
+/**
+ * Thrown by findReplaceInSection when a find string does not appear in the
+ * section body (after tokenising). No silent no-op — the page is not modified.
+ */
+export const FIND_REPLACE_MATCH_FAILED = "FIND_REPLACE_MATCH_FAILED";
 
 /**
  * Caller-supplied body size cap (Track A3). Checked at the entry of
@@ -1527,4 +1541,492 @@ export async function safeSubmitPage(
     );
     throw err;
   }
+}
+
+// ---------------------------------------------------------------------------
+// findReplaceInSection (D2: find_replace mode for update_page_section)
+// ---------------------------------------------------------------------------
+
+/**
+ * One find/replace pair supplied by the caller.
+ */
+export interface FindReplacePair {
+  /** Literal string to find (not a regex). */
+  find: string;
+  /** Replacement string (may contain Confluence storage syntax). */
+  replace: string;
+}
+
+/**
+ * Apply a sequence of literal find/replace substitutions to a Confluence
+ * storage-format section body.
+ *
+ * DATA-LOSS GUARD: substitutions are ONLY applied to plain-text tokens, never
+ * inside macro attribute values or CDATA bodies. The section body is first
+ * tokenised with tokeniseStorage(), which replaces every outer <ac:*>, <ri:*>,
+ * and <time> element with an opaque placeholder. Substitutions run on the
+ * placeholder-bearing canonical form, so they can only touch text that exists
+ * outside any macro boundary. The sidecar is then restored verbatim.
+ *
+ * Semantics:
+ *   - Each pair's `find` is a LITERAL string (not a regex). We use
+ *     `split(find).join(replace)` to avoid any regex-special-char hazards.
+ *   - Substitutions are applied IN ORDER; each subsequent `find` searches the
+ *     partially-substituted canonical, so chained substitutions work as
+ *     expected.
+ *   - If a `find` string does not appear in the canonical BEFORE that step is
+ *     applied, the call FAILS with a structured error. No silent no-op. The
+ *     page is NOT modified.
+ *
+ * @returns The storage-format body with all substitutions applied.
+ * @throws ConverterError (code FIND_REPLACE_MATCH_FAILED) if any find string
+ *   is absent from the (partially-substituted) canonical.
+ */
+export function findReplaceInSection(
+  sectionBody: string,
+  pairs: readonly FindReplacePair[],
+): string {
+  // Tokenise: replace all macro elements with opaque placeholders.
+  // This is the key safety step — substitutions cannot touch macro internals.
+  const { canonical: tokenised, sidecar } = tokeniseStorage(sectionBody);
+
+  // Apply each pair in order against the running tokenised form.
+  let working = tokenised;
+  for (const { find, replace } of pairs) {
+    if (!working.includes(find)) {
+      const err = new ConverterError(
+        `find_replace: the find string ${JSON.stringify(find)} does not appear ` +
+          `in the section body (after macro tokenisation). No changes were made. ` +
+          `Check that the find string matches text outside macro/attribute boundaries.`,
+        FIND_REPLACE_MATCH_FAILED,
+      );
+      throw err;
+    }
+    // Literal replacement: split on the literal string, rejoin with replacement.
+    // This avoids any regex special-character hazards in `find`.
+    working = working.split(find).join(replace);
+  }
+
+  // Restore macro tokens verbatim from the sidecar.
+  // Any token literal that was inside a `find` match would not have been in
+  // the sidecar since sidecar keys are the placeholder forms, not the inner
+  // text — so restoration is always consistent.
+  for (const [id, xml] of Object.entries(sidecar)) {
+    working = working.split(`[[epi:${id}]]`).join(xml);
+  }
+
+  return working;
+}
+
+// ---------------------------------------------------------------------------
+// safePrepareMultiSectionBody (D1: update_page_sections)
+// ---------------------------------------------------------------------------
+
+/**
+ * One section to apply in a multi-section update.
+ */
+export interface MultiSectionInput {
+  /** Heading text identifying the section. */
+  section: string;
+  /** New body content (markdown or storage). */
+  body: string;
+}
+
+/**
+ * Per-section preparation result. The `matchedHeading` is the heading text as
+ * it actually appears in the page — useful for the tool response so the
+ * caller can see which heading the tolerant matcher resolved to.
+ */
+export interface MultiSectionResult {
+  /** The section name as supplied by the caller. */
+  section: string;
+  /** The heading text as it appears in the page (after tolerant match). */
+  matchedHeading: string;
+  /** Token deletions reported by the per-section safePrepareBody call. */
+  deletedTokens: DeletedToken[];
+  /** Byte-equivalent regenerated tokens (C1) for this section. */
+  regeneratedTokens: RegeneratedTokenPair[];
+}
+
+/**
+ * Per-section failure record carried in MultiSectionError.
+ */
+export interface MultiSectionFailure {
+  section: string;
+  /**
+   * Reason category:
+   *   - "duplicate" — the section name appears more than once in the input.
+   *   - "missing"   — heading not present in the page.
+   *   - "ambiguous" — heading matched multiple candidates in the page.
+   *   - "prepare"   — the per-section safePrepareBody call threw.
+   */
+  reason: "duplicate" | "missing" | "ambiguous" | "prepare";
+  /** Human-readable detail (e.g. ambiguity list, prepare error message). */
+  message: string;
+}
+
+export class MultiSectionError extends Error {
+  readonly code = MULTI_SECTION_FAILED;
+  readonly failures: MultiSectionFailure[];
+  constructor(failures: MultiSectionFailure[]) {
+    const summary = failures
+      .map((f) => `"${f.section}" (${f.reason}: ${f.message})`)
+      .join("; ");
+    super(
+      `update_page_sections rejected: ${failures.length} section${
+        failures.length === 1 ? "" : "s"
+      } failed — ${summary}. ` +
+        `No changes were submitted; resolve every failing section and retry.`,
+    );
+    this.name = "MultiSectionError";
+    this.failures = failures;
+  }
+}
+
+/**
+ * Output of safePrepareMultiSectionBody. The handler feeds `finalStorage`
+ * straight into safeSubmitPage and uses `perSectionResults` /
+ * `aggregatedDeletedTokens` for the gate prompt and the tool response.
+ */
+export interface MultiSectionPrepareOutput {
+  /** Merged page storage with all sections spliced in (one final document). */
+  finalStorage: string;
+  /** Per-section preparation result, in input order. */
+  perSectionResults: MultiSectionResult[];
+  /**
+   * Aggregated deleted tokens across all sections — what the user must
+   * acknowledge through the confirm_deletions gate. The gate runs ONCE on
+   * this list, not per-section.
+   */
+  aggregatedDeletedTokens: DeletedToken[];
+  /** Aggregated regenerated tokens (C1). */
+  aggregatedRegeneratedTokens: RegeneratedTokenPair[];
+  /**
+   * Combined version-message hints from each per-section safePrepareBody.
+   * Joined with "; " so the caller can pass it through unchanged.
+   */
+  versionMessage: string;
+}
+
+/**
+ * Locate a section's body byte-range in `currentStorage` against the
+ * ORIGINAL page contents. Used to compute splice plans for
+ * safePrepareMultiSectionBody — the offsets remain valid as long as the
+ * splices are applied in reverse-by-offset order.
+ *
+ * Returns:
+ *   - { ok: true, ... }     — section present and unambiguous.
+ *   - { ok: false, ... }    — section missing or ambiguous (carries the
+ *                             reason for the per-section failure record).
+ *
+ * Errors thrown by extractSection / extractSectionBody (B1's tolerant
+ * matcher throws on ambiguity) are translated into the structured failure
+ * shape so the caller can collect every failure across all sections before
+ * raising MultiSectionError.
+ */
+function locateSectionRange(
+  currentStorage: string,
+  sectionName: string,
+):
+  | {
+      ok: true;
+      bodyStart: number;
+      bodyEnd: number;
+      currentBody: string;
+      matchedHeading: string;
+    }
+  | { ok: false; reason: "missing" | "ambiguous"; message: string } {
+  let sectionWithHeading: string | null;
+  let body: string | null;
+  try {
+    sectionWithHeading = extractSection(currentStorage, sectionName);
+    body = extractSectionBody(currentStorage, sectionName);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: "ambiguous",
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+  if (sectionWithHeading === null || body === null) {
+    return {
+      ok: false,
+      reason: "missing",
+      message:
+        `Section "${sectionName}" not found. Use headings_only to see ` +
+        `available sections.`,
+    };
+  }
+
+  // Locate the section byte-range in the source by string-search.
+  // sectionWithHeading is a verbatim slice of currentStorage; the unique
+  // section means a unique slice at this offset. Verify uniqueness so a
+  // freak duplication can't silently route the wrong splice.
+  const offset = currentStorage.indexOf(sectionWithHeading);
+  if (offset < 0) {
+    // Should never happen — extractSection returns a slice of currentStorage.
+    return {
+      ok: false,
+      reason: "missing",
+      message:
+        `Section "${sectionName}" matched but its byte-range could not be ` +
+        `located in the source storage. This indicates a corrupt page body.`,
+    };
+  }
+  const second = currentStorage.indexOf(sectionWithHeading, offset + 1);
+  if (second !== -1) {
+    return {
+      ok: false,
+      reason: "ambiguous",
+      message:
+        `Section "${sectionName}" matched a heading whose surrounding ` +
+        `content appears more than once in the page; refusing to splice ` +
+        `because the target offset is not unique.`,
+    };
+  }
+
+  const headingLen = sectionWithHeading.length - body.length;
+  const bodyStart = offset + headingLen;
+  const bodyEnd = bodyStart + body.length;
+
+  // Recover the heading text from the original — the part before the body in
+  // the section slice. We surface the rendered heading element back to the
+  // caller so they can confirm the tolerant matcher (B1) resolved to the
+  // expected target.
+  const matchedHeading = sectionWithHeading.slice(0, headingLen);
+
+  return {
+    ok: true,
+    bodyStart,
+    bodyEnd,
+    currentBody: body,
+    matchedHeading,
+  };
+}
+
+/**
+ * Multi-section, atomic body preparation for the `update_page_sections`
+ * tool (D1). Runs every section's prepare against the ORIGINAL page
+ * contents, then merges all splices into a single final document.
+ *
+ * Atomicity: either every section applies cleanly or the whole call throws
+ * MultiSectionError. No partial writes — the caller submits one document
+ * to safeSubmitPage, which produces one version bump.
+ *
+ * Ordering: sections are matched against the ORIGINAL page (not the
+ * cumulative-edited state), so reordering the input cannot change which
+ * heading each section resolves to. Section bodies cannot reference content
+ * introduced by an earlier section in the same call. This is documented on
+ * the tool description — see register("update_page_sections", ...) in
+ * src/server/index.ts.
+ *
+ * Splice ordering: ranges are sorted by `bodyEnd` descending and applied in
+ * that order so an earlier (lower-offset) splice never invalidates a later
+ * (higher-offset) splice's offsets. Equivalent to a single-pass merge.
+ *
+ * Pure: no API calls. Throws MultiSectionError on any per-section failure.
+ *
+ * DATA-LOSS RISK: medium-high. A naive "apply what we can" mode would
+ * silently corrupt pages on partial failure. Mitigations:
+ *   1. Locate every section against the ORIGINAL page first; failures are
+ *      collected and reported together via MultiSectionError.
+ *   2. Each per-section safePrepareBody is invoked in isolation; any throw
+ *      is captured into the failure list. If ANY section fails, NO splice
+ *      is performed, NO submit happens.
+ *   3. The deletion-gate runs once on the AGGREGATED deletion list — a
+ *      caller cannot bypass the gate by spreading deletions across sections.
+ */
+export async function safePrepareMultiSectionBody(input: {
+  currentStorage: string;
+  sections: readonly MultiSectionInput[];
+  confirmDeletions?: boolean;
+  allowRawHtml?: boolean;
+  confluenceBaseUrl?: string;
+}): Promise<MultiSectionPrepareOutput> {
+  const {
+    currentStorage,
+    sections,
+    confirmDeletions,
+    allowRawHtml,
+    confluenceBaseUrl,
+  } = input;
+
+  if (sections.length === 0) {
+    // Defensive — the zod schema enforces .min(1) at the handler boundary.
+    throw new MultiSectionError([
+      {
+        section: "(none)",
+        reason: "missing",
+        message: "sections list is empty",
+      },
+    ]);
+  }
+
+  // 1. Dedup check — duplicate section names are an ambiguous-intent signal
+  //    and must be rejected before any processing. Collect every duplicate
+  //    in one pass so the error message lists them all.
+  const seen = new Map<string, number>();
+  const dupFailures: MultiSectionFailure[] = [];
+  for (const s of sections) {
+    const count = (seen.get(s.section) ?? 0) + 1;
+    seen.set(s.section, count);
+  }
+  for (const [name, count] of seen) {
+    if (count > 1) {
+      dupFailures.push({
+        section: name,
+        reason: "duplicate",
+        message: `appears ${count} times in input — each section name may ` +
+          `appear at most once per call`,
+      });
+    }
+  }
+  if (dupFailures.length > 0) {
+    throw new MultiSectionError(dupFailures);
+  }
+
+  // 2. Locate every section against the ORIGINAL page and collect failures.
+  //    Heading-resolution failures are collected here, BEFORE any prepare
+  //    runs. This guarantees the per-section prepare step (which is the
+  //    expensive part — markdown conversion etc.) only fires when every
+  //    section is known to exist in the source.
+  type Located = {
+    section: string;
+    body: string;
+    inputBody: string;
+    bodyStart: number;
+    bodyEnd: number;
+    matchedHeading: string;
+  };
+  const located: Located[] = [];
+  const failures: MultiSectionFailure[] = [];
+  for (const s of sections) {
+    const r = locateSectionRange(currentStorage, s.section);
+    if (!r.ok) {
+      failures.push({
+        section: s.section,
+        reason: r.reason,
+        message: r.message,
+      });
+      continue;
+    }
+    located.push({
+      section: s.section,
+      body: r.currentBody,
+      inputBody: s.body,
+      bodyStart: r.bodyStart,
+      bodyEnd: r.bodyEnd,
+      matchedHeading: r.matchedHeading,
+    });
+  }
+  if (failures.length > 0) {
+    throw new MultiSectionError(failures);
+  }
+
+  // 3. Verify no two section ranges overlap. Two distinct, unambiguous
+  //    sections in the same page cannot legitimately occupy the same byte
+  //    range — overlapping ranges would mean the splice plan is non-
+  //    deterministic. This catches the pathological case where one section
+  //    is fully contained in another (e.g. an h3 nested under an h2 with
+  //    the same name); the dedup check above would already cover identical
+  //    names. We keep the guard belt-and-braces.
+  const sortedByStart = [...located].sort((a, b) => a.bodyStart - b.bodyStart);
+  for (let i = 1; i < sortedByStart.length; i++) {
+    const prev = sortedByStart[i - 1];
+    const cur = sortedByStart[i];
+    if (cur.bodyStart < prev.bodyEnd) {
+      throw new MultiSectionError([
+        {
+          section: cur.section,
+          reason: "ambiguous",
+          message:
+            `section "${cur.section}" (range ${cur.bodyStart}-${cur.bodyEnd}) ` +
+            `overlaps with "${prev.section}" (range ${prev.bodyStart}-${prev.bodyEnd}). ` +
+            `Sections cannot be nested inside each other in a single ` +
+            `update_page_sections call.`,
+        },
+      ]);
+    }
+  }
+
+  // 4. Per-section safePrepareBody. Each call is isolated against its own
+  //    section body. Failures are captured into the failure list; we only
+  //    throw the aggregated error AFTER all sections have been attempted,
+  //    so the caller sees every problem in one round-trip.
+  const perSectionResults: MultiSectionResult[] = [];
+  const prepareFailures: MultiSectionFailure[] = [];
+  const splices: { bodyStart: number; bodyEnd: number; replacement: string }[] = [];
+  const versionMessageParts: string[] = [];
+  const aggregatedDeleted: DeletedToken[] = [];
+  const aggregatedRegenerated: RegeneratedTokenPair[] = [];
+
+  for (const loc of located) {
+    let prepared;
+    try {
+      prepared = await safePrepareBody({
+        body: loc.inputBody,
+        currentBody: loc.body,
+        scope: "section",
+        confirmDeletions: confirmDeletions ? true : undefined,
+        ...(allowRawHtml !== undefined ? { allowRawHtml } : {}),
+        ...(confluenceBaseUrl !== undefined ? { confluenceBaseUrl } : {}),
+      });
+    } catch (err) {
+      prepareFailures.push({
+        section: loc.section,
+        reason: "prepare",
+        message: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+    if (prepared.finalStorage === undefined) {
+      // safePrepareBody returned title-only — meaningless for a section
+      // splice. Treat as a prepare failure.
+      prepareFailures.push({
+        section: loc.section,
+        reason: "prepare",
+        message:
+          "safePrepareBody returned undefined finalStorage; sections require a body",
+      });
+      continue;
+    }
+    perSectionResults.push({
+      section: loc.section,
+      matchedHeading: loc.matchedHeading,
+      deletedTokens: prepared.deletedTokens,
+      regeneratedTokens: prepared.regeneratedTokens,
+    });
+    splices.push({
+      bodyStart: loc.bodyStart,
+      bodyEnd: loc.bodyEnd,
+      replacement: prepared.finalStorage,
+    });
+    if (prepared.versionMessage) {
+      versionMessageParts.push(`${loc.section}: ${prepared.versionMessage}`);
+    }
+    aggregatedDeleted.push(...prepared.deletedTokens);
+    aggregatedRegenerated.push(...prepared.regeneratedTokens);
+  }
+  if (prepareFailures.length > 0) {
+    throw new MultiSectionError(prepareFailures);
+  }
+
+  // 5. Apply splices in reverse-by-offset order against the ORIGINAL body.
+  //    Splice indexes were computed against `currentStorage`; replacing in
+  //    descending offset order means earlier (lower-offset) replacements
+  //    never invalidate later (higher-offset) splice indexes.
+  splices.sort((a, b) => b.bodyEnd - a.bodyEnd);
+  let merged = currentStorage;
+  for (const sp of splices) {
+    merged =
+      merged.slice(0, sp.bodyStart) + sp.replacement + merged.slice(sp.bodyEnd);
+  }
+
+  return {
+    finalStorage: merged,
+    perSectionResults,
+    aggregatedDeletedTokens: aggregatedDeleted,
+    aggregatedRegeneratedTokens: aggregatedRegenerated,
+    versionMessage: versionMessageParts.join("; "),
+  };
 }

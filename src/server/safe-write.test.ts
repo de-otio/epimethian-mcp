@@ -74,15 +74,20 @@ vi.mock("./mutation-log.js", async (importOriginal) => {
 
 import {
   emitDestructiveBanner,
+  findReplaceInSection,
+  MultiSectionError,
   safePrepareBody,
+  safePrepareMultiSectionBody,
   safeSubmitPage,
   type SafePrepareBodyInput,
   type DeletedToken,
   type RegeneratedTokenPair,
   DELETION_ACK_MISMATCH,
+  FIND_REPLACE_MATCH_FAILED,
   INPUT_BODY_TOO_LARGE,
   MAX_INPUT_BODY,
   MIXED_INPUT_DETECTED,
+  MULTI_SECTION_FAILED,
   POST_TRANSFORM_BODY_REJECTED,
   READ_ONLY_MARKDOWN_ROUND_TRIP,
   WRITE_CONTAINS_UNTRUSTED_FENCE,
@@ -2129,5 +2134,386 @@ describe("safeSubmitPage — C1 audit log for regenerated tokens", () => {
     });
 
     expect(result.regeneratedTokens).toEqual(regeneratedTokens);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Section M: safePrepareMultiSectionBody (D1 — update_page_sections)
+// ---------------------------------------------------------------------------
+//
+// Atomicity guarantees verified here:
+//   1. Heading missing / ambiguous / duplicate → MultiSectionError thrown
+//      BEFORE any splice. Source body is returned untouched (test asserts
+//      on the merged storage in success cases only).
+//   2. Multiple sections splice into ONE merged document — no partial
+//      mutation, no per-section commit.
+//   3. Section finders run against the ORIGINAL page (not the cumulative-
+//      edited state); a later section in the input cannot match content
+//      introduced by an earlier section's body.
+//   4. Aggregated deletion list is exposed for the gate to fire ONCE on
+//      the union, not per-section. (Gate-call wiring is verified by the
+//      handler tests in index.test.ts.)
+// ---------------------------------------------------------------------------
+
+describe("safePrepareMultiSectionBody (D1)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("splices N sections into one merged document with all replacements applied", async () => {
+    const source =
+      "<h2>A</h2><p>old A</p>" +
+      "<h2>B</h2><p>old B</p>" +
+      "<h2>C</h2><p>old C</p>" +
+      "<h2>D</h2><p>old D</p>";
+    const result = await safePrepareMultiSectionBody({
+      currentStorage: source,
+      sections: [
+        { section: "A", body: "<p>new A</p>" },
+        { section: "B", body: "<p>new B</p>" },
+        { section: "C", body: "<p>new C</p>" },
+        { section: "D", body: "<p>new D</p>" },
+      ],
+    });
+    // Each old body replaced; headings preserved.
+    expect(result.finalStorage).toContain("<h2>A</h2><p>new A</p>");
+    expect(result.finalStorage).toContain("<h2>B</h2><p>new B</p>");
+    expect(result.finalStorage).toContain("<h2>C</h2><p>new C</p>");
+    expect(result.finalStorage).toContain("<h2>D</h2><p>new D</p>");
+    // Old bodies are gone (note: we only replaced the BODY under each
+    // heading, not the heading text itself).
+    expect(result.finalStorage).not.toContain("<p>old A</p>");
+    expect(result.finalStorage).not.toContain("<p>old B</p>");
+    expect(result.finalStorage).not.toContain("<p>old C</p>");
+    expect(result.finalStorage).not.toContain("<p>old D</p>");
+    expect(result.perSectionResults).toHaveLength(4);
+    expect(result.perSectionResults.map((r) => r.section)).toEqual([
+      "A", "B", "C", "D",
+    ]);
+  });
+
+  it("rejects the entire call when a single section's heading is missing", async () => {
+    const source = "<h2>A</h2><p>old A</p><h2>B</h2><p>old B</p>";
+    let thrown: unknown;
+    try {
+      await safePrepareMultiSectionBody({
+        currentStorage: source,
+        sections: [
+          { section: "A", body: "<p>new A</p>" },
+          { section: "DoesNotExist", body: "<p>x</p>" },
+        ],
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(MultiSectionError);
+    const err = thrown as MultiSectionError;
+    expect(err.code).toBe(MULTI_SECTION_FAILED);
+    expect(err.failures).toHaveLength(1);
+    expect(err.failures[0]).toMatchObject({
+      section: "DoesNotExist",
+      reason: "missing",
+    });
+    expect(err.failures[0].message).toContain("not found");
+    // The error message itself surfaces the offending section name.
+    expect(err.message).toContain("DoesNotExist");
+  });
+
+  it("rejects on ambiguous heading (B1's tolerant matcher tripped)", async () => {
+    // Two headings both stripping to "Notes" — tolerant matcher throws.
+    const source =
+      "<h2>1.2. Notes</h2><p>n1</p>" +
+      "<h2>2.3. Notes</h2><p>n2</p>";
+    let thrown: unknown;
+    try {
+      await safePrepareMultiSectionBody({
+        currentStorage: source,
+        sections: [{ section: "Notes", body: "<p>x</p>" }],
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(MultiSectionError);
+    const err = thrown as MultiSectionError;
+    expect(err.failures[0].reason).toBe("ambiguous");
+    expect(err.failures[0].message).toContain("ambiguous");
+  });
+
+  it("rejects when the input list contains a duplicate section name", async () => {
+    const source = "<h2>A</h2><p>old A</p>";
+    let thrown: unknown;
+    try {
+      await safePrepareMultiSectionBody({
+        currentStorage: source,
+        sections: [
+          { section: "A", body: "<p>new1</p>" },
+          { section: "A", body: "<p>new2</p>" },
+        ],
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(MultiSectionError);
+    const err = thrown as MultiSectionError;
+    expect(err.failures).toHaveLength(1);
+    expect(err.failures[0]).toMatchObject({
+      section: "A",
+      reason: "duplicate",
+    });
+  });
+
+  it("rejects with empty sections list (defensive — schema enforces .min(1))", async () => {
+    let thrown: unknown;
+    try {
+      await safePrepareMultiSectionBody({
+        currentStorage: "<h2>A</h2><p>x</p>",
+        sections: [],
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(MultiSectionError);
+  });
+
+  it("collects EVERY missing-heading failure in one error (not just the first)", async () => {
+    const source = "<h2>A</h2><p>old</p>";
+    let thrown: unknown;
+    try {
+      await safePrepareMultiSectionBody({
+        currentStorage: source,
+        sections: [
+          { section: "Missing1", body: "<p>x</p>" },
+          { section: "Missing2", body: "<p>y</p>" },
+          { section: "A", body: "<p>z</p>" },
+        ],
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    const err = thrown as MultiSectionError;
+    const missing = err.failures.filter((f) => f.reason === "missing");
+    // Both missing sections reported; the valid "A" entry is not a failure.
+    expect(missing.map((f) => f.section).sort()).toEqual(["Missing1", "Missing2"]);
+  });
+
+  it("a single-section call produces the same outcome as update_page_section's splice", async () => {
+    const source = "<h2>A</h2><p>old A</p><h2>B</h2><p>keep B</p>";
+    const result = await safePrepareMultiSectionBody({
+      currentStorage: source,
+      sections: [{ section: "A", body: "<p>new A</p>" }],
+    });
+    expect(result.finalStorage).toBe(
+      "<h2>A</h2><p>new A</p><h2>B</h2><p>keep B</p>",
+    );
+  });
+
+  it("matches each section against the ORIGINAL page (not cumulative state)", async () => {
+    // Section A's NEW body literally contains the heading text used by a
+    // later section search ("Section B"). If the implementation matched
+    // each section against the cumulative-edited state, the second match
+    // would resolve to whatever appeared inside A's replacement body.
+    // Because matching runs against the ORIGINAL page, this is irrelevant —
+    // the second section resolves against the original heading.
+    const source =
+      "<h2>Section A</h2><p>old A</p>" +
+      "<h2>Section B</h2><p>old B</p>";
+    const result = await safePrepareMultiSectionBody({
+      currentStorage: source,
+      sections: [
+        // A's new body mentions "Section B" as plain text — would confuse
+        // a naïve cumulative-state finder.
+        { section: "Section A", body: "<p>new A discusses Section B</p>" },
+        { section: "Section B", body: "<p>new B</p>" },
+      ],
+    });
+    expect(result.finalStorage).toContain(
+      "<h2>Section A</h2><p>new A discusses Section B</p>",
+    );
+    // Section B's heading-and-body still resolved correctly.
+    expect(result.finalStorage).toContain("<h2>Section B</h2><p>new B</p>");
+    expect(result.finalStorage).not.toContain("<p>old A</p>");
+    expect(result.finalStorage).not.toContain("<p>old B</p>");
+  });
+
+  it("aggregates deletedTokens across sections (no per-section gate fires here)", async () => {
+    // Section A has an emoticon; the markdown replacement removes it.
+    // Section B has an emoticon; the markdown replacement also removes it.
+    // confirm_deletions: true makes per-section prepare accept the loss;
+    // we then verify the aggregate carries both deletions.
+    const EMOTICON_A = `<ac:emoticon ac:name="warning"/>`;
+    const EMOTICON_B = `<ac:emoticon ac:name="info"/>`;
+    const source =
+      `<h2>A</h2><p>note ${EMOTICON_A}</p>` +
+      `<h2>B</h2><p>tip ${EMOTICON_B}</p>`;
+    const result = await safePrepareMultiSectionBody({
+      currentStorage: source,
+      sections: [
+        { section: "A", body: "note without macro" },
+        { section: "B", body: "tip without macro" },
+      ],
+      confirmDeletions: true,
+    });
+    // Two emoticons aggregated, one per section. The exact ID (T#) differs
+    // because each section is tokenised independently — we assert on count.
+    expect(result.aggregatedDeletedTokens).toHaveLength(2);
+    expect(
+      result.aggregatedDeletedTokens.every((t) => t.tag === "ac:emoticon"),
+    ).toBe(true);
+  });
+
+  it("propagates per-section deletion-not-confirmed errors as 'prepare' failures (no submit)", async () => {
+    // Same setup as above but WITHOUT confirm_deletions — each section's
+    // safePrepareBody throws DELETIONS_NOT_CONFIRMED, which we capture as
+    // a prepare failure. The whole call rejects.
+    const EMOTICON = `<ac:emoticon ac:name="warning"/>`;
+    const source =
+      `<h2>A</h2><p>note ${EMOTICON}</p>` +
+      `<h2>B</h2><p>tip ${EMOTICON}</p>`;
+    let thrown: unknown;
+    try {
+      await safePrepareMultiSectionBody({
+        currentStorage: source,
+        sections: [
+          { section: "A", body: "note without macro" },
+          { section: "B", body: "tip without macro" },
+        ],
+        // confirmDeletions omitted → each per-section prepare throws.
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(MultiSectionError);
+    const err = thrown as MultiSectionError;
+    // Both sections appear as 'prepare' failures.
+    expect(err.failures).toHaveLength(2);
+    expect(err.failures.every((f) => f.reason === "prepare")).toBe(true);
+    expect(err.failures.map((f) => f.section).sort()).toEqual(["A", "B"]);
+  });
+
+  it("perSectionResults exposes the matched heading verbatim from the source", async () => {
+    const source = "<h2>1.2. Lesereihenfolge</h2><p>old</p>";
+    const result = await safePrepareMultiSectionBody({
+      currentStorage: source,
+      // Caller supplies the bare form; B1's tolerant matcher resolves it.
+      sections: [{ section: "Lesereihenfolge", body: "<p>new</p>" }],
+    });
+    expect(result.perSectionResults[0].section).toBe("Lesereihenfolge");
+    expect(result.perSectionResults[0].matchedHeading).toBe(
+      "<h2>1.2. Lesereihenfolge</h2>",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findReplaceInSection (D2)
+// ---------------------------------------------------------------------------
+
+describe("findReplaceInSection (D2)", () => {
+  it("replaces a plain-text literal in a simple section body", () => {
+    const body = "<p>Hello world. See <strong>1. Overview</strong> for more.</p>";
+    const result = findReplaceInSection(body, [
+      { find: "<strong>1. Overview</strong>", replace: "<strong>REPLACED</strong>" },
+    ]);
+    expect(result).toContain("<strong>REPLACED</strong>");
+    expect(result).not.toContain("<strong>1. Overview</strong>");
+    // Surrounding content is byte-identical.
+    expect(result).toContain("<p>Hello world. See ");
+    expect(result).toContain(" for more.</p>");
+  });
+
+  it("returns body unchanged when the section has no macros and find matches", () => {
+    const body = "<p>alpha bravo</p>";
+    const result = findReplaceInSection(body, [
+      { find: "alpha", replace: "ALPHA" },
+    ]);
+    expect(result).toBe("<p>ALPHA bravo</p>");
+  });
+
+  it("throws FIND_REPLACE_MATCH_FAILED when find string is absent", () => {
+    const body = "<p>Hello world.</p>";
+    let thrown: unknown;
+    try {
+      findReplaceInSection(body, [{ find: "MISSING_STRING", replace: "x" }]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeDefined();
+    expect((thrown as { code?: string }).code).toBe(FIND_REPLACE_MATCH_FAILED);
+    expect((thrown as Error).message).toContain("MISSING_STRING");
+  });
+
+  it("applies multiple pairs in order (chaining semantics)", () => {
+    const body = "<p>alpha bravo charlie</p>";
+    const result = findReplaceInSection(body, [
+      { find: "alpha", replace: "ALPHA" },
+      { find: "bravo", replace: "BRAVO" },
+      // Third pair matches the partially-substituted form.
+      { find: "BRAVO charlie", replace: "BRAVO-CHARLIE" },
+    ]);
+    expect(result).toBe("<p>ALPHA BRAVO-CHARLIE</p>");
+  });
+
+  it("does NOT replace text inside a macro's attribute value (tokenisation guard)", () => {
+    // An ac:link whose ri:page content-title contains "X".
+    // After tokenisation the whole <ac:link> is opaque, so "X" inside it is safe.
+    const AC_LINK =
+      '<ac:link><ri:page ri:content-title="X"/>' +
+      "<ac:plain-text-link-body><![CDATA[X]]></ac:plain-text-link-body>" +
+      "</ac:link>";
+    const body = `<p>See ${AC_LINK} here. Also X in text.</p>`;
+    const result = findReplaceInSection(body, [{ find: "X", replace: "Y" }]);
+    // The plain-text " X in text" became " Y in text".
+    expect(result).toContain("Y in text");
+    // The macro's attribute and CDATA are preserved verbatim.
+    expect(result).toContain('ri:content-title="X"');
+    expect(result).toContain("<![CDATA[X]]>");
+    // The ac:link itself is still intact.
+    expect(result).toContain("ri:page");
+  });
+
+  it("does NOT replace text inside a CDATA body of a structured macro", () => {
+    // A code macro whose CDATA body contains the find string.
+    const CODE_MACRO =
+      '<ac:structured-macro ac:name="code">' +
+      "<ac:plain-text-body><![CDATA[find me here]]></ac:plain-text-body>" +
+      "</ac:structured-macro>";
+    const body = `<p>find me here</p>${CODE_MACRO}`;
+    const result = findReplaceInSection(body, [
+      { find: "find me here", replace: "REPLACED" },
+    ]);
+    // Only the text outside the macro is replaced.
+    expect(result).toContain("<p>REPLACED</p>");
+    // The macro's CDATA is preserved.
+    expect(result).toContain("<![CDATA[find me here]]>");
+  });
+
+  it("throws with the first failing find when a later pair also fails", () => {
+    const body = "<p>Hello.</p>";
+    let thrown: unknown;
+    try {
+      findReplaceInSection(body, [
+        { find: "Hello", replace: "Hi" },     // succeeds
+        { find: "NOT_HERE", replace: "x" },   // fails
+      ]);
+    } catch (e) {
+      thrown = e;
+    }
+    expect((thrown as { code?: string }).code).toBe(FIND_REPLACE_MATCH_FAILED);
+    expect((thrown as Error).message).toContain("NOT_HERE");
+  });
+
+  it("preserves a section body with no macros and no match when find string is absent", () => {
+    // This is the 'fails loudly' case. The body is NOT modified.
+    const body = "<p>Untouched content.</p>";
+    expect(() =>
+      findReplaceInSection(body, [{ find: "xyz", replace: "abc" }])
+    ).toThrow();
+  });
+
+  it("handles empty section body gracefully — find always fails (body is empty)", () => {
+    const body = "";
+    expect(() =>
+      findReplaceInSection(body, [{ find: "anything", replace: "x" }])
+    ).toThrow();
   });
 });

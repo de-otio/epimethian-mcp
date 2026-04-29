@@ -5,6 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.4.0] - 2026-04-28 - UX feedback: new tool surface (batch 3 of 3)
+
+Final batch from `plans/ux-feedback-confluence-tree-build.md`. Adds two
+new ways to update a page that don't require resending the full content
+of every section.
+
+### Added
+
+- **`update_page_sections` (plural)** (§4) — atomic multi-section update
+  in a single version bump. Input is a list of `{section, body}` pairs;
+  the server splices each section against the *original* page (not the
+  cumulative-edited state) and submits one merged document. Either every
+  section applies or none do — if any heading is missing, ambiguous, or
+  duplicated in the input list, the entire call is rejected and the
+  page is left unchanged. The aggregated `confirm_deletions` gate fires
+  once on the cross-section total, so a caller cannot bypass the gate
+  by spreading deletions across many sections.
+
+  When was this needed? The original feedback session did 18 section
+  updates across 4 waves of the same page, each wave waiting on the
+  previous version. With `update_page_sections`, the same workflow
+  collapses to 4 calls (one per page) and 4 version bumps, not 18.
+- **`find_replace` mode for `update_page_section`** (§4b) — instead of
+  resending the full section body, callers can pass an array of
+  `{find, replace}` pairs that apply literal-string substitutions
+  inside the section. The cross-link-pass workflow from the feedback
+  session — `**1. Overview**` → `**[1. Overview](confluence://...)**` —
+  is now a 50-byte input rather than the section's full body. Pairs
+  are applied in input order; each subsequent `find` runs against the
+  partially-substituted body, so chained substitutions work.
+
+  Schema enforces *exactly one* of `body` or `find_replace`. Missing
+  find strings cause a structured rejection with the missing string
+  named — no silent no-op. Replacement strings can themselves contain
+  Confluence storage syntax (caller's responsibility).
+
+### Macro-safety guard
+
+The find/replace pipeline tokenises the section body using the existing
+converter tokeniser before applying substitutions, so each
+`<ac:link>` / `<ac:structured-macro>` / `<ri:page>` element is replaced
+by an opaque placeholder for the duration of the rewrite. Substitutions
+*cannot* match inside attribute values or CDATA bodies — only on text
+that exists outside any macro boundary. The `D2-4` test pins this:
+`find_replace: [{find: "X", replace: "Y"}]` against a page containing an
+`<ac:link>` whose `ri:page` content-title is "X" and whose CDATA body is
+"X" leaves both intact while still rewriting "X here" in the surrounding
+text.
+
+### Internal
+
+- New helper `safePrepareMultiSectionBody()` in `safe-write.ts`. Locates
+  every section against the original storage XML, sorts splice ranges
+  in descending byte order so earlier splices never invalidate later
+  offsets, and returns either `{ finalStorage, perSectionResults,
+  aggregatedDeletedTokens, aggregatedRegeneratedTokens }` or throws
+  `MultiSectionError` listing every per-section failure in one error
+  (so the caller sees all problems in one round-trip, not just the
+  first).
+- New helper `findReplaceInSection()` in `safe-write.ts`. Tokenises the
+  section body, applies substitutions on the placeholder-bearing
+  canonical form using `split(find).join(replace)` (no regex, fully
+  literal), then restores the sidecar verbatim.
+- `install-agent.md` tool-count table updated to 35.
+
+### Test cleanup
+
+Removed unused `mockResolvedValueOnce` calls from the `D2-5` and
+`D2-6` schema-rejection tests — the rejection runs before any HTTP
+call, and queueing values that are never consumed leaks into later
+tests' mock state. (Found while reconciling 23 spurious "D1 already
+broken" failures during integration; the queued values were poisoning
+the next 7 D1 success-path tests.)
+
 ## [6.3.0] - 2026-04-28 - UX feedback: behaviour changes (batch 2 of 3)
 
 Second batch of fixes from the live-session UX feedback. Each change has
