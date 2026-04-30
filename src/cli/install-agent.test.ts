@@ -160,7 +160,7 @@ describe("install-agent.md write budget section", () => {
 
 describe("install-agent.md soft confirmation section", () => {
   it("contains the soft confirmation section heading", () => {
-    expect(guideContent).toContain("Soft confirmation (clients without elicitation)");
+    expect(guideContent).toContain("Soft confirmation (clients without working elicitation)");
   });
 });
 
