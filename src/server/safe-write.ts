@@ -678,6 +678,17 @@ export function formatSoftConfirmationResult(
     `and invalidated by any competing write to this page. If validation\n` +
     `fails, mint a new one by re-calling without \`confirm_token\`.`;
 
+  // EPIMETHIAN_TOKEN_IN_TEXT=true: opt-in fallback for clients that drop
+  // structuredContent or content blocks when outputSchema is present (Claude
+  // Code issues #15412, #9962, #39976). Only the exact string "true" activates
+  // this; "1", "yes", "on", "TRUE" etc. do not. The structured payload is
+  // unchanged — this is strictly additive to the text block.
+  const tokenInText = process.env.EPIMETHIAN_TOKEN_IN_TEXT === "true";
+  const finalText = tokenInText
+    ? text +
+      `\n\n[FALLBACK] Full token (EPIMETHIAN_TOKEN_IN_TEXT=true): ${err.token}`
+    : text;
+
   // ── Structured content generation ──────────────────────────────────
   // Shape matches `confirmationRequiredArm` in output-schema.ts. Keys
   // are snake_case; deletion_summary's inner keys are also converted
@@ -718,7 +729,7 @@ export function formatSoftConfirmationResult(
   }
 
   return {
-    content: [{ type: "text", text }],
+    content: [{ type: "text", text: finalText }],
     isError: true,
     structuredContent,
   };
