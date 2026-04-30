@@ -1318,7 +1318,7 @@ describe("Claude Code fake-elicitation interop", () => {
 
     // A real (slow) decline must yield USER_DECLINED, not a soft-confirm.
     expect(r1.isError).toBe(true);
-    expect(r1.content[0].text).toContain("USER_DECLINED");
+    expect(r1.content[0].text).toContain("user declined");
     // Critically: no token in structuredContent.
     expect(r1.structuredContent?.confirm_token).toBeUndefined();
 

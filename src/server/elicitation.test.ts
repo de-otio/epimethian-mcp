@@ -107,7 +107,10 @@ describe("gateOperation (E4)", () => {
 
   it("E4: throws USER_DECLINED on decline", async () => {
     vi.mocked(clientSupportsElicitation).mockReturnValue(true);
-    const elicit = vi.fn(async () => ({ action: "decline", content: undefined }));
+    const elicit = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+      return { action: "decline" as const, content: undefined };
+    });
     const server = makeFakeServer(elicit);
 
     try {

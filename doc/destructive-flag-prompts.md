@@ -152,6 +152,27 @@ Nonetheless, options if we wanted to tune it:
   to proceed."* would let users distinguish a destructive-action
   prompt from an ordinary tool-name prompt.
 
+## Environment variables (v6.6.1+)
+
+When using an MCP client that advertises elicitation support but does not
+actually handle elicitation callbacks (e.g. Claude Code VS Code extension),
+v6.6.1 automatically detects and adapts to this in the first call. For users
+who need deterministic control or debugging:
+
+- **`EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true`** — Force the gate
+  to treat the client as elicitation-less from the start, bypassing the
+  auto-detection phase. Distinct from `EPIMETHIAN_BYPASS_ELICITATION`
+  (which skips the gate entirely); this env var keeps the soft-confirmation
+  token flow active. See [fix-claude-code-elicitation-and-version-schema.md](../plans/fix-claude-code-elicitation-and-version-schema.md) for the full precedence table.
+
+- **`EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS=<10..5000>`** — Tune the threshold
+  (default 50 ms) for auto-detecting fast declines. Use this if your CI
+  environment has slow transport latency that pushes legitimate declines
+  above the default threshold.
+
+- **`EPIMETHIAN_DISABLE_FAST_DECLINE_DETECTION=true`** — Disable the
+  fast-decline auto-detection entirely, restoring exactly v6.6.0 behaviour.
+
 ## Related
 
 - [data-preservation.md](data-preservation.md) — the token-preservation

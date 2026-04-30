@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.6.1] - 2026-04-30 - Claude Code silent-decline + version schema fixes
+
+### Fixed
+
+- **Claude Code VS Code extension silent-decline.** The extension advertises
+  `capabilities.elicitation = {}` during the MCP handshake but the agent SDK
+  transport returns `{action: "decline"}` immediately when no `onElicitation`
+  callback is registered. v6.6.0's soft-elicitation path was gated on
+  `!clientSupportsElicitation(server)`, so it never fired for this case. v6.6.1
+  detects fast declines (default <50 ms — well below human reaction time) and
+  routes the call through the existing soft-confirmation token path,
+  restoring v6.6.0's intended user experience. `EPIMETHIAN_BYPASS_ELICITATION`
+  is no longer required as a workaround for affected clients.
+
+- **`version` field accepts string-encoded positive integers.** The schema
+  on `update_page`, `update_page_section`, `append_to_page`,
+  `prepend_to_page`, and `delete_page` is now `z.union([…coerce…, "current"])`.
+  Workaround for an LM serialisation quirk in tagged unions with a string-literal
+  alternative — `"6"` is occasionally emitted instead of `6`. Coercion is narrow:
+  `^\d+$` only. `"6.0"`, `"-6"`, `" 6 "`, `""`, and `0` still reject.
+
+### Added
+
+- **`EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true`** — deterministic
+  counterpart to the auto-detection. Use this if your client is known to lie
+  about elicitation and you want to skip the first-call probe. Distinct from
+  `EPIMETHIAN_BYPASS_ELICITATION` (which skips the gate entirely): this env
+  var keeps the soft-confirmation token gate in force.
+- **`EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS=<10..5000>`** — tune the
+  auto-detection threshold (default 50 ms) for slow CI links.
+- **`EPIMETHIAN_DISABLE_FAST_DECLINE_DETECTION=true`** — total off-switch
+  for the auto-detection. Restores exactly v6.6.0 behaviour.
+
+### Security
+
+The fast-decline path mints tokens via the same `mintToken` call used by the
+existing soft-elicitation flow; all v6.6.0 token guarantees (single-use, TTL,
+5-field binding, rate ceiling, no exfil channel) apply. The threshold is
+clamped to `[10, 5000]` to prevent both unintended bypasses (very high values
+turning real declines into soft-confirms) and dead-zone misconfiguration
+(very low values that never trigger). The "client is faking elicitation" flag
+is per-`McpServer` instance via `WeakMap`, so multi-tenant host processes
+cannot cross-contaminate sessions. `EPIMETHIAN_BYPASS_ELICITATION`'s
+precedence is unchanged: row 1 still wins.
+
+### Tests
+
+Net test delta vs v6.6.0: +36 (1815 → 1851 passing, 1 skipped, 5 todo,
+60 test files). New coverage:
+
+- 18 unit tests in `elicitation.test.ts` covering the
+  `effectiveSupportsElicitation` helper, the WeakMap-backed faking
+  flag, threshold clamping, sticky-flag semantics, per-server
+  isolation, and the `DISABLE_FAST_DECLINE_DETECTION` off-switch.
+- 12 unit tests in the new `src/server/version-schema.test.ts`
+  pinning the strict-positive-integer regex (rejects empty,
+  whitespace, decimals, signs; accepts `"6"`, `"007"`, `"current"`).
+- 4 integration tests in `soft-elicitation.integration.test.ts`
+  exercising the end-to-end Claude Code interop scenarios (fast
+  decline retried via soft-confirm, slow decline still
+  USER_DECLINED, env-var deterministic routing, sticky flag across
+  tools).
+- 1 pre-existing decline test updated with a 100 ms response delay
+  to stay above the fast-decline threshold (matches the new
+  contract: instant declines are now treated as faking-client
+  signals, not real user intent).
+
 ## [6.6.0] - 2026-04-29 - soft elicitation for clients without in-protocol confirmation (OpenCode, phase 2 of 2)
 
 Phase 2 of the OpenCode-compatibility work specified in

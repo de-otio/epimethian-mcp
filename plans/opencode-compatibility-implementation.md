@@ -1376,3 +1376,16 @@ or scoped out with rationale).
 | **LOW (carry-over)** Agent retries with token without asking the user | medium | silent gate bypass | tool-result message is imperative ("STOP and ask"); same risk as today's `EPIMETHIAN_ALLOW_UNGATED_WRITES`; mitigated, not eliminated, by routing the token through `structuredContent` (out of free-text scratchpad) |
 | **LOW** Token-store bug lets a wrong-page token validate | low | data loss | strict 5-field ctx equality; single-use; validate-time sibling-invalidation; mandatory human code review on `confirmation-tokens.ts` before merge |
 | **LOW** Soft-mode trigger fires for elicitation-capable clients | very low | safety downgrade | trigger explicitly requires `!clientSupportsElicitation()`; precedence matrix tested in scenario 13 |
+
+---
+
+## v6.6.1 addendum (2026-04-30)
+
+The §3.4 precedence table in this document is **superseded** by §3.3 of
+[plans/fix-claude-code-elicitation-and-version-schema.md](fix-claude-code-elicitation-and-version-schema.md).
+The substantive change: row 6 (real elicitation) now records the
+elicitInput response time and, on a fast-decline (<50 ms by default),
+flips the session's effective elicitation-support flag and re-evaluates
+the gate from row 1. This closes the gap §10's `EPIMETHIAN_BYPASS_ELICITATION`
+escape hatch was working around — affected clients now get the
+soft-elicitation token flow automatically.

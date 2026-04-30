@@ -17,7 +17,7 @@ import { z } from "zod";
  *     ("6.0"), negative strings ("-6"), zero (0), negative integers,
  *     non-integer floats (6.5), and any other string not matching `^\d+$`.
  */
-export const versionField: z.ZodType<number | "current"> = z.union([
+export const versionField = z.union([
   z.preprocess(
     (v) => (typeof v === "string" && /^\d+$/.test(v) ? Number(v) : v),
     z.number().int().positive(),
