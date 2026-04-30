@@ -1160,3 +1160,257 @@ describe("Scenario 19 — humanSummary exfil resistance (CRITICAL)", () => {
     expect(text).not.toContain(ATTACKER_PAYLOAD);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Claude Code fake-elicitation interop (T3 — v6.6.1)
+//
+// These tests exercise the new fast-decline auto-detection path added by T1.
+// The mock client advertises elicitation capability but has its elicitInput
+// spy resolve immediately (< FAST_DECLINE_THRESHOLD_MS = 50 ms) or slowly
+// (250 ms), exercising all branches of the §3.3 updated precedence table.
+//
+// T1 adds to elicitation.ts:
+//   - `_resetFakeElicitationStateForTest()` — clears the per-server WeakMap
+//   - `FAST_DECLINE_THRESHOLD_MS` (default 50) constant
+//   - `effectiveSupportsElicitation(server)` — honours env override + sticky flag
+//   - `isClientFakingElicitation(server)` — per-server boolean
+//
+// The production `gateOperation` is NOT mocked here — the full call stack
+// runs through elicitation.ts → confirmation-tokens.ts exactly as in
+// production.
+// ---------------------------------------------------------------------------
+
+describe("Claude Code fake-elicitation interop", () => {
+  // Capture and silence the BYPASS / ungated-write console.error noise that
+  // some branches emit, so test output stays clean.
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    // T1 adds _resetFakeElicitationStateForTest() to elicitation.ts.
+    // Calling it here clears the per-server WeakMap so stickiness from a
+    // prior test does not bleed into the next one.
+    const { _resetFakeElicitationStateForTest } = await import("./elicitation.js");
+    _resetFakeElicitationStateForTest();
+
+    // Reset the elicitInput spy so call-count assertions start from zero.
+    mockElicitInput.mockReset();
+
+    // Make the client advertise elicitation (the "lies" scenario).
+    mockGetClientCapabilities.mockReturnValue({ elicitation: {} });
+
+    // Env-var cleanup — test cases that need them set them explicitly.
+    delete process.env.EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED;
+    delete process.env.EPIMETHIAN_BYPASS_ELICITATION;
+    delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+    delete process.env.EPIMETHIAN_DISABLE_SOFT_CONFIRM;
+
+    consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Restore page/update mocks to defaults for this group.
+    mockGetPage.mockReset();
+    mockGetPage.mockResolvedValue(pageStub(7));
+    mockRawUpdatePage.mockReset();
+    mockRawUpdatePage.mockResolvedValue(updateResponseStub(8));
+    mockDeletePage.mockReset();
+    mockDeletePage.mockResolvedValue(undefined);
+
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    consoleErrorSpy.mockRestore();
+    delete process.env.EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED;
+    vi.useRealTimers();
+  });
+
+  // ── Case 1 ────────────────────────────────────────────────────────────────
+  // Fast decline (< 50 ms) + all four soft fields present → tool returns the
+  // soft-confirm payload (isError, confirm_token in structuredContent,
+  // humanSummary present). Re-invoking with the token should write successfully.
+  it("fast decline (< 50 ms) + all soft fields → soft-confirm payload; re-invoke with token succeeds", async () => {
+    // Simulate a near-instant decline — well below the 50 ms threshold.
+    // Because gateOperation measures elapsed time with performance.now(),
+    // and the mock resolves synchronously within the microtask queue, the
+    // elapsed time will be < 50 ms in any real execution environment.
+    mockElicitInput.mockResolvedValue({ action: "decline", content: undefined });
+
+    const handler = registeredTools.get("update_page")!.handler;
+
+    // First call — no confirm_token, all soft fields will be present because
+    // the page stub has cloudId (from activeConfig.sealedCloudId), pageId,
+    // version, and a computable diffHash.
+    const r1 = await handler({
+      page_id: DEFAULT_PAGE_ID,
+      title: "Test Page",
+      version: 7,
+      body: "<p>Fast-decline test body</p>",
+      replace_body: true,
+    });
+
+    // The fast-decline path must route to soft-confirm, NOT USER_DECLINED.
+    expect(r1.isError).toBe(true);
+    expect(r1.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(r1.structuredContent).toBeDefined();
+    const token = r1.structuredContent.confirm_token;
+    expect(typeof token).toBe("string");
+    expect(token.length).toBeGreaterThan(10);
+    expect(r1.structuredContent.page_id).toBe(DEFAULT_PAGE_ID);
+    expect(r1.structuredContent.audit_id).toBeDefined();
+    expect(r1.structuredContent.expires_at).toBeDefined();
+
+    // humanSummary must be present (it's the description shown to the user).
+    // The text is embedded in content[0].text by the handler's formatter.
+    expect(r1.content[0].text).toBeDefined();
+
+    // elicitInput was called exactly once (the probe call that returned fast).
+    expect(mockElicitInput).toHaveBeenCalledTimes(1);
+
+    // Re-invoke with the token — the write must proceed.
+    const r2 = await handler({
+      page_id: DEFAULT_PAGE_ID,
+      title: "Test Page",
+      version: 7,
+      body: "<p>Fast-decline test body</p>",
+      replace_body: true,
+      confirm_token: token,
+    });
+
+    expect(r2.isError).toBeUndefined();
+    expect(r2.content[0].text).toContain("Updated:");
+    expect(mockRawUpdatePage).toHaveBeenCalledTimes(1);
+
+    // elicitInput must NOT have been called again during the retry.
+    expect(mockElicitInput).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Case 2 ────────────────────────────────────────────────────────────────
+  // Slow decline (≥ 250 ms) + all soft fields → USER_DECLINED (real human
+  // decline; no token minted). Re-invoking with a fabricated token should
+  // fail with CONFIRMATION_TOKEN_INVALID.
+  it("slow decline (250 ms) + all soft fields → USER_DECLINED; no token; fabricated token rejected", async () => {
+    // Use fake timers so the 250 ms await completes instantly in test time
+    // while still advancing performance.now() by 250 ms — enough to exceed
+    // the 50 ms threshold.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    // Mock elicitInput to decline after 250 ms.
+    mockElicitInput.mockImplementation(
+      () =>
+        new Promise<{ action: string; content: undefined }>((resolve) => {
+          setTimeout(() => resolve({ action: "decline", content: undefined }), 250);
+        }),
+    );
+
+    const handler = registeredTools.get("update_page")!.handler;
+
+    // Kick off the handler — it will await elicitInput internally.
+    const callPromise = handler({
+      page_id: DEFAULT_PAGE_ID,
+      title: "Test Page",
+      version: 7,
+      body: "<p>Slow-decline test body</p>",
+      replace_body: true,
+    });
+
+    // Advance fake timers past the 250 ms mark so the elicit resolves.
+    await vi.advanceTimersByTimeAsync(300);
+    const r1 = await callPromise;
+
+    // A real (slow) decline must yield USER_DECLINED, not a soft-confirm.
+    expect(r1.isError).toBe(true);
+    expect(r1.content[0].text).toContain("USER_DECLINED");
+    // Critically: no token in structuredContent.
+    expect(r1.structuredContent?.confirm_token).toBeUndefined();
+
+    // Fabricate a token and try to use it — must be rejected.
+    const fakeToken = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 34 chars, not a real token
+    const r2 = await handler({
+      page_id: DEFAULT_PAGE_ID,
+      title: "Test Page",
+      version: 7,
+      body: "<p>Slow-decline test body</p>",
+      replace_body: true,
+      confirm_token: fakeToken,
+    });
+
+    expect(r2.isError).toBe(true);
+    expect(r2.content[0].text).toContain("confirmation token is no longer valid");
+  }, 15_000);
+
+  // ── Case 3 ────────────────────────────────────────────────────────────────
+  // EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true from the start →
+  // the very first call routes straight to soft-confirm; elicitInput is
+  // never invoked (spy call count = 0).
+  it("EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true → straight to soft-confirm; elicitInput never called", async () => {
+    process.env.EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED = "true";
+
+    // elicitInput must NOT be called — if it is, the env-var override failed.
+    mockElicitInput.mockImplementation(() => {
+      throw new Error("elicitInput must not be called when TREAT_ELICITATION_AS_UNSUPPORTED=true");
+    });
+
+    const handler = registeredTools.get("update_page")!.handler;
+
+    const r = await handler({
+      page_id: DEFAULT_PAGE_ID,
+      title: "Test Page",
+      version: 7,
+      body: "<p>Unsupported-override test body</p>",
+      replace_body: true,
+    });
+
+    // Must reach the soft-confirm path immediately.
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(r.structuredContent?.confirm_token).toBeDefined();
+
+    // The critical assertion: elicitInput was NEVER invoked.
+    expect(mockElicitInput).toHaveBeenCalledTimes(0);
+  });
+
+  // ── Case 4 ────────────────────────────────────────────────────────────────
+  // Stickiness: fast-decline observed on update_page → subsequent delete_page
+  // call in the same session goes straight to soft-confirm without invoking
+  // elicitInput again. Total elicitInput call count across both tool calls = 1.
+  it("stickiness: fast-decline on update_page makes delete_page skip elicitInput (total calls = 1)", async () => {
+    // First: trigger fast-decline on update_page.
+    mockElicitInput.mockResolvedValue({ action: "decline", content: undefined });
+
+    const updateHandler = registeredTools.get("update_page")!.handler;
+    const deleteHandler = registeredTools.get("delete_page")!.handler;
+
+    // Call update_page — fast decline detected, sticky flag set on the server.
+    const r1 = await updateHandler({
+      page_id: DEFAULT_PAGE_ID,
+      title: "Test Page",
+      version: 7,
+      body: "<p>Stickiness test body</p>",
+      replace_body: true,
+    });
+
+    // Confirm the first call produced a soft-confirm (fast-decline triggered).
+    expect(r1.isError).toBe(true);
+    expect(r1.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(mockElicitInput).toHaveBeenCalledTimes(1);
+
+    // Second call: delete_page in the same session. Because the sticky flag is
+    // set, gateOperation must not call elicitInput again — it goes straight to
+    // the soft-confirm path (row 4 of §3.3).
+    // Arrange a fresh page stub for the delete handler.
+    mockGetPage.mockResolvedValue(pageStub(7));
+
+    const r2 = await deleteHandler({
+      page_id: DEFAULT_PAGE_ID,
+      version: 7,
+    });
+
+    // delete_page must also return soft-confirm (not USER_DECLINED).
+    expect(r2.isError).toBe(true);
+    expect(r2.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(r2.structuredContent?.confirm_token).toBeDefined();
+
+    // The critical assertion: only ONE total elicitInput invocation across
+    // both tool calls. The second call must not have probed the client again.
+    expect(mockElicitInput).toHaveBeenCalledTimes(1);
+  });
+});
