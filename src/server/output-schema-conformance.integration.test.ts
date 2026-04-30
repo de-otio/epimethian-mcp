@@ -296,6 +296,7 @@ afterEach(() => {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let writeOutputSchema: { safeParse: (v: unknown) => { success: boolean }; parse: (v: unknown) => unknown };
+let writeSuccessArm: { safeParse: (v: unknown) => { success: boolean }; parse: (v: unknown) => unknown };
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let deleteOutputSchema: { safeParse: (v: unknown) => { success: boolean }; parse: (v: unknown) => unknown };
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -306,6 +307,7 @@ let confirmationRequiredArm: { safeParse: (v: unknown) => { success: boolean }; 
 beforeAll(async () => {
   const mod = await import("./output-schema.js");
   writeOutputSchema = mod.writeOutputSchema;
+  writeSuccessArm = mod.writeSuccessArm;
   deleteOutputSchema = mod.deleteOutputSchema;
   confirmationRequiredArm = mod.confirmationRequiredArm;
 });
@@ -512,7 +514,13 @@ describe("C6–C10: confirmation-required arm — all five write tools conform t
     assertConfirmationRequired(r, "update_page_section");
   });
 
-  it("C8: append_to_page — no confirm_token → structuredContent.kind === 'confirmation_required'", async () => {
+  // C8 / C9: append_to_page and prepend_to_page are purely-additive tools
+  // and do NOT trigger the soft-confirm gate even with
+  // EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true — the gate only fires
+  // for destructive intent (replace_body, deletion, delete_page itself).
+  // Verify that here: with no destructive flags, the calls succeed and
+  // emit kind: "written".
+  it("C8: append_to_page — no destructive flags → succeeds (kind: 'written'), gate does NOT fire", async () => {
     const handler = registeredTools.get("append_to_page")!.handler;
 
     const r = await handler({
@@ -521,10 +529,12 @@ describe("C6–C10: confirmation-required arm — all five write tools conform t
       content: "<p>Appended content</p>",
     });
 
-    assertConfirmationRequired(r, "append_to_page");
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent?.kind).toBe("written");
+    expect(writeOutputSchema.safeParse(r.structuredContent).success).toBe(true);
   });
 
-  it("C9: prepend_to_page — no confirm_token → structuredContent.kind === 'confirmation_required'", async () => {
+  it("C9: prepend_to_page — no destructive flags → succeeds (kind: 'written'), gate does NOT fire", async () => {
     const handler = registeredTools.get("prepend_to_page")!.handler;
 
     const r = await handler({
@@ -533,7 +543,9 @@ describe("C6–C10: confirmation-required arm — all five write tools conform t
       content: "<p>Prepended content</p>",
     });
 
-    assertConfirmationRequired(r, "prepend_to_page");
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent?.kind).toBe("written");
+    expect(writeOutputSchema.safeParse(r.structuredContent).success).toBe(true);
   });
 
   it("C10: delete_page — no confirm_token → structuredContent.kind === 'confirmation_required'", async () => {
@@ -578,9 +590,11 @@ describe("C11: negative — discriminator integrity: confirmation_required does 
     expect(confirmationPayload).toBeDefined();
     expect(confirmationPayload.kind).toBe("confirmation_required");
 
-    // A confirmation_required payload must NOT satisfy writeOutputSchema
-    // (different discriminator value).
-    expect(writeOutputSchema.safeParse(confirmationPayload).success).toBe(false);
+    // A confirmation_required payload satisfies writeOutputSchema (the
+    // union accepts both arms by design) BUT must NOT satisfy
+    // writeSuccessArm (the success-only arm).
+    expect(writeOutputSchema.safeParse(confirmationPayload).success).toBe(true);
+    expect(writeSuccessArm.safeParse(confirmationPayload).success).toBe(false);
 
     // A written payload must NOT satisfy confirmationRequiredArm.
     const writtenPayload = {
@@ -592,5 +606,8 @@ describe("C11: negative — discriminator integrity: confirmation_required does 
 
     // Sanity-check: the confirmation_required payload still validates its own arm.
     expect(confirmationRequiredArm.safeParse(confirmationPayload).success).toBe(true);
+
+    // Sanity-check: the written payload satisfies writeSuccessArm.
+    expect(writeSuccessArm.safeParse(writtenPayload).success).toBe(true);
   });
 });

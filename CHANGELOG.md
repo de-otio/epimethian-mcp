@@ -49,6 +49,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check the new outputSchema declaration in
   `src/server/output-schema.ts`.
 
+### Tests
+
+Net test delta vs v6.6.1: +43 (1851 → 1894 passing, 1 skipped, 5
+todo, 62 test files). New coverage:
+
+- 11 unit tests in `src/server/output-schema.test.ts` pinning
+  the discriminated-union shape (each arm's positive cases,
+  discriminator-mismatch rejection, success-arm-vs-confirm-arm
+  isolation).
+- 11 integration tests in
+  `src/server/output-schema-conformance.integration.test.ts`
+  asserting the emitted `structuredContent` validates against
+  the declared `outputSchema` for every mutating tool, both on
+  the success path and when the soft-confirm gate fires.
+- 9 unit tests in `elicitation.test.ts` for
+  `EPIMETHIAN_TOKEN_IN_TEXT` (default off, exact `"true"`-only
+  activation, additive — never replaces the structured payload,
+  audit ID and expiry remain visible).
+- Updated `safe-write.test.ts` Section G assertions for the new
+  snake_case keys and `kind: "confirmation_required"`
+  discriminator.
+
 ### Investigation
 
 See `doc/design/investigations/investigate-claude-code-structured-content-surfacing.md`
