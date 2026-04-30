@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ELICITATION_REQUIRED_BUT_UNAVAILABLE,
+  FAST_DECLINE_THRESHOLD_MS,
   GatedOperationError,
   NO_USER_RESPONSE,
   SOFT_CONFIRMATION_REQUIRED,
@@ -8,8 +9,12 @@ import {
   SoftConfirmationRequiredError,
   USER_CANCELLED,
   USER_DECLINED,
+  _markClientAsFakingElicitation,
+  _resetFakeElicitationStateForTest,
   _resetStartupWarningForTest,
+  effectiveSupportsElicitation,
   gateOperation,
+  isClientFakingElicitation,
   renderDeletionSummary,
   type DeletionSummary,
   type GatedOperationContext,
@@ -70,6 +75,7 @@ const FULL_SOFT_CTX = {
 describe("gateOperation (E4)", () => {
   beforeEach(() => {
     _resetStartupWarningForTest();
+    _resetFakeElicitationStateForTest();
     vi.mocked(mintToken).mockReset();
     vi.mocked(mintToken).mockReturnValue({
       token: "test-token-abcdefghij12345678",
@@ -293,6 +299,7 @@ describe("renderDeletionSummary", () => {
 describe("gateOperation soft-elicitation (branch 4)", () => {
   beforeEach(() => {
     _resetStartupWarningForTest();
+    _resetFakeElicitationStateForTest();
     vi.mocked(mintToken).mockReset();
     vi.mocked(mintToken).mockReturnValue({
       token: "soft-tok-XXXXXXXXXXXXXXXXXXXXabcd1234",
@@ -497,6 +504,7 @@ describe("BYPASS startup-time warning (§3.4)", () => {
 
   beforeEach(() => {
     _resetStartupWarningForTest();
+    _resetFakeElicitationStateForTest();
     consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   });
 
@@ -625,6 +633,7 @@ describe("§3.4 precedence matrix (32 cells = 16 env combos × 2 client modes)",
 
   beforeEach(() => {
     _resetStartupWarningForTest();
+    _resetFakeElicitationStateForTest();
     vi.mocked(mintToken).mockReset();
     vi.mocked(mintToken).mockReturnValue({
       token: "tok-matrix",
@@ -714,4 +723,455 @@ describe("§3.4 precedence matrix (32 cells = 16 env combos × 2 client modes)",
       }
     },
   );
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// v6.6.1 T1: fast-decline auto-detection + TREAT_AS_UNSUPPORTED env var.
+//
+// Models the Claude Code VS Code extension (≤ 2.1.123) bug: client
+// advertises `capabilities.elicitation = {}` during the initialize
+// handshake, then auto-declines every elicitation/create call without
+// surfacing UI to the user. The naive support check returns true and
+// row 6 fires, but the response comes back declined faster than any
+// human could click — we detect that timing and re-route the call
+// through the soft-confirm path.
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build a stub `elicitInput` that resolves with the supplied action
+ * after `delayMs` real-time milliseconds. The delay drives the
+ * fast-decline timing measurement, so the test must use a real
+ * `setTimeout` (not fake timers) — `performance.now()` is also real.
+ */
+function makeDelayedElicit(
+  action: "accept" | "decline" | "cancel" | "timeout",
+  delayMs: number,
+  content?: unknown,
+) {
+  return vi.fn(async () => {
+    await new Promise<void>((r) => setTimeout(r, delayMs));
+    return { action, content };
+  });
+}
+
+describe("effectiveSupportsElicitation (T1)", () => {
+  beforeEach(() => {
+    _resetStartupWarningForTest();
+    _resetFakeElicitationStateForTest();
+    vi.mocked(clientSupportsElicitation).mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    delete process.env.EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED;
+    vi.mocked(clientSupportsElicitation).mockReturnValue(false);
+  });
+
+  it("returns false when EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true, regardless of advertised capability", () => {
+    process.env.EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED = "true";
+    vi.mocked(clientSupportsElicitation).mockReturnValue(true);
+    const server = makeFakeServer(() => undefined);
+    expect(effectiveSupportsElicitation(server)).toBe(false);
+  });
+
+  it("returns false after a fast-decline has been observed for the server", () => {
+    vi.mocked(clientSupportsElicitation).mockReturnValue(true);
+    const server = makeFakeServer(() => undefined);
+    expect(effectiveSupportsElicitation(server)).toBe(true);
+    _markClientAsFakingElicitation(server);
+    expect(effectiveSupportsElicitation(server)).toBe(false);
+    expect(isClientFakingElicitation(server)).toBe(true);
+  });
+
+  it("delegates to clientSupportsElicitation when neither override applies", () => {
+    vi.mocked(clientSupportsElicitation).mockReturnValue(true);
+    const server = makeFakeServer(() => undefined);
+    expect(effectiveSupportsElicitation(server)).toBe(true);
+    vi.mocked(clientSupportsElicitation).mockReturnValue(false);
+    expect(effectiveSupportsElicitation(server)).toBe(false);
+  });
+
+  it("isolates the faking flag per McpServer instance (no cross-server contamination)", () => {
+    vi.mocked(clientSupportsElicitation).mockReturnValue(true);
+    const serverA = makeFakeServer(() => undefined);
+    const serverB = makeFakeServer(() => undefined);
+    _markClientAsFakingElicitation(serverA);
+    expect(isClientFakingElicitation(serverA)).toBe(true);
+    expect(isClientFakingElicitation(serverB)).toBe(false);
+    expect(effectiveSupportsElicitation(serverA)).toBe(false);
+    expect(effectiveSupportsElicitation(serverB)).toBe(true);
+  });
+});
+
+describe("gateOperation fast-decline auto-detection (T1)", () => {
+  beforeEach(() => {
+    _resetStartupWarningForTest();
+    _resetFakeElicitationStateForTest();
+    vi.mocked(mintToken).mockReset();
+    vi.mocked(mintToken).mockReturnValue({
+      token: "fast-decline-tok-12345",
+      auditId: "fast-decline-audit",
+      expiresAt: 9_999_999_999_999,
+    });
+    // Default: client advertises elicitation (the Claude Code bug shape).
+    vi.mocked(clientSupportsElicitation).mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+    delete process.env.EPIMETHIAN_BYPASS_ELICITATION;
+    delete process.env.EPIMETHIAN_DISABLE_SOFT_CONFIRM;
+    delete process.env.EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED;
+    delete process.env.EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS;
+    delete process.env.EPIMETHIAN_DISABLE_FAST_DECLINE_DETECTION;
+    vi.mocked(clientSupportsElicitation).mockReturnValue(false);
+  });
+
+  it("fast decline (< threshold) WITH all soft fields → SoftConfirmationRequiredError, not USER_DECLINED", async () => {
+    // 5 ms decline — well below the 50 ms default threshold.
+    const elicit = makeDelayedElicit("decline", 5);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    try {
+      await gateOperation(server, ctx);
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(SoftConfirmationRequiredError);
+      expect((err as GatedOperationError).code).toBe(
+        SOFT_CONFIRMATION_REQUIRED,
+      );
+      const sce = err as SoftConfirmationRequiredError;
+      expect(sce.token).toBe("fast-decline-tok-12345");
+    }
+
+    // The faking flag is now sticky for this server.
+    expect(isClientFakingElicitation(server)).toBe(true);
+    // elicitInput was called exactly once — the retry must NOT reissue it.
+    expect(elicit).toHaveBeenCalledOnce();
+    expect(vi.mocked(mintToken)).toHaveBeenCalledOnce();
+  });
+
+  it("slow decline (> threshold) → still throws USER_DECLINED (real human declines honoured)", async () => {
+    // 200 ms decline — well above the 50 ms default. A real human click.
+    const elicit = makeDelayedElicit("decline", 200);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    try {
+      await gateOperation(server, ctx);
+      expect.unreachable();
+    } catch (err) {
+      expect((err as GatedOperationError).code).toBe(USER_DECLINED);
+      expect(err).not.toBeInstanceOf(SoftConfirmationRequiredError);
+    }
+    // Faking flag NOT set — the decline was timed as legitimate.
+    expect(isClientFakingElicitation(server)).toBe(false);
+    expect(vi.mocked(mintToken)).not.toHaveBeenCalled();
+    expect(elicit).toHaveBeenCalledOnce();
+  });
+
+  it("fast decline WITHOUT soft fields → ELICITATION_REQUIRED_BUT_UNAVAILABLE (row 5)", async () => {
+    const elicit = makeDelayedElicit("decline", 5);
+    const server = makeFakeServer(elicit);
+    // No FULL_SOFT_CTX spread — all four binding fields missing.
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+    };
+
+    try {
+      await gateOperation(server, ctx);
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(GatedOperationError);
+      expect(err).not.toBeInstanceOf(SoftConfirmationRequiredError);
+      expect((err as GatedOperationError).code).toBe(
+        ELICITATION_REQUIRED_BUT_UNAVAILABLE,
+      );
+    }
+    // Faking flag IS set — fast-decline observation is independent of
+    // whether the retry can mint a token.
+    expect(isClientFakingElicitation(server)).toBe(true);
+    expect(vi.mocked(mintToken)).not.toHaveBeenCalled();
+    expect(elicit).toHaveBeenCalledOnce();
+  });
+
+  it("BYPASS_ELICITATION wins even when fast-decline would otherwise apply (row 1 short-circuits before any timing)", async () => {
+    process.env.EPIMETHIAN_BYPASS_ELICITATION = "true";
+    // The elicit stub would have been a fast decliner — but BYPASS
+    // means it's never invoked.
+    const elicit = makeDelayedElicit("decline", 5);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    // Suppress the BYPASS log lines — they're tested separately.
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+
+    await expect(gateOperation(server, ctx)).resolves.toBeUndefined();
+    expect(elicit).not.toHaveBeenCalled();
+    expect(vi.mocked(mintToken)).not.toHaveBeenCalled();
+    expect(isClientFakingElicitation(server)).toBe(false);
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("sticky flag: second gateOperation call goes straight to the unsupported branch — elicitInput call count stays at 1", async () => {
+    const elicit = makeDelayedElicit("decline", 5);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    // First call: triggers fast decline + flag.
+    await expect(gateOperation(server, ctx)).rejects.toBeInstanceOf(
+      SoftConfirmationRequiredError,
+    );
+    expect(elicit).toHaveBeenCalledOnce();
+    expect(isClientFakingElicitation(server)).toBe(true);
+
+    // Second call: should bypass the elicitation entirely and route
+    // straight to the soft-confirm branch.
+    await expect(gateOperation(server, ctx)).rejects.toBeInstanceOf(
+      SoftConfirmationRequiredError,
+    );
+    // Critical assertion — call count unchanged across two gateOperation invocations.
+    expect(elicit).toHaveBeenCalledOnce();
+    expect(vi.mocked(mintToken)).toHaveBeenCalledTimes(2);
+  });
+
+  it("per-server isolation: flagging one McpServer does not flag another", async () => {
+    const elicitA = makeDelayedElicit("decline", 5);
+    const elicitB = makeDelayedElicit("accept", 100, { confirm: true });
+    const serverA = makeFakeServer(elicitA);
+    const serverB = makeFakeServer(elicitB);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    await expect(gateOperation(serverA, ctx)).rejects.toBeInstanceOf(
+      SoftConfirmationRequiredError,
+    );
+    expect(isClientFakingElicitation(serverA)).toBe(true);
+    expect(isClientFakingElicitation(serverB)).toBe(false);
+
+    // Server B still goes through real elicitation (and accepts).
+    await expect(gateOperation(serverB, ctx)).resolves.toBeUndefined();
+    expect(elicitB).toHaveBeenCalledOnce();
+    expect(isClientFakingElicitation(serverB)).toBe(false);
+  });
+
+  it("threshold override raises the bar: 100 ms decline counts as fast when threshold=200", async () => {
+    process.env.EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS = "200";
+    const elicit = makeDelayedElicit("decline", 100);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    await expect(gateOperation(server, ctx)).rejects.toBeInstanceOf(
+      SoftConfirmationRequiredError,
+    );
+    expect(isClientFakingElicitation(server)).toBe(true);
+  });
+
+  it("threshold override lowers the bar: 30 ms decline is real when threshold=20", async () => {
+    process.env.EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS = "20";
+    // 30 ms decline — above the 20 ms tightened threshold.
+    const elicit = makeDelayedElicit("decline", 30);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    try {
+      await gateOperation(server, ctx);
+      expect.unreachable();
+    } catch (err) {
+      expect((err as GatedOperationError).code).toBe(USER_DECLINED);
+      expect(err).not.toBeInstanceOf(SoftConfirmationRequiredError);
+    }
+    expect(isClientFakingElicitation(server)).toBe(false);
+  });
+
+  it("threshold env var '5' is accepted (clamp floor is 10, so 5 is silently raised — sanity check)", async () => {
+    process.env.EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS = "5";
+    // 1ms delay → robustly < both 5 (unclamped) and 10 (clamped). The
+    // assertion is that a tiny-delay decline still triggers the soft
+    // path under "5" — i.e. "5" doesn't crash the parser or disable
+    // detection.
+    const elicit = makeDelayedElicit("decline", 1);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    await expect(gateOperation(server, ctx)).rejects.toBeInstanceOf(
+      SoftConfirmationRequiredError,
+    );
+    expect(isClientFakingElicitation(server)).toBe(true);
+  });
+
+  it("threshold env var '0' is clamped UP to 10 ms (prevents disabling detection by setting 0)", async () => {
+    // env=0 would, without clamping, give a threshold of 0 ms — and
+    // every elapsedMs >= 0 means NO fast-decline trigger ever. The
+    // clamp lifts that to 10 ms, so a sub-10ms decline still triggers.
+    process.env.EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS = "0";
+    // 1ms delay → elapsed is robustly in [1, 9] on any reasonable host;
+    // < 10 (clamped threshold) → fast-decline fires.
+    const elicit = makeDelayedElicit("decline", 1);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    await expect(gateOperation(server, ctx)).rejects.toBeInstanceOf(
+      SoftConfirmationRequiredError,
+    );
+    expect(isClientFakingElicitation(server)).toBe(true);
+  });
+
+  it("threshold env var '99999' is clamped DOWN to 5000 ms (prevents converting real declines to soft)", async () => {
+    process.env.EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS = "99999";
+    // After clamping to 5000, a real-human-paced 200 ms decline is
+    // WELL below the cap and should count as fast — confirming the
+    // clamp is permissive at the upper end (i.e. 99999 was reduced
+    // to a usable threshold rather than rejected outright).
+    const elicit = makeDelayedElicit("decline", 200);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    await expect(gateOperation(server, ctx)).rejects.toBeInstanceOf(
+      SoftConfirmationRequiredError,
+    );
+    expect(isClientFakingElicitation(server)).toBe(true);
+  });
+
+  it("fast cancel (not decline) is NOT treated as fast-decline — only `decline` triggers the flag", async () => {
+    // 5 ms cancel — fast, but the action is "cancel". Must not flip the flag.
+    const elicit = makeDelayedElicit("cancel", 5);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    try {
+      await gateOperation(server, ctx);
+      expect.unreachable();
+    } catch (err) {
+      expect((err as GatedOperationError).code).toBe(USER_CANCELLED);
+    }
+    expect(isClientFakingElicitation(server)).toBe(false);
+    expect(vi.mocked(mintToken)).not.toHaveBeenCalled();
+  });
+
+  it("fast-decline retry does NOT call elicitInput a second time (data-loss invariant)", async () => {
+    const elicit = makeDelayedElicit("decline", 5);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    await expect(gateOperation(server, ctx)).rejects.toBeInstanceOf(
+      SoftConfirmationRequiredError,
+    );
+    // Critical: only ONE elicitInput on the wire across the whole call,
+    // even though we re-evaluated the gate after marking faking.
+    expect(elicit).toHaveBeenCalledOnce();
+  });
+
+  it("EPIMETHIAN_DISABLE_FAST_DECLINE_DETECTION=true preserves v6.6.0 behaviour: fast decline still throws USER_DECLINED (rollback off-switch)", async () => {
+    process.env.EPIMETHIAN_DISABLE_FAST_DECLINE_DETECTION = "true";
+    const elicit = makeDelayedElicit("decline", 5);
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    try {
+      await gateOperation(server, ctx);
+      expect.unreachable();
+    } catch (err) {
+      expect((err as GatedOperationError).code).toBe(USER_DECLINED);
+      expect(err).not.toBeInstanceOf(SoftConfirmationRequiredError);
+    }
+    // Off-switch: faking flag is NOT flipped, even though the timing
+    // matched a fast decline.
+    expect(isClientFakingElicitation(server)).toBe(false);
+    expect(vi.mocked(mintToken)).not.toHaveBeenCalled();
+  });
+
+  it("TREAT_ELICITATION_AS_UNSUPPORTED=true skips elicitInput entirely on the first call (deterministic counterpart)", async () => {
+    process.env.EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED = "true";
+    const elicit = vi.fn(async () => {
+      throw new Error("elicitInput must NOT be called when TREAT_AS_UNSUPPORTED is set");
+    });
+    const server = makeFakeServer(elicit);
+    const ctx: GatedOperationContext = {
+      tool: "update_page",
+      summary: "Replace body",
+      details: { deletionSummary: SAMPLE_DELETIONS },
+      ...FULL_SOFT_CTX,
+    };
+
+    await expect(gateOperation(server, ctx)).rejects.toBeInstanceOf(
+      SoftConfirmationRequiredError,
+    );
+    expect(elicit).not.toHaveBeenCalled();
+    expect(vi.mocked(mintToken)).toHaveBeenCalledOnce();
+  });
+
+  it("uses the documented default threshold of 50 ms when no env override is set", () => {
+    // Spec sanity check — the public constant is the documented default.
+    expect(FAST_DECLINE_THRESHOLD_MS).toBe(50);
+  });
 });

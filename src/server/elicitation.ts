@@ -227,29 +227,171 @@ export function _resetStartupWarningForTest(): void {
   bypassMisconfigWarningFired = false;
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Fast-decline auto-detection (v6.6.1, §3.2 of fix-claude-code-elicitation
+// plan). Some MCP clients (notably the Claude Code VS Code extension
+// ≤ 2.1.123) advertise `capabilities.elicitation = {}` during the MCP
+// `initialize` handshake but auto-decline every elicitation/create call
+// without surfacing UI to the user. The naive
+// `clientSupportsElicitation()` check returns `true` and we'd take the
+// row-6 branch, get an instant `decline`, and throw `USER_DECLINED` —
+// the user never sees a prompt.
+//
+// We detect this by timing the round trip: if `elicitInput()` resolves
+// with `action: "decline"` faster than any human could plausibly hit a
+// button, treat it as a fake decline. Mark the client as "faking" for
+// the rest of the session and re-evaluate the gate as if elicitation
+// were unsupported (which routes through the soft-confirm path).
+// ────────────────────────────────────────────────────────────────────────
+
+/** Default threshold below which a `decline` is considered fake. */
+export const FAST_DECLINE_THRESHOLD_MS = 50;
+
 /**
- * Dispatch an elicitation for a gated operation. Resolves normally on
- * approval; throws `GatedOperationError` on denial, unsupported client
- * (in fail-closed mode), or — in the soft-elicitation path —
- * `SoftConfirmationRequiredError` carrying a freshly-minted
- * confirmation token.
- *
- * Branch precedence is the §3.4 table; the first matching row wins.
+ * Env var name for overriding the threshold. Value is parsed as an
+ * integer and clamped to `[10, 5000]`.
  */
-export async function gateOperation(
+export const FAST_DECLINE_THRESHOLD_OVERRIDE_ENV =
+  "EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS";
+
+/**
+ * Env var name for the total off-switch. When set to `"true"` the
+ * timing measurement still happens (to keep the code path simple) but
+ * the result is never used to flip the faking flag. See §7 of the plan.
+ */
+export const DISABLE_FAST_DECLINE_DETECTION_ENV =
+  "EPIMETHIAN_DISABLE_FAST_DECLINE_DETECTION";
+
+/**
+ * Env var name for the deterministic "treat this client as
+ * elicitation-unsupported" override. Bypasses the timing heuristic
+ * entirely and always routes through `effectiveSupportsElicitation`'s
+ * `false` branch.
+ */
+export const TREAT_ELICITATION_AS_UNSUPPORTED_ENV =
+  "EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED";
+
+/**
+ * Per-`McpServer`-instance flag set on the first observed fast-decline.
+ * Sticky for the lifetime of the McpServer (one MCP session). Stored
+ * as a `WeakMap` so server instances can be GC'd without leaking.
+ *
+ * NOT a global flag — multi-tenant MCP host processes that connect to
+ * several clients must track this per `McpServer` instance.
+ *
+ * Module-level `let` (not `const`) so `_resetFakeElicitationStateForTest`
+ * can swap the map reference cheaply rather than iterating to clear it.
+ */
+let fakingElicitationFlags: WeakMap<McpServer, boolean> = new WeakMap();
+
+/**
+ * Read the per-server fake-elicitation flag.
+ *
+ * Returns `true` when this server's client has been observed to
+ * fast-decline an `elicitInput` request earlier in the session.
+ */
+export function isClientFakingElicitation(server: McpServer): boolean {
+  return fakingElicitationFlags.get(server) === true;
+}
+
+/**
+ * Internal: mark a server's client as faking elicitation. Sticky for
+ * the lifetime of the server. Exported with an underscore-prefix so
+ * it's discoverable in tests but signposted as not part of the public
+ * surface.
+ */
+export function _markClientAsFakingElicitation(server: McpServer): void {
+  fakingElicitationFlags.set(server, true);
+}
+
+/**
+ * Testing-only: clear the fake-elicitation WeakMap. Implemented as a
+ * fresh-map swap so we don't have to enumerate keys (WeakMap is
+ * non-iterable). Not part of the public package surface.
+ */
+export function _resetFakeElicitationStateForTest(): void {
+  fakingElicitationFlags = new WeakMap();
+}
+
+/**
+ * Read and clamp the fast-decline threshold.
+ *
+ * - Default: `FAST_DECLINE_THRESHOLD_MS` (50).
+ * - Override via `EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS=<integer>`.
+ * - Clamped to `[10, 5000]` to prevent both pathological tunings (0 →
+ *   never trigger; 60000 → real declines auto-converted to soft) and
+ *   adversarial overrides. See §5.1 of the plan.
+ * - Non-integer / non-finite values fall back to the default.
+ */
+function readFastDeclineThresholdMs(): number {
+  const raw = process.env[FAST_DECLINE_THRESHOLD_OVERRIDE_ENV];
+  if (raw === undefined || raw === "") return FAST_DECLINE_THRESHOLD_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return FAST_DECLINE_THRESHOLD_MS;
+  if (parsed < 10) return 10;
+  if (parsed > 5000) return 5000;
+  return parsed;
+}
+
+/**
+ * Composite check used by `gateOperation`. Returns `false` when:
+ *   1. `EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true`, or
+ *   2. The connected client has been observed to fast-decline an
+ *      earlier elicitation request in this session.
+ *
+ * Otherwise delegates to `clientSupportsElicitation` (the unchanged
+ * read of advertised capabilities).
+ */
+export function effectiveSupportsElicitation(server: McpServer): boolean {
+  if (process.env[TREAT_ELICITATION_AS_UNSUPPORTED_ENV] === "true") {
+    return false;
+  }
+  if (isClientFakingElicitation(server)) {
+    return false;
+  }
+  return clientSupportsElicitation(server);
+}
+
+/**
+ * Result of `evaluateUnsupportedBranch`:
+ *   - `"handled"` — rows 1–5 short-circuited the gate. Either the gate
+ *     resolved silently (rows 1–2) or threw (rows 3–5). The caller
+ *     must not invoke row 6.
+ *   - `"fall_through"` — the client effectively supports elicitation;
+ *     row 6 (the real `elicitInput()` request) should run.
+ */
+type UnsupportedBranchOutcome = "handled" | "fall_through";
+
+/**
+ * Evaluate rows 1–5 of the §3.3 precedence table. Returns
+ * `"fall_through"` only when none of those rows applies — i.e. the
+ * client effectively supports elicitation and the caller should run the
+ * row-6 real-elicitation path.
+ *
+ * Extracted from `gateOperation` so the post-fast-decline retry can
+ * re-use the same selector without duplicating logic. The retry path
+ * MUST NOT issue a second `elicitInput` (data-loss invariant — see
+ * §3.2 of the v6.6.1 plan); routing the retry through this helper
+ * guarantees that, since the helper never calls `elicitInput`.
+ */
+async function evaluateUnsupportedBranch(
   server: McpServer,
   context: GatedOperationContext,
-): Promise<void> {
-  const supported = clientSupportsElicitation(server);
+): Promise<UnsupportedBranchOutcome> {
+  const supported = effectiveSupportsElicitation(server);
 
   // Row 1: BYPASS — escape hatch for clients that falsely advertise
   // elicitation support but auto-decline every request without UI.
   // Observed in the Claude Code VS Code extension (≤ 2.1.123).
   if (process.env.EPIMETHIAN_BYPASS_ELICITATION === "true") {
     // Startup-time misconfiguration warning (§3.4): if the connected
-    // client does NOT advertise elicitation, BYPASS is the wrong knob —
-    // ALLOW_UNGATED_WRITES (or v6.6.0's soft-confirmation default) is
-    // the intended path. Warn ONCE per process to avoid log spam.
+    // client effectively does NOT support elicitation, BYPASS is the
+    // wrong knob — ALLOW_UNGATED_WRITES (or v6.6.0's soft-confirmation
+    // default) is the intended path. Warn ONCE per process to avoid log
+    // spam. `supported` was computed from `effectiveSupportsElicitation`
+    // above (per the §3.3 v6.6.1 contract); we reuse it here to keep
+    // gateOperation's code path free of direct `clientSupportsElicitation`
+    // calls.
     if (!supported && !bypassMisconfigWarningFired) {
       bypassMisconfigWarningFired = true;
       console.error(
@@ -265,7 +407,7 @@ export async function gateOperation(
       `epimethian-mcp: [UNGATED] tool=${context.tool} — bypassing elicitation gate; ` +
         `proceeding because EPIMETHIAN_BYPASS_ELICITATION=true.`,
     );
-    return;
+    return "handled";
   }
 
   // Row 2: ALLOW_UNGATED_WRITES + unsupported client — operator opt-out.
@@ -277,7 +419,7 @@ export async function gateOperation(
       `epimethian-mcp: [UNGATED] tool=${context.tool} — client does not support elicitation; ` +
         `proceeding because EPIMETHIAN_ALLOW_UNGATED_WRITES=true.`,
     );
-    return;
+    return "handled";
   }
 
   // Row 3: DISABLE_SOFT_CONFIRM + unsupported client — restore v6.5.0
@@ -368,7 +510,31 @@ export async function gateOperation(
     );
   }
 
-  // Row 6: client supports elicitation — real elicitInput() request.
+  // No row 1–5 fired; caller proceeds to row 6.
+  return "fall_through";
+}
+
+/**
+ * Dispatch an elicitation for a gated operation. Resolves normally on
+ * approval; throws `GatedOperationError` on denial, unsupported client
+ * (in fail-closed mode), or — in the soft-elicitation path —
+ * `SoftConfirmationRequiredError` carrying a freshly-minted
+ * confirmation token.
+ *
+ * Branch precedence is the §3.3 table of the v6.6.1 plan; the first
+ * matching row wins.
+ */
+export async function gateOperation(
+  server: McpServer,
+  context: GatedOperationContext,
+): Promise<void> {
+  // Rows 1–5: env-var overrides + unsupported-client paths. If this
+  // returns "handled" (or throws), we're done.
+  const initial = await evaluateUnsupportedBranch(server, context);
+  if (initial === "handled") return;
+
+  // Row 6: client effectively supports elicitation — real
+  // `elicitInput()` request, with fast-decline detection wrapping it.
 
   // Build a concise human-readable message.
   const lines: string[] = [context.summary];
@@ -393,6 +559,7 @@ export async function gateOperation(
   const message = lines.join("\n");
 
   let result;
+  const startedAt = performance.now();
   try {
     result = await server.server.elicitInput({
       message,
@@ -418,6 +585,45 @@ export async function gateOperation(
         err instanceof Error ? err.message : String(err)
       }) — refusing the operation.`,
     );
+  }
+  const elapsedMs = performance.now() - startedAt;
+
+  // Fast-decline detection (§3.2 of the v6.6.1 plan): if the response
+  // came back as a `decline` faster than any human could plausibly
+  // hit a button, the client is auto-declining without surfacing UI.
+  // Mark the client as "faking" for the rest of the session and re-run
+  // the gate selector — `effectiveSupportsElicitation` will now read
+  // `false` and the call will route through the soft-confirm path
+  // (or row 5's fail-closed throw if the soft fields are missing).
+  //
+  // Data-loss invariants:
+  //   - Only triggers on `decline`, not `cancel`/`accept`/unknown.
+  //   - The retry goes through `evaluateUnsupportedBranch` which never
+  //     calls `elicitInput` — preventing a second prompt that the user
+  //     might actually answer.
+  //   - The off-switch env var skips the heuristic entirely; the call
+  //     proceeds to the normal action handling below.
+  const fastDeclineDisabled =
+    process.env[DISABLE_FAST_DECLINE_DETECTION_ENV] === "true";
+  if (
+    !fastDeclineDisabled &&
+    result.action === "decline" &&
+    elapsedMs < readFastDeclineThresholdMs()
+  ) {
+    _markClientAsFakingElicitation(server);
+    const retry = await evaluateUnsupportedBranch(server, context);
+    // After marking faking, `effectiveSupportsElicitation` returns
+    // `false`, so the retry MUST hit row 1 (BYPASS — already false at
+    // this point since row 1 didn't fire on the first pass) or rows
+    // 2–5. If it ever returned `"fall_through"` we'd have a serious
+    // bug — fail closed defensively rather than risk a second prompt.
+    if (retry === "fall_through") {
+      throw new GatedOperationError(
+        NO_USER_RESPONSE,
+        `${context.tool} could not be confirmed: fast-decline retry unexpectedly fell through to row 6.`,
+      );
+    }
+    return;
   }
 
   // "accept" with confirm=true is the only path that proceeds.
