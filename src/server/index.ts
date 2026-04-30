@@ -92,6 +92,10 @@ import {
   invalidateForPage,
 } from "./confirmation-tokens.js";
 import { versionField } from "./version-schema.js";
+import {
+  writeOutputSchema,
+  deleteOutputSchema,
+} from "./output-schema.js";
 import { planUpdate } from "./converter/update-orchestrator.js";
 import { tokeniseStorage } from "./converter/tokeniser.js";
 import { resolveToolFilter } from "./tool-allowlist.js";
@@ -1137,6 +1141,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .optional()
           .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and page version."),
       },
+      // v6.6.2 §3.1 — declared so spec-compliant clients forward our
+      // structuredContent payload to the agent (the soft-confirmation
+      // round-trip relied on this from the start; v6.6.0/6.6.1 emitted
+      // structuredContent without a schema so most clients dropped it).
+      outputSchema: writeOutputSchema,
       annotations: { destructiveHint: false, idempotentHint: false },
     },
     async ({ page_id, title, version, body, version_message, confirm_deletions, replace_body, confirm_shrinkage, confirm_structure_loss, allow_raw_html, confluence_base_url, source, confirm_token }) => {
@@ -1278,17 +1287,41 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (badgeResult.warning) warnings.push(badgeResult.warning);
 
         if (isTitleOnly) {
-          return toolResult(
+          // v6.6.2 \u00a73.1 \u2014 title-only updates: omit body byte counts (no
+          // body change). new_version is the just-written revision.
+          const titleOnlyResult = toolResult(
             appendWarnings(`Updated: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, title only, body unchanged)`, warnings) + echo
           );
+          return {
+            ...titleOnlyResult,
+            structuredContent: {
+              kind: "written" as const,
+              page_id,
+              new_version: submitted.newVersion,
+              title: submitted.page.title,
+            },
+          };
         }
         const removalNote =
           submitted.deletedTokens.length > 0
             ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`
             : "";
-        return toolResult(
+        // v6.6.2 \u00a73.1 \u2014 body-update success: structuredContent matches
+        // `writeSuccessArm`. Existing text content is preserved.
+        const bodyUpdateResult = toolResult(
           appendWarnings(`Updated: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, body: ${submitted.oldLen}\u2192${submitted.newLen} chars${removalNote})`, warnings) + echo
         );
+        return {
+          ...bodyUpdateResult,
+          structuredContent: {
+            kind: "written" as const,
+            page_id,
+            new_version: submitted.newVersion,
+            body_bytes_before: submitted.oldLen,
+            body_bytes_after: submitted.newLen,
+            title: submitted.page.title,
+          },
+        };
       } catch (err) {
         // 2.D: SoftConfirmationRequiredError \u2192 structured token response.
         if (err instanceof SoftConfirmationRequiredError) {
@@ -1333,6 +1366,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .optional()
           .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact page version."),
       },
+      // v6.6.2 §3.1 — declared so spec-compliant clients forward our
+      // structuredContent payload (especially the soft-confirm token)
+      // to the agent.
+      outputSchema: deleteOutputSchema,
       annotations: { destructiveHint: true, idempotentHint: true },
     },
     async ({ page_id, version, source, confirm_token }) => {
@@ -1424,7 +1461,18 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           ...(version !== undefined ? { oldVersion: version } : {}),
           source: effectiveSource,
         });
-        return toolResult(`Deleted page ${page_id}` + echo);
+        // v6.6.2 §3.1 — structuredContent matches `deleteSuccessArm`.
+        // last_version is omitted only under the deprecated legacy
+        // version-less opt-out (already warned about via stderr above).
+        const deletedResult = toolResult(`Deleted page ${page_id}` + echo);
+        return {
+          ...deletedResult,
+          structuredContent: {
+            kind: "deleted" as const,
+            page_id,
+            ...(version !== undefined ? { last_version: version } : {}),
+          },
+        };
       } catch (err) {
         // 2.D: SoftConfirmationRequiredError → structured token response.
         if (err instanceof SoftConfirmationRequiredError) {
@@ -1522,6 +1570,9 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .optional()
           .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and page version."),
       },
+      // v6.6.2 §3.1 — declared so spec-compliant clients forward our
+      // structuredContent payload to the agent.
+      outputSchema: writeOutputSchema,
       annotations: { destructiveHint: false, idempotentHint: false },
     },
     async ({ page_id, section, body, find_replace, version, version_message, confirm_deletions, confirm_token }) => {
@@ -1612,12 +1663,26 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           const badgeResult = await markPageUnverified(submitted.page.id, cfg);
           if (badgeResult.warning) warnings.push(badgeResult.warning);
           const pairCount = (find_replace as FindReplacePair[]).length;
-          return toolResult(
+          // v6.6.2 §3.1 — find_replace success: structuredContent
+          // matches `writeSuccessArm`. body byte counts reflect the
+          // full-page body before/after the section substitution.
+          const findReplaceResult = toolResult(
             appendWarnings(
               `Updated section "${section}" in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}; applied ${pairCount} find/replace substitution${pairCount === 1 ? "" : "s"})`,
               warnings,
             ) + echo
           );
+          return {
+            ...findReplaceResult,
+            structuredContent: {
+              kind: "written" as const,
+              page_id,
+              new_version: submitted.newVersion,
+              body_bytes_before: submitted.oldLen,
+              body_bytes_after: submitted.newLen,
+              title: submitted.page.title,
+            },
+          };
         }
 
         // body mode (original path):
@@ -1716,9 +1781,21 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           submitted.deletedTokens.length > 0
             ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`
             : "";
-        return toolResult(
+        // v6.6.2 §3.1 — body-mode section update success.
+        const sectionBodyResult = toolResult(
           appendWarnings(`Updated section "${section}" in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}${removalNote})`, warnings) + echo
         );
+        return {
+          ...sectionBodyResult,
+          structuredContent: {
+            kind: "written" as const,
+            page_id,
+            new_version: submitted.newVersion,
+            body_bytes_before: submitted.oldLen,
+            body_bytes_after: submitted.newLen,
+            title: submitted.page.title,
+          },
+        };
       } catch (err) {
         // 2.D: SoftConfirmationRequiredError → structured token response.
         if (err instanceof SoftConfirmationRequiredError) {
@@ -2019,6 +2096,9 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .optional()
           .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and page version."),
       },
+      // v6.6.2 \u00a73.1 \u2014 declared so spec-compliant clients forward our
+      // structuredContent payload to the agent.
+      outputSchema: writeOutputSchema,
       annotations: { destructiveHint: false, idempotentHint: false },
     },
     async ({ page_id, version, content, separator, version_message, allow_raw_html, confluence_base_url }) => {
@@ -2038,7 +2118,19 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (labelResult.warning) warnings.push(labelResult.warning);
         const badgeResult = await markPageUnverified(page.id, cfg);
         if (badgeResult.warning) warnings.push(badgeResult.warning);
-        return toolResult(appendWarnings(`Prepended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)`, warnings) + echo);
+        // v6.6.2 \u00a73.1 \u2014 structuredContent matches `writeSuccessArm`.
+        const prependResult = toolResult(appendWarnings(`Prepended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)`, warnings) + echo);
+        return {
+          ...prependResult,
+          structuredContent: {
+            kind: "written" as const,
+            page_id,
+            new_version: newVersion,
+            body_bytes_before: oldLen,
+            body_bytes_after: newLen,
+            title: page.title,
+          },
+        };
       } catch (err) {
         // 2.D: SoftConfirmationRequiredError \u2192 structured token response.
         if (err instanceof SoftConfirmationRequiredError) {
@@ -2083,6 +2175,9 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .optional()
           .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and page version."),
       },
+      // v6.6.2 \u00a73.1 \u2014 declared so spec-compliant clients forward our
+      // structuredContent payload to the agent.
+      outputSchema: writeOutputSchema,
       annotations: { destructiveHint: false, idempotentHint: false },
     },
     async ({ page_id, version, content, separator, version_message, allow_raw_html, confluence_base_url }) => {
@@ -2102,7 +2197,19 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (labelResult.warning) warnings.push(labelResult.warning);
         const badgeResult = await markPageUnverified(page.id, cfg);
         if (badgeResult.warning) warnings.push(badgeResult.warning);
-        return toolResult(appendWarnings(`Appended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)`, warnings) + echo);
+        // v6.6.2 \u00a73.1 \u2014 structuredContent matches `writeSuccessArm`.
+        const appendResult = toolResult(appendWarnings(`Appended to: ${page.title} (ID: ${page.id}, version: ${newVersion}, body: ${oldLen}\u2192${newLen} chars)`, warnings) + echo);
+        return {
+          ...appendResult,
+          structuredContent: {
+            kind: "written" as const,
+            page_id,
+            new_version: newVersion,
+            body_bytes_before: oldLen,
+            body_bytes_after: newLen,
+            title: page.title,
+          },
+        };
       } catch (err) {
         // 2.D: SoftConfirmationRequiredError \u2192 structured token response.
         if (err instanceof SoftConfirmationRequiredError) {

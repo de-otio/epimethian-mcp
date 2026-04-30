@@ -591,15 +591,33 @@ export async function maybeConsumeConfirmToken(args: {
 
 /**
  * Format a `SoftConfirmationRequiredError` as the structured tool result
- * defined in §3.5 of the opencode-compatibility plan.
+ * defined by `confirmationRequiredArm` in `output-schema.ts` (v6.6.2 §3.2).
  *
  * The full token lives in `structuredContent.confirm_token` — NOT in the
  * free-text content — so it stays out of the agent's scratchpad. The
  * visible message shows only the last 8 chars of the token for human
  * reference.
  *
- * A deletion_summary with numeric counts only is included in structuredContent
- * when the error carries one via `deletionSummary`.
+ * A `deletion_summary` with numeric counts only (snake_case keys) is
+ * included in `structuredContent` when the caller passes one via
+ * `params.deletionSummary` — the function converts the camelCase
+ * `DeletionSummary` shape to the snake_case wire shape declared in the
+ * output schema.
+ *
+ * `human_summary` is sourced solely from `err.humanSummary`, which the
+ * elicitation pipeline derives from numeric deletion counts (or the
+ * gate's literal one-line summary). It is NEVER built from tenant
+ * content — see §3.5 humanSummary content invariant.
+ *
+ * Discriminator: `kind: "confirmation_required"`. This is the load-
+ * bearing field that lets `writeOutputSchema` / `deleteOutputSchema`
+ * route a single response shape to either the success or
+ * confirmation-required arm.
+ *
+ * Author's note for T2: the text generation and structured payload
+ * generation are intentionally decoupled below. T2's
+ * `EPIMETHIAN_TOKEN_IN_TEXT` env-var branch will splice into the text
+ * builder without touching the structuredContent emission.
  */
 export function formatSoftConfirmationResult(
   err: {
@@ -624,16 +642,18 @@ export function formatSoftConfirmationResult(
   content: { type: "text"; text: string }[];
   isError: true;
   structuredContent: {
+    kind: "confirmation_required";
     confirm_token: string;
     audit_id: string;
     expires_at: string;
     page_id: string;
+    human_summary: string;
     deletion_summary?: {
       tocs: number;
       links: number;
-      structuredMacros: number;
-      codeMacros: number;
-      plainElements: number;
+      structured_macros: number;
+      code_macros: number;
+      plain_elements: number;
       other: number;
     };
   };
@@ -641,6 +661,10 @@ export function formatSoftConfirmationResult(
   const last8 = err.token.slice(-8);
   const isoExpires = new Date(err.expiresAt).toISOString();
 
+  // ── Text generation ────────────────────────────────────────────────
+  // Agent-facing prose. Decoupled from the structuredContent builder
+  // below so T2's EPIMETHIAN_TOKEN_IN_TEXT branch can splice in here
+  // without touching the data payload.
   const text =
     `⚠️  Confirmation required (SOFT_CONFIRMATION_REQUIRED)\n\n` +
     `${err.humanSummary}\n\n` +
@@ -654,28 +678,43 @@ export function formatSoftConfirmationResult(
     `and invalidated by any competing write to this page. If validation\n` +
     `fails, mint a new one by re-calling without \`confirm_token\`.`;
 
+  // ── Structured content generation ──────────────────────────────────
+  // Shape matches `confirmationRequiredArm` in output-schema.ts. Keys
+  // are snake_case; deletion_summary's inner keys are also converted
+  // from the camelCase `DeletionSummary` (elicitation.ts) to snake_case.
   const structuredContent: {
+    kind: "confirmation_required";
     confirm_token: string;
     audit_id: string;
     expires_at: string;
     page_id: string;
+    human_summary: string;
     deletion_summary?: {
       tocs: number;
       links: number;
-      structuredMacros: number;
-      codeMacros: number;
-      plainElements: number;
+      structured_macros: number;
+      code_macros: number;
+      plain_elements: number;
       other: number;
     };
   } = {
+    kind: "confirmation_required",
     confirm_token: err.token,
     audit_id: err.auditId,
     expires_at: isoExpires,
     page_id: params.pageId,
+    human_summary: err.humanSummary,
   };
 
   if (params.deletionSummary) {
-    structuredContent.deletion_summary = params.deletionSummary;
+    structuredContent.deletion_summary = {
+      tocs: params.deletionSummary.tocs,
+      links: params.deletionSummary.links,
+      structured_macros: params.deletionSummary.structuredMacros,
+      code_macros: params.deletionSummary.codeMacros,
+      plain_elements: params.deletionSummary.plainElements,
+      other: params.deletionSummary.other,
+    };
   }
 
   return {

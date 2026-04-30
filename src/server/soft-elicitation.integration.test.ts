@@ -320,6 +320,9 @@ describe("Scenario 1 — happy path: SOFT_CONFIRMATION_REQUIRED then success", (
     expect(r1.isError).toBe(true);
     expect(r1.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
     expect(r1.structuredContent).toBeDefined();
+    // v6.6.2 §3.1 — confirmation_required arm carries the kind discriminator.
+    expect(r1.structuredContent.kind).toBe("confirmation_required");
+    expect(typeof r1.structuredContent.human_summary).toBe("string");
     const token = r1.structuredContent.confirm_token;
     expect(typeof token).toBe("string");
     expect(token.length).toBeGreaterThan(10);
@@ -1251,6 +1254,8 @@ describe("Claude Code fake-elicitation interop", () => {
     expect(r1.isError).toBe(true);
     expect(r1.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
     expect(r1.structuredContent).toBeDefined();
+    // v6.6.2 §3.1 — confirmation_required arm carries the kind discriminator.
+    expect(r1.structuredContent.kind).toBe("confirmation_required");
     const token = r1.structuredContent.confirm_token;
     expect(typeof token).toBe("string");
     expect(token.length).toBeGreaterThan(10);

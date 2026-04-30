@@ -2812,7 +2812,7 @@ describe("formatSoftConfirmationResult", () => {
     expect(result.content[0].text).toContain("TAIL1234");
   });
 
-  it("puts the full token in structuredContent.confirm_token", () => {
+  it("puts the full token in structuredContent.confirm_token + sets the kind discriminator", () => {
     const fakeErr = {
       token: "FULL_TOKEN_VALUE_HERE_12345678",
       auditId: "audit-uuid-002",
@@ -2821,13 +2821,15 @@ describe("formatSoftConfirmationResult", () => {
       pageId: "page-7",
     };
     const result = formatSoftConfirmationResult(fakeErr, { pageId: "page-7" });
+    expect(result.structuredContent.kind).toBe("confirmation_required");
     expect(result.structuredContent.confirm_token).toBe("FULL_TOKEN_VALUE_HERE_12345678");
     expect(result.structuredContent.audit_id).toBe("audit-uuid-002");
     expect(result.structuredContent.page_id).toBe("page-7");
+    expect(result.structuredContent.human_summary).toBe("Confirmation needed.");
     expect(typeof result.structuredContent.expires_at).toBe("string");
   });
 
-  it("includes deletion_summary in structuredContent when provided", () => {
+  it("includes deletion_summary (snake_case keys) in structuredContent when provided", () => {
     const fakeErr = {
       token: "tok",
       auditId: "audit-003",
@@ -2835,6 +2837,8 @@ describe("formatSoftConfirmationResult", () => {
       humanSummary: "Will remove macros.",
       pageId: "page-1",
     };
+    // Caller passes the camelCase DeletionSummary shape used internally
+    // by elicitation.ts; the function emits snake_case on the wire.
     const deletionSummary = {
       tocs: 1,
       links: 2,
@@ -2844,7 +2848,14 @@ describe("formatSoftConfirmationResult", () => {
       other: 0,
     };
     const result = formatSoftConfirmationResult(fakeErr, { pageId: "page-1", deletionSummary });
-    expect(result.structuredContent.deletion_summary).toEqual(deletionSummary);
+    expect(result.structuredContent.deletion_summary).toEqual({
+      tocs: 1,
+      links: 2,
+      structured_macros: 3,
+      code_macros: 0,
+      plain_elements: 0,
+      other: 0,
+    });
   });
 
   it("omits deletion_summary from structuredContent when not provided", () => {
