@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.6.3] - 2026-04-30 - hotfix: outputSchema must be z.object (not z.discriminatedUnion)
+
+### Fixed
+
+- **Successful destructive writes no longer surface a `_zod` error**.
+  v6.6.2 declared `outputSchema` as a `z.discriminatedUnion(...)` for
+  the five mutating tools. The MCP SDK's `validateToolOutput` (run
+  after every successful tool handler) calls
+  `normalizeObjectSchema(tool.outputSchema)` which, for Zod 3 schemas,
+  checks `schema.shape !== undefined`. Discriminated unions have no
+  `.shape` (only `.options` and `.discriminator`), so normalize
+  returned `undefined` and the SDK then called
+  `safeParseAsync(undefined, …)` → `Cannot read properties of
+  undefined (reading '_zod')`. **The throw fires AFTER the Confluence
+  write committed**, so the agent saw a "failed" call result while
+  the page was already mutated — a data-integrity hazard.
+
+  v6.6.3 swaps the discriminated unions for `z.object(...)` supersets
+  that accept either arm. The schemas now expose a `.shape` property
+  and the SDK's normalize-then-parse path completes cleanly.
+
+  The internal strict-arm schemas (`writeSuccessArm`,
+  `deleteSuccessArm`, `confirmationRequiredArm`) are unchanged —
+  tests still use them to pin emission shape and the discriminator-
+  mismatch invariants.
+
+### Tests
+
+10 new regression-net tests in `output-schema.test.ts` that probe
+the SDK's exact `normalizeObjectSchema` check inline. Any future
+regression that swaps the schemas back to a non-`.shape` form
+(discriminated union, raw union, intersection) trips these tests in
+milliseconds. See
+`doc/design/investigations/investigate-v6.6.2-regression-and-coverage-gaps.md`
+for the full root-cause analysis and process retrospective.
+
+Net test delta vs v6.6.2: +10 (1894 → 1904 passing, 1 skipped, 5
+todo, 62 test files).
+
+### Investigation
+
+`doc/design/investigations/investigate-v6.6.2-regression-and-coverage-gaps.md`
+(2026-04-30) — root-cause analysis of three consecutive patches
+(v6.6.0 → v6.6.1 → v6.6.2) each shipping a runtime regression caught
+only post-publish, plus the test-coverage and pre-flight changes
+that catch this class of bug going forward.
+
 ## [6.6.2] - 2026-04-30 - structured content surfacing
 
 ### Fixed

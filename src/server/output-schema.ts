@@ -132,22 +132,69 @@ export const deleteSuccessArm = z.object({
 });
 
 /**
- * Discriminated union for tools that mutate a page body in place:
+ * Output schema for tools that mutate a page body in place:
  * `update_page`, `update_page_section`, `append_to_page`,
  * `prepend_to_page`.
+ *
+ * IMPORTANT — why this is `z.object` and not `z.discriminatedUnion`:
+ * the MCP SDK's `normalizeObjectSchema` (used by `validateToolOutput`)
+ * checks for `schema.shape !== undefined` to decide whether a Zod 3
+ * schema is "object-shaped." Discriminated unions have no `.shape`
+ * property — only `.options` and `.discriminator` — so they fail
+ * normalisation, and the SDK then calls `safeParseAsync(undefined,
+ * result.structuredContent)` which throws `Cannot read properties of
+ * undefined (reading '_zod')`. That throw fires AFTER the underlying
+ * write committed in Confluence, leaving the agent with a "failed"
+ * call result while the page is already mutated — a data-integrity
+ * hazard.
+ *
+ * v6.6.2 shipped the discriminated-union form and hit that exact
+ * regression. v6.6.3 swaps in this loose `z.object` superset that
+ * accepts both arms. See `investigate-v6.6.2-regression-and-coverage-gaps.md`
+ * for the full root-cause analysis.
+ *
+ * The looser shape doesn't weaken safety: production handlers always
+ * emit one of the strict arms (`writeSuccessArm` /
+ * `confirmationRequiredArm`), and tests pin the emission shape via
+ * the strict-arm exports above. The registered `outputSchema` is
+ * just the wire contract advertised to clients; its narrow purpose
+ * is to make spec-compliant clients forward `structuredContent` to
+ * the agent.
  */
-export const writeOutputSchema = z.discriminatedUnion("kind", [
-  writeSuccessArm,
-  confirmationRequiredArm,
-]);
+export const writeOutputSchema = z.object({
+  kind: z.enum(["written", "confirmation_required"]),
+  page_id: z.string().min(1),
+  // success arm fields (all optional — present only on `written`)
+  new_version: z.number().int().positive().optional(),
+  body_bytes_before: z.number().int().nonnegative().optional(),
+  body_bytes_after: z.number().int().nonnegative().optional(),
+  title: z.string().optional(),
+  // confirmation_required arm fields (all optional — present only
+  // when `kind: "confirmation_required"`)
+  confirm_token: z.string().min(1).optional(),
+  audit_id: z.string().min(1).optional(),
+  expires_at: z.string().min(1).optional(),
+  human_summary: z.string().optional(),
+  deletion_summary: deletionSummarySchema.optional(),
+});
 
 /**
- * Discriminated union for `delete_page`.
+ * Output schema for `delete_page`. See the comment on
+ * `writeOutputSchema` for why this is a `z.object` and not a
+ * `z.discriminatedUnion`.
  */
-export const deleteOutputSchema = z.discriminatedUnion("kind", [
-  deleteSuccessArm,
-  confirmationRequiredArm,
-]);
+export const deleteOutputSchema = z.object({
+  kind: z.enum(["deleted", "confirmation_required"]),
+  page_id: z.string().min(1),
+  // success arm fields
+  last_version: z.number().int().positive().optional(),
+  // confirmation_required arm fields
+  confirm_token: z.string().min(1).optional(),
+  audit_id: z.string().min(1).optional(),
+  expires_at: z.string().min(1).optional(),
+  human_summary: z.string().optional(),
+  deletion_summary: deletionSummarySchema.optional(),
+});
 
 /** Inferred output type for the four write tools. */
 export type WriteOutput = z.infer<typeof writeOutputSchema>;

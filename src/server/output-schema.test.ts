@@ -361,3 +361,118 @@ describe("output-schema — success arm cannot carry token fields (type-level)",
     expect((stripped as Record<string, unknown>).audit_id).toBeUndefined();
   });
 });
+
+// v6.6.3 regression-net — would have caught the v6.6.2 ship.
+//
+// The MCP SDK's `normalizeObjectSchema` (called by `validateToolOutput`
+// after every tool handler returns) only handles Zod-3 schemas that
+// expose a `.shape` property. `z.discriminatedUnion` does NOT — it
+// exposes `.options` and `.discriminator` instead. v6.6.2 declared the
+// outputSchemas as discriminated unions; the SDK normalised them to
+// `undefined` and then threw `Cannot read properties of undefined
+// (reading '_zod')` AFTER the Confluence write had already committed,
+// leaving the agent with a "failed" call result while the page was
+// already mutated.
+//
+// These tests replicate the SDK's own check inline and assert the
+// registered schemas survive it. Any future regression that swaps
+// the schemas back to a non-`.shape` form (discriminated union, raw
+// union, intersection) trips this test in milliseconds.
+//
+// See `doc/design/investigations/investigate-v6.6.2-regression-and-coverage-gaps.md`
+// for the full root-cause analysis.
+function normalizeObjectSchemaProbe(schema: unknown): unknown | undefined {
+  if (
+    schema &&
+    typeof schema === "object" &&
+    (schema as { shape?: unknown }).shape !== undefined
+  ) {
+    return schema;
+  }
+  return undefined;
+}
+
+describe("outputSchema is SDK-normalisable (v6.6.3 regression net)", () => {
+  it("writeOutputSchema exposes a .shape property", () => {
+    const shape = (writeOutputSchema as unknown as { shape?: Record<string, unknown> }).shape;
+    expect(shape).toBeDefined();
+    expect(Object.keys(shape!)).toContain("kind");
+    expect(Object.keys(shape!)).toContain("page_id");
+  });
+
+  it("deleteOutputSchema exposes a .shape property", () => {
+    const shape = (deleteOutputSchema as unknown as { shape?: Record<string, unknown> }).shape;
+    expect(shape).toBeDefined();
+    expect(Object.keys(shape!)).toContain("kind");
+    expect(Object.keys(shape!)).toContain("page_id");
+  });
+
+  it("writeOutputSchema survives the SDK's normalize-object check", () => {
+    expect(normalizeObjectSchemaProbe(writeOutputSchema)).toBeDefined();
+  });
+
+  it("deleteOutputSchema survives the SDK's normalize-object check", () => {
+    expect(normalizeObjectSchemaProbe(deleteOutputSchema)).toBeDefined();
+  });
+
+  it("writeOutputSchema accepts the success arm's payload shape", () => {
+    const r = writeOutputSchema.safeParse({
+      kind: "written",
+      page_id: "page-1",
+      new_version: 5,
+      body_bytes_before: 100,
+      body_bytes_after: 200,
+      title: "T",
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it("writeOutputSchema accepts the confirmation_required arm's payload shape", () => {
+    const r = writeOutputSchema.safeParse({
+      kind: "confirmation_required",
+      page_id: "page-1",
+      confirm_token: "x".repeat(32),
+      audit_id: "audit-1",
+      expires_at: "2026-04-30T07:00:00.000Z",
+      human_summary: "summary",
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it("writeOutputSchema rejects a payload with an invalid kind value", () => {
+    const r = writeOutputSchema.safeParse({
+      kind: "deleted", // wrong discriminator for write tools
+      page_id: "page-1",
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("deleteOutputSchema accepts the success arm's payload shape", () => {
+    const r = deleteOutputSchema.safeParse({
+      kind: "deleted",
+      page_id: "page-1",
+      last_version: 5,
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it("deleteOutputSchema accepts the confirmation_required arm's payload shape", () => {
+    const r = deleteOutputSchema.safeParse({
+      kind: "confirmation_required",
+      page_id: "page-1",
+      confirm_token: "x".repeat(32),
+      audit_id: "audit-1",
+      expires_at: "2026-04-30T07:00:00.000Z",
+      human_summary: "summary",
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it("deleteOutputSchema rejects a payload with an invalid kind value", () => {
+    const r = deleteOutputSchema.safeParse({
+      kind: "written", // wrong discriminator for delete
+      page_id: "page-1",
+    });
+    expect(r.success).toBe(false);
+  });
+});
