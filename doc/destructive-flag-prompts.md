@@ -67,12 +67,16 @@ interactively or rephrase request."* This is distinct from "user declined" —
 the prompt never reaches the user.
 
 If the confirmation prompt isn't visible or the user doesn't respond to it,
-the call returns with one of four codes: `USER_DECLINED` (explicit decline
+the call returns with one of these codes: `USER_DECLINED` (explicit decline
 or "no" response), `USER_CANCELLED` (dismissed without choosing), `NO_USER_RESPONSE`
 (timeout, transport error, or client never honoured the elicitation capability),
-or `ELICITATION_REQUIRED_BUT_UNAVAILABLE` (client didn't advertise elicitation
-at MCP init time; try `update_page_section`, `EPIMETHIAN_ALLOW_UNGATED_WRITES`,
-or `EPIMETHIAN_BYPASS_ELICITATION` as workarounds).
+`SOFT_CONFIRMATION_REQUIRED` (v6.6.0+ — the soft-confirm token flow has
+fired; ask the user and re-call with `confirm_token` from `structuredContent`,
+or from the `[FALLBACK]` line of `content[0].text` when
+`EPIMETHIAN_TOKEN_IN_TEXT=true`), or `ELICITATION_REQUIRED_BUT_UNAVAILABLE`
+(rare in v6.6.x — the soft-confirm path didn't fire and the bypass env-vars
+aren't set; try `update_page_section` for narrower edits or set
+`EPIMETHIAN_ALLOW_UNGATED_WRITES=true` for a headless workflow).
 
 ## The two layers, as a chain
 

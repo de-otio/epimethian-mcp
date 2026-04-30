@@ -2,7 +2,7 @@
 
 The Epimethian MCP server provides **35 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
 
-_Last updated: 2026-04-29 — v6.4.1_
+_Last updated: 2026-04-30 — v6.6.3_
 
 ---
 

@@ -6,7 +6,7 @@
 
 A security-focused [MCP](https://modelcontextprotocol.io/) server that gives AI agents safe, multi-tenant access to Confluence Cloud. It provides some features not available in the official MCP server, like support for draw.io diagrams, macros, etc.
 
-**What's new (v6.4.1):** Atomic multi-section updates (`update_page_sections`), find-replace mode for section edits, `version: "current"` shortcut, write-budget UX overhaul, and an escape hatch for MCP clients that fake elicitation support. See [CHANGELOG.md](CHANGELOG.md) for v6.2.2–6.4.1.
+**What's new (v6.6.3):** Soft-confirmation token round-trip for MCP clients without (or with broken) elicitation. v6.6.0 introduced single-use, diff-bound tokens; v6.6.1 added fast-decline auto-detection (the Claude Code "fakes elicitation" bug now Just Works without `EPIMETHIAN_BYPASS_ELICITATION`) plus `versionField` coercion for string-encoded ints; v6.6.2 declared `outputSchema` so spec-compliant clients forward the structured payload to the agent, plus an `EPIMETHIAN_TOKEN_IN_TEXT=true` fallback for clients that drop content blocks; v6.6.3 hotfixed an SDK incompatibility with `z.discriminatedUnion` outputSchemas. v6.5 added per-client setup CLI snippets (`epimethian-mcp setup --client …`). v6.4.1 added atomic multi-section updates and find-replace mode. See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ## Why use this?
 

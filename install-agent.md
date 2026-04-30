@@ -309,46 +309,98 @@ discover the result an hour later.
 - **`EPIMETHIAN_WRITE_BUDGET_ROLLING`** — default 75 per 15-minute window; set to "0" to disable.
 - **`EPIMETHIAN_WRITE_BUDGET_HOURLY`** — deprecated alias for `EPIMETHIAN_WRITE_BUDGET_ROLLING`; will be removed in version 7.
 
-## Soft confirmation (clients without elicitation)
+## Soft confirmation (clients without working elicitation)
 
-Some MCP clients (currently OpenCode, plus others) don't implement the in-protocol
-confirmation prompt. Starting in v6.6.0, epimethian-mcp routes those confirmations
-through your agent's normal chat surface instead.
+Some MCP clients (OpenCode, the Claude Code VS Code extension, and
+others) don't implement the in-protocol confirmation prompt — either
+they don't advertise the capability, or they advertise it and never
+honour the request (the SDK transport silently returns
+`{action: "decline"}` without showing the user a UI). Starting in
+v6.6.0, epimethian-mcp routes those confirmations through your
+agent's normal chat surface instead.
+
+The implementation evolved across v6.6.0 → v6.6.3:
+
+- **v6.6.0** introduced soft elicitation for clients that don't
+  *advertise* the capability — token-bound, single-use, diff-bound.
+- **v6.6.1** added **fast-decline auto-detection**: if the client
+  advertises elicitation but the decline arrives in <50 ms (well below
+  human reaction time), the session is flagged as fake and the call
+  is re-routed through the soft-confirm path automatically. Threshold
+  is overridable via `EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS=<10..5000>`.
+  No env-var configuration needed for the Claude Code VS Code
+  extension's "fakes elicitation" bug — it Just Works.
+- **v6.6.2** declared `outputSchema` on every mutating tool so
+  spec-compliant clients are obliged to forward `structuredContent`
+  (where the token lives) to the agent. Added an opt-in
+  `EPIMETHIAN_TOKEN_IN_TEXT=true` fallback that appends the full
+  token to `content[0].text` for clients that drop `content` blocks
+  on `isError: true` results (Claude Code issues #15412 / #9962 /
+  #39976).
+- **v6.6.3** swapped the `outputSchema` from `z.discriminatedUnion`
+  to `z.object` so the MCP SDK's `normalizeObjectSchema` (which only
+  accepts schemas with `.shape`) can route the structured payload
+  through `validateToolOutput` without throwing `_zod` undefined
+  after the write commits. Hotfix; data-integrity-critical.
 
 ### What you (the agent) see
 
-When a destructive write is requested against a client without elicitation, the
-tool returns an error with a confirmation token:
+When a destructive write is requested against a client without working
+elicitation, the tool returns an error with a confirmation token:
 
 ```
 isError: true
 structuredContent:
   {
+    "kind": "confirmation_required",
     "confirm_token": "<opaque token>",
     "audit_id": "<UUID for correlation>",
     "expires_at": "<ISO timestamp>",
     "page_id": "<pageId>",
-    ...
+    "human_summary": "<one-line description for the user>",
+    "deletion_summary": { ... numeric counts only ... }   // optional
   }
 content[0].text:
   ⚠️  Confirmation required (SOFT_CONFIRMATION_REQUIRED)
 
-  {humanSummary}
+  {human_summary}
 
-  Please ask the user before retrying. If approved, re-call with:
-  "confirm_token": from structuredContent.
+  Please ask the user before retrying. If approved, re-call with the
+  same parameters plus "confirm_token" from structuredContent.
 
-  Expires at {timestamp}; invalidated by competing writes.
+  Token tail: ...<last 8 chars>    Expires: <timestamp>    Audit ID: <uuid>
+
+  [FALLBACK] Full token (EPIMETHIAN_TOKEN_IN_TEXT=true): <full token>
+  ← only present when EPIMETHIAN_TOKEN_IN_TEXT=true is set
 ```
+
+The `kind` discriminator distinguishes this `"confirmation_required"`
+arm from the success arm (`"written"` or `"deleted"`) on the same
+tool. Successful writes return:
+
+```
+structuredContent:
+  { "kind": "written", "page_id": "...", "new_version": 12, ... }
+```
+
+…or `"kind": "deleted"` for `delete_page`.
 
 ### What to do
 
 1. STOP. Don't retry blindly.
-2. Show the user, in their language, what's about to happen (use the
-   `humanSummary` field from the result).
+2. Show the user, in their language, what's about to happen — use the
+   `human_summary` field from `structuredContent`, or the
+   human-readable text in `content[0].text` if your client doesn't
+   forward `structuredContent`. **Never echo the token bytes to the
+   user** — the token is meant to flow agent → server, not user → eye.
 3. Ask the user explicitly. Wait for their answer.
 4. If approved: re-call the tool with the SAME parameters plus
-   `confirm_token` from the structuredContent.
+   `confirm_token`. Read the token from `structuredContent.confirm_token`
+   when available; if your client doesn't surface that, the token's
+   full bytes are in the `[FALLBACK] Full token: …` line of
+   `content[0].text` whenever `EPIMETHIAN_TOKEN_IN_TEXT=true` is set
+   on the server. The 8-character "Token tail: …" line in the prose
+   is for human inspection only — it is **not** the token.
 5. If denied: tell the user the operation has been cancelled.
 
 ### Token semantics
@@ -364,7 +416,8 @@ content[0].text:
 These environment variables control soft confirmation behavior:
 
 - **`EPIMETHIAN_ALLOW_UNGATED_WRITES=true`** — bypasses soft confirmation
-  entirely (no prompt; useful for headless / CI).
+  entirely (no prompt; useful for headless / CI). Removes the
+  human-in-the-loop gate; the harness's tool allow-list still applies.
 - **`EPIMETHIAN_DISABLE_SOFT_CONFIRM=true`** — keeps the legacy
   `ELICITATION_REQUIRED_BUT_UNAVAILABLE` failure mode for clients without
   elicitation support.
@@ -372,6 +425,35 @@ These environment variables control soft confirmation behavior:
   TTL (clamped to 60 seconds minimum, 15 minutes maximum).
 - **`EPIMETHIAN_SOFT_CONFIRM_MINT_LIMIT=100`** — override the per-15-minute
   mint cap (default 100; "0" disables the cap entirely).
+
+#### v6.6.1+ fast-decline auto-detection (Claude Code VS Code et al.)
+
+- **`EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true`** — deterministic
+  counterpart to fast-decline auto-detection. Use when your client is
+  known to advertise elicitation but never honour it (e.g. the Claude
+  Code VS Code extension ≤ 2.1.123) and you want to skip the timing
+  probe on the first call. Distinct from `EPIMETHIAN_BYPASS_ELICITATION`:
+  this routes through the soft-confirmation gate; bypass removes the
+  gate entirely.
+- **`EPIMETHIAN_FAST_DECLINE_THRESHOLD_MS=<10..5000>`** — override the
+  fast-decline threshold (default 50 ms). Raise this if a slow MCP
+  transport is mis-classifying real declines as fake.
+- **`EPIMETHIAN_DISABLE_FAST_DECLINE_DETECTION=true`** — total
+  off-switch for the auto-detection; restores exactly v6.6.0 behaviour.
+
+#### v6.6.2+ structured-content fallback
+
+- **`EPIMETHIAN_TOKEN_IN_TEXT=true`** — opt-in fallback for clients that
+  drop `content` blocks on `isError: true` results, or that ignore the
+  `outputSchema` declaration and never surface `structuredContent`
+  to the agent. When set, the soft-confirm result text appends a
+  `[FALLBACK] Full token (EPIMETHIAN_TOKEN_IN_TEXT=true): <token>`
+  line so the agent can still extract the token. The structured
+  payload is unchanged. Trade-off: the token is visible in the agent
+  transcript (the security choice v6.6.0 explicitly avoided), so use
+  only when needed. Today this is required for Claude Code (the VS
+  Code extension and possibly the CLI) — see the per-client matrix
+  below.
 
 ### Multi-process deployments
 
@@ -395,37 +477,47 @@ fully, some not at all, and some advertise the capability without honouring
 it. The compatibility matrix below tells you which env-var workaround to
 recommend, if any.
 
-| Client | Elicitation? | What to do |
+| Client | Elicitation? | What to do (v6.6.3+) |
 |---|---|---|
 | **Claude Code (CLI)** | Yes — full support | No special config needed. |
 | **Claude Desktop** | Yes — full support | No special config needed. |
-| **Claude Code VS Code extension ≤ 2.1.123** | Fakes it | Set `EPIMETHIAN_BYPASS_ELICITATION=true` (see below). |
-| **Claude Code VS Code extension ≥ 2.1.124** | Likely fixed (verify) | If write tools fail with `NO_USER_RESPONSE`, fall back to `EPIMETHIAN_BYPASS_ELICITATION=true`. |
-| **OpenCode** | No — capability not advertised | Set `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` or use only read tools / additive writes that don't trigger the gate. No tracking issue at sst/opencode yet (as of v6.4.1); a feature request would be needed for real elicitation support. |
-| **Cursor / Windsurf / Zed / others** | Varies | If write tools fail with `ELICITATION_REQUIRED_BUT_UNAVAILABLE`, the client doesn't advertise the capability — use `EPIMETHIAN_ALLOW_UNGATED_WRITES=true`. If write tools fail with `NO_USER_RESPONSE` despite the client claiming support, the client fakes it — use `EPIMETHIAN_BYPASS_ELICITATION=true`. |
+| **Claude Code VS Code extension** (all versions tested through 2.1.x) | Fakes it (advertises capability, never honours) | v6.6.1's fast-decline auto-detection routes the call through soft-confirm automatically. **Plus** set `EPIMETHIAN_TOKEN_IN_TEXT=true` in the server's env so the agent can read the full token from `content[0].text` — Claude Code does not currently surface `structuredContent` on `isError: true` responses (issue #15412). No `EPIMETHIAN_BYPASS_ELICITATION` needed; the gate works through the soft-confirm token flow. |
+| **OpenCode** | No — capability not advertised | v6.6.0+ soft-confirmation token flow is automatic when the client lacks elicitation. The Vercel AI SDK forwards `structuredContent` to the model when `outputSchema` is declared (which v6.6.2 added) — the agent should be able to read `confirm_token` directly. If your build of OpenCode/AI-SDK doesn't honour `outputSchema`, set `EPIMETHIAN_TOKEN_IN_TEXT=true` as a fallback. `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` remains an escape hatch for headless / CI runs where no human is in the loop. |
+| **Cursor / Windsurf / Zed / others** | Varies | If write tools fail with `ELICITATION_REQUIRED_BUT_UNAVAILABLE`, the client doesn't advertise the capability — soft-confirm should kick in automatically; use `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` only if no human is in the loop. If write tools succeed at the gate but the agent can't see the token in the response, set `EPIMETHIAN_TOKEN_IN_TEXT=true`. If the client *advertises* elicitation but always fails fast (decline arrives in <50 ms), v6.6.1's auto-detection re-routes through soft-confirm. Set `EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true` to skip the timing probe on the first call when the client is known to fake it. |
 
-### Difference between the two bypass env vars
+### Three configuration paths — pick the one that matches your client
 
-These are **not** interchangeable. Pick the one that matches the failure mode:
+These flags are **not interchangeable**. The newer (v6.6.x) flags
+preserve the human-in-the-loop gate; the older bypass flags remove it.
+Default to preserving the gate.
 
+- **(Recommended) Soft-confirm token flow.** No env-var bypass needed.
+  v6.6.0 + v6.6.1 + v6.6.3 give you a working soft-confirm round-trip
+  for any client whose host can put a "do you approve?" prompt in front
+  of the user (chat surface, tool-result UI, etc.). For clients with
+  rendering quirks, layer on `EPIMETHIAN_TOKEN_IN_TEXT=true`
+  (additive — keeps the gate, just exposes the token in
+  `content[0].text` too).
 - **`EPIMETHIAN_ALLOW_UNGATED_WRITES=true`** — for clients that *don't
-  advertise* elicitation during the MCP handshake. The server detects the
-  absence and (with this flag) lets writes proceed. OpenCode falls in this
-  category.
-- **`EPIMETHIAN_BYPASS_ELICITATION=true`** — for clients that *advertise*
-  elicitation but never actually honour the request (the SDK transport
-  silently returns `{action: "decline"}`). The Claude Code VS Code
-  extension ≤ 2.1.123 falls in this category. This flag is unconditional —
-  it bypasses elicitation even when the client claims to support it.
+  advertise* elicitation AND have no other way to surface a
+  confirmation prompt (e.g. headless / CI runs). Removes the gate
+  entirely; only the harness allow-list and server-side guards remain.
+  Pre-v6.6.0 escape hatch; rarely needed today.
+- **`EPIMETHIAN_BYPASS_ELICITATION=true`** — unconditional bypass,
+  regardless of whether the client advertises elicitation. Original
+  v6.4.1 escape hatch for Claude Code VS Code's "fakes elicitation"
+  bug. **In v6.6.1+ this is no longer needed** for that bug — the
+  fast-decline detector routes around it. Use only if you specifically
+  want to remove the gate.
 
-### Trade-off: what you give up by setting either flag
+### Trade-off: what you give up by setting `ALLOW_UNGATED_WRITES` or `BYPASS_ELICITATION`
 
-Both flags **disable the in-protocol confirmation gate**. Writes still go
-through the harness's tool allow-list (so users can still block the tool
-in their permission settings) and through every server-side guard
-(provenance, source-policy, write-budget, byte-equivalence) — but the user
-no longer gets a UI prompt before each destructive operation. Recommend
-this only when:
+These two flags **disable the human-in-the-loop confirmation gate
+entirely**. Writes still go through the harness's tool allow-list (so
+users can still block the tool in their permission settings) and
+through every server-side guard (provenance, source-policy,
+write-budget, byte-equivalence) — but the user no longer gets a
+prompt before each destructive operation. Recommend this only when:
 
 1. The user is aware of and accepts the trade-off, AND
 2. The user's MCP client provides some other interaction model where they
@@ -435,6 +527,13 @@ this only when:
 **Do NOT set either flag silently.** If you (the agent) need to recommend
 one, explain to the user what the gate is for, why their client can't
 honour it, and what alternative protections remain.
+
+`EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED` and
+`EPIMETHIAN_TOKEN_IN_TEXT` (v6.6.1+ / v6.6.2+) are different — they
+**preserve** the gate by routing through the soft-confirm token flow.
+They affect how the prompt reaches the user, not whether one happens.
+Prefer these to the bypass flags whenever the client supports any
+form of agent ↔ user dialogue.
 
 ## Other operator-side environment variables
 
