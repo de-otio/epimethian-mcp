@@ -91,6 +91,7 @@ import {
   computeDiffHash,
   invalidateForPage,
 } from "./confirmation-tokens.js";
+import { versionField } from "./version-schema.js";
 import { planUpdate } from "./converter/update-orchestrator.js";
 import { tokeniseStorage } from "./converter/tokeniser.js";
 import { resolveToolFilter } from "./tool-allowlist.js";
@@ -1078,8 +1079,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         title: z
           .string()
           .describe("Page title (use the title from get_page if unchanged)"),
-        version: z
-          .union([z.number().int().positive(), z.literal("current")])
+        version: versionField
           .describe(
             "The page version number from your most recent get_page call. " +
             "Pass the literal string \"current\" to skip the read and apply " +
@@ -1498,8 +1498,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "values and CDATA bodies are protected). Exactly one of `body` or `find_replace` " +
             "must be provided."
           ),
-        version: z
-          .union([z.number().int().positive(), z.literal("current")])
+        version: versionField
           .describe(
             "The page version number from your most recent get_page call. " +
             "Pass the literal string \"current\" to skip the read and apply " +
@@ -1757,8 +1756,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       ),
       inputSchema: {
         page_id: z.string().describe("The Confluence page ID"),
-        version: z
-          .union([z.number().int().positive(), z.literal("current")])
+        version: versionField
           .describe(
             "The page version number from your most recent get_page call. " +
             "Pass the literal string \"current\" to skip the read and apply " +
@@ -2003,8 +2001,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       ),
       inputSchema: {
         page_id: z.string().describe("The Confluence page ID"),
-        version: z
-          .union([z.number().int().positive(), z.literal("current")])
+        version: versionField
           .describe(
             "Page version from your most recent get_page call. Pass the literal " +
             "string \"current\" to skip the read and apply on top of whatever " +
@@ -2068,8 +2065,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       ),
       inputSchema: {
         page_id: z.string().describe("The Confluence page ID"),
-        version: z
-          .union([z.number().int().positive(), z.literal("current")])
+        version: versionField
           .describe(
             "Page version from your most recent get_page call. Pass the literal " +
             "string \"current\" to skip the read and apply on top of whatever " +
