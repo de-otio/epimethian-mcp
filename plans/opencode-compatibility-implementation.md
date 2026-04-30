@@ -1389,3 +1389,17 @@ flips the session's effective elicitation-support flag and re-evaluates
 the gate from row 1. This closes the gap §10's `EPIMETHIAN_BYPASS_ELICITATION`
 escape hatch was working around — affected clients now get the
 soft-elicitation token flow automatically.
+
+---
+
+## v6.6.2 addendum (2026-04-30)
+
+The soft-elicitation token-flow design (Phase 2) assumed that MCP
+clients would forward `structuredContent` to the agent. That
+assumption holds only when the tool declares an `outputSchema`,
+per the MCP spec. v6.6.0 / v6.6.1 did not declare one, so most
+clients dropped `structuredContent` and the round-trip silently
+failed at the agent's end. v6.6.2 declares `outputSchema` on every
+mutating tool. See
+[plans/fix-structured-content-surfacing-v6.6.2.md](fix-structured-content-surfacing-v6.6.2.md)
+and the linked investigation for details.

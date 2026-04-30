@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.6.2] - 2026-04-30 - structured content surfacing
+
+### Fixed
+
+- **Soft-confirmation round-trip works in spec-compliant clients.**
+  v6.6.0's design returns the full `confirm_token` in
+  `structuredContent.confirm_token`, never in `content` text. But
+  epimethian's mutating tools never declared an `outputSchema`,
+  and per the MCP spec clients are obliged to forward
+  `structuredContent` to the agent only when one is declared.
+  Without it, most clients (verified: Claude Code in our smoke
+  test; OpenCode via Vercel AI SDK without outputSchema) dropped
+  the field. v6.6.2 declares `outputSchema` on `update_page`,
+  `update_page_section`, `append_to_page`, `prepend_to_page`,
+  and `delete_page`. Spec-compliant clients now MUST forward the
+  structured payload to the agent.
+- All five tools now also emit a `kind: "written"` /
+  `"deleted"` structured payload on success — agents can parse
+  `new_version`, `body_bytes_after`, etc. without string-matching
+  the human-readable text.
+
+### Added
+
+- **`EPIMETHIAN_TOKEN_IN_TEXT=true`** — opt-in fallback for clients
+  that ignore `outputSchema` declarations or drop `content` blocks
+  when structured content is present (Claude Code issues #15412,
+  #9962, #39976). When set, the soft-confirm `content` text appends
+  a `[FALLBACK] Full token (EPIMETHIAN_TOKEN_IN_TEXT=true): ...`
+  line. The structured payload is unchanged — the env var is
+  strictly additive. Trade-off: token now visible in agent
+  transcripts (the security choice v6.6.0 explicitly avoided), so
+  use only when needed.
+
+### Changed
+
+- Soft-confirm `structuredContent` field names are now snake_case
+  (`confirm_token`, `audit_id`, `expires_at`, `page_id`,
+  `deletion_summary`, `human_summary`) and discriminated by
+  `kind: "confirmation_required"`. Agents that consumed the
+  v6.6.0 keys (which were already snake_case for `confirm_token`
+  but inconsistent for others) need a small key-name update —
+  check the new outputSchema declaration in
+  `src/server/output-schema.ts`.
+
+### Investigation
+
+See `doc/design/investigations/investigate-claude-code-structured-content-surfacing.md`
+for the root-cause analysis (MCP spec interpretation, per-client
+behaviour matrix).
+
 ## [6.6.1] - 2026-04-30 - Claude Code silent-decline + version schema fixes
 
 ### Fixed

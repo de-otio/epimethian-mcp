@@ -173,6 +173,15 @@ who need deterministic control or debugging:
 - **`EPIMETHIAN_DISABLE_FAST_DECLINE_DETECTION=true`** — Disable the
   fast-decline auto-detection entirely, restoring exactly v6.6.0 behaviour.
 
+- **`EPIMETHIAN_TOKEN_IN_TEXT=true`** — (v6.6.2+) Opt-in fallback for
+  clients that drop content blocks when structuredContent is
+  present, or that ignore outputSchema declarations. When set, the
+  soft-confirmation result's content text appends a `[FALLBACK]
+  Full token` line. The structured payload is unchanged. Use only
+  when your client is documented to have rendering bugs (e.g. some
+  Claude Code versions); for other clients v6.6.2's outputSchema
+  declaration is sufficient.
+
 ## Related
 
 - [data-preservation.md](data-preservation.md) — the token-preservation
