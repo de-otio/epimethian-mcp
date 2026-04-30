@@ -824,7 +824,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "Create a new page in Confluence. Accepts either Confluence storage format (XHTML) or GFM markdown — markdown is automatically converted to storage format before submission. " +
           "Do NOT mix the two: a body that contains both <ac:.../> storage tags AND markdown structural patterns (## headings, lists, fenced code blocks) is rejected with MIXED_INPUT_DETECTED. " +
           "To inject a TOC macro from markdown, use YAML frontmatter at the top of the body: `---\\ntoc:\\n  maxLevel: 3\\n  minLevel: 1\\n---`. " +
-          "For other macros from markdown, use directive syntax: `:info[content]`, `:mention[Name]{accountId=...}`, `:date[2026-04-23]`. " +
+          "For other macros from markdown, use directive syntax: panel macros `:info[...]`/`:note[...]`/`:warning[...]`/`:tip[...]`/`:success[...]` (panel body accepts inline markdown; optional `{title=\"...\"}`), plus `:status[...]{colour=...}`, `:mention[Name]{accountId=...}`, `:date[2026-04-23]`, `:emoji[smile]`, `:jira[PROJ-1]`, `:anchor[name]`. " +
           "Use allow_raw_html: true to permit raw HTML inside markdown (disabled by default for security). " +
           "Use confluence_base_url to override the base URL used by the link rewriter (defaults to the configured Confluence URL). " +
           "If the space has auto-numbering, the page version may advance silently after creation while post-processing renders the TOC and number prefixes. Re-read the page before subsequent updates. " +
@@ -840,7 +840,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         body: z
           .string()
           .describe(
-            "Page content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted. Do not mix the two: inlining <ac:.../> macros inside a markdown body is rejected. For a TOC use YAML frontmatter (toc: { maxLevel, minLevel }); for other macros use directive syntax (:info[...], :mention[...]{...})."
+            "Page content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted. Do not mix the two: inlining <ac:.../> macros inside a markdown body is rejected. For a TOC use YAML frontmatter (toc: { maxLevel, minLevel }); for other macros use directive syntax — panels (:info[...] / :note[...] / :warning[...] / :tip[...] / :success[...] with optional {title=\"...\"}), plus :status[...]{colour=...}, :mention[...]{accountId=...}, :date[YYYY-MM-DD], :emoji[name], :jira[KEY-123], :anchor[name]."
           ),
         parent_id: z.string().optional().describe("Optional parent page ID"),
         allow_raw_html: z
@@ -1061,7 +1061,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "Update an existing Confluence page. Accepts GFM markdown or Confluence storage format — markdown is automatically converted via the token-aware write path, which preserves all existing macros and rich elements. " +
           "Do NOT mix the two: a body that contains both <ac:.../> storage tags AND markdown structural patterns (## headings, lists, fenced code blocks) is rejected with MIXED_INPUT_DETECTED. " +
           "To inject a TOC macro from markdown, use YAML frontmatter at the top of the body: `---\\ntoc:\\n  maxLevel: 3\\n  minLevel: 1\\n---`. " +
-          "For other macros from markdown, use directive syntax: `:info[content]`, `:mention[Name]{accountId=...}`, `:date[2026-04-23]`. " +
+          "For other macros from markdown, use directive syntax: panel macros `:info[...]`/`:note[...]`/`:warning[...]`/`:tip[...]`/`:success[...]` (panel body accepts inline markdown; optional `{title=\"...\"}`), plus `:status[...]{colour=...}`, `:mention[Name]{accountId=...}`, `:date[2026-04-23]`, `:emoji[smile]`, `:jira[PROJ-1]`, `:anchor[name]`. " +
           "You must provide the version number from your most recent get_page call. If the page was modified by someone else since then, this will return a conflict error — re-read the page and retry.\n\n" +
           "For narrow changes to a single section, prefer update_page_section — it leaves the rest of the page untouched and is safer for targeted edits.\n\n" +
           "Markdown update flags:\n" +
@@ -1099,7 +1099,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         body: z
           .string()
           .optional()
-          .describe("New body content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted via the token-aware write path. Do not mix the two: inlining <ac:.../> macros inside a markdown body is rejected. For a TOC use YAML frontmatter (toc: { maxLevel, minLevel }); for other macros use directive syntax (:info[...], :mention[...]{...})."),
+          .describe("New body content — GFM markdown or Confluence storage format (XHTML). Markdown is auto-detected and converted via the token-aware write path. Do not mix the two: inlining <ac:.../> macros inside a markdown body is rejected. For a TOC use YAML frontmatter (toc: { maxLevel, minLevel }); for other macros use directive syntax — panels (:info[...] / :note[...] / :warning[...] / :tip[...] / :success[...] with optional {title=\"...\"}), plus :status[...]{colour=...}, :mention[...]{accountId=...}, :date[YYYY-MM-DD], :emoji[name], :jira[KEY-123], :anchor[name]."),
         version_message: z
           .string()
           .optional()
@@ -1510,7 +1510,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "preserves existing macros and emoticons within the section. The heading itself " +
             "is preserved; only content under it is replaced. Do not mix the two: inlining " +
             "<ac:.../> macros inside a markdown body is rejected with MIXED_INPUT_DETECTED. " +
-            "For macros from markdown use directive syntax (:info[...], :mention[...]{...}). " +
+            "For macros from markdown use directive syntax — panels :info[...] / :note[...] / :warning[...] / :tip[...] / :success[...] (with optional {title=\"...\"}), plus :status[...]{colour=...}, :mention[...]{accountId=...}, :date[YYYY-MM-DD], :emoji[name], :jira[KEY-123], :anchor[name]. " +
             "Exactly one of `body` or `find_replace` must be provided."
           ),
         find_replace: z

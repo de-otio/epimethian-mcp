@@ -521,37 +521,50 @@ function parseDirectiveAttrs(attrs: string): Record<string, string> {
  * and paragraphs.
  *
  * Directive syntax: :name[label]{attrs}
- * - name: one of status, mention, date, emoji, jira, anchor
+ * - name: one of
+ *     - inline: status, mention, date, emoji, jira, anchor
+ *     - block (panels): info, note, warning, tip, success
  * - label: the text inside [...]
  * - attrs: optional key=value pairs inside {...}
  *
+ * Panel directives (info/note/warning/tip/success) are block-level macros.
+ * Their label is rendered as inline markdown (bold, italic, code, links etc.)
+ * via `mdi.renderInline`, then placed inside <ac:rich-text-body>. They accept
+ * an optional `title` attr that becomes the panel title.
+ *
  * Each directive is replaced by a unique placeholder, which is then restored
  * after markdown-it renders to HTML. This prevents markdown-it from escaping
- * the XML we emit.
+ * the XML we emit. Block-level directives carry isBlock: true so the caller
+ * can strip the surrounding <p>...</p> wrapper that markdown-it wraps around
+ * paragraph-level placeholders.
  *
  * Returns:
  * - processed: the markdown with directives replaced by placeholders
- * - directives: map from placeholder → resolved XML
+ * - directives: map from placeholder → { xml, isBlock }
  * - errors: any ConverterErrors encountered (thrown after processing so the
  *   caller can report the first error)
  */
-function extractInlineDirectives(md: string): {
+function extractInlineDirectives(md: string, mdi: MarkdownIt): {
   processed: string;
-  directives: Map<string, string>;
+  directives: Map<string, { xml: string; isBlock: boolean }>;
 } {
-  const directives = new Map<string, string>();
+  const directives = new Map<string, { xml: string; isBlock: boolean }>();
   let idx = 0;
 
   // Pattern: :name[label]{attrs}  or  :name[label]  (no attrs)
-  // We match them in one pass.
+  // We match them in one pass. The label allows one level of nested square
+  // brackets so panel directives can carry `[link](url)` markdown links —
+  // the inner `]` is consumed as part of the bracket-pair alternative
+  // (`\[[^\]]*\]`) and the outer `]` terminates the directive.
   const directiveRe =
-    /:(status|mention|date|emoji|jira|anchor)\[([^\]]*)\](?:\{([^}]*)\})?/g;
+    /:(status|mention|date|emoji|jira|anchor|info|note|warning|tip|success)\[((?:[^\[\]]|\[[^\]]*\])*)\](?:\{([^}]*)\})?/g;
 
   const processed = md.replace(
     directiveRe,
     (_match, name: string, label: string, rawAttrs: string | undefined) => {
       const attrs = rawAttrs ? parseDirectiveAttrs(rawAttrs) : {};
       let xml: string;
+      let isBlock = false;
 
       switch (name) {
         case "status": {
@@ -639,6 +652,26 @@ function extractInlineDirectives(md: string): {
           break;
         }
 
+        case "info":
+        case "note":
+        case "warning":
+        case "tip":
+        case "success": {
+          // Block-level Confluence panel macro. Label is rendered as inline
+          // markdown so users can write `:warning[**Bold** and `code`]` and
+          // get the formatted body inside the panel. Optional `title` attr.
+          const title = attrs["title"] ?? "";
+          const body = mdi.renderInline(label, {});
+          xml = `<ac:structured-macro ac:name="${name}" ac:schema-version="1">`;
+          if (title) {
+            xml += `<ac:parameter ac:name="title">${escapeXmlAttr(title)}</ac:parameter>`;
+          }
+          xml += `<ac:rich-text-body><p>${body}</p></ac:rich-text-body>`;
+          xml += `</ac:structured-macro>`;
+          isBlock = true;
+          break;
+        }
+
         default: {
           // Should never reach here due to the regex pattern.
           throw new ConverterError(`Unknown directive ':${name}'.`, "UNKNOWN_DIRECTIVE");
@@ -646,7 +679,7 @@ function extractInlineDirectives(md: string): {
       }
 
       const placeholder = `@@@EPIDIRECTIVE${idx++}@@@`;
-      directives.set(placeholder, xml);
+      directives.set(placeholder, { xml, isBlock });
       return placeholder;
     }
   );
@@ -1118,8 +1151,10 @@ export function markdownToStorage(md: string, opts?: ConverterOptions): string {
 
   // --- Stream 9: Extract inline directives before markdown-it sees them ---
   // Directives like :status[...]{...} are replaced by placeholders that
-  // survive markdown-it rendering, then restored afterward.
-  const { processed: mdAfterDirectives, directives } = extractInlineDirectives(bodyMd);
+  // survive markdown-it rendering, then restored afterward. Panel directives
+  // (:info, :note, :warning, :tip, :success) are block-level and rendered
+  // through `mdi.renderInline` so the label can carry inline markdown.
+  const { processed: mdAfterDirectives, directives } = extractInlineDirectives(bodyMd, mdi);
 
   // --- Stream 8 (columns): Extract ::: columns blocks before markdown-it ---
   // This avoids the mixed-type nesting problem in markdown-it-container.
@@ -1174,9 +1209,18 @@ export function markdownToStorage(md: string, opts?: ConverterOptions): string {
     html = html.replace(placeholder, raw);
   }
 
-  // 5. Restore inline directive placeholders.
-  for (const [placeholder, directiveXml] of directives) {
-    html = html.replace(new RegExp(escapeRegex(placeholder), "g"), directiveXml);
+  // 5. Restore inline directive placeholders. Block-level directives (panels)
+  //    first have their surrounding <p>...</p> wrapper stripped — markdown-it
+  //    wraps any standalone placeholder in a paragraph, but a panel macro is
+  //    a block-level element that must not sit inside <p>.
+  for (const [placeholder, { xml, isBlock }] of directives) {
+    if (isBlock) {
+      html = html.replace(
+        new RegExp(`<p>\\s*${escapeRegex(placeholder)}\\s*</p>`, "g"),
+        xml
+      );
+    }
+    html = html.replace(new RegExp(escapeRegex(placeholder), "g"), xml);
   }
 
   // 6. Restore columns block placeholders.

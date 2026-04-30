@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.7.0] - 2026-04-30 - panel directives (:info / :note / :warning / :tip / :success)
+
+### Added
+
+- **Panel directives in markdown:** `:info[...]`, `:note[...]`, `:warning[...]`,
+  `:tip[...]`, `:success[...]` now render to the corresponding Confluence
+  `<ac:structured-macro>` panel macros. The label accepts inline markdown
+  (bold, italic, code, links — including one level of `[link](url)`) and an
+  optional `{title="..."}` attribute renders as the panel title. The directive
+  must sit on its own paragraph; the surrounding `<p>` wrapper is stripped
+  automatically. For multi-paragraph or list-containing bodies, continue to use
+  the GitHub-alert blockquote form (`> [!WARNING] …`).
+
+### Fixed
+
+- **`:info[...]` and friends were silently passed through as literal text** by
+  every markdown→storage path. Tool descriptions across `create_page`,
+  `update_page`, `update_page_section`, `prepend_to_page`, `append_to_page`,
+  and `restore` claimed `:info[content]` was supported, but the converter
+  regex only matched `status|mention|date|emoji|jira|anchor`, so the directive
+  was preserved verbatim and rendered as `:info[…]` text in Confluence. The
+  directive parser is now extended to the five panel macros and the regex
+  tolerates one level of nested `[...]` in the label, so `[link](url)` works
+  inside panel bodies.
+
 ## [6.6.3] - 2026-04-30 - hotfix: outputSchema must be z.object (not z.discriminatedUnion)
 
 ### Fixed

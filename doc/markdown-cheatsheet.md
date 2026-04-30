@@ -300,6 +300,28 @@ Result: `<ac:structured-macro ac:name="jira"><ac:parameter ac:name="key">PROJ-12
 
 Result: `<ac:anchor>my-section</ac:anchor>` placed before the heading, allowing other pages to link to `[link text](#my-section)`.
 
+### Panel macros (info / note / warning / tip / success)
+
+```markdown
+:info[Heads up — this is informational.]
+:warning[**Do not** delete this row.]{title="Caution"}
+:tip[See the [docs](https://example.com) for details.]
+```
+
+Result: `<ac:structured-macro ac:name="info|note|warning|tip|success" ac:schema-version="1">…<ac:rich-text-body><p>…</p></ac:rich-text-body></ac:structured-macro>`.
+
+The body accepts inline markdown (bold, italic, code, links, including one level of `[link](url)` brackets inside the label). An optional `{title="…"}` attribute renders as the panel title. The directive must sit on its own paragraph; it is treated as a block-level macro and the surrounding `<p>` wrapper is stripped automatically.
+
+For multi-paragraph or list-containing panel bodies, use the GitHub-alert blockquote form instead:
+
+```markdown
+> [!WARNING] Caution
+> First paragraph with **inline** markdown.
+>
+> - List item 1
+> - List item 2
+```
+
 ## Frontmatter configuration
 
 ### Table of Contents

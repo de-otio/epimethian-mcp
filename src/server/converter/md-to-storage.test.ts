@@ -995,6 +995,55 @@ describe("inline directives (Stream 9)", () => {
     expect(out).toContain('<ac:parameter ac:name="key">EX-1</ac:parameter>');
     expect(out).toContain('<time datetime="2026-01-01"/>');
   });
+
+  // --- Panel directives (block-level): :info / :note / :warning / :tip / :success ---
+  it.each(["info", "note", "warning", "tip", "success"])(
+    "renders :%s panel as a block-level macro",
+    (panel) => {
+      const out = convert(`:${panel}[Hello world]`);
+      expect(out).toContain(`<ac:structured-macro ac:name="${panel}" ac:schema-version="1">`);
+      expect(out).toContain("<ac:rich-text-body><p>Hello world</p></ac:rich-text-body>");
+      expect(out).toContain("</ac:structured-macro>");
+    }
+  );
+
+  it("strips <p> wrapper around a standalone panel directive", () => {
+    // markdown-it would normally wrap a paragraph-level placeholder in <p>...</p>;
+    // the post-substitution must unwrap it for block-level macros.
+    const out = convert(":warning[Standalone panel]");
+    expect(out).not.toMatch(/<p>\s*<ac:structured-macro ac:name="warning"/);
+    expect(out).toMatch(/^<ac:structured-macro ac:name="warning"/);
+  });
+
+  it("renders inline markdown inside a panel body", () => {
+    const out = convert(":info[**Bold** and `code` and [link](https://example.com)]");
+    expect(out).toContain('<ac:structured-macro ac:name="info"');
+    expect(out).toContain("<strong>Bold</strong>");
+    expect(out).toContain("<code>code</code>");
+    expect(out).toContain('<a href="https://example.com">link</a>');
+  });
+
+  it("supports an optional title attr on panel directives", () => {
+    const out = convert(':warning[Body text]{title="Heads up"}');
+    expect(out).toContain('<ac:structured-macro ac:name="warning"');
+    expect(out).toContain('<ac:parameter ac:name="title">Heads up</ac:parameter>');
+    expect(out).toContain("<ac:rich-text-body><p>Body text</p></ac:rich-text-body>");
+  });
+
+  it("escapes XML-special chars in the panel title", () => {
+    const out = convert(':info[Body]{title="A & B"}');
+    expect(out).toContain('<ac:parameter ac:name="title">A &amp; B</ac:parameter>');
+  });
+
+  it("renders a panel directive following an h2", () => {
+    // Repro of the original bug from the prepend_to_page workflow:
+    // "## TL;DR\n\n:warning[**Gesamtfazit:** ...]"
+    const out = convert("## TL;DR\n\n:warning[**Gesamtfazit:** Nicht übernehmen.]");
+    expect(out).toContain('<h2 id="tl-dr">TL;DR</h2>');
+    expect(out).toContain('<ac:structured-macro ac:name="warning"');
+    expect(out).toContain("<strong>Gesamtfazit:</strong>");
+    expect(out).not.toContain(":warning[");
+  });
 });
 
 // ---------------------------------------------------------------------------
