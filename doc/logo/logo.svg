@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Background -->
+  <circle cx="32" cy="32" r="30" fill="#1A1A2E"/>
+
+  <!-- Greek uppercase Epsilon — serif -->
+  <text x="32" y="45" text-anchor="middle" font-family="'Times New Roman', 'Georgia', serif" font-size="44" font-weight="bold" fill="#C0A040">&#917;</text>
+</svg>

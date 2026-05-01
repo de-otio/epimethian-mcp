@@ -1,0 +1,60 @@
+{
+  "name": "@de-otio/epimethian-mcp",
+  "description": "Confluence Cloud tools for AI assistants via the Model Context Protocol",
+  "version": "6.7.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/de-otio/epimethian-mcp.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/cli/index.js",
+  "bin": {
+    "epimethian-mcp": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "confluence",
+    "mcp",
+    "model-context-protocol",
+    "atlassian",
+    "cli"
+  ],
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch",
+    "prepublishOnly": "npm run build",
+    "prepack": "chmod +x dist/cli/index.js 2>/dev/null || true",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "diff": "^8.0.4",
+    "gray-matter": "^4.0.3",
+    "markdown-it": "^14.1.1",
+    "markdown-it-attrs": "^4.3.1",
+    "markdown-it-container": "^4.0.0",
+    "markdown-it-task-lists": "^2.1.1",
+    "node-html-parser": "^7.1.0",
+    "turndown": "^7.2.4",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.2",
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^22.0.0",
+    "@types/turndown": "^5.0.6",
+    "@vitest/coverage-v8": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}
