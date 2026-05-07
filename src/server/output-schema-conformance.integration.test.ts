@@ -59,6 +59,11 @@ vi.hoisted(() => {
   delete process.env.EPIMETHIAN_BYPASS_ELICITATION;
   delete process.env.EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED;
   delete process.env.EPIMETHIAN_TOKEN_IN_TEXT;
+  // Token-in-text is default-on as of v6.7.2; force the opt-out here so
+  // existing assertions in this conformance file (which predate the
+  // default flip) keep checking the structuredContent path in isolation
+  // without the [FALLBACK] line in content text.
+  process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = "true";
 });
 
 vi.mock("../shared/keychain.js", () => ({
@@ -265,6 +270,7 @@ beforeEach(async () => {
   delete process.env.EPIMETHIAN_BYPASS_ELICITATION;
   delete process.env.EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED;
   delete process.env.EPIMETHIAN_TOKEN_IN_TEXT;
+  process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = "true";
 
   // Reset cloudId to default.
   activeConfig.sealedCloudId = DEFAULT_CLOUD_ID;

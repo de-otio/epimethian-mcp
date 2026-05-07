@@ -196,8 +196,53 @@ export const deleteOutputSchema = z.object({
   deletion_summary: deletionSummarySchema.optional(),
 });
 
+/**
+ * Successful batch-authorisation arm — emitted when
+ * `authorise_destructive_writes` mints a batch token (v6.8.0).
+ *
+ * The token bytes round-trip cleanly through the schema; spec-
+ * compliant clients forward `structuredContent` to the agent so the
+ * batch_token can be read without parsing free text.
+ */
+export const batchAuthorisedArm = z.object({
+  kind: z.literal("batch_authorised"),
+  batch_token: z.string().min(1),
+  audit_id: z.string().min(1),
+  expires_at: z.string().min(1),
+  authorised_page_ids: z.array(z.string().min(1)).min(1),
+  remaining_operations: z.number().int().nonnegative(),
+});
+
+/**
+ * Output schema for `authorise_destructive_writes`. Either the mint
+ * succeeded (`kind: "batch_authorised"`) or a soft confirmation is
+ * required (`kind: "confirmation_required"` — same shape as the other
+ * gated tools, page_id holds a synthetic batch-authorisation marker).
+ *
+ * `z.object` superset shape (not `z.discriminatedUnion`) — see the
+ * `writeOutputSchema` doc comment for why.
+ */
+export const batchAuthOutputSchema = z.object({
+  kind: z.enum(["batch_authorised", "confirmation_required"]),
+  // shared (audit_id and expires_at appear on both arms)
+  audit_id: z.string().min(1).optional(),
+  expires_at: z.string().min(1).optional(),
+  // batch_authorised arm fields
+  batch_token: z.string().min(1).optional(),
+  authorised_page_ids: z.array(z.string().min(1)).optional(),
+  remaining_operations: z.number().int().nonnegative().optional(),
+  // confirmation_required arm fields
+  confirm_token: z.string().min(1).optional(),
+  page_id: z.string().min(1).optional(),
+  human_summary: z.string().optional(),
+  deletion_summary: deletionSummarySchema.optional(),
+});
+
 /** Inferred output type for the four write tools. */
 export type WriteOutput = z.infer<typeof writeOutputSchema>;
 
 /** Inferred output type for delete_page. */
 export type DeleteOutput = z.infer<typeof deleteOutputSchema>;
+
+/** Inferred output type for authorise_destructive_writes. */
+export type BatchAuthOutput = z.infer<typeof batchAuthOutputSchema>;

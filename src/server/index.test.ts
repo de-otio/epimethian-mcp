@@ -5824,11 +5824,15 @@ describe("Phase 2: soft-confirm preamble on gated tools", () => {
     expect(result.structuredContent).toBeDefined();
     expect(typeof result.structuredContent?.confirm_token).toBe("string");
     expect(result.structuredContent?.page_id).toBe(PAGE_ID);
-    // Full token must NOT appear in free-text content (security invariant).
+    // v6.7.2: token-in-text is default-on, so the full token DOES
+    // appear in `content[0].text` under the [FALLBACK] line. The
+    // strong "no token in text" invariant only holds when
+    // EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true (covered separately).
     const fullToken = result.structuredContent?.confirm_token as string;
-    if (fullToken && fullToken.length > 8) {
-      expect(result.content[0].text).not.toContain(fullToken);
-    }
+    expect(typeof fullToken).toBe("string");
+    expect(fullToken.length).toBeGreaterThan(8);
+    expect(result.content[0].text).toContain(fullToken);
+    expect(result.content[0].text).toContain("[FALLBACK]");
   });
 
   // -------------------------------------------------------------------------

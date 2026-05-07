@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.8.0] - 2026-05-07 - parallel sub-agent batch confirmation
+
+### Added
+
+- **`authorise_destructive_writes` tool + `batch_token` field on every
+  destructive tool.** Pre-authorise a batch of destructive Confluence
+  writes with a single user prompt, then fan out the actual writes
+  across many sub-agents (or just many calls) without each one going
+  through its own elicitation round-trip.
+
+  Why: a fan-out of N parallel `update_page(replace_body: true)` calls
+  used to require N separate soft-confirmation prompts; many clients
+  truncate the structured payload across sub-agent boundaries, and
+  even when they don't, the user is now answering N prompts that the
+  parent agent already aggregated into one. The batch_token model
+  inverts that: ONE elicitation, then the token is passed into each
+  destructive call as `batch_token: "btk_..."`.
+
+  The token is page-id-scoped (no wildcards), TTL-bounded (60s–3600s,
+  default 15 min), operation-bounded (default `page_ids.length`,
+  capped at `× 2` for network-retry headroom), and validated against
+  the resolved `cloudId`. Validation failures (wrong page, expired,
+  exhausted, cross-tenant, malformed) fall through transparently to
+  the per-call confirmation gate — agents see the normal
+  `SOFT_CONFIRMATION_REQUIRED` response, NEVER a distinct error class
+  (the validation-failure invariant prevents a token-state oracle).
+
+  The token is **not** diff-bound — the user approves which pages may
+  be written to and how many times, but not the exact bytes of each
+  write. This is a real reduction in defence vs. the per-call
+  `confirm_token` flow against page-content-driven prompt injection
+  that targets the same page being viewed. For maintainers driving
+  doc cleanups (the primary use case), this is the right trade.
+  Operators who want stricter posture can set
+  `EPIMETHIAN_BATCH_REQUIRES_ELICITATION=true` to refuse soft-confirm
+  fallback for batch authorisation.
+
+  Reservation accounting is per-call atomic: validate decrements the
+  counter and returns a `reservationId`; refund-on-pre-flight-failure
+  is idempotent; post-dispatch failures keep the slot consumed (we
+  can't prove the remote did not mutate, mirroring the
+  `write-budget.ts` semantics). See `src/server/batch-tokens.ts` for
+  the module and `plans/parallel-subagent-batch-confirmation.md` for
+  the design plan.
+
+  Plan / module / surface area:
+  - New module `src/server/batch-tokens.ts` (mirrors
+    `confirmation-tokens.ts` patterns: opaque-failure validate,
+    rate-limited mint, FIFO eviction, TTL clamp, 5 ms validate
+    floor for timing-side-channel resistance).
+  - New tool `authorise_destructive_writes` (registered in
+    `index.ts`).
+  - New optional `batch_token` field on `update_page`,
+    `update_page_section`, `update_page_sections`, `delete_page`.
+  - Batch and confirmation-token mint budgets are independent — they
+    represent different threat models (1-to-N vs. 1-to-1 user
+    approval) and don't share counters.
+  - Independent rate-limit env var: `EPIMETHIAN_BATCH_MINT_LIMIT`
+    (default 25 mints / 15 min; "0" disables).
+  - 37 unit tests in `batch-tokens.test.ts` + 8 integration tests in
+    `batch-confirmation.integration.test.ts`.
+
+## [6.7.2] - 2026-05-07 - token-in-text default-on
+
+### Changed
+
+- **`EPIMETHIAN_TOKEN_IN_TEXT` is now default-on**; the soft-confirm
+  result text appends a `[FALLBACK] Full token: <token>` line by
+  default. This matches the configuration `install-agent.md` already
+  instructs Claude Code users to set; making it the default closes
+  the under-configured-install gap.
+
+### Added
+
+- **`EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true`** — explicit opt-out for
+  clients that reliably forward `structuredContent` to the agent and
+  want to keep the token out of the transcript on principle (the
+  security choice v6.6.0 originally optimised for).
+- **`EPIMETHIAN_TOKEN_IN_TEXT=false`** — legacy spelling for the same
+  opt-out, honoured for back-compat with v6.6.x configs that pinned
+  the env var to a disabled value.
+
 ## [6.7.1] - 2026-05-01 - internal cleanup
 
 ### Changed

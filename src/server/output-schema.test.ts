@@ -23,6 +23,8 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  batchAuthOutputSchema,
+  batchAuthorisedArm,
   confirmationRequiredArm,
   deleteOutputSchema,
   deleteSuccessArm,
@@ -472,6 +474,89 @@ describe("outputSchema is SDK-normalisable (v6.6.3 regression net)", () => {
     const r = deleteOutputSchema.safeParse({
       kind: "written", // wrong discriminator for delete
       page_id: "page-1",
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("batchAuthOutputSchema exposes a .shape property", () => {
+    const shape = (batchAuthOutputSchema as unknown as { shape?: Record<string, unknown> }).shape;
+    expect(shape).toBeDefined();
+    expect(Object.keys(shape!)).toContain("kind");
+    expect(Object.keys(shape!)).toContain("batch_token");
+  });
+
+  it("batchAuthOutputSchema survives the SDK's normalize-object check", () => {
+    expect(normalizeObjectSchemaProbe(batchAuthOutputSchema)).toBeDefined();
+  });
+
+  it("batchAuthOutputSchema accepts the batch_authorised arm's payload shape", () => {
+    const r = batchAuthOutputSchema.safeParse({
+      kind: "batch_authorised",
+      batch_token: "btk_" + "a".repeat(64),
+      audit_id: "audit-1",
+      expires_at: "2026-05-07T07:30:00.000Z",
+      authorised_page_ids: ["644251678", "644677642"],
+      remaining_operations: 4,
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it("batchAuthOutputSchema accepts the confirmation_required arm's payload shape", () => {
+    const r = batchAuthOutputSchema.safeParse({
+      kind: "confirmation_required",
+      page_id: "__batch_authorisation__",
+      confirm_token: "x".repeat(32),
+      audit_id: "audit-1",
+      expires_at: "2026-05-07T07:30:00.000Z",
+      human_summary: "Pre-authorise destructive writes to N pages.",
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it("batchAuthOutputSchema rejects a payload with an invalid kind value", () => {
+    const r = batchAuthOutputSchema.safeParse({
+      kind: "written", // wrong discriminator
+      batch_token: "btk_" + "a".repeat(64),
+    });
+    expect(r.success).toBe(false);
+  });
+});
+
+describe("batchAuthorisedArm — strict positive case", () => {
+  it("accepts a fully-populated batch_authorised payload", () => {
+    const ok = batchAuthorisedArm.parse({
+      kind: "batch_authorised",
+      batch_token: "btk_" + "0".repeat(64),
+      audit_id: "audit-uuid-001",
+      expires_at: "2026-05-07T08:00:00.000Z",
+      authorised_page_ids: ["page-A", "page-B", "page-C"],
+      remaining_operations: 3,
+    });
+    expect(ok.kind).toBe("batch_authorised");
+    expect(ok.batch_token.startsWith("btk_")).toBe(true);
+    expect(ok.authorised_page_ids).toHaveLength(3);
+  });
+
+  it("rejects an empty authorised_page_ids array (page-id allowlist must be non-empty)", () => {
+    const r = batchAuthorisedArm.safeParse({
+      kind: "batch_authorised",
+      batch_token: "btk_" + "0".repeat(64),
+      audit_id: "audit-uuid-001",
+      expires_at: "2026-05-07T08:00:00.000Z",
+      authorised_page_ids: [],
+      remaining_operations: 0,
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects a negative remaining_operations counter", () => {
+    const r = batchAuthorisedArm.safeParse({
+      kind: "batch_authorised",
+      batch_token: "btk_" + "0".repeat(64),
+      audit_id: "audit-uuid-001",
+      expires_at: "2026-05-07T08:00:00.000Z",
+      authorised_page_ids: ["p"],
+      remaining_operations: -1,
     });
     expect(r.success).toBe(false);
   });

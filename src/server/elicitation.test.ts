@@ -1181,17 +1181,19 @@ describe("gateOperation fast-decline auto-detection (T1)", () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────
-// T2: EPIMETHIAN_TOKEN_IN_TEXT opt-in fallback
+// v6.7.2: token-in-text default-on, with EPIMETHIAN_HIDE_TOKEN_IN_TEXT
+// (and the legacy EPIMETHIAN_TOKEN_IN_TEXT=false spelling) as opt-outs.
 //
-// When EPIMETHIAN_TOKEN_IN_TEXT=true, formatSoftConfirmationResult
-// appends a [FALLBACK] line containing the full token to the text
-// content. Only the exact string "true" activates this.
+// Rationale: install-agent.md already instructs Claude Code users to set
+// EPIMETHIAN_TOKEN_IN_TEXT=true; making it the default closes the
+// under-configured-install gap for the existing single-page flow.
 //
-// The structured payload (structuredContent.confirm_token) is
-// unchanged in ALL modes — the env var is strictly additive.
+// The structured payload (structuredContent.confirm_token) is unchanged
+// in ALL modes — the env vars only toggle the [FALLBACK] line in the
+// text content.
 // ────────────────────────────────────────────────────────────────────────
 
-/** A realistic fake SoftConfirmationRequiredError payload for T2 tests. */
+/** A realistic fake SoftConfirmationRequiredError payload. */
 const T2_FULL_TOKEN = "full-token-T2-ABCDEFGHIJ12345678";
 const T2_TOKEN_LAST8 = T2_FULL_TOKEN.slice(-8); // "12345678"
 const T2_FAKE_ERR = {
@@ -1203,140 +1205,117 @@ const T2_FAKE_ERR = {
 };
 const T2_PARAMS = { pageId: "t2-page-999" };
 
-describe("formatSoftConfirmationResult — EPIMETHIAN_TOKEN_IN_TEXT fallback", () => {
+describe("formatSoftConfirmationResult — token-in-text default-on (v6.7.2+)", () => {
   beforeEach(() => {
-    // Ensure the env var is clean before each test.
     delete process.env.EPIMETHIAN_TOKEN_IN_TEXT;
+    delete process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT;
   });
 
   afterEach(() => {
     delete process.env.EPIMETHIAN_TOKEN_IN_TEXT;
+    delete process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT;
   });
 
-  // ── Test 1: Default (env unset) ─────────────────────────────────────
+  // ── Default behaviour: env unset → fallback present ─────────────────
 
-  it("default (env unset): text contains tail hint but NOT the full token", () => {
+  it("default (env unset): text contains the [FALLBACK] line AND the full token; tail hint also present", () => {
     const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
     const text = result.content[0].text;
 
-    // The tail line is present with exactly 8 chars.
     expect(text).toContain(`Token tail: ...${T2_TOKEN_LAST8}`);
-
-    // The full token byte sequence must NOT be in the text.
-    expect(text).not.toContain(T2_FULL_TOKEN);
-
-    // No fallback line.
-    expect(text).not.toContain("[FALLBACK]");
-  });
-
-  // ── Test 2: EPIMETHIAN_TOKEN_IN_TEXT=true ────────────────────────────
-
-  it("EPIMETHIAN_TOKEN_IN_TEXT=true: text contains [FALLBACK] line AND the full token; tail line is also present (additive)", () => {
-    process.env.EPIMETHIAN_TOKEN_IN_TEXT = "true";
-    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
-    const text = result.content[0].text;
-
-    // Tail line is still present (fallback is additive, not replacement).
-    expect(text).toContain(`Token tail: ...${T2_TOKEN_LAST8}`);
-
-    // The [FALLBACK] marker with the required literal substring.
-    expect(text).toContain(
-      "[FALLBACK] Full token (EPIMETHIAN_TOKEN_IN_TEXT=true):",
-    );
-
-    // The full token byte sequence is present in the text.
+    expect(text).toContain("[FALLBACK] Full token:");
     expect(text).toContain(T2_FULL_TOKEN);
-
-    // The appended line is preceded by a blank line (\n\n separator).
-    expect(text).toContain(
-      `\n\n[FALLBACK] Full token (EPIMETHIAN_TOKEN_IN_TEXT=true): ${T2_FULL_TOKEN}`,
-    );
+    expect(text).toContain(`\n\n[FALLBACK] Full token: ${T2_FULL_TOKEN}`);
   });
 
-  // ── Test 3: EPIMETHIAN_TOKEN_IN_TEXT=false ───────────────────────────
+  // ── Explicit opt-out via EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true ──────────
 
-  it("EPIMETHIAN_TOKEN_IN_TEXT=false: behaves like default (no fallback line)", () => {
+  it("EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true: no [FALLBACK] line; full token is NOT in text", () => {
+    process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = "true";
+    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
+    const text = result.content[0].text;
+
+    expect(text).toContain(`Token tail: ...${T2_TOKEN_LAST8}`);
+    expect(text).not.toContain("[FALLBACK]");
+    expect(text).not.toContain(T2_FULL_TOKEN);
+  });
+
+  it("EPIMETHIAN_HIDE_TOKEN_IN_TEXT=false: leaves the default-on behaviour in place", () => {
+    process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = "false";
+    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
+    expect(result.content[0].text).toContain("[FALLBACK]");
+    expect(result.content[0].text).toContain(T2_FULL_TOKEN);
+  });
+
+  it("EPIMETHIAN_HIDE_TOKEN_IN_TEXT=TRUE (uppercase): does NOT hide (exact 'true' only)", () => {
+    process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = "TRUE";
+    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
+    expect(result.content[0].text).toContain("[FALLBACK]");
+    expect(result.content[0].text).toContain(T2_FULL_TOKEN);
+  });
+
+  // ── Legacy opt-out via EPIMETHIAN_TOKEN_IN_TEXT=false ────────────────
+
+  it("EPIMETHIAN_TOKEN_IN_TEXT=false (legacy spelling): hides the fallback", () => {
     process.env.EPIMETHIAN_TOKEN_IN_TEXT = "false";
     const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
     const text = result.content[0].text;
 
     expect(text).toContain(`Token tail: ...${T2_TOKEN_LAST8}`);
-    expect(text).not.toContain(T2_FULL_TOKEN);
     expect(text).not.toContain("[FALLBACK]");
-  });
-
-  // ── Test 4: EPIMETHIAN_TOKEN_IN_TEXT=1 ──────────────────────────────
-
-  it("EPIMETHIAN_TOKEN_IN_TEXT=1: behaves like default (only exact 'true' activates)", () => {
-    process.env.EPIMETHIAN_TOKEN_IN_TEXT = "1";
-    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
-    const text = result.content[0].text;
-
-    expect(text).toContain(`Token tail: ...${T2_TOKEN_LAST8}`);
     expect(text).not.toContain(T2_FULL_TOKEN);
-    expect(text).not.toContain("[FALLBACK]");
   });
 
-  // ── Test 5 (skipped per plan §4 T2): soft-mode-binding-fields variant
-  // is not applicable — formatSoftConfirmationResult is only called from
-  // the soft-confirm path and does not re-validate whether soft fields
-  // are present. The gateOperation tests cover that invariant.
+  // ── Other values of EPIMETHIAN_TOKEN_IN_TEXT leave default-on in place
 
-  // ── Test 6: structuredContent.confirm_token is full token in both modes
-
-  it("default mode: structuredContent.confirm_token is the full token (not the tail)", () => {
-    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
-    expect(result.structuredContent.confirm_token).toBe(T2_FULL_TOKEN);
-  });
-
-  it("EPIMETHIAN_TOKEN_IN_TEXT=true mode: structuredContent.confirm_token is still the full token (env var is additive)", () => {
+  it("EPIMETHIAN_TOKEN_IN_TEXT=true: redundant but harmless; fallback present", () => {
     process.env.EPIMETHIAN_TOKEN_IN_TEXT = "true";
     const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
-    // The structured payload is unchanged; token lives in both places.
-    expect(result.structuredContent.confirm_token).toBe(T2_FULL_TOKEN);
-    // Belt-and-braces: the full token also appears in the text (additive).
+    expect(result.content[0].text).toContain("[FALLBACK]");
     expect(result.content[0].text).toContain(T2_FULL_TOKEN);
   });
 
-  // ── Test 7: audit ID and expiry timestamp remain visible in content text
+  it("EPIMETHIAN_TOKEN_IN_TEXT=1: not the legacy 'false' opt-out; fallback present", () => {
+    process.env.EPIMETHIAN_TOKEN_IN_TEXT = "1";
+    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
+    expect(result.content[0].text).toContain("[FALLBACK]");
+    expect(result.content[0].text).toContain(T2_FULL_TOKEN);
+  });
 
-  it("default mode: audit ID and expiry timestamp are visible in content text", () => {
+  it("EPIMETHIAN_TOKEN_IN_TEXT=FALSE (uppercase): does NOT hide (exact lowercase 'false' only)", () => {
+    process.env.EPIMETHIAN_TOKEN_IN_TEXT = "FALSE";
+    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
+    expect(result.content[0].text).toContain("[FALLBACK]");
+    expect(result.content[0].text).toContain(T2_FULL_TOKEN);
+  });
+
+  // ── structuredContent invariant: token always present, regardless of env
+
+  it("default: structuredContent.confirm_token is the full token", () => {
+    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
+    expect(result.structuredContent.confirm_token).toBe(T2_FULL_TOKEN);
+  });
+
+  it("opt-out: structuredContent.confirm_token is still the full token (env only affects text)", () => {
+    process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = "true";
+    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
+    expect(result.structuredContent.confirm_token).toBe(T2_FULL_TOKEN);
+  });
+
+  // ── Audit ID and expiry timestamp remain visible in either mode
+
+  it("default: audit ID and expiry timestamp are visible in content text", () => {
     const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
     const text = result.content[0].text;
-
     expect(text).toContain("t2-audit-uuid-001");
-    // Expiry is rendered as ISO 8601; check for the year prefix as a proxy.
     expect(text).toContain(new Date(T2_FAKE_ERR.expiresAt).toISOString());
   });
 
-  it("EPIMETHIAN_TOKEN_IN_TEXT=true mode: audit ID and expiry timestamp remain visible in content text", () => {
-    process.env.EPIMETHIAN_TOKEN_IN_TEXT = "true";
+  it("opt-out: audit ID and expiry timestamp remain visible in content text", () => {
+    process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = "true";
     const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
     const text = result.content[0].text;
-
     expect(text).toContain("t2-audit-uuid-001");
     expect(text).toContain(new Date(T2_FAKE_ERR.expiresAt).toISOString());
-  });
-
-  // ── Additional exactness: "TRUE" and "yes" and "on" do NOT activate ──
-
-  it("EPIMETHIAN_TOKEN_IN_TEXT=TRUE (uppercase): does NOT activate fallback (exact 'true' only)", () => {
-    process.env.EPIMETHIAN_TOKEN_IN_TEXT = "TRUE";
-    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
-    const text = result.content[0].text;
-    expect(text).not.toContain("[FALLBACK]");
-    expect(text).not.toContain(T2_FULL_TOKEN);
-  });
-
-  it("EPIMETHIAN_TOKEN_IN_TEXT=yes: does NOT activate fallback", () => {
-    process.env.EPIMETHIAN_TOKEN_IN_TEXT = "yes";
-    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
-    expect(result.content[0].text).not.toContain("[FALLBACK]");
-  });
-
-  it("EPIMETHIAN_TOKEN_IN_TEXT=on: does NOT activate fallback", () => {
-    process.env.EPIMETHIAN_TOKEN_IN_TEXT = "on";
-    const result = formatSoftConfirmationResult(T2_FAKE_ERR, T2_PARAMS);
-    expect(result.content[0].text).not.toContain("[FALLBACK]");
   });
 });

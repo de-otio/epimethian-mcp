@@ -65,7 +65,7 @@ export const CLIENT_CONFIGS: readonly ClientConfigEntry[] = [
     ),
     warning:
       "VS Code extension ≤ 2.1.123 does not honour elicitation requests; if write tools fail with NO_USER_RESPONSE, set `EPIMETHIAN_BYPASS_ELICITATION=true`.\n\n" +
-      "v6.6.2 declares an `outputSchema` on every write tool, so a spec-compliant client should now surface the soft-confirm `structuredContent` to the agent. If your version of Claude Code drops content blocks when structuredContent is present (issue #15412), set `EPIMETHIAN_TOKEN_IN_TEXT=true` as a fallback — this restores the human-readable explanation by also putting the full token in the text block.",
+      "Soft-confirm tokens are surfaced in the text content by default (v6.7.2+) so Claude Code can read them even when it drops `structuredContent` (issue #15412). To opt out for a client that does forward `structuredContent` reliably, set `EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true`.",
   },
   {
     id: "cursor",

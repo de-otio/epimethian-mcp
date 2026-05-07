@@ -70,6 +70,10 @@ import {
   validateToken,
   invalidateForPage,
 } from "./confirmation-tokens.js";
+import {
+  isBatchTokenShape,
+  validateBatchToken,
+} from "./batch-tokens.js";
 import { markdownToStorage } from "./converter/md-to-storage.js";
 import { planUpdate } from "./converter/update-orchestrator.js";
 import { enforceContentSafetyGuards } from "./converter/content-safety-guards.js";
@@ -590,6 +594,63 @@ export async function maybeConsumeConfirmToken(args: {
 }
 
 /**
+ * Try to satisfy a destructive write's gate via a pre-authorised
+ * `batch_token` (v6.8.0 / Option C). Returns:
+ *
+ *   - `{ batchReservationId: <id> }` when the token validates for this
+ *     {cloudId, pageId} and an operation slot has been atomically
+ *     reserved. The handler MUST either:
+ *       a) call `finaliseReservation(<id>)` after the underlying write
+ *          succeeds OR after a post-dispatch failure (the slot stays
+ *          consumed — we cannot prove the remote did not mutate), OR
+ *       b) call `refundReservation(<id>)` ONLY for pre-dispatch
+ *          failures (schema validation, conversion errors, anything
+ *          thrown before `safeSubmitPage` was invoked).
+ *
+ *   - `{ batchReservationId: undefined }` when the token is absent,
+ *     malformed, or fails any validation check. The caller MUST then
+ *     fall through to the existing `maybeConsumeConfirmToken` +
+ *     `gateOperation` flow — the agent sees the normal
+ *     `SOFT_CONFIRMATION_REQUIRED` response, NOT a different error
+ *     class. This is the validation-failure invariant from §3 of
+ *     `plans/parallel-subagent-batch-confirmation.md`: granular
+ *     reasons (`page_id_not_authorised`, `expired`, `exhausted`,
+ *     `cloudid_mismatch`, `unknown`) flow only into the audit hook;
+ *     the public surface returns one bit. Otherwise a malicious
+ *     orchestrator could probe the token store ("is this token
+ *     expired or did I never have it?", "which page IDs are
+ *     authorised?").
+ *
+ * `cloudId` undefined → returns `{ batchReservationId: undefined }`
+ * regardless of token presence (env-var-mode / pre-seal profiles
+ * cannot use batch tokens, the same fail-closed posture as the
+ * confirm-token preamble).
+ */
+export async function tryBatchTokenForWrite(args: {
+  batch_token: string | undefined;
+  cloudId: string | undefined;
+  pageId: string;
+}): Promise<{ batchReservationId: string | undefined }> {
+  const { batch_token, cloudId, pageId } = args;
+  if (
+    batch_token === undefined ||
+    cloudId === undefined ||
+    !isBatchTokenShape(batch_token)
+  ) {
+    return { batchReservationId: undefined };
+  }
+  const result = await validateBatchToken({
+    token: batch_token,
+    cloudId,
+    pageId,
+  });
+  if (result.valid) {
+    return { batchReservationId: result.reservationId };
+  }
+  return { batchReservationId: undefined };
+}
+
+/**
  * Format a `SoftConfirmationRequiredError` as the structured tool result
  * defined by `confirmationRequiredArm` in `output-schema.ts` (v6.6.2 §3.2).
  *
@@ -614,9 +675,10 @@ export async function maybeConsumeConfirmToken(args: {
  * route a single response shape to either the success or
  * confirmation-required arm.
  *
- * Author's note for T2: the text generation and structured payload
- * generation are intentionally decoupled below. T2's
- * `EPIMETHIAN_TOKEN_IN_TEXT` env-var branch will splice into the text
+ * The text generation and structured payload generation are
+ * intentionally decoupled below: the token-in-text branch (default-on
+ * since v6.7.2; opt-out via `EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true` or the
+ * legacy `EPIMETHIAN_TOKEN_IN_TEXT=false`) splices into the text
  * builder without touching the structuredContent emission.
  */
 export function formatSoftConfirmationResult(
@@ -663,8 +725,8 @@ export function formatSoftConfirmationResult(
 
   // ── Text generation ────────────────────────────────────────────────
   // Agent-facing prose. Decoupled from the structuredContent builder
-  // below so T2's EPIMETHIAN_TOKEN_IN_TEXT branch can splice in here
-  // without touching the data payload.
+  // below so the token-in-text branch can splice in here without
+  // touching the data payload.
   const text =
     `⚠️  Confirmation required (SOFT_CONFIRMATION_REQUIRED)\n\n` +
     `${err.humanSummary}\n\n` +
@@ -678,16 +740,28 @@ export function formatSoftConfirmationResult(
     `and invalidated by any competing write to this page. If validation\n` +
     `fails, mint a new one by re-calling without \`confirm_token\`.`;
 
-  // EPIMETHIAN_TOKEN_IN_TEXT=true: opt-in fallback for clients that drop
-  // structuredContent or content blocks when outputSchema is present (Claude
-  // Code issues #15412, #9962, #39976). Only the exact string "true" activates
-  // this; "1", "yes", "on", "TRUE" etc. do not. The structured payload is
-  // unchanged — this is strictly additive to the text block.
-  const tokenInText = process.env.EPIMETHIAN_TOKEN_IN_TEXT === "true";
-  const finalText = tokenInText
-    ? text +
-      `\n\n[FALLBACK] Full token (EPIMETHIAN_TOKEN_IN_TEXT=true): ${err.token}`
-    : text;
+  // Token-in-text behaviour (v6.7.2+): the full token is appended to the
+  // text block by default so clients that drop structuredContent or content
+  // blocks when outputSchema is present (Claude Code issues #15412, #9962,
+  // #39976) still surface the token to the agent. This matches the
+  // configuration `install-agent.md` already instructs Claude Code users
+  // to set; making it the default closes the under-configured-install gap.
+  //
+  // Two opt-out shapes are honoured:
+  //   - EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true (preferred) — explicit opt-out.
+  //   - EPIMETHIAN_TOKEN_IN_TEXT=false — legacy spelling; back-compat with
+  //     setups that pinned the v6.6.x opt-in to its disabled state. Any
+  //     other value of EPIMETHIAN_TOKEN_IN_TEXT (including unset, "true",
+  //     "1", "yes", typos) leaves the default-on behaviour in place.
+  //
+  // The structured payload is unchanged — this is strictly additive to
+  // the text block.
+  const explicitlyHidden =
+    process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT === "true" ||
+    process.env.EPIMETHIAN_TOKEN_IN_TEXT === "false";
+  const finalText = explicitlyHidden
+    ? text
+    : text + `\n\n[FALLBACK] Full token: ${err.token}`;
 
   // ── Structured content generation ──────────────────────────────────
   // Shape matches `confirmationRequiredArm` in output-schema.ts. Keys

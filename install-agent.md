@@ -342,6 +342,15 @@ The implementation evolved across v6.6.0 → v6.6.3:
   accepts schemas with `.shape`) can route the structured payload
   through `validateToolOutput` without throwing `_zod` undefined
   after the write commits. Hotfix; data-integrity-critical.
+- **v6.7.2** flipped the token-in-text fallback to default-on: the
+  full token now appears in `content[0].text` without needing an env
+  var, since most clients we care about (Claude Code in particular)
+  drop `structuredContent` on `isError: true` results. Set
+  `EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true` to opt out for clients that
+  reliably forward `structuredContent` (or to keep the token out of
+  the agent transcript on principle). The legacy
+  `EPIMETHIAN_TOKEN_IN_TEXT=false` spelling is also honoured for
+  back-compat.
 
 ### What you (the agent) see
 
@@ -370,8 +379,10 @@ content[0].text:
 
   Token tail: ...<last 8 chars>    Expires: <timestamp>    Audit ID: <uuid>
 
-  [FALLBACK] Full token (EPIMETHIAN_TOKEN_IN_TEXT=true): <full token>
-  ← only present when EPIMETHIAN_TOKEN_IN_TEXT=true is set
+  [FALLBACK] Full token: <full token>
+  ← present by default in v6.7.2+; suppressed when
+     EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true (or the legacy
+     EPIMETHIAN_TOKEN_IN_TEXT=false) is set
 ```
 
 The `kind` discriminator distinguishes this `"confirmation_required"`
@@ -396,11 +407,11 @@ structuredContent:
 3. Ask the user explicitly. Wait for their answer.
 4. If approved: re-call the tool with the SAME parameters plus
    `confirm_token`. Read the token from `structuredContent.confirm_token`
-   when available; if your client doesn't surface that, the token's
-   full bytes are in the `[FALLBACK] Full token: …` line of
-   `content[0].text` whenever `EPIMETHIAN_TOKEN_IN_TEXT=true` is set
-   on the server. The 8-character "Token tail: …" line in the prose
-   is for human inspection only — it is **not** the token.
+   when available; otherwise the token's full bytes are in the
+   `[FALLBACK] Full token: …` line of `content[0].text` (present by
+   default in v6.7.2+, suppressed by `EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true`).
+   The 8-character "Token tail: …" line in the prose is for human
+   inspection only — it is **not** the token.
 5. If denied: tell the user the operation has been cancelled.
 
 ### Token semantics
@@ -441,19 +452,99 @@ These environment variables control soft confirmation behavior:
 - **`EPIMETHIAN_DISABLE_FAST_DECLINE_DETECTION=true`** — total
   off-switch for the auto-detection; restores exactly v6.6.0 behaviour.
 
-#### v6.6.2+ structured-content fallback
+#### v6.7.2+ token-in-text default
 
-- **`EPIMETHIAN_TOKEN_IN_TEXT=true`** — opt-in fallback for clients that
-  drop `content` blocks on `isError: true` results, or that ignore the
-  `outputSchema` declaration and never surface `structuredContent`
-  to the agent. When set, the soft-confirm result text appends a
-  `[FALLBACK] Full token (EPIMETHIAN_TOKEN_IN_TEXT=true): <token>`
-  line so the agent can still extract the token. The structured
-  payload is unchanged. Trade-off: the token is visible in the agent
-  transcript (the security choice v6.6.0 explicitly avoided), so use
-  only when needed. Today this is required for Claude Code (the VS
-  Code extension and possibly the CLI) — see the per-client matrix
-  below.
+The soft-confirm result text appends a `[FALLBACK] Full token: <token>`
+line by default, so the token is visible to the agent even when the
+client drops `structuredContent` on `isError: true` (Claude Code issues
+#15412 / #9962 / #39976). This matches the configuration most clients
+need; making it the default closes the under-configured-install gap.
+The structured payload is unchanged.
+
+- **`EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true`** — opt out of the in-text
+  fallback. Use when your client reliably forwards `structuredContent`
+  to the agent and you'd rather keep the token out of the transcript
+  (the security choice v6.6.0 originally optimised for).
+- **`EPIMETHIAN_TOKEN_IN_TEXT=false`** — legacy spelling for the same
+  opt-out, honoured for back-compat with v6.6.x configs that pinned
+  the env var to a disabled value. Any other value (unset, "true",
+  "1", typos) leaves the default-on behaviour in place.
+
+#### v6.8.0+ batch authorisation tokens
+
+When you need to fan out destructive writes across many pages — bulk
+doc refreshes, post-migration cleanups, sub-agent fan-out — use
+`authorise_destructive_writes` once to get a `batch_token`, then pass
+it to every subsequent `update_page` / `update_page_section` /
+`update_page_sections` / `delete_page` call. ONE user prompt covers
+the entire batch.
+
+```
+[parent agent]
+  → AskUserQuestion("Rewrite these 13 pages?")     ← agent harness UX
+  → user approves
+  → mcp.authorise_destructive_writes({
+      page_ids: [...13 IDs...],
+      ttl_seconds: 3600,
+      max_operations: 13,
+      reason: "Refresh all runbook pages with v6.8.0 release notes"
+    })
+  → server fires soft-confirm OR live elicitation (ONE prompt)
+  → batch_token returned to parent
+  ↓
+[parent dispatches 13 sub-agents, each given the batch_token]
+  ↓
+[sub-agent N]
+  → reads sources, drafts page N
+  → mcp.update_page({
+      page_id, body, replace_body: true,
+      source: "user_request",
+      batch_token  // ← bypasses the per-call gate
+    })
+  → server validates batch_token; on match, decrements the operation
+    counter and writes; on any failure (wrong page, expired,
+    exhausted, cloud mismatch), falls through to the per-call
+    confirmation gate transparently
+```
+
+**What the agent should know:**
+
+- The `batch_token` is page-id-scoped. A call to a page outside the
+  approved list looks like a normal first-call destructive write —
+  the agent gets `SOFT_CONFIRMATION_REQUIRED`, NOT a different error
+  class (this is the validation-failure invariant: granular reasons
+  never leak). The fall-through is the right ergonomics; the agent
+  can recover by handling the per-call confirm_token round-trip.
+- The token is NOT diff-bound. The user approved which pages may be
+  written to and how many times — not the exact bytes of each write.
+  This is a real reduction in defence vs. the per-call `confirm_token`
+  flow: a poisoned page can make the agent draft adversarial content,
+  but only for pages already in the allowlist (the injection cannot
+  redirect the write target). Don't request a batch token for pages
+  the agent discovered autonomously.
+- The token has a maximum TTL of 1 hour and a maximum operation cap
+  of `page_ids.length × 2` (network-retry headroom — not an
+  application-level retry budget). Defaults are 15 min and `N × 1`.
+- The token covers `update_page`, `update_page_section`,
+  `update_page_sections`, and `delete_page`. It does NOT cover
+  `create_page` (no target page_id), `prepend_to_page` /
+  `append_to_page` (use the per-call gate; these are non-destructive
+  by default), or `find_replace` mode of `update_page_section` (also
+  non-destructive).
+- Tokens are process-local. Multi-process deployments hit the same
+  caveat as `confirm_token` — pin one process per agent.
+
+**Operator opt-outs / strict mode:**
+
+- **`EPIMETHIAN_BATCH_REQUIRES_ELICITATION=true`** — refuse to mint a
+  batch token via the soft-confirm fallback. Forces the user to
+  approve via real (in-protocol) elicitation. Use when you want to
+  preserve the strong per-call diff-binding and only allow batch
+  authorisation through clients that can render a real confirmation
+  UI.
+- **`EPIMETHIAN_BATCH_MINT_LIMIT=<n>`** — override the rolling
+  15-minute mint cap (default 25; "0" disables). Distinct from the
+  `confirm_token` mint budget.
 
 ### Multi-process deployments
 
@@ -481,9 +572,9 @@ recommend, if any.
 |---|---|---|
 | **Claude Code (CLI)** | Yes — full support | No special config needed. |
 | **Claude Desktop** | Yes — full support | No special config needed. |
-| **Claude Code VS Code extension** (all versions tested through 2.1.x) | Fakes it (advertises capability, never honours) | v6.6.1's fast-decline auto-detection routes the call through soft-confirm automatically. **Plus** set `EPIMETHIAN_TOKEN_IN_TEXT=true` in the server's env so the agent can read the full token from `content[0].text` — Claude Code does not currently surface `structuredContent` on `isError: true` responses (issue #15412). No `EPIMETHIAN_BYPASS_ELICITATION` needed; the gate works through the soft-confirm token flow. |
-| **OpenCode** | No — capability not advertised | v6.6.0+ soft-confirmation token flow is automatic when the client lacks elicitation. The Vercel AI SDK forwards `structuredContent` to the model when `outputSchema` is declared (which v6.6.2 added) — the agent should be able to read `confirm_token` directly. If your build of OpenCode/AI-SDK doesn't honour `outputSchema`, set `EPIMETHIAN_TOKEN_IN_TEXT=true` as a fallback. `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` remains an escape hatch for headless / CI runs where no human is in the loop. |
-| **Cursor / Windsurf / Zed / others** | Varies | If write tools fail with `ELICITATION_REQUIRED_BUT_UNAVAILABLE`, the client doesn't advertise the capability — soft-confirm should kick in automatically; use `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` only if no human is in the loop. If write tools succeed at the gate but the agent can't see the token in the response, set `EPIMETHIAN_TOKEN_IN_TEXT=true`. If the client *advertises* elicitation but always fails fast (decline arrives in <50 ms), v6.6.1's auto-detection re-routes through soft-confirm. Set `EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true` to skip the timing probe on the first call when the client is known to fake it. |
+| **Claude Code VS Code extension** (all versions tested through 2.1.x) | Fakes it (advertises capability, never honours) | v6.6.1's fast-decline auto-detection routes the call through soft-confirm automatically. v6.7.2+ surfaces the full token in `content[0].text` by default (Claude Code does not forward `structuredContent` on `isError: true` — issue #15412), so no env-var configuration is needed. No `EPIMETHIAN_BYPASS_ELICITATION` either; the gate works through the soft-confirm token flow. |
+| **OpenCode** | No — capability not advertised | v6.6.0+ soft-confirmation token flow is automatic when the client lacks elicitation. The Vercel AI SDK forwards `structuredContent` when `outputSchema` is declared (v6.6.2+); v6.7.2+ also surfaces the token in `content[0].text` by default as a defence-in-depth fallback. Set `EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true` if you'd rather keep the token out of the transcript on a build that does forward `structuredContent` reliably. `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` remains an escape hatch for headless / CI runs where no human is in the loop. |
+| **Cursor / Windsurf / Zed / others** | Varies | If write tools fail with `ELICITATION_REQUIRED_BUT_UNAVAILABLE`, the client doesn't advertise the capability — soft-confirm should kick in automatically; use `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` only if no human is in the loop. v6.7.2+ ships the full token in `content[0].text` by default, so the agent should always be able to read it. If the client *advertises* elicitation but always fails fast (decline arrives in <50 ms), v6.6.1's auto-detection re-routes through soft-confirm. Set `EPIMETHIAN_TREAT_ELICITATION_AS_UNSUPPORTED=true` to skip the timing probe on the first call when the client is known to fake it. |
 
 ### Three configuration paths — pick the one that matches your client
 
@@ -561,7 +652,7 @@ These are off by default and only relevant in specific scenarios:
   write tools are disabled regardless of MCP client config. Useful for
   read-only profiles or sandbox environments.
 
-## Available Tools (35)
+## Available Tools (36)
 
 | Tool | Description |
 |------|-------------|
@@ -575,6 +666,7 @@ These are off by default and only relevant in specific scenarios:
 | `prepend_to_page` | Insert content at the beginning of an existing page (additive, safe) |
 | `append_to_page` | Insert content at the end of an existing page (additive, safe) |
 | `delete_page` | Delete a page |
+| `authorise_destructive_writes` | Pre-authorise a batch of destructive writes (returns `batch_token` consumed by subsequent update / delete calls) |
 | `revert_page` | Revert a page to a previous version |
 | `list_pages` | List pages in a space |
 | `get_page_children` | Get child pages of a page |

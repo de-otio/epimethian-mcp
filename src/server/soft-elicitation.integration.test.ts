@@ -330,8 +330,12 @@ describe("Scenario 1 — happy path: SOFT_CONFIRMATION_REQUIRED then success", (
     expect(r1.structuredContent.audit_id).toBeDefined();
     expect(r1.structuredContent.expires_at).toBeDefined();
 
-    // Token must NOT appear in the free-text content (scenario 16 guarantee).
-    expect(r1.content[0].text).not.toContain(token);
+    // v6.7.2+: token-in-text is default-on, so the full token DOES
+    // appear in `content[0].text` (under the [FALLBACK] line). The
+    // no-leak guarantee for stderr (scenario 16) is unaffected — that
+    // covers console.error output, not agent-facing tool results.
+    expect(r1.content[0].text).toContain(token);
+    expect(r1.content[0].text).toContain("[FALLBACK]");
 
     // Call 2: supply the token → should succeed.
     const r2 = await handler({

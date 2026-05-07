@@ -2794,7 +2794,7 @@ describe("safeSubmitPage — invalidateForPage defense-in-depth (2.E)", () => {
 // ---------------------------------------------------------------------------
 
 describe("formatSoftConfirmationResult", () => {
-  it("returns isError: true with SOFT_CONFIRMATION_REQUIRED in text content", () => {
+  it("returns isError: true with SOFT_CONFIRMATION_REQUIRED in text content (token-in-text default-on as of v6.7.2)", () => {
     const fakeErr = {
       token: "abcdefgh12345678TAIL1234",
       auditId: "audit-uuid-001",
@@ -2802,14 +2802,48 @@ describe("formatSoftConfirmationResult", () => {
       humanSummary: "This update will remove 2 TOC macros.",
       pageId: "page-42",
     };
-    const result = formatSoftConfirmationResult(fakeErr, { pageId: "page-42" });
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
-    expect(result.content[0].text).toContain("This update will remove 2 TOC macros.");
-    // Full token must NOT appear in free text.
-    expect(result.content[0].text).not.toContain(fakeErr.token);
-    // Last 8 chars appear as the tail.
-    expect(result.content[0].text).toContain("TAIL1234");
+    // Default behaviour (no env var set): the [FALLBACK] line carries
+    // the full token. Save and clear both env vars to cover the
+    // default-on path explicitly.
+    const prevHide = process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT;
+    const prevLegacy = process.env.EPIMETHIAN_TOKEN_IN_TEXT;
+    delete process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT;
+    delete process.env.EPIMETHIAN_TOKEN_IN_TEXT;
+    try {
+      const result = formatSoftConfirmationResult(fakeErr, { pageId: "page-42" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("SOFT_CONFIRMATION_REQUIRED");
+      expect(result.content[0].text).toContain("This update will remove 2 TOC macros.");
+      // The tail is still present for human inspection.
+      expect(result.content[0].text).toContain("TAIL1234");
+      // Default-on: the [FALLBACK] line carries the full token bytes.
+      expect(result.content[0].text).toContain("[FALLBACK]");
+      expect(result.content[0].text).toContain(fakeErr.token);
+    } finally {
+      if (prevHide !== undefined) process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = prevHide;
+      if (prevLegacy !== undefined) process.env.EPIMETHIAN_TOKEN_IN_TEXT = prevLegacy;
+    }
+  });
+
+  it("EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true keeps the full token out of free text", () => {
+    const fakeErr = {
+      token: "abcdefgh12345678TAIL1234",
+      auditId: "audit-uuid-001",
+      expiresAt: Date.now() + 300_000,
+      humanSummary: "This update will remove 2 TOC macros.",
+      pageId: "page-42",
+    };
+    const prev = process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT;
+    process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = "true";
+    try {
+      const result = formatSoftConfirmationResult(fakeErr, { pageId: "page-42" });
+      expect(result.content[0].text).toContain("Token tail: ...TAIL1234");
+      expect(result.content[0].text).not.toContain("[FALLBACK]");
+      expect(result.content[0].text).not.toContain(fakeErr.token);
+    } finally {
+      if (prev === undefined) delete process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT;
+      else process.env.EPIMETHIAN_HIDE_TOKEN_IN_TEXT = prev;
+    }
   });
 
   it("puts the full token in structuredContent.confirm_token + sets the kind discriminator", () => {
