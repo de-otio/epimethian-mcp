@@ -116,6 +116,15 @@ Exactly one of `body` or `find_replace` must be provided.
 | `version` | number \| `"current"` | Yes | Version from your most recent `get_page` call. Pass `"current"` to skip the read. **Warning:** `"current"` bypasses optimistic concurrency. |
 | `version_message` | string | No | Version comment visible in page history |
 | `confirm_deletions` | boolean | No | Acknowledge that your markdown removes preserved macros, emoticons, or rich elements from this section (default: false). |
+| `confirm_shrinkage` | boolean | No | Acknowledge a large body reduction (default: false). Measured against the **whole page**, not the isolated section — see note below. |
+| `confirm_structure_loss` | boolean | No | Acknowledge a large drop in heading count, measured against the whole page (default: false). |
+
+> **Page-relative guards.** The shrinkage / structure / content-floor guards
+> for a section edit are measured against the **whole page**, not the section
+> fragment. A small change to a short section (e.g. removing one macro) is a
+> small page-level change and will not trip the guards. `confirm_shrinkage` /
+> `confirm_structure_loss` are only needed for a genuinely large *page-level*
+> reduction.
 
 **Example — `find_replace` mode:**
 
@@ -146,6 +155,8 @@ In auto-numbered spaces, section names accept both prefixed and plain forms.
 | `version` | number \| `"current"` | Yes | Version from your most recent `get_page` call. Pass `"current"` to skip the read. **Warning:** `"current"` bypasses optimistic concurrency. |
 | `version_message` | string | No | Version comment for the single resulting revision |
 | `confirm_deletions` | boolean | No | Acknowledge that the aggregated set of sections removes preserved macros, emoticons, or rich elements (default: false). The gate fires once on the aggregate. |
+| `confirm_shrinkage` | boolean | No | Acknowledge a large body reduction (default: false). Each section's guard is measured against the **whole page** (as for `update_page_section`). |
+| `confirm_structure_loss` | boolean | No | Acknowledge a large drop in heading count, measured against the whole page (default: false). |
 | `sections` | array | Yes | List of `{section, body}` pairs. `section` is the heading text (case-insensitive); `body` is GFM markdown or Confluence storage format. Section names must be unique within the list. |
 
 **Example:**
@@ -315,7 +326,13 @@ The result text includes both `attachment_id` and `macro_id` so a follow-up call
 | `page_id` | string | Yes | Numeric page ID |
 | `diagram_xml` | string | Yes | The diagram in mxGraph XML format (starting with `<mxfile>`) |
 | `diagram_name` | string | Yes | Filename for the diagram (e.g., `architecture.drawio`). `.drawio` is appended if not already present. |
-| `append` | boolean | No | If true, appends the diagram to existing page content; if false, replaces the page body (default: true). |
+| `append` | boolean | No | If true, appends the diagram to the end of the page; if false, replaces the page body (default: true). Ignored when `after_section` or `return_macro_only` is set. |
+| `after_section` | string | No | Heading text of a section to place the diagram in. The macro is inserted at the **end of that section** (before the next heading) instead of at the end of the page. Takes precedence over `append`. |
+| `return_macro_only` | boolean | No | If true, upload the attachment but **do not modify the page body**; the result returns the draw.io macro storage markup so you can position it yourself with `update_page` / `update_page_section` (default: false). Takes precedence over `after_section` and `append`. The attachment is created regardless; an un-embedded macro leaves it orphaned. |
+
+**Placement.** By default the diagram is appended at the end of the page. Use
+`after_section` for one-call placement inside a section, or `return_macro_only`
+when you need exact positioning the other options can't express.
 
 **Example result text:**
 

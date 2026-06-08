@@ -1921,6 +1921,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .boolean()
           .default(false)
           .describe("Set to true to acknowledge that your markdown removes preserved macros, emoticons, or rich elements from this section. Required when any preserved element would be deleted."),
+        confirm_shrinkage: z
+          .boolean()
+          .default(false)
+          .describe("Set to true to acknowledge a large body reduction. The shrinkage guard is measured against the WHOLE page (not the isolated section), so a small edit to a short section will not trip it; this flag is only needed for a genuinely large page-level reduction."),
+        confirm_structure_loss: z
+          .boolean()
+          .default(false)
+          .describe("Set to true to acknowledge a large drop in heading count, measured against the whole page."),
         confirm_token: z
           .string()
           .optional()
@@ -1939,7 +1947,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       outputSchema: writeOutputSchema,
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, section, body, find_replace, version, version_message, confirm_deletions, confirm_token, batch_token }) => {
+    async ({ page_id, section, body, find_replace, version, version_message, confirm_deletions, confirm_shrinkage, confirm_structure_loss, confirm_token, batch_token }) => {
       const blocked = writeGuard("update_page_section", config);
       if (blocked) return blocked;
       // v6.8.0 §C: batch-token reservation tracking.
@@ -2062,11 +2070,17 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
 
         // body mode (original path):
 
-        // E4/A2: gate when confirm_deletions is set, with a deletion forecast
-        // describing what the section update will remove. The section body and
-        // caller markdown are both available here, so we can compute the
-        // forecast purely (planUpdate has no side effects).
-        if (confirm_deletions) {
+        // E4/A2: gate when ANY destructive flag is set (confirm_deletions,
+        // confirm_shrinkage, confirm_structure_loss), with a deletion forecast
+        // when confirm_deletions is among them. The section body and caller
+        // markdown are both available here, so the forecast is computed purely
+        // (planUpdate has no side effects).
+        const sectionFlagsSet = listDestructiveFlagsSet({
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          confirmDeletions: confirm_deletions,
+        });
+        if (sectionFlagsSet.length > 0) {
           // v6.8.0 §C: try batch_token first.
           const batchAttempt = await tryBatchTokenForWrite({
             batch_token,
@@ -2076,7 +2090,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           batchReservationId = batchAttempt.batchReservationId;
 
           if (batchReservationId === undefined) {
-            const deletionSummary = tryForecastDeletions(currentSectionBody, body!, cfg.url);
+            const deletionSummary =
+              confirm_deletions && body
+                ? tryForecastDeletions(currentSectionBody, body, cfg.url)
+                : null;
 
             // 2.C preamble — diffHash from the caller's body + pageVersion.
             const diffHash = (cloudId && pageVersion > 0)
@@ -2102,11 +2119,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             } else if (tokenResult === "no_token") {
               await gateOperation(server, {
                 tool: "update_page_section",
-                summary: `Update section "${section}" in page ${page_id} with confirm_deletions?`,
+                summary: `Update section "${section}" in page ${page_id} with ${sectionFlagsSet.join(", ")}?`,
                 details: {
                   page_id,
                   section,
-                  source: "confirm_deletions",
+                  flags: sectionFlagsSet.join(","),
                   ...(deletionSummary ? { deletionSummary } : {}),
                 },
                 cloudId,
@@ -2124,6 +2141,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           currentBody: currentSectionBody,
           scope: "section",
           confirmDeletions: confirm_deletions || undefined,
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          // Measure shrink/structure/floor guards against the whole page.
+          fullPageBody: fullBody,
           confluenceBaseUrl: cfg.url,
         });
 
@@ -2154,6 +2175,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           deletedTokens: prepared.deletedTokens,
           operation: "update_page_section",
           clientLabel: getClientLabel(server),
+          // Recorded for the destructive-flag audit / version-message suffix;
+          // guards already ran in safePrepareBody (page-relative).
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          confirmDeletions: confirm_deletions || undefined,
           cloudId,
         });
 
@@ -2246,6 +2272,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "deletion-summary gate fires once on the AGGREGATE — a caller " +
             "cannot bypass the gate by spreading deletions across sections."
           ),
+        confirm_shrinkage: z
+          .boolean()
+          .default(false)
+          .describe("Set to true to acknowledge a large body reduction. Each section's shrinkage is measured against the WHOLE page, so small edits to short sections will not trip it; needed only for a genuinely large page-level reduction."),
+        confirm_structure_loss: z
+          .boolean()
+          .default(false)
+          .describe("Set to true to acknowledge a large drop in heading count, measured against the whole page."),
         confirm_token: z
           .string()
           .optional()
@@ -2284,7 +2318,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, version, version_message, confirm_deletions, sections, confirm_token, batch_token }) => {
+    async ({ page_id, version, version_message, confirm_deletions, confirm_shrinkage, confirm_structure_loss, sections, confirm_token, batch_token }) => {
       const blocked = writeGuard("update_page_sections", config);
       if (blocked) return blocked;
       // v6.8.0 §C: batch-token reservation tracking.
@@ -2310,13 +2344,19 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           );
         }
 
-        // E4/A2: gate when confirm_deletions is set, with an aggregated
-        // deletion forecast across all sections. Each section's forecast is
-        // computed independently against its own current body (planUpdate is
-        // pure — no side effects), then summed into one DeletionSummary.
-        // The gate fires ONCE on the aggregate; a caller cannot bypass the
-        // gate by spreading deletions across many sections.
-        if (confirm_deletions) {
+        // E4/A2: gate when ANY destructive flag is set (confirm_deletions,
+        // confirm_shrinkage, confirm_structure_loss). When confirm_deletions
+        // is among them, an aggregated deletion forecast across all sections
+        // is computed independently against each section's current body
+        // (planUpdate is pure — no side effects), then summed into one
+        // DeletionSummary. The gate fires ONCE on the aggregate; a caller
+        // cannot bypass it by spreading changes across many sections.
+        const sectionsFlagsSet = listDestructiveFlagsSet({
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          confirmDeletions: confirm_deletions,
+        });
+        if (sectionsFlagsSet.length > 0) {
           // v6.8.0 §C: try batch_token first.
           const batchAttempt = await tryBatchTokenForWrite({
             batch_token,
@@ -2335,31 +2375,33 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
               other: 0,
             };
             let any = false;
-            for (const s of sections) {
-              // Use extractSectionBody against the original body. If the
-              // section is missing or ambiguous, the forecast is skipped — the
-              // real failure surfaces (with a structured error) inside
-              // safePrepareMultiSectionBody.
-              let currentSectionBody: string | null = null;
-              try {
-                currentSectionBody = extractSectionBody(fullBody, s.section);
-              } catch {
-                currentSectionBody = null;
-              }
-              if (currentSectionBody === null) continue;
-              const summary = tryForecastDeletions(
-                currentSectionBody,
-                s.body,
-                cfg.url,
-              );
-              if (summary !== null) {
-                summed.tocs += summary.tocs;
-                summed.links += summary.links;
-                summed.structuredMacros += summary.structuredMacros;
-                summed.codeMacros += summary.codeMacros;
-                summed.plainElements += summary.plainElements;
-                summed.other += summary.other;
-                any = true;
+            if (confirm_deletions) {
+              for (const s of sections) {
+                // Use extractSectionBody against the original body. If the
+                // section is missing or ambiguous, the forecast is skipped —
+                // the real failure surfaces (with a structured error) inside
+                // safePrepareMultiSectionBody.
+                let currentSectionBody: string | null = null;
+                try {
+                  currentSectionBody = extractSectionBody(fullBody, s.section);
+                } catch {
+                  currentSectionBody = null;
+                }
+                if (currentSectionBody === null) continue;
+                const summary = tryForecastDeletions(
+                  currentSectionBody,
+                  s.body,
+                  cfg.url,
+                );
+                if (summary !== null) {
+                  summed.tocs += summary.tocs;
+                  summed.links += summary.links;
+                  summed.structuredMacros += summary.structuredMacros;
+                  summed.codeMacros += summary.codeMacros;
+                  summed.plainElements += summary.plainElements;
+                  summed.other += summary.other;
+                  any = true;
+                }
               }
             }
 
@@ -2389,11 +2431,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             } else if (tokenResult === "no_token") {
               await gateOperation(server, {
                 tool: "update_page_sections",
-                summary: `Update ${sections.length} section${sections.length === 1 ? "" : "s"} in page ${page_id} with confirm_deletions?`,
+                summary: `Update ${sections.length} section${sections.length === 1 ? "" : "s"} in page ${page_id} with ${sectionsFlagsSet.join(", ")}?`,
                 details: {
                   page_id,
                   section_count: sections.length,
-                  source: "confirm_deletions",
+                  flags: sectionsFlagsSet.join(","),
                   ...(any ? { deletionSummary: summed } : {}),
                 },
                 cloudId,
@@ -2414,6 +2456,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           currentStorage: fullBody,
           sections,
           confirmDeletions: confirm_deletions,
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
           confluenceBaseUrl: cfg.url,
         });
 
@@ -2438,6 +2482,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           operation: "update_page_section",
           clientLabel: getClientLabel(server),
           confirmDeletions: confirm_deletions,
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
           cloudId,
         });
 
@@ -3011,12 +3057,24 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .boolean()
           .default(true)
           .describe(
-            "If true, appends the diagram to existing page content. If false, replaces the page body."
+            "If true, appends the diagram to the end of the page. If false, replaces the page body. Ignored when after_section or return_macro_only is set."
+          ),
+        after_section: z
+          .string()
+          .optional()
+          .describe(
+            "Heading text of a section to place the diagram in. The diagram is inserted at the END of that section's content (before the next heading) instead of at the end of the page. Use headings_only / get_page to find section names. Takes precedence over `append`."
+          ),
+        return_macro_only: z
+          .boolean()
+          .default(false)
+          .describe(
+            "If true, upload the diagram as an attachment but DO NOT modify the page body; instead return the draw.io macro storage markup so you can place it yourself with update_page / update_page_section. Use this when you need precise positioning the other options can't express. Takes precedence over `after_section` and `append`. (The attachment is created either way; if you never embed the returned macro it is left orphaned.)"
           ),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
     },
-    async ({ page_id, diagram_xml, diagram_name, append }) => {
+    async ({ page_id, diagram_xml, diagram_name, append, after_section, return_macro_only }) => {
       const blocked = writeGuard("add_drawio_diagram", config);
       if (blocked) return blocked;
       try {
@@ -3062,21 +3120,59 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         const existingBody =
           current.body?.storage?.value ?? current.body?.value ?? "";
 
-        const newBody = append ? `${existingBody}\n${macro}` : macro;
+        // return_macro_only: upload the attachment but leave the page body
+        // untouched, returning the macro markup so the caller can position it
+        // precisely (e.g. via update_page_section). No version bump, no
+        // attribution label / badge — the page is not modified.
+        if (return_macro_only) {
+          return toolResult(
+            `Diagram "${filename}" uploaded to page ${current.title} ` +
+              `(ID: ${page_id}, attachment ID: ${attachmentId}, macro ID: ${macroId}). ` +
+              `The page body was NOT modified. Embed the diagram by inserting ` +
+              `this macro where you want it (its baseUrl/pageId/diagramName are ` +
+              `bound to this page):\n\n${macro}${echo}`
+          );
+        }
 
-        // scope: "full" — newBody is the fully-assembled storage body (either
-        // append=true: existingBody + macro, or append=false: macro only).
+        // Assemble the new full body. Precedence: after_section > append.
+        let newBody: string;
+        let placementNote = "";
+        if (after_section !== undefined) {
+          // Insert at the END of the named section (before the next heading).
+          const sectionBody = extractSectionBody(existingBody, after_section);
+          if (sectionBody === null) {
+            return toolError(
+              new Error(
+                `Section "${after_section}" not found. Use headings_only to see available sections.`
+              )
+            );
+          }
+          const spliced = replaceSection(
+            existingBody,
+            after_section,
+            `${sectionBody}\n${macro}`,
+          );
+          if (spliced === null) {
+            return toolError(
+              new Error(
+                `Section "${after_section}" not found. Use headings_only to see available sections.`
+              )
+            );
+          }
+          newBody = spliced;
+          placementNote = ` in section "${after_section}"`;
+        } else {
+          newBody = append ? `${existingBody}\n${macro}` : macro;
+        }
+
+        // scope: "full" — newBody is the fully-assembled storage body.
         // safePrepareBody detects non-markdown and passes it through unchanged;
-        // content guards compare existingBody→newBody, same as the old direct
-        // enforceContentSafetyGuards call did. safeSubmitPage owns mutation
-        // logging (success and failure), so no direct logMutation call is needed.
+        // content guards compare existingBody→newBody. safeSubmitPage owns
+        // mutation logging (success and failure).
         const prepared = await safePrepareBody({
           body: newBody,
           currentBody: existingBody,
           scope: "full",
-          // append=true is additive but newBody already contains the concat,
-          // so "full" is correct: guards compare existingBody vs the complete
-          // new body, which is what we want for both branches.
         });
 
         const submitted = await safeSubmitPage({
@@ -3098,7 +3194,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (badgeResult.warning) warnings.push(badgeResult.warning);
 
         return toolResult(
-          appendWarnings(`Diagram "${filename}" added to page ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, attachment ID: ${attachmentId}, macro ID: ${macroId})`, warnings) + echo
+          appendWarnings(`Diagram "${filename}" added to page ${submitted.page.title}${placementNote} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, attachment ID: ${attachmentId}, macro ID: ${macroId})`, warnings) + echo
         );
       } catch (err) {
         return toolErrorWithContext(err, { operation: "add_drawio_diagram", resource: `page ${page_id}`, profile: config.profile });

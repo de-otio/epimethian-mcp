@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.9.0] - 2026-06-08 - page-relative section guards & draw.io placement
+
+### Fixed
+
+- **Section-edit safety guards are now measured against the whole page,
+  not the isolated section.** Previously `update_page_section` /
+  `update_page_sections` evaluated the shrinkage, structure-loss, and
+  content-floor guards against the section *fragment*. A small, benign
+  edit to a short section — e.g. removing one macro from a brief
+  "References" section — read as a >50% "loss" and was rejected, with no
+  way to proceed because the section tools did not expose
+  `confirm_shrinkage`. The guards now project the change onto the full
+  page (the section body swapped in place), so a small page-level change
+  no longer trips a page-scale guard. The catastrophic-reduction content
+  floor still applies, page-relative.
+
+- The shrinkage-guard message no longer suggests "omit `replace_body`"
+  (which is meaningless on the section tools); it now names the flag
+  (`confirm_shrinkage`) and the tools that accept it.
+
+### Added
+
+- **`confirm_shrinkage` and `confirm_structure_loss` on
+  `update_page_section` and `update_page_sections`.** A genuinely large
+  *page-level* reduction made through a section edit can now be
+  acknowledged in place, instead of forcing an escalation to a full-page
+  `update_page`. Setting either flag routes through the same
+  soft-confirmation gate as `confirm_deletions`.
+
+- **`add_drawio_diagram` placement options.** Two new optional inputs
+  remove the previous append-only limitation:
+  - `after_section` — embed the diagram at the end of a named section
+    instead of at the end of the page (one call).
+  - `return_macro_only` — upload the attachment but leave the page body
+    untouched, returning the draw.io macro markup so the caller can place
+    it precisely via `update_page` / `update_page_section`.
+
 ## [6.8.0] - 2026-05-07 - parallel sub-agent batch confirmation
 
 ### Added

@@ -307,6 +307,56 @@ const cases: Row[] = [
     },
     outcome: { kind: "success" },
   },
+  // --- Section scope: shrinkage measured page-relative when fullPageBody
+  //     is supplied (P2). A >50% reduction of the section FRAGMENT still
+  //     fires when measured fragment-relative... ---
+  {
+    name: "section scope without fullPageBody: fragment >50% shrink still fires",
+    input: {
+      body: "<p>tiny</p>",
+      currentBody: BIG_STORAGE_BODY,
+      scope: "section",
+    },
+    outcome: { kind: "error", code: "SHRINKAGE_NOT_CONFIRMED" },
+  },
+  // ...but the SAME section edit, measured against a large surrounding page,
+  // is a small page-level change and must NOT trip the guard.
+  {
+    name: "section scope with fullPageBody: small change to a short section is page-relative (no false shrinkage)",
+    input: {
+      body: "<p>tiny</p>",
+      currentBody: BIG_STORAGE_BODY,
+      scope: "section",
+      fullPageBody: `<p>${"a".repeat(1500)}</p>${BIG_STORAGE_BODY}<p>${"b".repeat(1500)}</p>`,
+    },
+    outcome: { kind: "success" },
+  },
+  // A real page-level >50% reduction (but above the 10% floor) in section
+  // scope still fires even with fullPageBody (here the section is most of
+  // the page).
+  {
+    name: "section scope with fullPageBody: page-level >50% reduction still fires",
+    input: {
+      body: `<p>${"y".repeat(400)}</p>`,
+      currentBody: BIG_STORAGE_BODY,
+      scope: "section",
+      fullPageBody: `<p>x</p>${BIG_STORAGE_BODY}`,
+    },
+    outcome: { kind: "error", code: "SHRINKAGE_NOT_CONFIRMED" },
+  },
+  // ...and that page-level reduction is then confirmable via confirmShrinkage
+  // (the flag the section tools now expose — P1).
+  {
+    name: "section scope page-level reduction confirmable with confirmShrinkage",
+    input: {
+      body: `<p>${"y".repeat(400)}</p>`,
+      currentBody: BIG_STORAGE_BODY,
+      scope: "section",
+      fullPageBody: `<p>x</p>${BIG_STORAGE_BODY}`,
+      confirmShrinkage: true,
+    },
+    outcome: { kind: "success" },
+  },
   // --- Structure loss guard fired / skipped. ---
   {
     name: "structure loss guard fires on >50% heading drop",

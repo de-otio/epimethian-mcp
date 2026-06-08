@@ -219,8 +219,8 @@ export function enforceContentSafetyGuards(input: ContentSafetyInput): void {
       `Body would shrink from ${oldLen} to ${newLen} characters ` +
         `(${pct}% reduction). ` +
         `This may indicate accidental content loss. ` +
-        `Re-submit with confirm_shrinkage: true to proceed, ` +
-        `or omit replace_body to use token-aware preservation.`,
+        `Re-submit with confirm_shrinkage: true to proceed ` +
+        `(accepted by update_page, update_page_section, and update_page_sections).`,
       SHRINKAGE_NOT_CONFIRMED,
     );
   }

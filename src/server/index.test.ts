@@ -526,6 +526,131 @@ describe("add_drawio_diagram filename normalization", () => {
   });
 });
 
+describe("add_drawio_diagram placement (P3)", () => {
+  it("return_macro_only uploads the attachment but does NOT modify the page body", async () => {
+    const { uploadAttachment, getPage, _rawUpdatePage } = await import(
+      "./confluence-client.js"
+    );
+    (_rawUpdatePage as any).mockClear();
+    (uploadAttachment as any).mockResolvedValueOnce({
+      title: "d.drawio",
+      id: "att-9",
+    });
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      version: { number: 2 },
+      body: { storage: { value: "<p>existing</p>" } },
+    });
+
+    mockMkdtemp.mockResolvedValueOnce("/tmp/drawio-ret");
+    mockWriteFile.mockResolvedValueOnce(undefined);
+    mockReadFile.mockResolvedValueOnce(Buffer.from("<mxfile/>"));
+    mockRm.mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("add_drawio_diagram")!.handler;
+    const result = await handler({
+      page_id: "1",
+      diagram_xml: "<mxfile/>",
+      diagram_name: "d",
+      return_macro_only: true,
+    });
+
+    expect(result.isError).toBeUndefined();
+    // Attachment uploaded...
+    expect((uploadAttachment as any).mock.calls.length).toBeGreaterThan(0);
+    // ...but the page body was NOT written.
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+    // The macro markup is returned for the caller to place.
+    expect(result.content[0].text).toContain("was NOT modified");
+    expect(result.content[0].text).toContain(
+      '<ac:structured-macro ac:name="drawio"',
+    );
+    expect(result.content[0].text).toContain("attachment ID: att-9");
+  });
+
+  it("after_section embeds the diagram inside the named section", async () => {
+    const { uploadAttachment, getPage, _rawUpdatePage } = await import(
+      "./confluence-client.js"
+    );
+    (_rawUpdatePage as any).mockClear();
+    (uploadAttachment as any).mockResolvedValueOnce({
+      title: "d.drawio",
+      id: "att-7",
+    });
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      version: { number: 4 },
+      body: {
+        storage: {
+          value: "<h1>Target</h1><p>tbody</p><h1>End</h1><p>z</p>",
+        },
+      },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 5,
+    });
+
+    mockMkdtemp.mockResolvedValueOnce("/tmp/drawio-sec");
+    mockWriteFile.mockResolvedValueOnce(undefined);
+    mockReadFile.mockResolvedValueOnce(Buffer.from("<mxfile/>"));
+    mockRm.mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("add_drawio_diagram")!.handler;
+    const result = await handler({
+      page_id: "1",
+      diagram_xml: "<mxfile/>",
+      diagram_name: "d",
+      after_section: "Target",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain('in section "Target"');
+    const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
+    // The diagram macro lands inside the Target section — before the End heading.
+    const macroPos = submittedBody.indexOf(
+      '<ac:structured-macro ac:name="drawio"',
+    );
+    const endPos = submittedBody.indexOf("<h1>End</h1>");
+    expect(macroPos).toBeGreaterThan(-1);
+    expect(endPos).toBeGreaterThan(-1);
+    expect(macroPos).toBeLessThan(endPos);
+  });
+
+  it("after_section returns an error when the section is missing", async () => {
+    const { uploadAttachment, getPage, _rawUpdatePage } = await import(
+      "./confluence-client.js"
+    );
+    (_rawUpdatePage as any).mockClear();
+    (uploadAttachment as any).mockResolvedValueOnce({ title: "d.drawio", id: "att-x" });
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      version: { number: 4 },
+      body: { storage: { value: "<h1>Other</h1><p>x</p>" } },
+    });
+
+    mockMkdtemp.mockResolvedValueOnce("/tmp/drawio-miss");
+    mockWriteFile.mockResolvedValueOnce(undefined);
+    mockReadFile.mockResolvedValueOnce(Buffer.from("<mxfile/>"));
+    mockRm.mockResolvedValueOnce(undefined);
+
+    const handler = registeredTools.get("add_drawio_diagram")!.handler;
+    const result = await handler({
+      page_id: "1",
+      diagram_xml: "<mxfile/>",
+      diagram_name: "d",
+      after_section: "Nope",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Section "Nope" not found');
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+  });
+});
+
 describe("search_pages tool", () => {
   it("formats results correctly", async () => {
     const { searchPages } = await import("./confluence-client.js");
@@ -970,6 +1095,91 @@ describe("update_page_section token-aware preservation", () => {
     const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
     expect(submittedBody).toContain("ac:emoticon");
     expect(submittedBody).toContain("new content");
+  });
+});
+
+describe("update_page_section page-relative guards + confirm flags (P1/P2)", () => {
+  it("P2: shrinking a short section in a large page does NOT trip the shrinkage guard (no confirm flag needed)", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    (_rawUpdatePage as any).mockClear();
+    // A large page; "Refs" is a small section. Reducing it ~96% as a fragment
+    // would historically trip the shrinkage guard — but page-relative it is a
+    // ~12% change and must pass without any acknowledgement.
+    (getPage as any).mockResolvedValueOnce({
+      id: "1",
+      title: "T",
+      body: {
+        storage: {
+          value: `<h1>Big</h1><p>${"x".repeat(3000)}</p><h1>Refs</h1><p>${"r".repeat(400)}</p>`,
+        },
+      },
+    });
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const result = await handler({
+      page_id: "1",
+      section: "Refs",
+      body: "<p>short</p>",
+      version: 5,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Updated section");
+    const submittedBody = (_rawUpdatePage as any).mock.calls[0][1].body;
+    expect(submittedBody).toContain("<p>short</p>");
+    expect(submittedBody).toContain(`<p>${"x".repeat(3000)}</p>`); // Big section untouched
+  });
+
+  it("P1: a genuine page-level >50% reduction still fires, and confirm_shrinkage clears it", async () => {
+    const { getPage, _rawUpdatePage } = await import("./confluence-client.js");
+    // Here the section IS the bulk of the page, so reducing it is a real
+    // page-level reduction the guard should still catch.
+    const bigPage = {
+      id: "1",
+      title: "T",
+      body: {
+        storage: {
+          value: `<h1>A</h1><p>${"x".repeat(1500)}</p><h1>B</h1><p>k</p>`,
+        },
+      },
+    };
+
+    // (a) without the flag → rejected.
+    (_rawUpdatePage as any).mockClear();
+    (getPage as any).mockResolvedValueOnce(bigPage);
+    const handler = registeredTools.get("update_page_section")!.handler;
+    const rejected = await handler({
+      page_id: "1",
+      section: "A",
+      body: `<p>${"y".repeat(400)}</p>`,
+      version: 5,
+    });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.content[0].text).toContain("confirm_shrinkage");
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
+
+    // (b) with confirm_shrinkage → proceeds, and the flag is recorded on the
+    // submit (destructive-flag audit / version-message suffix).
+    (getPage as any).mockResolvedValueOnce(bigPage);
+    (_rawUpdatePage as any).mockResolvedValueOnce({
+      page: { id: "1", title: "T" },
+      newVersion: 6,
+    });
+    const ok = await handler({
+      page_id: "1",
+      section: "A",
+      body: `<p>${"y".repeat(400)}</p>`,
+      version: 5,
+      confirm_shrinkage: true,
+    });
+    expect(ok.isError).toBeUndefined();
+    expect((_rawUpdatePage as any).mock.calls[0][1].destructiveFlags).toContain(
+      "confirm_shrinkage",
+    );
   });
 });
 

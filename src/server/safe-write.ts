@@ -239,6 +239,18 @@ export interface SafePrepareBodyInput {
   confirmStructureLoss?: boolean;
 
   /**
+   * Scope "section" only: the COMPLETE current page body (not just the
+   * section). When provided, the shrinkage / structure / floor guards are
+   * evaluated against the projected full page (the section body swapped in
+   * place) rather than the isolated section fragment. This stops a small,
+   * benign edit to a small section — e.g. removing one macro — from reading
+   * as a >50% "loss" just because the section it lives in is short. Ignored
+   * for non-section scopes and when the current section body is not found
+   * verbatim inside it (falls back to fragment-relative measurement).
+   */
+  fullPageBody?: string;
+
+  /**
    * Intent to overwrite the whole body (e.g. revert_page). Bypasses
    * **token deletion** and **structure-loss** checks — diffing tokens is
    * not meaningful when the caller is replacing everything.
@@ -1238,6 +1250,7 @@ export async function safePrepareBody(
     confirmDeletions,
     confirmShrinkage,
     confirmStructureLoss,
+    fullPageBody,
     replaceBody,
     allowRawHtml,
     confluenceBaseUrl,
@@ -1505,9 +1518,28 @@ export async function safePrepareBody(
   // via the scope-"additive" branch / planUpdate's replaceBody parameter;
   // we pass confirmStructureLoss-effective to enforceContentSafetyGuards.
   if (scope !== "additive" && currentBody !== undefined) {
+    // For scope "section", measure the guards against the projected FULL
+    // page when the caller supplied it (and the current section body is
+    // present verbatim inside it). Removing one macro from a short section
+    // is a ~6% page change, not the >50% section-fragment "loss" the guards
+    // would otherwise see — measuring page-relative avoids that false
+    // positive while still catching catastrophic page-level reduction. The
+    // string replace uses a function replacement so `$`-sequences in the new
+    // body are not interpreted as backreferences. Falls back to fragment-
+    // relative when the section body is not found (defensive).
+    let guardOld = currentBody;
+    let guardNew = finalStorage;
+    if (
+      scope === "section" &&
+      fullPageBody !== undefined &&
+      fullPageBody.includes(currentBody)
+    ) {
+      guardOld = fullPageBody;
+      guardNew = fullPageBody.replace(currentBody, () => finalStorage);
+    }
     enforceContentSafetyGuards({
-      oldStorage: currentBody,
-      newStorage: finalStorage,
+      oldStorage: guardOld,
+      newStorage: guardNew,
       confirmShrinkage,
       confirmStructureLoss: confirmStructureLoss || replaceBody === true,
       // confirmDeletions (any truthy form, incl. a non-empty string[]) OR
@@ -2144,6 +2176,8 @@ export async function safePrepareMultiSectionBody(input: {
   currentStorage: string;
   sections: readonly MultiSectionInput[];
   confirmDeletions?: boolean;
+  confirmShrinkage?: boolean;
+  confirmStructureLoss?: boolean;
   allowRawHtml?: boolean;
   confluenceBaseUrl?: string;
 }): Promise<MultiSectionPrepareOutput> {
@@ -2151,6 +2185,8 @@ export async function safePrepareMultiSectionBody(input: {
     currentStorage,
     sections,
     confirmDeletions,
+    confirmShrinkage,
+    confirmStructureLoss,
     allowRawHtml,
     confluenceBaseUrl,
   } = input;
@@ -2272,6 +2308,10 @@ export async function safePrepareMultiSectionBody(input: {
         currentBody: loc.body,
         scope: "section",
         confirmDeletions: confirmDeletions ? true : undefined,
+        confirmShrinkage,
+        confirmStructureLoss,
+        // Measure each section's guards page-relative (see safePrepareBody).
+        fullPageBody: currentStorage,
         ...(allowRawHtml !== undefined ? { allowRawHtml } : {}),
         ...(confluenceBaseUrl !== undefined ? { confluenceBaseUrl } : {}),
       });
