@@ -22,13 +22,15 @@ vi.mock("../shared/profiles.js", () => ({
 // Capture McpServer construction + tool registrations.
 const mockConnect = vi.fn().mockResolvedValue(undefined);
 const mockRegisterTool = vi.fn();
-const mockMcpServer = vi.fn().mockImplementation(() => ({
-  connect: mockConnect,
-  registerTool: mockRegisterTool,
-  server: {
-    getClientVersion: () => ({ name: "test-client", version: "1.0.0" }),
-  },
-}));
+const mockMcpServer = vi.fn().mockImplementation(function () {
+  return {
+    connect: mockConnect,
+    registerTool: mockRegisterTool,
+    server: {
+      getClientVersion: () => ({ name: "test-client", version: "1.0.0" }),
+    },
+  };
+});
 
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
   McpServer: mockMcpServer,

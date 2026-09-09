@@ -86,15 +86,17 @@ const mockElicitInput = vi.fn();
 const mockGetClientCapabilities = vi.fn(() => ({})); // default: no elicitation
 
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
-  McpServer: vi.fn().mockImplementation(() => ({
-    connect: mockConnect,
-    registerTool: mockRegisterTool,
-    server: {
-      getClientVersion: () => ({ name: "test-client", version: "1.0.0" }),
-      getClientCapabilities: mockGetClientCapabilities,
-      elicitInput: mockElicitInput,
-    },
-  })),
+  McpServer: vi.fn().mockImplementation(function () {
+    return {
+      connect: mockConnect,
+      registerTool: mockRegisterTool,
+      server: {
+        getClientVersion: () => ({ name: "test-client", version: "1.0.0" }),
+        getClientCapabilities: mockGetClientCapabilities,
+        elicitInput: mockElicitInput,
+      },
+    };
+  }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({

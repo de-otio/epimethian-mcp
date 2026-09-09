@@ -18,10 +18,12 @@ const mockConnect = vi.fn().mockResolvedValue(undefined);
 const mockRegisterTool = vi.fn();
 
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
-  McpServer: vi.fn().mockImplementation(() => ({
-    connect: mockConnect,
-    registerTool: mockRegisterTool,
-  })),
+  McpServer: vi.fn().mockImplementation(function () {
+    return {
+      connect: mockConnect,
+      registerTool: mockRegisterTool,
+    };
+  }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({

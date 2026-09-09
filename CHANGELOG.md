@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.9.1] - 2026-09-09 - dependency security updates
+
+### Security
+
+- **Cleared every open Dependabot alert (51 alerts across 18 packages).**
+  All of the runtime advisories were in transitive dependencies — chiefly
+  the MCP SDK's HTTP-server stack (`hono`, `@hono/node-server`,
+  `express` → `body-parser` / `qs`, `express-rate-limit` → `ip-address`,
+  `ajv` → `fast-uri`), plus `gray-matter` → `js-yaml` and
+  `markdown-it` → `linkify-it`. Every one resolved inside the version
+  ranges already declared, so **no runtime dependency in `package.json`
+  changed** — the fix is a lockfile refresh. This package speaks MCP over
+  the stdio transport only, so the HTTP-server advisories were not on its
+  code path.
+
+### Changed
+
+- Dev tooling: `vitest` and `@vitest/coverage-v8` 3.x → 4.1.11, which
+  clears the `@vitest/mocker` path-traversal advisory (the last
+  development-scope alert), and `esbuild` 0.25 → 0.28.2. The esbuild bump
+  puts the build and test toolchains on a single esbuild copy, which also
+  keeps `npm ci` working under npm 10 as well as npm 11.
+- Test doubles updated for vitest 4: it constructs mock implementations
+  with `new`, and arrow functions are not constructible.
+- `diffTokens` documents — and excludes from branch coverage — a guard
+  whose `else` path is unreachable by construction. Both filtered arrays
+  are the same preserved-ID set drawn from deduplicated sequences, so
+  their lengths are always equal. vitest 4's AST-aware branch remapping
+  surfaced it. No behaviour change.
+- Added a test covering the validate-floor fast path in
+  `confirmation-tokens`, for when the floor deadline has already elapsed.
+
 ## [6.9.0] - 2026-06-08 - page-relative section guards & draw.io placement
 
 ### Fixed

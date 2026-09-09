@@ -31,13 +31,15 @@ const mockConnect = vi.fn().mockResolvedValue(undefined);
 const mockRegisterTool = vi.fn();
 
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
-  McpServer: vi.fn().mockImplementation(() => ({
-    connect: mockConnect,
-    registerTool: mockRegisterTool,
-    server: {
-      getClientVersion: () => ({ name: "test-client", version: "1.0.0" }),
-    },
-  })),
+  McpServer: vi.fn().mockImplementation(function () {
+    return {
+      connect: mockConnect,
+      registerTool: mockRegisterTool,
+      server: {
+        getClientVersion: () => ({ name: "test-client", version: "1.0.0" }),
+      },
+    };
+  }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({

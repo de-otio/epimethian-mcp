@@ -377,6 +377,34 @@ describe("confirmation-tokens — timing floor", () => {
     expect(avgMiss).toBeGreaterThanOrEqual(4.5);
     expect(Math.abs(avgHit - avgMiss)).toBeLessThan(1);
   });
+
+  it("resolves without scheduling a timer when the floor has already elapsed", async () => {
+    // sleepUntil()'s fast path (`remaining <= 0`): if the synchronous
+    // validate work already overran the 5 ms floor there is nothing left
+    // to wait for, so it resolves rather than arming a setTimeout.
+    //
+    // Deterministic construction: fake timers are installed and never
+    // advanced, so a scheduled timer could not fire. Date.now() is then
+    // stubbed to jump 1 s on every read — by the time sleepUntil() reads
+    // the clock the floor deadline is long past. An unknown token is used
+    // because its path reads the clock exactly twice (floor, then sleep),
+    // with no expiry check in between.
+    const c = ctx();
+    vi.useFakeTimers();
+    const nowSpy = vi.spyOn(Date, "now");
+    try {
+      let fakeClock = 0;
+      nowSpy.mockImplementation(() => (fakeClock += 1000));
+
+      // If the setTimeout branch were taken this would never settle.
+      await expect(
+        validateToken("never-minted-floor-elapsed-aaaaaaaaaaaa", c),
+      ).resolves.toBe("invalid");
+    } finally {
+      nowSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ===========================================================================

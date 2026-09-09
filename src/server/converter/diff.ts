@@ -135,6 +135,12 @@ export function diffTokens(
   );
 
   const reordered: TokenId[] = [];
+  // Both arrays are `preservedSet` filtered out of a first-occurrence
+  // (deduplicated) sequence, and every preserved ID appears in both
+  // token streams by construction — so the lengths are always equal and
+  // the else path is unreachable. Kept as a guard, excluded from branch
+  // coverage rather than faked with an untriggerable test.
+  /* v8 ignore else */
   if (canonicalOrder.length === callerOrder.length) {
     // Pairwise index comparison captures "same set, different order"
     // exactly. If the arrays are identical, reordered is empty; if any
