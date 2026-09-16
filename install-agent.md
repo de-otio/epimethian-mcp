@@ -652,7 +652,7 @@ These are off by default and only relevant in specific scenarios:
   write tools are disabled regardless of MCP client config. Useful for
   read-only profiles or sandbox environments.
 
-## Available Tools (36)
+## Available Tools (37)
 
 | Tool | Description |
 |------|-------------|
@@ -674,6 +674,7 @@ These are off by default and only relevant in specific scenarios:
 | `get_spaces` | List available Confluence spaces |
 | `add_attachment` | Upload a file attachment to a page |
 | `get_attachments` | List attachments on a page |
+| `download_attachment` | Download an attachment to a local file under the working directory (read-only; the bytes are not returned inline) |
 | `add_drawio_diagram` | Add a draw.io diagram to a page |
 | `get_labels` | Get all labels on a Confluence page |
 | `add_label` | Add one or more labels to a Confluence page |

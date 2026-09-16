@@ -1,8 +1,8 @@
 # Tools Reference
 
-The Epimethian MCP server provides **35 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
+The Epimethian MCP server provides **36 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
 
-_Last updated: 2026-04-30 — v6.6.3_
+_Last updated: 2026-09-16 — v6.10.0_
 
 ---
 
@@ -310,6 +310,36 @@ Lists attachments on a page.
 | `limit` | number | No | Maximum number of attachments to return (default: 25) |
 
 Returns filename, attachment ID, media type, and file size for each attachment.
+
+---
+
+### `download_attachment`
+
+Fetches an attachment's bytes and writes them to a local file, returning the path. The file contents are **not** returned in the tool response — attachments are routinely megabytes of binary, so the bytes go to disk and the agent reads the saved file with its own file tools if it needs the content.
+
+This is a **read** with respect to Confluence: it is annotated `readOnlyHint: true`, works in read-only profiles, and consumes no write budget. The asymmetry is deliberate — the tool writes to the local filesystem, but the read-only posture governs the *remote* side.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `attachment_id` | string | Yes | Attachment ID from `get_attachments` (e.g., `att12345678`) |
+| `output_path` | string | No | Absolute path to write to (must be under the working directory). Defaults to the attachment's own filename in the working directory. |
+| `overwrite` | boolean | No | Replace an existing file at the destination (default: false) |
+
+**Example result text:**
+
+```
+Downloaded: quarterly-report.pdf (application/pdf, 284713 bytes)
+Saved to: /home/user/project/quarterly-report.pdf
+```
+
+**Safety.** The destination is constrained so a Confluence-controlled filename cannot steer the write:
+
+- The destination must resolve inside the current working directory; paths outside it are rejected.
+- When `output_path` is omitted, the attachment's own filename is validated — no path separators, no control characters, no `..`, no leading dot — and **rejected rather than sanitised** if it fails.
+- Symlinks at the destination are never followed — the write opens with `O_NOFOLLOW`, in both overwrite modes — so a symlink planted at the destination cannot redirect the bytes elsewhere on disk.
+- An existing file is never replaced unless `overwrite: true` is passed (the write adds `O_EXCL` otherwise).
+- The file is created with mode `0600`.
+- Attachments larger than 10 MB are refused before the body is fetched, with an error naming the actual size.
 
 ---
 

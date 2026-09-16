@@ -40,6 +40,7 @@ export const KNOWN_TOOLS = [
   "add_attachment",
   "add_drawio_diagram",
   "get_attachments",
+  "download_attachment",
   "get_labels",
   "add_label",
   "remove_label",

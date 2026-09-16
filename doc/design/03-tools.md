@@ -14,6 +14,7 @@ The legacy `readOnly: boolean` profile key remains supported as an alias for `po
 |------|:---:|:---:|:---:|
 | `get_page`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_page_by_title`, `get_attachments`, `get_labels`, `get_comments`, `get_page_status`, `get_page_versions`, `get_page_version`, `diff_page_versions`, `get_version` | yes | — | — |
 | `check_permissions` | yes | — | — |
+| `download_attachment` | yes | — | — |
 | `create_page`, `add_attachment`, `add_drawio_diagram`, `add_label`, `create_comment` | — | no | no |
 | `update_page`, `update_page_section`, `resolve_comment`, `prepend_to_page`, `append_to_page` | — | no | no |
 | `revert_page` | — | no | no |
@@ -36,6 +37,7 @@ The legacy `readOnly: boolean` profile key remains supported as an alias for `po
 | `get_page_by_title` | title, space_key, include_body?, headings_only?, section?, max_length?, format? | Look up a page by title within a space |
 | `add_attachment` | page_id, file_path, filename?, comment? | Upload a file attachment to a page. Requires add-attachment permission. |
 | `get_attachments` | page_id, limit? | List attachments on a page |
+| `download_attachment` | attachment_id, output_path?, overwrite? | Download an attachment's bytes to a local file under the working directory and return the path. Read-only against Confluence; no write permission and no write budget consumed. |
 | `add_drawio_diagram` | page_id, diagram_xml, diagram_name, append? | Add a draw.io diagram to a page (all-in-one). Applies the "AI-edited" provenance badge. Requires write permission. |
 | `get_labels` | page_id | Get all labels on a page |
 | `add_label` | page_id, labels | Add one or more labels to a page. Requires edit permission. |
@@ -95,6 +97,9 @@ Uploads a local file as an attachment to a Confluence page. Reads the file from 
 
 ### get_attachments
 Lists attachments on a page with filename, ID, media type, and size.
+
+### download_attachment
+Fetches an attachment's bytes by attachment ID and writes them to a local file, returning the path. The bytes are never returned inline — attachments are routinely megabytes of binary, and base64 in a tool result would consume the agent's context for no benefit; the agent reads the saved file with its own file tools. Registered in every posture: it is a read against Confluence (`readOnlyHint: true`), so it is not gated by the write guard and does not consume write budget. The asymmetry is deliberate — the tool writes to the *local* filesystem while the read-only posture governs the *remote* side. **Security:** `output_path` is resolved and validated to be under `process.cwd()`; when it is omitted the attachment's own (Confluence-controlled) filename is validated — no separators, no control characters, no `..`, no leading dot — and rejected rather than sanitised; the write opens with `O_NOFOLLOW | O_EXCL` so a symlink at the destination is not followed and an existing file is not clobbered unless `overwrite: true`; attachments above a 10 MB ceiling are refused before the body is fetched, with an error naming the actual size.
 
 ### add_drawio_diagram
 All-in-one tool for adding draw.io diagrams. The LLM provides the diagram XML (mxGraph format) and the tool handles the entire workflow:

@@ -1,4 +1,18 @@
 import { describe, it, expect, vi, beforeEach, beforeAll, afterEach } from "vitest";
+// Sync fs from `node:fs` on purpose: `node:fs/promises` is mocked below, so the
+// download_attachment tests reach for the un-mocked twin to build and inspect
+// real files on disk.
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { join, resolve as resolvePath } from "node:path";
 import {
   mintToken,
   computeDiffHash,
@@ -94,6 +108,11 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     getPageByTitle: vi.fn(),
     getAttachments: vi.fn(),
     uploadAttachment: vi.fn(),
+    getAttachmentMetadata: vi.fn(),
+    downloadAttachmentBytes: vi.fn(),
+    // Real constant, not a magic number: the handler's ceiling check and the
+    // test's oversized fixture must move together if the limit ever changes.
+    MAX_ATTACHMENT_DOWNLOAD_BYTES: actual.MAX_ATTACHMENT_DOWNLOAD_BYTES,
     getLabels: vi.fn(),
     addLabels: vi.fn(),
     removeLabel: vi.fn(),
@@ -164,13 +183,26 @@ const mockMkdtemp = vi.fn();
 const mockRm = vi.fn();
 const mockRealpath = vi.fn((p: string) => Promise.resolve(p));
 
-vi.mock("node:fs/promises", () => ({
-  readFile: (...args: unknown[]) => mockReadFile(...args),
-  writeFile: (...args: unknown[]) => mockWriteFile(...args),
-  mkdtemp: (...args: unknown[]) => mockMkdtemp(...args),
-  rm: (...args: unknown[]) => mockRm(...args),
-  realpath: (...args: unknown[]) => mockRealpath(...(args as [string])),
-}));
+vi.mock("node:fs/promises", async () => {
+  const actual =
+    await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  return {
+    readFile: (...args: unknown[]) => mockReadFile(...args),
+    writeFile: (...args: unknown[]) => mockWriteFile(...args),
+    mkdtemp: (...args: unknown[]) => mockMkdtemp(...args),
+    rm: (...args: unknown[]) => mockRm(...args),
+    realpath: (...args: unknown[]) => mockRealpath(...(args as [string])),
+    // NOT mocked: `open` is what safeWriteFile (download_attachment's write
+    // path) uses, and its whole job is the O_NOFOLLOW / O_EXCL / O_TRUNC
+    // semantics the kernel provides. Stubbing it would test nothing. `lstat`
+    // is the companion the handler uses to tell "a symlink is in the way"
+    // from "a regular file is in the way" after an EEXIST. Neither is used by
+    // any other module in this test's graph, so passing the real ones through
+    // has no blast radius.
+    open: actual.open,
+    lstat: actual.lstat,
+  };
+});
 
 // Mock provenance module (Track P2)
 vi.mock("./provenance.js", () => ({
@@ -789,6 +821,411 @@ describe("get_attachments tool", () => {
     const handler = registeredTools.get("get_attachments")!.handler;
     const result = await handler({ page_id: "1", limit: 25 });
     expect(result.content[0].text).toContain("No attachments found");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// download_attachment
+//
+// These tests write to a real directory under process.cwd() rather than
+// mocking the filesystem. The whole point of the tool's guards — cwd
+// containment via realpath(dirname), O_NOFOLLOW against a planted symlink,
+// O_EXCL vs O_TRUNC — is kernel behaviour, and a mocked fs would assert only
+// that we called ourselves. `.tmp/` is gitignored, so the scratch dirs never
+// reach a commit.
+// ---------------------------------------------------------------------------
+
+describe("download_attachment tool", () => {
+  const TMP_ROOT = join(process.cwd(), ".tmp");
+  let tmpDir: string;
+  let getAttachmentMetadata: any;
+  let downloadAttachmentBytes: any;
+  let handler: Function;
+  let MAX_BYTES: number;
+
+  /** Metadata fixture; overridable per test. */
+  function meta(over: Record<string, unknown> = {}) {
+    return {
+      id: "att-1",
+      title: "report.pdf",
+      mediaType: "application/pdf",
+      fileSize: 11,
+      pageId: "123456",
+      downloadLink: "/download/attachments/123456/report.pdf",
+      ...over,
+    };
+  }
+
+  beforeAll(async () => {
+    const client = await import("./confluence-client.js");
+    getAttachmentMetadata = client.getAttachmentMetadata;
+    downloadAttachmentBytes = client.downloadAttachmentBytes;
+    MAX_BYTES = client.MAX_ATTACHMENT_DOWNLOAD_BYTES;
+    handler = registeredTools.get("download_attachment")!.handler;
+  });
+
+  beforeEach(() => {
+    mkdirSync(TMP_ROOT, { recursive: true });
+    tmpDir = mkdtempSync(join(TMP_ROOT, "download-attachment-"));
+    getAttachmentMetadata.mockReset();
+    downloadAttachmentBytes.mockReset();
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // --- 1. Happy path -------------------------------------------------------
+
+  it("writes the bytes to output_path and reports the two-line contract", async () => {
+    const bytes = Buffer.from("hello world");
+    getAttachmentMetadata.mockResolvedValueOnce(meta());
+    downloadAttachmentBytes.mockResolvedValueOnce(bytes);
+
+    const dest = join(tmpDir, "report.pdf");
+    const result = await handler({
+      attachment_id: "att-1",
+      output_path: dest,
+      overwrite: false,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe(
+      `Downloaded: report.pdf (application/pdf, 11 bytes)\nSaved to: ${dest}`,
+    );
+    // Bytes on disk, not just in the message.
+    expect(readFileSync(dest).equals(bytes)).toBe(true);
+    expect(statSync(dest).mode & 0o777).toBe(0o600);
+    expect(getAttachmentMetadata).toHaveBeenCalledWith("att-1");
+  });
+
+  it("defaults the destination to the attachment title in the working directory", async () => {
+    // A title that is safe but unlikely to collide with a repo file.
+    const title = "epimethian-download-default-dest.bin";
+    const dest = resolvePath(process.cwd(), title);
+    expect(existsSync(dest)).toBe(false);
+
+    getAttachmentMetadata.mockResolvedValueOnce(
+      meta({ title, mediaType: "application/octet-stream", fileSize: 3 }),
+    );
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("abc"));
+
+    try {
+      const result = await handler({ attachment_id: "att-1" });
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toBe(
+        `Downloaded: ${title} (application/octet-stream, 3 bytes)\nSaved to: ${dest}`,
+      );
+      expect(readFileSync(dest, "utf-8")).toBe("abc");
+    } finally {
+      rmSync(dest, { force: true });
+    }
+  });
+
+  it("falls back to 'unknown type' when mediaType is absent", async () => {
+    getAttachmentMetadata.mockResolvedValueOnce(
+      meta({ mediaType: undefined, fileSize: undefined }),
+    );
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("xy"));
+
+    const dest = join(tmpDir, "report.pdf");
+    const result = await handler({ attachment_id: "att-1", output_path: dest });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe(
+      `Downloaded: report.pdf (unknown type, 2 bytes)\nSaved to: ${dest}`,
+    );
+  });
+
+  it("strips control characters and caps the echoed title at 255 chars", async () => {
+    // A control character in the title would otherwise let a tenant inject a
+    // newline into the two-line contract.
+    const title = `a`.repeat(300);
+    getAttachmentMetadata.mockResolvedValueOnce(
+      meta({ title: `evil[31m`, fileSize: 2 }),
+    );
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("hi"));
+
+    const dest = join(tmpDir, "out.bin");
+    const result = await handler({ attachment_id: "att-1", output_path: dest });
+    expect(result.isError).toBeUndefined();
+    const text = result.content[0].text as string;
+    expect(text.split("\n")).toHaveLength(2);
+    expect(text).toContain("Downloaded: evil[31m (");
+    expect(text).not.toContain("");
+    expect(text).not.toContain("");
+
+    // And the 255-char cap.
+    getAttachmentMetadata.mockResolvedValueOnce(meta({ title, fileSize: 2 }));
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("hi"));
+    const dest2 = join(tmpDir, "out2.bin");
+    const result2 = await handler({ attachment_id: "att-1", output_path: dest2 });
+    expect(result2.content[0].text).toBe(
+      `Downloaded: ${"a".repeat(255)} (application/pdf, 2 bytes)\nSaved to: ${dest2}`,
+    );
+  });
+
+  // --- 2. Hostile attachment titles ---------------------------------------
+
+  const hostileTitles: Array<[string, string]> = [
+    ["path traversal", "../../etc/passwd"],
+    ["embedded separator", "foo/bar"],
+    ["backslash separator", "foo\\bar"],
+    ["leading dot", ".bashrc"],
+    ["control character", "in voice.pdf"],
+    ["bare dot-dot", ".."],
+  ];
+
+  it.each(hostileTitles)(
+    "rejects a hostile attachment title (%s) and writes nothing",
+    async (_label, title) => {
+      getAttachmentMetadata.mockResolvedValueOnce(meta({ title }));
+
+      const result = await handler({ attachment_id: "att-1" });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("not safe to write to disk");
+      // Nothing fetched, so nothing could have been written.
+      expect(downloadAttachmentBytes).not.toHaveBeenCalled();
+      // And the obvious landing spots are still empty.
+      expect(existsSync(resolvePath(process.cwd(), "passwd"))).toBe(false);
+      expect(existsSync(resolvePath(process.cwd(), ".bashrc"))).toBe(false);
+      expect(existsSync(resolvePath(process.cwd(), "bar"))).toBe(false);
+    },
+  );
+
+  // --- 3. output_path outside the working directory ------------------------
+
+  it("rejects an absolute output_path outside the working directory", async () => {
+    getAttachmentMetadata.mockResolvedValueOnce(meta());
+
+    const result = await handler({
+      attachment_id: "att-1",
+      output_path: "/etc/passwd",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain(
+      "Output path must be under the working directory",
+    );
+    expect(downloadAttachmentBytes).not.toHaveBeenCalled();
+  });
+
+  it("rejects an output_path that escapes the working directory via ..", async () => {
+    getAttachmentMetadata.mockResolvedValueOnce(meta());
+
+    const escaping = join(tmpDir, "..", "..", "..", "escaped.bin");
+    const result = await handler({
+      attachment_id: "att-1",
+      output_path: escaping,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain(
+      "Output path must be under the working directory",
+    );
+    expect(downloadAttachmentBytes).not.toHaveBeenCalled();
+    expect(existsSync(resolvePath(process.cwd(), "..", "escaped.bin"))).toBe(false);
+  });
+
+  // --- 4. Symlinked destination -------------------------------------------
+
+  it("refuses to write through a symlinked destination and leaves the target intact", async () => {
+    const target = join(tmpDir, "target.txt");
+    const link = join(tmpDir, "innocent.pdf");
+    writeFileSync(target, "ORIGINAL TARGET CONTENT", { mode: 0o600 });
+    symlinkSync(target, link);
+
+    getAttachmentMetadata.mockResolvedValueOnce(meta());
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("attacker bytes"));
+
+    // overwrite: true is the interesting case — it is the only path that
+    // reaches O_TRUNC, so O_NOFOLLOW is the sole thing standing between the
+    // attacker and the symlink target.
+    const result = await handler({
+      attachment_id: "att-1",
+      output_path: link,
+      overwrite: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain(
+      "Refusing to write through a symlink",
+    );
+    expect(readFileSync(target, "utf-8")).toBe("ORIGINAL TARGET CONTENT");
+  });
+
+  it("refuses a symlinked destination with overwrite: false and leaves the target intact", async () => {
+    const target = join(tmpDir, "target.txt");
+    const link = join(tmpDir, "innocent.pdf");
+    writeFileSync(target, "ORIGINAL TARGET CONTENT", { mode: 0o600 });
+    symlinkSync(target, link);
+
+    getAttachmentMetadata.mockResolvedValueOnce(meta());
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("attacker bytes"));
+
+    const result = await handler({
+      attachment_id: "att-1",
+      output_path: link,
+      overwrite: false,
+    });
+
+    expect(result.isError).toBe(true);
+    // O_CREAT|O_EXCL fails EEXIST on a symlink before O_NOFOLLOW gets a say,
+    // so the handler has to lstat the destination to tell this apart from an
+    // ordinary collision. Telling the agent "pass overwrite: true" here would
+    // be wrong advice — the retry fails with ELOOP.
+    expect(result.content[0].text).toContain(
+      "Refusing to write through a symlink",
+    );
+    expect(result.content[0].text).not.toContain("overwrite: true");
+    expect(readFileSync(target, "utf-8")).toBe("ORIGINAL TARGET CONTENT");
+  });
+
+  it("does not clobber a symlink pointing outside the working directory", async () => {
+    const outside = join(TMP_ROOT, "outside-target.txt");
+    writeFileSync(outside, "OUTSIDE", { mode: 0o600 });
+    const link = join(tmpDir, "escape.pdf");
+    symlinkSync(outside, link);
+
+    getAttachmentMetadata.mockResolvedValueOnce(meta());
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("attacker bytes"));
+
+    try {
+      const result = await handler({
+        attachment_id: "att-1",
+        output_path: link,
+        overwrite: true,
+      });
+      expect(result.isError).toBe(true);
+      expect(readFileSync(outside, "utf-8")).toBe("OUTSIDE");
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+
+  // --- 5. Existing regular file -------------------------------------------
+
+  it("refuses to replace an existing file unless overwrite is set", async () => {
+    const dest = join(tmpDir, "report.pdf");
+    writeFileSync(dest, "PRE-EXISTING", { mode: 0o600 });
+
+    getAttachmentMetadata.mockResolvedValueOnce(meta());
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("new content"));
+
+    const result = await handler({
+      attachment_id: "att-1",
+      output_path: dest,
+      overwrite: false,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("already exists");
+    expect(result.content[0].text).toContain("overwrite: true");
+    expect(readFileSync(dest, "utf-8")).toBe("PRE-EXISTING");
+  });
+
+  it("replaces an existing file when overwrite is true, truncating leftover bytes", async () => {
+    const dest = join(tmpDir, "report.pdf");
+    // Deliberately longer than the replacement: without O_TRUNC the tail of
+    // the old file would survive and the test would catch it.
+    writeFileSync(dest, "X".repeat(64), { mode: 0o600 });
+
+    getAttachmentMetadata.mockResolvedValueOnce(meta({ fileSize: 2 }));
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("hi"));
+
+    const result = await handler({
+      attachment_id: "att-1",
+      output_path: dest,
+      overwrite: true,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(readFileSync(dest, "utf-8")).toBe("hi");
+    expect(statSync(dest).size).toBe(2);
+  });
+
+  // --- 6. Size ceiling -----------------------------------------------------
+
+  it("rejects an oversized attachment before fetching the body", async () => {
+    getAttachmentMetadata.mockResolvedValueOnce(
+      meta({ fileSize: MAX_BYTES + 1 }),
+    );
+
+    const dest = join(tmpDir, "huge.bin");
+    const result = await handler({
+      attachment_id: "att-1",
+      output_path: dest,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("download limit");
+    expect(downloadAttachmentBytes).not.toHaveBeenCalled();
+    expect(existsSync(dest)).toBe(false);
+  });
+
+  it("accepts an attachment exactly at the ceiling", async () => {
+    getAttachmentMetadata.mockResolvedValueOnce(meta({ fileSize: MAX_BYTES }));
+    downloadAttachmentBytes.mockResolvedValueOnce(Buffer.from("ok"));
+
+    const dest = join(tmpDir, "atlimit.bin");
+    const result = await handler({ attachment_id: "att-1", output_path: dest });
+
+    expect(result.isError).toBeUndefined();
+    expect(downloadAttachmentBytes).toHaveBeenCalledOnce();
+  });
+
+  // --- Error propagation ---------------------------------------------------
+
+  it("surfaces a metadata lookup failure without writing", async () => {
+    getAttachmentMetadata.mockRejectedValueOnce(new Error("Not found"));
+
+    const result = await handler({
+      attachment_id: "nope",
+      output_path: join(tmpDir, "x.bin"),
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Error:");
+    expect(downloadAttachmentBytes).not.toHaveBeenCalled();
+    expect(existsSync(join(tmpDir, "x.bin"))).toBe(false);
+  });
+
+  // --- Registration shape --------------------------------------------------
+
+  it("is registered read-only and consumes no write permission", async () => {
+    const entry = registeredTools.get("download_attachment")!;
+    expect(entry).toBeDefined();
+    expect(entry.schema.annotations?.readOnlyHint).toBe(true);
+
+    const { WRITE_TOOLS } = await import("./index.js");
+    expect(WRITE_TOOLS.has("download_attachment")).toBe(false);
+  });
+
+  it("every registered tool name is present in KNOWN_TOOLS", async () => {
+    const { KNOWN_TOOLS } = await import("./tool-allowlist.js");
+    const known = new Set<string>(KNOWN_TOOLS);
+
+    // Pre-existing drift, NOT sanctioned by this test: these four are
+    // registered but absent from KNOWN_TOOLS, so naming any of them in a
+    // profile's allowed_tools/denied_tools aborts startup with "unknown tool
+    // name". Recorded explicitly so the invariant below still catches *new*
+    // drift instead of being deleted; remove entries as they are fixed.
+    const knownGaps = new Set([
+      "authorise_destructive_writes",
+      "check_permissions",
+      "setup_profile",
+      "update_page_sections",
+    ]);
+
+    const missing = [...registeredTools.keys()].filter(
+      (name) => !known.has(name) && !knownGaps.has(name),
+    );
+    expect(missing, "registered tools absent from KNOWN_TOOLS").toEqual([]);
+
+    // The tool this suite is about must be covered by the real invariant.
+    expect(registeredTools.has("download_attachment")).toBe(true);
+    expect(known.has("download_attachment")).toBe(true);
   });
 });
 
@@ -6129,5 +6566,92 @@ describe("Phase 2: soft-confirm preamble on gated tools", () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Reverted");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// download_attachment under a read-only posture.
+//
+// Placed last on purpose: spinning the server up read-only sets the
+// module-level read-only flag, which prefixes the next tool result with the
+// read-only banner. Anything declared after this would inherit that state.
+// ---------------------------------------------------------------------------
+
+describe("download_attachment in a read-only profile", () => {
+  /** Like spinUpWithPosture, but keeps the handlers, not just the names. */
+  async function spinUpHandlers(
+    effectivePosture: "read-only" | "read-write",
+  ): Promise<Map<string, Function>> {
+    const { getConfig } = await import("./confluence-client.js");
+    (getConfig as any).mockResolvedValueOnce({
+      ...BASE_CONFIG,
+      readOnly: effectivePosture === "read-only",
+      posture: effectivePosture,
+      effectivePosture,
+      postureSource: "profile",
+      probedCapability: null,
+    });
+
+    mockRegisterTool.mockClear();
+    const { main, _resetReadOnlyNoteForTest } = await import("./index.js");
+    _resetReadOnlyNoteForTest();
+    await main();
+
+    const tools = new Map<string, Function>();
+    for (const call of mockRegisterTool.mock.calls) {
+      tools.set(call[0] as string, call[2] as Function);
+    }
+    return tools;
+  }
+
+  it("is still registered and still downloads when writes are disabled", async () => {
+    const tools = await spinUpHandlers("read-only");
+    // Sanity: this really is a read-only spin-up.
+    expect(tools.has("add_attachment")).toBe(false);
+    expect(tools.has("download_attachment")).toBe(true);
+
+    const client = await import("./confluence-client.js");
+    (client.getAttachmentMetadata as any).mockReset();
+    (client.downloadAttachmentBytes as any).mockReset();
+    (client.getAttachmentMetadata as any).mockResolvedValueOnce({
+      id: "att-ro",
+      title: "readonly.txt",
+      mediaType: "text/plain",
+      fileSize: 8,
+      pageId: "123456",
+      downloadLink: "/download/attachments/123456/readonly.txt",
+    });
+    (client.downloadAttachmentBytes as any).mockResolvedValueOnce(
+      Buffer.from("ro-bytes"),
+    );
+
+    const tmpRoot = join(process.cwd(), ".tmp");
+    mkdirSync(tmpRoot, { recursive: true });
+    const dir = mkdtempSync(join(tmpRoot, "download-attachment-ro-"));
+    try {
+      const dest = join(dir, "readonly.txt");
+      const result = await tools.get("download_attachment")!({
+        attachment_id: "att-ro",
+        output_path: dest,
+      });
+
+      expect(result.isError).toBeUndefined();
+      // toContain, not toBe: the first result of a read-only session carries
+      // the one-shot read-only banner.
+      expect(result.content[0].text).toContain(
+        `Downloaded: readonly.txt (text/plain, 8 bytes)\nSaved to: ${dest}`,
+      );
+      expect(readFileSync(dest, "utf-8")).toBe("ro-bytes");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stays out of WRITE_TOOLS so the posture gate never strips it", async () => {
+    const { WRITE_TOOLS } = await import("./index.js");
+    expect(WRITE_TOOLS.has("download_attachment")).toBe(false);
+    // Guard the count too: adding it to WRITE_TOOLS would silently unregister
+    // the tool in read-only profiles.
+    expect(WRITE_TOOLS.size).toBe(17);
   });
 });

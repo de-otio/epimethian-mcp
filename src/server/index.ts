@@ -1,9 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { readFile, writeFile, mkdtemp, rm, realpath } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, rm, realpath, lstat } from "node:fs/promises";
 import { tmpdir, homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 
 declare const __PKG_VERSION__: string;
@@ -19,6 +19,9 @@ import {
   getPageByTitle,
   getAttachments,
   uploadAttachment,
+  getAttachmentMetadata,
+  downloadAttachmentBytes,
+  MAX_ATTACHMENT_DOWNLOAD_BYTES,
   getLabels,
   addLabels,
   removeLabel,
@@ -64,6 +67,8 @@ import {
 } from "./diff.js";
 import { ConverterError } from "./converter/types.js";
 import { fenceUntrusted } from "./converter/untrusted-fence.js";
+import { isValidAttachmentFilename } from "./converter/filename-validator.js";
+import { safeWriteFile } from "../shared/safe-fs.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
 import { markPageUnverified } from "./provenance.js";
@@ -3236,6 +3241,169 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         return toolResult(lines.join("\n"));
       } catch (err) {
         return toolError(err);
+      }
+    }
+  );
+
+  // download_attachment
+  //
+  // Classification note (do not "fix" this by adding writeGuard): this tool is
+  // a READ against Confluence — it never mutates the wiki, consumes no write
+  // budget, and must keep working in read-only profiles. The local file it
+  // creates is the *output channel*, not a remote write. The read-only posture
+  // governs the remote side only.
+  server.registerTool(
+    "download_attachment",
+    {
+      description:
+        "Download a Confluence attachment to a local file and return the path. " +
+        "The bytes are written to disk and are NOT returned in the response — attachments " +
+        "are routinely megabytes of binary, which would flood the context for no benefit; " +
+        "read the saved file with your own file tools if you need its contents. " +
+        "This is a read against Confluence (it never modifies the wiki) even though it " +
+        "writes a local file, so it remains available in read-only profiles. " +
+        "The destination must be under the current working directory.",
+      inputSchema: {
+        attachment_id: z
+          .string()
+          .describe("Attachment ID from get_attachments, e.g. att12345678"),
+        output_path: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute path to write to, under the current working directory. " +
+              "Defaults to the attachment's own filename in the working directory."
+          ),
+        overwrite: z
+          .boolean()
+          .default(false)
+          .describe("Replace an existing file at the destination"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ attachment_id, output_path, overwrite }) => {
+      try {
+        // Metadata first: it supplies the parent page for the space check, the
+        // size for the ceiling check, and the default filename — all of which
+        // must be settled before a single byte of the payload is requested.
+        const meta = await getAttachmentMetadata(attachment_id);
+
+        // F3: space allowlist. get_attachments does not check, but a download
+        // copies wiki content onto local disk, which is the same boundary
+        // crossing add_attachment guards in the other direction — so it
+        // belongs with the write tools' posture, not the listing tools'.
+        // An attachment on a blog post or custom content has no pageId; with
+        // an allowlist configured, assertSpaceAllowed then fails closed, which
+        // is the intended behaviour.
+        await checkSpaceAllowed({ pageId: meta.pageId });
+
+        if (
+          meta.fileSize !== undefined &&
+          meta.fileSize > MAX_ATTACHMENT_DOWNLOAD_BYTES
+        ) {
+          return toolError(
+            new Error(
+              `Attachment ${attachment_id} is ${meta.fileSize} bytes, above the ` +
+                `${MAX_ATTACHMENT_DOWNLOAD_BYTES}-byte download limit. ` +
+                `Fetch it outside the MCP server if you genuinely need it.`
+            )
+          );
+        }
+
+        const cwd = await realpath(process.cwd());
+        let destination: string;
+        if (output_path !== undefined) {
+          destination = resolve(output_path);
+        } else {
+          // The attachment title is attacker-influenced — anyone who can
+          // upload to the page chooses it. Reject rather than sanitise so the
+          // behaviour is predictable, and do not echo the rejected name back.
+          if (!isValidAttachmentFilename(meta.title)) {
+            return toolError(
+              new Error(
+                `Attachment ${attachment_id} has a filename that is not safe to write to disk ` +
+                  `(it contains a path separator, a control character, or a leading dot). ` +
+                  `Pass output_path to choose a destination explicitly.`
+              )
+            );
+          }
+          destination = resolve(cwd, meta.title);
+        }
+
+        // Security: confine the write to the working directory. realpath the
+        // *parent* — the file itself does not exist yet — so a symlinked
+        // directory cannot land the write outside cwd. O_NOFOLLOW in
+        // safeWriteFile covers the final component.
+        let parent: string;
+        try {
+          parent = await realpath(dirname(destination));
+        } catch {
+          return toolError(
+            new Error(
+              `Output directory does not exist: ${dirname(destination)}`
+            )
+          );
+        }
+        if (!parent.startsWith(cwd + "/") && parent !== cwd) {
+          return toolError(
+            new Error(
+              `Output path must be under the working directory (${cwd}). Got: ${parent}`
+            )
+          );
+        }
+        const finalPath = join(parent, basename(destination));
+
+        const data = await downloadAttachmentBytes(meta);
+
+        try {
+          await safeWriteFile(finalPath, data, { overwrite });
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          // ELOOP is O_NOFOLLOW refusing a symlink. EEXIST is O_EXCL, which
+          // fires first for a symlink too — so check what is actually there
+          // before telling the agent that overwrite: true would help, because
+          // for a symlink it would not (the retry fails with ELOOP).
+          const isSymlink =
+            (code === "EEXIST" || code === "ELOOP") &&
+            (await lstat(finalPath)
+              .then((st) => st.isSymbolicLink())
+              .catch(() => false));
+          if (isSymlink || code === "ELOOP") {
+            return toolError(
+              new Error(
+                `Refusing to write through a symlink at ${finalPath}. ` +
+                  `Remove it or choose a different output_path.`
+              )
+            );
+          }
+          if (code === "EEXIST") {
+            return toolError(
+              new Error(
+                `A file already exists at ${finalPath}. Pass overwrite: true to replace it, ` +
+                  `or choose a different output_path.`
+              )
+            );
+          }
+          throw err;
+        }
+
+        // Titles are tenant-authored. Strip control characters and cap the
+        // length before echoing so a crafted filename cannot inject line
+        // breaks or terminal escapes into the tool result.
+        const safeTitle = meta.title
+          // eslint-disable-next-line no-control-regex
+          .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+          .slice(0, 255);
+        return toolResult(
+          `Downloaded: ${safeTitle} (${meta.mediaType ?? "unknown type"}, ${data.byteLength} bytes)\n` +
+            `Saved to: ${finalPath}`
+        );
+      } catch (err) {
+        return toolErrorWithContext(err, {
+          operation: "download_attachment",
+          resource: `attachment ${attachment_id}`,
+          profile: config.profile,
+        });
       }
     }
   );

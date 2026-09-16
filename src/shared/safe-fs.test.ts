@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   safeOpenRead,
   safeOpenAppend,
+  safeWriteFile,
   verifyDirChain,
   SAFE_FS_HAS_O_NOFOLLOW,
 } from "./safe-fs.js";
@@ -150,5 +151,96 @@ posixOnly("verifyDirChain (E2)", () => {
     await mkdir(join(realParent, "leaf"), { mode: 0o700 });
 
     await expect(verifyDirChain(child, dir)).rejects.toThrow(/symlink/);
+  });
+});
+
+posixOnly("safeWriteFile (download_attachment write path)", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "safe-fs-write-"));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("creates a new file with 0600 perms and the exact bytes", async () => {
+    const { readFile, stat } = await import("node:fs/promises");
+    const path = join(dir, "new.bin");
+    const data = new Uint8Array([0x00, 0xff, 0x41, 0x0a]);
+
+    await safeWriteFile(path, data);
+
+    expect(new Uint8Array(await readFile(path))).toEqual(data);
+    const st = await stat(path);
+    expect(st.mode & 0o777).toBe(0o600);
+  });
+
+  it("rejects an existing file with EEXIST when overwrite is not set", async () => {
+    const path = join(dir, "exists.bin");
+    await writeFile(path, "ORIGINAL", { mode: 0o600 });
+
+    await expect(
+      safeWriteFile(path, new TextEncoder().encode("replacement")),
+    ).rejects.toMatchObject({ code: "EEXIST" });
+
+    const { readFile } = await import("node:fs/promises");
+    expect(await readFile(path, "utf-8")).toBe("ORIGINAL");
+  });
+
+  it("truncates and replaces when overwrite is true", async () => {
+    const { readFile, stat } = await import("node:fs/promises");
+    const path = join(dir, "replace.bin");
+    // Longer than the replacement, so a missing O_TRUNC would leave a tail.
+    await writeFile(path, "X".repeat(64), { mode: 0o600 });
+
+    await safeWriteFile(path, new TextEncoder().encode("hi"), {
+      overwrite: true,
+    });
+
+    expect(await readFile(path, "utf-8")).toBe("hi");
+    expect((await stat(path)).size).toBe(2);
+  });
+
+  it("rejects a symlinked destination with ELOOP and leaves the target intact", async () => {
+    if (!SAFE_FS_HAS_O_NOFOLLOW) return;
+    const { readFile } = await import("node:fs/promises");
+    const real = join(dir, "real.txt");
+    const link = join(dir, "link.txt");
+    await writeFile(real, "TARGET", { mode: 0o600 });
+    await symlink(real, link);
+
+    // overwrite: true is the case that reaches O_TRUNC, so O_NOFOLLOW is the
+    // only guard left.
+    await expect(
+      safeWriteFile(link, new TextEncoder().encode("attacker"), {
+        overwrite: true,
+      }),
+    ).rejects.toMatchObject({ code: "ELOOP" });
+
+    expect(await readFile(real, "utf-8")).toBe("TARGET");
+  });
+
+  it("rejects a symlinked destination with EEXIST when overwrite is not set", async () => {
+    if (!SAFE_FS_HAS_O_NOFOLLOW) return;
+    const { readFile } = await import("node:fs/promises");
+    const real = join(dir, "real2.txt");
+    const link = join(dir, "link2.txt");
+    await writeFile(real, "TARGET", { mode: 0o600 });
+    await symlink(real, link);
+
+    await expect(
+      safeWriteFile(link, new TextEncoder().encode("attacker")),
+    ).rejects.toMatchObject({ code: "EEXIST" });
+
+    expect(await readFile(real, "utf-8")).toBe("TARGET");
+  });
+
+  it("writes an empty payload without error", async () => {
+    const { stat } = await import("node:fs/promises");
+    const path = join(dir, "empty.bin");
+    await safeWriteFile(path, new Uint8Array(0));
+    expect((await stat(path)).size).toBe(0);
   });
 });

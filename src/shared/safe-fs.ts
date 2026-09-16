@@ -89,6 +89,43 @@ export async function safeOpenAppend(path: string, data: string): Promise<void> 
 }
 
 /**
+ * Write `data` to `path` without ever following a symlink at the final
+ * component.
+ *
+ * Opens with `O_WRONLY | O_CREAT | O_NOFOLLOW`, plus `O_EXCL` unless
+ * `overwrite` is set (in which case `O_TRUNC`). The `O_NOFOLLOW` applies to
+ * `path` itself, so a symlink planted at the destination cannot redirect the
+ * write to a target elsewhere on disk — it fails with `ELOOP` instead. Callers
+ * are still responsible for validating the *parent* directory (see
+ * `verifyDirChain`, or a `realpath` containment check).
+ *
+ * Throws:
+ *   - EEXIST when the destination exists and `overwrite` is false.
+ *   - ELOOP when `path` is a symlink.
+ */
+export async function safeWriteFile(
+  path: string,
+  data: Uint8Array,
+  opts: { overwrite?: boolean } = {},
+): Promise<void> {
+  const flags =
+    fsConstants.O_WRONLY |
+    fsConstants.O_CREAT |
+    O_NOFOLLOW |
+    (opts.overwrite ? fsConstants.O_TRUNC : fsConstants.O_EXCL);
+  const handle = await fsOpen(path, flags, 0o600);
+  try {
+    // `writeFile` on the handle, not `write`: a raw `write(2)` may complete
+    // having written fewer bytes than requested, and a single unchecked call
+    // would leave a silently truncated file that the caller reports as a
+    // success. `FileHandle.writeFile` loops until the buffer is drained.
+    await handle.writeFile(data);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
  * Walk from `dir` upwards, lstat-ing each ancestor up to (and including) the
  * `stopAt` boundary. Throws if any ancestor is a symlink, not owned by the
  * current euid, or group/world-writable.

@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.10.0] - 2026-09-16 - attachment download
+
+### Added
+
+- **`download_attachment` tool.** Fetches a Confluence attachment's bytes
+  and writes them to a local file, returning the path. Closes the last gap
+  in attachment handling: the server could already *list* (`get_attachments`)
+  and *upload* (`add_attachment`) attachments, but an agent that found a
+  template or document stored on a page had no way to get its contents and
+  had to hand the task back to the user.
+
+  The bytes are deliberately **not** returned inline. Attachments are
+  routinely megabytes of binary; base64 in a tool result would consume the
+  agent's context for no benefit, and the agent can read the saved file with
+  its own file tools.
+
+  Inputs: `attachment_id` (from `get_attachments`, e.g. `att12345678`),
+  optional `output_path` (absolute, must be under the working directory;
+  defaults to the attachment's own filename there), and `overwrite`
+  (default `false`).
+
+- **`download_attachment` is a read, and works in read-only profiles.** It
+  carries `readOnlyHint: true`, is not gated by the write guard, and
+  consumes no write budget. The asymmetry is intentional and documented:
+  the tool writes to the *local* filesystem, while the read-only posture
+  governs the *remote* side.
+
+### Security
+
+- The download destination is constrained so a Confluence-controlled
+  filename cannot steer the write: the path must resolve inside the current
+  working directory; an omitted `output_path` means the attachment's own
+  filename is validated (no path separators, no control characters, no
+  `..`, no leading dot) and **rejected rather than sanitised**; the write
+  uses `O_NOFOLLOW | O_EXCL`, so a symlink at the destination is not
+  followed and an existing file is never replaced unless `overwrite: true`.
+- Attachments larger than 10 MB are refused *before* the body is fetched,
+  with an error naming the actual size, so a large file cannot silently
+  fill the disk.
+
 ## [6.9.1] - 2026-09-09 - dependency security updates
 
 ### Security

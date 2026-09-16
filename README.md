@@ -242,6 +242,7 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `get_spaces`          | List available spaces                                                  |
 | `add_attachment`      | Upload a file attachment                                               |
 | `get_attachments`     | List attachments on a page                                             |
+| `download_attachment` | Download an attachment's bytes to a local file (read-only)             |
 | `add_drawio_diagram`  | Add a draw.io diagram                                                  |
 | `get_labels`          | Get all labels on a page                                               |
 | `add_label`           | Add one or more labels to a page                                       |

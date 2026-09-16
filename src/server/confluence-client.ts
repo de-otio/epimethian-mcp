@@ -222,7 +222,9 @@ export async function getConfig(): Promise<Config> {
 
   // Confluence exposes two API generations:
   //   - v2 (REST): /wiki/api/v2  — used for page CRUD, spaces, children
-  //   - v1 (REST): /wiki/rest/api — used for CQL search and attachments (no v2 equivalent)
+  //   - v1 (REST): /wiki/rest/api — used for CQL search and for listing/uploading
+  //     attachments by page. (v2 has since grown /attachments/{id}, which is what
+  //     downloadAttachment uses; there is still no v2 upload or by-page listing.)
   const authHeader =
     "Basic " + Buffer.from(`${email}:${apiToken}`).toString("base64");
 
@@ -1286,6 +1288,203 @@ export async function getAttachments(
   const res = await confluenceRequest(url.toString());
   const raw = await res.json();
   return AttachmentsResultSchema.parse(raw).results;
+}
+
+// --- Attachment download ---
+
+/**
+ * Ceiling on a single attachment download, in bytes.
+ *
+ * Attachments are unbounded in principle; without a cap one call could fill
+ * the disk. The ceiling is enforced at three points, deliberately: the
+ * `download_attachment` handler refuses on `meta.fileSize` before calling
+ * down here at all, `downloadAttachmentBytes` repeats that check so the
+ * guarantee holds for any other caller, and the streaming read enforces it a
+ * third time against a server that under-reports `fileSize` or omits it.
+ */
+export const MAX_ATTACHMENT_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+
+/** Redirect hops followed before giving up (Confluence normally uses one). */
+const MAX_DOWNLOAD_REDIRECTS = 5;
+
+const AttachmentMetadataSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  mediaType: z.string().optional(),
+  fileSize: z.number().optional(),
+  downloadLink: z.string().optional(),
+  pageId: z.string().optional(),
+  blogPostId: z.string().optional(),
+  customContentId: z.string().optional(),
+});
+
+export type AttachmentMetadata = z.infer<typeof AttachmentMetadataSchema>;
+
+/** Raised when an attachment exceeds `MAX_ATTACHMENT_DOWNLOAD_BYTES`. */
+export class AttachmentTooLargeError extends Error {
+  readonly bytes: number;
+  readonly limit: number;
+  constructor(attachmentId: string, bytes: number) {
+    super(
+      `Attachment ${attachmentId} is ${bytes} bytes, above the ` +
+        `${MAX_ATTACHMENT_DOWNLOAD_BYTES}-byte download limit. ` +
+        `Fetch it outside the MCP server if you genuinely need it.`
+    );
+    this.name = "AttachmentTooLargeError";
+    this.bytes = bytes;
+    this.limit = MAX_ATTACHMENT_DOWNLOAD_BYTES;
+  }
+}
+
+/**
+ * Fetch an attachment's metadata by attachment id.
+ *
+ * Uses v2 `/attachments/{id}`: it is keyed by attachment id (which is what
+ * `get_attachments` hands the agent) and returns `downloadLink`, `fileSize`,
+ * `mediaType` and the parent `pageId` in one call. The v1 endpoint is keyed by
+ * *page*, so it cannot serve an id-only lookup, and `/content/{id}` needs an
+ * extra `expand` round-trip to reach the container.
+ */
+export async function getAttachmentMetadata(
+  attachmentId: string
+): Promise<AttachmentMetadata> {
+  const raw = await v2Get(`/attachments/${encodeURIComponent(attachmentId)}`);
+  return AttachmentMetadataSchema.parse(raw);
+}
+
+/**
+ * Turn a `downloadLink` into an absolute URL against the configured site.
+ *
+ * Confluence has returned this field in several shapes across versions: a
+ * path rooted at the `/wiki` context (`/download/attachments/...`), a path
+ * already carrying the context (`/wiki/download/...`), or an absolute URL.
+ * Build from `cfg.url` rather than concatenating onto an API base — the
+ * download servlet does not live under `/rest/api` or `/api/v2`.
+ *
+ * An absolute link pointing at a different host is refused: the caller would
+ * have to decide whether to forward credentials, and the safe answer there is
+ * to not follow an unexpected host at all.
+ */
+export function resolveDownloadUrl(downloadLink: string, siteUrl: string): string {
+  const siteOrigin = new URL(siteUrl).origin;
+  if (/^https?:\/\//i.test(downloadLink)) {
+    const parsed = new URL(downloadLink);
+    if (parsed.origin !== siteOrigin) {
+      throw new Error(
+        `Refusing to download from ${parsed.origin}, which is not the configured Confluence site.`
+      );
+    }
+    return parsed.toString();
+  }
+  if (downloadLink.startsWith("/wiki/")) return `${siteUrl}${downloadLink}`;
+  if (downloadLink.startsWith("/")) return `${siteUrl}/wiki${downloadLink}`;
+  return `${siteUrl}/wiki/${downloadLink}`;
+}
+
+/**
+ * Fetch the bytes of an attachment described by `meta`.
+ *
+ * Deliberately does not go through `confluenceRequest`: that helper sets
+ * `Content-Type: application/json` and treats any non-2xx as an error, and
+ * this request must handle redirects itself. Confluence redirects downloads
+ * to a media host whose URL carries its own signed token — forwarding the
+ * `Authorization` header there would leak the site credentials to a different
+ * origin, so the header is dropped the moment the hop leaves the site origin.
+ *
+ * The body is consumed as bytes, never as JSON, and is never logged.
+ */
+export async function downloadAttachmentBytes(
+  meta: AttachmentMetadata
+): Promise<Buffer> {
+  const cfg = await getConfig();
+  if (!meta.downloadLink) {
+    throw new Error(
+      `Attachment ${meta.id} has no download link; it may have been deleted or archived.`
+    );
+  }
+
+  if (
+    meta.fileSize !== undefined &&
+    meta.fileSize > MAX_ATTACHMENT_DOWNLOAD_BYTES
+  ) {
+    throw new AttachmentTooLargeError(meta.id, meta.fileSize);
+  }
+
+  const siteOrigin = new URL(cfg.url).origin;
+  let url = resolveDownloadUrl(meta.downloadLink, cfg.url);
+  // Latched, not recomputed: once the chain has left the site origin the
+  // credential stays off for every remaining hop. Recomputing per hop would
+  // re-attach it on a site → third-party → site chain, which is exactly the
+  // shape an open redirect would take.
+  let credentialed = true;
+  let res: Response | null = null;
+
+  for (let hop = 0; hop <= MAX_DOWNLOAD_REDIRECTS; hop++) {
+    const current: Response = await fetch(url, {
+      headers: credentialed ? { Authorization: cfg.authHeader } : {},
+      redirect: "manual",
+    });
+    const isRedirect = current.status >= 300 && current.status < 400;
+    const location = isRedirect ? current.headers.get("location") : null;
+    if (!location) {
+      res = current;
+      break;
+    }
+    // A 3xx under `redirect: "manual"` may still carry a body. Release it
+    // rather than leaking the socket for the rest of the chain.
+    await current.body?.cancel().catch(() => {});
+    const next = new URL(location, url);
+    credentialed = credentialed && next.origin === siteOrigin;
+    url = next.toString();
+  }
+
+  if (!res) {
+    throw new Error(
+      `Too many redirects while downloading attachment ${meta.id}.`
+    );
+  }
+
+  if (!res.ok) {
+    // Error bodies are text, not the attachment payload. sanitizeError
+    // truncates and strips any credential material before it reaches a log.
+    const body = await res.text();
+    console.error(`Confluence API error (${res.status}): ${sanitizeError(body)}`);
+    if (res.status === 401) throw new ConfluenceAuthError(res.status, body);
+    if (res.status === 403) throw new ConfluencePermissionError(res.status, body);
+    if (res.status === 404) throw new ConfluenceNotFoundError(res.status, body);
+    throw new ConfluenceApiError(res.status, body);
+  }
+
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+    throw new AttachmentTooLargeError(meta.id, declared);
+  }
+
+  const reader = res.body?.getReader?.();
+  if (!reader) {
+    // No stream available (e.g. a stubbed Response in tests) — fall back to
+    // buffering, then apply the same ceiling.
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.byteLength > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+      throw new AttachmentTooLargeError(meta.id, buf.byteLength);
+    }
+    return buf;
+  }
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+      await reader.cancel();
+      throw new AttachmentTooLargeError(meta.id, total);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
 }
 
 // --- Version history ---

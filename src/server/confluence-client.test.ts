@@ -37,6 +37,11 @@ import {
   getPageByTitle,
   getAttachments,
   uploadAttachment,
+  getAttachmentMetadata,
+  resolveDownloadUrl,
+  downloadAttachmentBytes,
+  AttachmentTooLargeError,
+  MAX_ATTACHMENT_DOWNLOAD_BYTES,
   extractSection,
   extractSectionBody,
   replaceSection,
@@ -1825,6 +1830,430 @@ describe("uploadAttachment", () => {
     await expect(
       uploadAttachment("page-1", Buffer.from("data"), "file.txt")
     ).rejects.toThrow("Attachment uploaded but no details returned.");
+  });
+});
+
+// =============================================================================
+// Attachment download (client level)
+// =============================================================================
+
+/** The Basic header getConfig builds from the hoisted test env vars. */
+const EXPECTED_AUTH =
+  "Basic " + Buffer.from("user@test.com:test-token").toString("base64");
+
+const DOWNLOAD_LINK = "/download/attachments/123/diagram.png";
+const RESOLVED_DOWNLOAD_URL = `${BASE_URL}/wiki${DOWNLOAD_LINK}`;
+
+function attMeta(over: Record<string, unknown> = {}) {
+  return {
+    id: "att-42",
+    title: "diagram.png",
+    mediaType: "image/png",
+    downloadLink: DOWNLOAD_LINK,
+    ...over,
+  } as Parameters<typeof downloadAttachmentBytes>[0];
+}
+
+/** A 302 with a Location header — a real Response, so `redirect: "manual"` semantics hold. */
+function redirectTo(location: string, status = 302) {
+  return new Response(null, { status, headers: { location } });
+}
+
+/** Silence the deliberate console.error on the API-error paths. */
+function muteConsoleError() {
+  return vi.spyOn(console, "error").mockImplementation(() => {});
+}
+
+describe("getAttachmentMetadata", () => {
+  it("hits the v2 /attachments/{id} endpoint and returns the parsed fields", async () => {
+    global.fetch = mockFetchResponse({
+      id: "att-42",
+      title: "diagram.png",
+      mediaType: "image/png",
+      fileSize: 2048,
+      downloadLink: DOWNLOAD_LINK,
+      pageId: "123",
+      // Unknown fields must not break the parse.
+      _links: { webui: "/spaces/X/pages/123" },
+    });
+
+    const meta = await getAttachmentMetadata("att-42");
+
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).toBe(`${API_V2}/attachments/att-42`);
+    expect(meta).toEqual({
+      id: "att-42",
+      title: "diagram.png",
+      mediaType: "image/png",
+      fileSize: 2048,
+      downloadLink: DOWNLOAD_LINK,
+      pageId: "123",
+    });
+  });
+
+  it("tolerates a response carrying only the required fields", async () => {
+    global.fetch = mockFetchResponse({ id: "att-1", title: "notes.txt" });
+    const meta = await getAttachmentMetadata("att-1");
+    expect(meta).toEqual({ id: "att-1", title: "notes.txt" });
+    expect(meta.downloadLink).toBeUndefined();
+  });
+
+  it("url-encodes the attachment id", async () => {
+    global.fetch = mockFetchResponse({ id: "x", title: "t" });
+    await getAttachmentMetadata("att 42/weird?x=1&y");
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).toBe(`${API_V2}/attachments/att%2042%2Fweird%3Fx%3D1%26y`);
+    // The encoded id must not escape the /attachments/ path segment.
+    expect(url).not.toContain("/attachments/att 42");
+    expect(url).not.toContain("?x=1");
+  });
+
+  it("throws ConfluenceNotFoundError on 404", async () => {
+    global.fetch = mockFetchResponse("Not Found", 404);
+    const err = await getAttachmentMetadata("missing").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceNotFoundError);
+    expect((err as ConfluenceApiError).status).toBe(404);
+  });
+
+  it("throws ConfluencePermissionError on 403", async () => {
+    global.fetch = mockFetchResponse("Forbidden", 403);
+    const err = await getAttachmentMetadata("att-42").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluencePermissionError);
+    expect((err as ConfluenceApiError).status).toBe(403);
+  });
+
+  it("rejects a response missing the required id/title", async () => {
+    global.fetch = mockFetchResponse({ title: "no-id.png" });
+    await expect(getAttachmentMetadata("att-42")).rejects.toThrow();
+  });
+});
+
+describe("resolveDownloadUrl", () => {
+  it("returns an absolute link on the site origin unchanged", () => {
+    const link = `${BASE_URL}/wiki${DOWNLOAD_LINK}`;
+    expect(resolveDownloadUrl(link, BASE_URL)).toBe(link);
+  });
+
+  it("throws on an absolute link pointing at a different origin", () => {
+    expect(() =>
+      resolveDownloadUrl("https://evil.example.com/steal.png", BASE_URL)
+    ).toThrow(/Refusing to download from https:\/\/evil\.example\.com/);
+  });
+
+  it("treats a different port on the same host as a different origin", () => {
+    expect(() =>
+      resolveDownloadUrl("https://test.atlassian.net:8443/wiki/x.png", BASE_URL)
+    ).toThrow(/Refusing to download/);
+  });
+
+  it("treats http:// as a different origin than the https site", () => {
+    expect(() =>
+      resolveDownloadUrl("http://test.atlassian.net/wiki/x.png", BASE_URL)
+    ).toThrow(/Refusing to download/);
+  });
+
+  it("appends a /wiki-rooted path to the site url as-is", () => {
+    expect(resolveDownloadUrl("/wiki/download/attachments/1/a.png", BASE_URL)).toBe(
+      `${BASE_URL}/wiki/download/attachments/1/a.png`
+    );
+  });
+
+  it("inserts the /wiki context for a root-relative path", () => {
+    expect(resolveDownloadUrl(DOWNLOAD_LINK, BASE_URL)).toBe(RESOLVED_DOWNLOAD_URL);
+  });
+
+  it("inserts /wiki/ for a context-relative path", () => {
+    expect(resolveDownloadUrl("download/attachments/1/a.png", BASE_URL)).toBe(
+      `${BASE_URL}/wiki/download/attachments/1/a.png`
+    );
+  });
+});
+
+describe("AttachmentTooLargeError", () => {
+  it("carries the observed size and the ceiling", () => {
+    const err = new AttachmentTooLargeError("att-42", 99);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("AttachmentTooLargeError");
+    expect(err.bytes).toBe(99);
+    expect(err.limit).toBe(MAX_ATTACHMENT_DOWNLOAD_BYTES);
+    expect(MAX_ATTACHMENT_DOWNLOAD_BYTES).toBe(10 * 1024 * 1024);
+  });
+});
+
+describe("downloadAttachmentBytes", () => {
+  it("returns the exact bytes, sends Authorization, and never reads the body as JSON", async () => {
+    const payload = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x10]);
+    const res = new Response(payload);
+    const jsonSpy = vi.spyOn(res, "json");
+    const textSpy = vi.spyOn(res, "text");
+    global.fetch = vi.fn().mockResolvedValue(res);
+
+    const buf = await downloadAttachmentBytes(attMeta());
+
+    expect(Buffer.isBuffer(buf)).toBe(true);
+    expect(new Uint8Array(buf)).toEqual(payload);
+
+    const [url, init] = (global.fetch as any).mock.calls[0];
+    expect(url).toBe(RESOLVED_DOWNLOAD_URL);
+    expect(init.redirect).toBe("manual");
+    expect(init.headers.Authorization).toBe(EXPECTED_AUTH);
+    expect(jsonSpy).not.toHaveBeenCalled();
+    expect(textSpy).not.toHaveBeenCalled();
+  });
+
+  it("follows a same-origin redirect and keeps the Authorization header", async () => {
+    const payload = new Uint8Array([1, 2, 3, 4]);
+    global.fetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectTo(`${BASE_URL}/wiki/media/signed/abc`))
+      .mockResolvedValueOnce(new Response(payload));
+
+    const buf = await downloadAttachmentBytes(attMeta());
+    expect(new Uint8Array(buf)).toEqual(payload);
+
+    const calls = (global.fetch as any).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[0][0]).toBe(RESOLVED_DOWNLOAD_URL);
+    expect(calls[0][1].headers.Authorization).toBe(EXPECTED_AUTH);
+    expect(calls[1][0]).toBe(`${BASE_URL}/wiki/media/signed/abc`);
+    expect(calls[1][1].headers.Authorization).toBe(EXPECTED_AUTH);
+  });
+
+  it("resolves a relative Location against the current hop", async () => {
+    global.fetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectTo("/wiki/media/relative.png"))
+      .mockResolvedValueOnce(new Response(new Uint8Array([9])));
+
+    await downloadAttachmentBytes(attMeta());
+    const calls = (global.fetch as any).mock.calls;
+    expect(calls[1][0]).toBe(`${BASE_URL}/wiki/media/relative.png`);
+    expect(calls[1][1].headers.Authorization).toBe(EXPECTED_AUTH);
+  });
+
+  it("drops the Authorization header on a cross-origin redirect (credential leak guard)", async () => {
+    const payload = new Uint8Array([7, 7, 7]);
+    const mediaUrl = "https://media.example.com/file/abc?token=signed-token";
+    global.fetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectTo(mediaUrl))
+      .mockResolvedValueOnce(new Response(payload));
+
+    const buf = await downloadAttachmentBytes(attMeta());
+    expect(new Uint8Array(buf)).toEqual(payload);
+
+    const calls = (global.fetch as any).mock.calls;
+    expect(calls).toHaveLength(2);
+    // Hop 1 is the site: credentials belong there.
+    expect(calls[0][1].headers.Authorization).toBe(EXPECTED_AUTH);
+    // Hop 2 is a foreign origin: nothing credential-bearing may go with it.
+    expect(calls[1][0]).toBe(mediaUrl);
+    expect(calls[1][1].headers).toEqual({});
+    expect(calls[1][1].headers.Authorization).toBeUndefined();
+    expect(JSON.stringify(calls[1][1])).not.toContain("Basic ");
+    expect(JSON.stringify(calls[1][1])).not.toContain("test-token");
+  });
+
+  it("follows a 303 as well as a 302", async () => {
+    global.fetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectTo(`${BASE_URL}/wiki/media/x`, 303))
+      .mockResolvedValueOnce(new Response(new Uint8Array([5])));
+    const buf = await downloadAttachmentBytes(attMeta());
+    expect(new Uint8Array(buf)).toEqual(new Uint8Array([5]));
+  });
+
+  it("maps 403 to ConfluencePermissionError", async () => {
+    muteConsoleError();
+    global.fetch = vi.fn().mockResolvedValue(new Response("Forbidden", { status: 403 }));
+    const err = await downloadAttachmentBytes(attMeta()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluencePermissionError);
+    expect((err as ConfluenceApiError).status).toBe(403);
+  });
+
+  it("maps 404 to ConfluenceNotFoundError", async () => {
+    muteConsoleError();
+    global.fetch = vi.fn().mockResolvedValue(new Response("Not Found", { status: 404 }));
+    const err = await downloadAttachmentBytes(attMeta()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceNotFoundError);
+    expect((err as ConfluenceApiError).status).toBe(404);
+  });
+
+  it("maps 401 to ConfluenceAuthError", async () => {
+    muteConsoleError();
+    global.fetch = vi.fn().mockResolvedValue(new Response("Unauthorized", { status: 401 }));
+    const err = await downloadAttachmentBytes(attMeta()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceAuthError);
+    expect((err as ConfluenceApiError).status).toBe(401);
+  });
+
+  it("maps any other non-ok status to ConfluenceApiError", async () => {
+    muteConsoleError();
+    global.fetch = vi.fn().mockResolvedValue(new Response("Boom", { status: 500 }));
+    const err = await downloadAttachmentBytes(attMeta()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect(err).not.toBeInstanceOf(ConfluenceNotFoundError);
+    expect((err as ConfluenceApiError).status).toBe(500);
+  });
+
+  it("does not log the attachment payload when the request fails", async () => {
+    const spy = muteConsoleError();
+    global.fetch = vi
+      .fn()
+      .mockResolvedValue(new Response("Forbidden: no permission", { status: 403 }));
+    await downloadAttachmentBytes(attMeta()).catch(() => {});
+    const logged = spy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logged).toContain("Confluence API error (403)");
+    expect(logged).not.toContain("test-token");
+    expect(logged).not.toContain(EXPECTED_AUTH);
+  });
+
+  it("refuses before reading the body when content-length exceeds the ceiling", async () => {
+    const declared = MAX_ATTACHMENT_DOWNLOAD_BYTES + 1;
+    const res = new Response(new Uint8Array([1, 2, 3]), {
+      headers: { "content-length": String(declared) },
+    });
+    const abSpy = vi.spyOn(res, "arrayBuffer");
+    global.fetch = vi.fn().mockResolvedValue(res);
+
+    const err = await downloadAttachmentBytes(attMeta()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AttachmentTooLargeError);
+    expect((err as AttachmentTooLargeError).bytes).toBe(declared);
+    expect((err as AttachmentTooLargeError).limit).toBe(MAX_ATTACHMENT_DOWNLOAD_BYTES);
+    expect(abSpy).not.toHaveBeenCalled();
+  });
+
+  it("accepts a body exactly at the ceiling", async () => {
+    const at = new Uint8Array(MAX_ATTACHMENT_DOWNLOAD_BYTES);
+    at[0] = 42;
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(at, { headers: { "content-length": String(at.byteLength) } })
+    );
+    const buf = await downloadAttachmentBytes(attMeta());
+    expect(buf.byteLength).toBe(MAX_ATTACHMENT_DOWNLOAD_BYTES);
+    expect(buf[0]).toBe(42);
+  });
+
+  it("catches an over-ceiling body while streaming when content-length is absent or lies", async () => {
+    const CHUNK = 1024 * 1024;
+    // The source never ends on its own — a real over-sized download does not
+    // stop being sent just because the client has seen enough. HARD_STOP only
+    // keeps a broken implementation from hanging the test.
+    const HARD_STOP = 64;
+    let emitted = 0;
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (emitted >= HARD_STOP) {
+          controller.close();
+          return;
+        }
+        emitted += 1;
+        controller.enqueue(new Uint8Array(CHUNK));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    // The server under-reports: a small, dishonest content-length.
+    const res = new Response(stream, { headers: { "content-length": "128" } });
+    global.fetch = vi.fn().mockResolvedValue(res);
+
+    const err = await downloadAttachmentBytes(attMeta()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AttachmentTooLargeError);
+    expect((err as AttachmentTooLargeError).bytes).toBeGreaterThan(
+      MAX_ATTACHMENT_DOWNLOAD_BYTES
+    );
+    // The read must stop shortly past the ceiling, not drain the whole source.
+    expect(emitted).toBeLessThan(HARD_STOP);
+    expect(emitted * CHUNK).toBeLessThan(MAX_ATTACHMENT_DOWNLOAD_BYTES * 2);
+    // And the upstream read must actually be torn down, not just abandoned.
+    expect(cancelled).toBe(true);
+  });
+
+  it("falls back to arrayBuffer when the response exposes no stream", async () => {
+    const payload = new Uint8Array([10, 20, 30]);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      arrayBuffer: () => Promise.resolve(payload.buffer.slice(0)),
+    });
+    const buf = await downloadAttachmentBytes(attMeta());
+    expect(new Uint8Array(buf)).toEqual(payload);
+  });
+
+  it("applies the ceiling on the arrayBuffer fallback path too", async () => {
+    const over = new Uint8Array(MAX_ATTACHMENT_DOWNLOAD_BYTES + 1);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      arrayBuffer: () => Promise.resolve(over.buffer),
+    });
+    const err = await downloadAttachmentBytes(attMeta()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AttachmentTooLargeError);
+    expect((err as AttachmentTooLargeError).bytes).toBe(
+      MAX_ATTACHMENT_DOWNLOAD_BYTES + 1
+    );
+  });
+
+  it("throws when the attachment has no download link", async () => {
+    global.fetch = vi.fn();
+    await expect(
+      downloadAttachmentBytes(attMeta({ downloadLink: undefined }))
+    ).rejects.toThrow(/att-42 has no download link/);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses a download link pointing at a foreign origin", async () => {
+    global.fetch = vi.fn();
+    await expect(
+      downloadAttachmentBytes(
+        attMeta({ downloadLink: "https://evil.example.com/payload.bin" })
+      )
+    ).rejects.toThrow(/Refusing to download from https:\/\/evil\.example\.com/);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("gives up once the redirect chain exceeds the cap", async () => {
+    let n = 0;
+    global.fetch = vi.fn().mockImplementation(() => {
+      n += 1;
+      return Promise.resolve(redirectTo(`${BASE_URL}/wiki/hop/${n}`));
+    });
+
+    await expect(downloadAttachmentBytes(attMeta())).rejects.toThrow(
+      /Too many redirects while downloading attachment att-42/
+    );
+    // One initial request plus five followed redirects.
+    expect((global.fetch as any).mock.calls).toHaveLength(6);
+  });
+
+  it("succeeds on a chain that stops exactly at the redirect cap", async () => {
+    const fn = vi.fn();
+    for (let i = 1; i <= 5; i++) {
+      fn.mockResolvedValueOnce(redirectTo(`${BASE_URL}/wiki/hop/${i}`));
+    }
+    fn.mockResolvedValueOnce(new Response(new Uint8Array([99])));
+    global.fetch = fn;
+
+    const buf = await downloadAttachmentBytes(attMeta());
+    expect(new Uint8Array(buf)).toEqual(new Uint8Array([99]));
+    expect(fn.mock.calls).toHaveLength(6);
+  });
+
+  it("treats a 3xx without a Location header as the final response", async () => {
+    muteConsoleError();
+    global.fetch = vi
+      .fn()
+      .mockResolvedValue(new Response("moved, but where?", { status: 302 }));
+    const err = await downloadAttachmentBytes(attMeta()).catch((e: unknown) => e);
+    // A redirect with no Location cannot be followed; it surfaces as an API
+    // error rather than looping.
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect((err as ConfluenceApiError).status).toBe(302);
+    expect((global.fetch as any).mock.calls).toHaveLength(1);
   });
 });
 
