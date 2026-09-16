@@ -7,6 +7,10 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Caps the 360-minute default. The publish step gets its own tighter
+    # bound because it is the one that talks to the registry and the
+    # sigstore/OIDC endpoints.
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
@@ -30,4 +34,5 @@ jobs:
         run: npm test
 
       - name: Publish
+        timeout-minutes: 10
         run: npx npm@11.12.1 publish --provenance --access public

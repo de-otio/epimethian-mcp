@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # The suite runs in well under a minute; 15 fails fast on a wedged runner
+    # rather than burning the 360-minute default.
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v6
