@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.10.1] - 2026-09-23 - code scanning fixes
+
+### Security
+
+- **CQL string escaping now escapes backslashes.** `resolve_page_link` and
+  `lookup_user` build CQL queries from caller-supplied titles, space keys
+  and names. Quotes were escaped but backslashes were not, so a value
+  containing `\"` could close the string literal early and append further
+  CQL clauses, and a value ending in `\` broke the query. Both call sites
+  now share `escapeCqlString`, which escapes backslashes before quotes. The
+  queries run as reads with the user's own credentials.
+- **Comment sanitizer strips to a fixed point.** `sanitizeCommentBody`
+  removed dangerous tags in a single pass, so a tag split around an inner
+  one (`<scr<script>…</script>ipt>…</script>`) was reassembled by the
+  removal itself. It now repeats until nothing more is removed.
+- The CI workflow declares `permissions: contents: read`, so its
+  `GITHUB_TOKEN` is read-only.
+
+### Changed
+
+- A heading round-trip test helper decoded `&amp;` first, which
+  double-unescaped `&amp;lt;` to `<`; it now decodes `&amp;` last.
+
 ## [6.10.0] - 2026-09-16 - attachment download
 
 ### Added

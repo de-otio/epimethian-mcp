@@ -1207,6 +1207,15 @@ const UserSearchResultSchema = z.object({
 });
 
 /**
+ * Escape a value for use inside a double-quoted CQL string literal.
+ * Backslashes must be escaped before quotes, or a trailing `\` in the input
+ * would consume the escape added for the closing quote.
+ */
+export function escapeCqlString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/**
  * Search for Confluence/Atlassian users by name, display name, or email substring.
  * Uses the v1 CQL user search endpoint. Returns at most `limit` matches.
  */
@@ -1216,7 +1225,7 @@ export async function searchUsers(
 ): Promise<UserResult[]> {
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/search/user`);
-  url.searchParams.set("cql", `user.fullname~"${query.replace(/"/g, '\\"')}"`);
+  url.searchParams.set("cql", `user.fullname~"${escapeCqlString(query)}"`);
   url.searchParams.set("limit", String(Math.min(limit, 10)));
   const res = await confluenceRequest(url.toString());
   const raw = await res.json();
@@ -1245,9 +1254,7 @@ export async function searchPagesByTitle(
   title: string,
   spaceKey: string
 ): Promise<PageLinkResult[]> {
-  const escapedTitle = title.replace(/"/g, '\\"');
-  const escapedSpace = spaceKey.replace(/"/g, '\\"');
-  const cql = `title="${escapedTitle}" AND space.key="${escapedSpace}" AND type=page`;
+  const cql = `title="${escapeCqlString(title)}" AND space.key="${escapeCqlString(spaceKey)}" AND type=page`;
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/search`);
   url.searchParams.set("cql", cql);
@@ -1953,7 +1960,14 @@ const DANGEROUS_TAG_RE =
   /<(ac:structured-macro|script|iframe|embed|object)[\s\S]*?<\/\1>|<(ac:structured-macro|script|iframe|embed|object)[^>]*\/>/gi;
 
 export function sanitizeCommentBody(body: string): string {
-  const stripped = body.replace(DANGEROUS_TAG_RE, "");
+  // Strip to a fixed point: a single pass can reassemble a tag split around
+  // an inner one, e.g. "<scr<script></script>ipt>…</script>".
+  let stripped = body;
+  let previous: string;
+  do {
+    previous = stripped;
+    stripped = stripped.replace(DANGEROUS_TAG_RE, "");
+  } while (stripped !== previous);
   if (stripped !== body) {
     console.error(
       "epimethian-mcp: sanitizeCommentBody stripped dangerous tags from comment body"

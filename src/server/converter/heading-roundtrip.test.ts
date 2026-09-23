@@ -49,12 +49,13 @@ import { extractHeadings } from "../confluence-client.js";
  * do it here to make the assertion round-trip correctly.
  */
 function decodeBasicEntities(s: string): string {
+  // &amp; last, so "&amp;lt;" decodes to "&lt;" rather than "<".
   return s
-    .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 /**

@@ -61,6 +61,7 @@ import {
   setContentState,
   removeContentState,
   sanitizeCommentBody,
+  escapeCqlString,
   getFooterComments,
   getInlineComments,
   getCommentReplies,
@@ -2603,6 +2604,30 @@ describe("removeContentState", () => {
 // Comments API
 // =============================================================================
 
+describe("escapeCqlString", () => {
+  it("leaves plain text unchanged", () => {
+    expect(escapeCqlString("Release notes 2026")).toBe("Release notes 2026");
+  });
+
+  it("escapes double quotes", () => {
+    expect(escapeCqlString('say "hi"')).toBe('say \\"hi\\"');
+  });
+
+  it("escapes a trailing backslash so it cannot eat the closing quote", () => {
+    expect(escapeCqlString("path\\")).toBe("path\\\\");
+  });
+
+  it("escapes backslash before quote so an injected \\\" stays inside the literal", () => {
+    // Input: x\" OR space.key="OTHER — must not terminate the string literal.
+    const escaped = escapeCqlString('x\\" OR space.key="OTHER');
+    expect(escaped).toBe('x\\\\\\" OR space.key=\\"OTHER');
+    // Every quote in the output is preceded by an odd number of backslashes.
+    for (const m of escaped.matchAll(/(\\*)"/g)) {
+      expect(m[1].length % 2).toBe(1);
+    }
+  });
+});
+
 describe("Comments", () => {
   // ---------------------------------------------------------------------------
   // sanitizeCommentBody
@@ -2635,6 +2660,14 @@ describe("Comments", () => {
       const result = sanitizeCommentBody(body);
       expect(result).not.toContain("<iframe");
       expect(result).toContain("<p>Start</p>");
+    });
+
+    it("strips a tag reassembled from fragments around an inner tag", () => {
+      const body = "<p>a</p><scr<script>x</script>ipt>alert(1)</script><p>b</p>";
+      const result = sanitizeCommentBody(body);
+      expect(result).not.toMatch(/<script/i);
+      expect(result).not.toContain("alert");
+      expect(result).toBe("<p>a</p><p>b</p>");
     });
 
     it("does not strip safe tags like <p>, <strong>, <em>", () => {
