@@ -87,6 +87,8 @@ Confluence Cloud uses a points-based model:
 
 Write operations cost **1 point flat**. Read operations cost 1 + (1 × objects returned). The practical bottleneck for bulk writes is network latency, not rate limits.
 
+**Points-based quotas vs. API-token traffic:** Atlassian's points-based quotas apply to Forge, Connect and OAuth 3LO applications. This server authenticates with API tokens, which remain subject to the existing burst-rate limits rather than points quotas. During batches, 429 responses remain possible and must be handled with retry-and-backoff. Version 7.0.0 adds GET-only retry-after retries.
+
 Response headers on 429: `Retry-After`, `X-RateLimit-Remaining`, `X-RateLimit-NearLimit`.
 
 **Required:** Add retry-with-backoff directly in `confluenceRequest` for 429 responses. Read the `Retry-After` header, apply exponential backoff with jitter, cap at 3 retries and 30 seconds total. This benefits all tools, not just bulk operations. For bulk tools specifically, implement adaptive throttling: if any request in a batch returns 429, drop concurrency to 1 for the remainder of the batch.

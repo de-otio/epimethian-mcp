@@ -1,7 +1,6 @@
 # Investigation: Findings from a long editing session (2026-10)
 
-**STATUS: PROPOSED** (nothing implemented). Written 2026-10-06 against `master` at
-f03ee8a (6.10.1). The session itself ran 6.10.0.
+**STATUS:** implemented in 7.0.0: S1, S2, S3, S4, S5, S6, S7, R1, R3, R5, A3 (annotations, validation-error regression test, SDK floor), A5, T5, T6; planned for 7.1.0: A2, T3, T2, R2 (label memo only), A1 low-risk reads; planned for 7.2.0: T1, T4, R4; deferred: A1 historical-body reads, attachment purge, A4, the 2026-07-28 protocol spike — see [../../../plans/field-session-findings-2026-10.md](../../../plans/field-session-findings-2026-10.md).
 
 ## Context
 
