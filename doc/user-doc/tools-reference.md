@@ -1,8 +1,14 @@
 # Tools Reference
 
-The Epimethian MCP server provides **36 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
+The Epimethian MCP server provides **37 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
 
-_Last updated: 2026-09-16 — v6.10.0_
+_Last updated: 2026-10-06 — v7.0.0_
+
+Every tool declares a title and the annotation hints `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`. The hints are advisory; the server's own guards never depend on them. `update_page`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `revert_page`, `download_attachment`, `remove_label`, `set_page_status`, `remove_page_status` and `upgrade` declare `destructiveHint: true`. `delete_page`, `revert_page`, `delete_comment`, `authorise_destructive_writes` and `upgrade` also set `_meta["anthropic/requiresUserInteraction"]`, so Claude Code asks for approval on every call.
+
+**Untrusted-content fence.** Text read from Confluence (page bodies, titles, search results, comments) is wrapped in a fence the agent must not treat as instructions. Within the fence, text is Unicode-normalised (NFKC) and zero-width, bidirectional and control characters are removed.
+
+**Network behaviour.** Requests time out (30 s reads, 60 s writes, 120 s transfers; scaled by `EPIMETHIAN_HTTP_TIMEOUT_MS`, clamped to 5-300 s for reads). `GET` and `HEAD` are retried up to 3 attempts on 429 and 503, honouring `Retry-After` up to 60 s. At most 6 requests run at once. A write that times out or fails after being sent has an unknown outcome, and further `version: "current"` writes to that page are refused until you read it again.
 
 ---
 
@@ -51,8 +57,10 @@ In Confluence spaces with heading auto-numbering enabled, stored heading text co
 | `include_body` | boolean | No | Whether to include page content (default: true) |
 | `headings_only` | boolean | No | Return only the heading outline (default: false). Takes precedence over all other body options. HTML entities in headings are decoded. |
 | `section` | string | No | Return only the content under this heading (case-insensitive). Use `headings_only` first to see available sections. Accepts both prefixed and plain forms in auto-numbered spaces. |
-| `max_length` | number | No | Truncate the page body after this many characters. Pass `0` for no limit. |
+| `max_length` | number | No | Truncate the page body after this many characters. Defaults to 50,000 when omitted. Pass `0` for no limit. |
 | `format` | string | No | `"storage"` (default) or `"markdown"`. Markdown is a read-only rendering — macros and rich elements are summarised, not preserved. |
+
+Every body path (full storage, `section`, markdown, truncated) is returned inside the untrusted-content fence, with the field named `body`, `section` or `markdown`. With `format: "markdown"` and `section`, placeholder ids (`[[epi:T0001]]`) are numbered from the section body, with the heading rendered separately, so they match the ids `update_page_section` and `find_replace` use.
 
 Returns title, ID, space, version, URL, and optionally the page content. Page bodies are cached in memory — repeated reads of the same page version avoid redundant API calls.
 
@@ -69,7 +77,7 @@ Looks up a page by its exact title within a space. Supports the same body-readin
 | `include_body` | boolean | No | Whether to include page content (default: false) |
 | `headings_only` | boolean | No | Return only the heading outline (default: false). Takes precedence over all other body options. HTML entities in headings are decoded. |
 | `section` | string | No | Return only the content under this heading (case-insensitive). |
-| `max_length` | number | No | Truncate the page body after this many characters. |
+| `max_length` | number | No | Truncate the page body after this many characters. Defaults to 50,000 when omitted; `0` means no limit. |
 | `format` | string | No | `"storage"` (default) or `"markdown"`. |
 
 ---
@@ -95,6 +103,8 @@ You must provide the `version` number from your most recent `get_page` call, or 
 | `confluence_base_url` | string (URL) | No | Override the Confluence base URL used by the link rewriter. |
 | `source` | string | No | Provenance hint: `user_request`, `chained_tool_output`, `agent_decision`, or `elicitation_response`. Required when destructive flags are set. |
 
+If the page's own prose contains literal `[[epi:Tnnnn]]` text, a markdown body write is refused (`PLACEHOLDER_LITERAL_IN_PAGE`), because the text cannot be told apart from a macro placeholder. Edit such pages with storage format.
+
 **Note:** `replace_body` skips all safety nets. When delegating `update_page` to a subagent, ensure the agent includes the full existing body — `replace_body` replaces ALL content with only what you provide.
 
 ---
@@ -112,12 +122,22 @@ Exactly one of `body` or `find_replace` must be provided.
 | `page_id` | string | Yes | Numeric page ID |
 | `section` | string | Yes | Heading text identifying the section to replace (case-insensitive). Accepts prefixed or plain forms in auto-numbered spaces. |
 | `body` | string | No* | New content for this section — GFM markdown or Confluence storage format. The heading itself is preserved; only content under it is replaced. *Exactly one of `body` or `find_replace` must be provided.* |
-| `find_replace` | array | No* | Alternative to `body`: array of `{find, replace}` pairs. Each `find` is a literal string (not a regex); substitutions cannot match inside macro attribute values or CDATA bodies. Pairs are applied in input order. If a `find` string is not found, the call fails with `FIND_REPLACE_MATCH_FAILED`. *Exactly one of `body` or `find_replace` must be provided.* |
+| `find_replace` | array | No* | Alternative to `body`: array of `{find, replace}` pairs. Each pair is `{find, replace, replace_all?}`. `find` is a literal string (not a regex); substitutions cannot match inside macro attribute values or CDATA bodies. Pairs are applied in input order, each on the result of the previous one. See the rules below. *Exactly one of `body` or `find_replace` must be provided.* |
 | `version` | number \| `"current"` | Yes | Version from your most recent `get_page` call. Pass `"current"` to skip the read. **Warning:** `"current"` bypasses optimistic concurrency. |
 | `version_message` | string | No | Version comment visible in page history |
 | `confirm_deletions` | boolean | No | Acknowledge that your markdown removes preserved macros, emoticons, or rich elements from this section (default: false). |
 | `confirm_shrinkage` | boolean | No | Acknowledge a large body reduction (default: false). Measured against the **whole page**, not the isolated section — see note below. |
 | `confirm_structure_loss` | boolean | No | Acknowledge a large drop in heading count, measured against the whole page (default: false). |
+
+**`find_replace` rules.**
+
+- **Exactly once.** Each `find` must match exactly once in the section. No match fails with `FIND_REPLACE_MATCH_FAILED`; several matches fail with `FIND_REPLACE_AMBIGUOUS`, which reports the count. Set `replace_all: true` on a pair to replace every occurrence. Overlapping occurrences are rejected even with `replace_all`.
+- **Fence-view fallback.** If the exact bytes are not found, the match is retried against the text as a fenced read shows it, so text copied from a read (`…`, non-breaking spaces, `²`, zero-width characters) still matches. The result notes when this was used. The common prefix and suffix of `find` and `replace` keep their stored bytes.
+- **Placeholders.** A `[[epi:Tnnnn]]` placeholder in `find` or `replace` refers to a macro in the section (ids as in a markdown section read). Duplicating a placeholder is rejected (`DUPLICATED_TOKEN`), an id the section does not have is rejected (`FORGED_TOKEN`), and dropping one is a deletion: it needs `confirm_deletions` (or the confirmation token flow).
+- **Pinned version.** `version: "current"` is refused when any pair contains a `[[epi:` placeholder (`PLACEHOLDER_NEEDS_PINNED_VERSION`), because ids are positional. Pass the version from your read.
+- **Literal placeholder text.** If the page's own prose contains literal `[[epi:Tnnnn]]` text, the write is refused (`PLACEHOLDER_LITERAL_IN_PAGE`).
+
+Confirmation tokens (`confirm_token`) for section writes are bound to the tool, page, section, the pairs or body and flags, the resulting storage hash, and the page version. A token issued for one call does not validate another.
 
 > **Page-relative guards.** The shrinkage / structure / content-floor guards
 > for a section edit are measured against the **whole page**, not the section
@@ -134,7 +154,8 @@ Exactly one of `body` or `find_replace` must be provided.
   "section": "1. Overview",
   "version": 7,
   "find_replace": [
-    { "find": "**1. Overview**", "replace": "**[1. Overview](confluence://ENG/Overview)**" }
+    { "find": "**1. Overview**", "replace": "**[1. Overview](confluence://ENG/Overview)**" },
+    { "find": "Draft", "replace": "Final", "replace_all": true }
   ]
 }
 ```
@@ -149,15 +170,19 @@ Sections are matched against the **original** page contents (not the cumulative-
 
 In auto-numbered spaces, section names accept both prefixed and plain forms.
 
+All sections are applied in memory and written with one request, producing one version. The content-safety guards (shrinkage, structure, empty body) also run on the merged page, so several sections that each stay under a threshold cannot together remove most of the page. Preserved elements that would be deleted are listed with section-qualified ids such as `Summary#T0001`.
+
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `page_id` | string | Yes | Numeric page ID |
-| `version` | number \| `"current"` | Yes | Version from your most recent `get_page` call. Pass `"current"` to skip the read. **Warning:** `"current"` bypasses optimistic concurrency. |
+| `version` | number \| `"current"` | Yes | Version from your most recent `get_page` call. Pass `"current"` to skip the read. **Warning:** `"current"` bypasses optimistic concurrency, and is refused when a `find_replace` pair contains a `[[epi:` placeholder. |
 | `version_message` | string | No | Version comment for the single resulting revision |
 | `confirm_deletions` | boolean | No | Acknowledge that the aggregated set of sections removes preserved macros, emoticons, or rich elements (default: false). The gate fires once on the aggregate. |
 | `confirm_shrinkage` | boolean | No | Acknowledge a large body reduction (default: false). Each section's guard is measured against the **whole page** (as for `update_page_section`). |
 | `confirm_structure_loss` | boolean | No | Acknowledge a large drop in heading count, measured against the whole page (default: false). |
-| `sections` | array | Yes | List of `{section, body}` pairs. `section` is the heading text (case-insensitive); `body` is GFM markdown or Confluence storage format. Section names must be unique within the list. |
+| `sections` | array | Yes | List of entries, each `{section, body}` or `{section, find_replace}` (exactly one of the two). `section` is the heading text (case-insensitive); `body` is GFM markdown or Confluence storage format; `find_replace` is an array of `{find, replace, replace_all?}` with the same rules as `update_page_section`. Placeholder ids are per section. Section names must be unique within the list. |
+| `confirm_token` | string | No | Soft-confirmation token from a prior `SOFT_CONFIRMATION_REQUIRED` response. Single-use; bound to this exact change and page version. |
+| `batch_token` | string | No | Token from `authorise_destructive_writes`. |
 
 **Example:**
 
@@ -168,7 +193,8 @@ In auto-numbered spaces, section names accept both prefixed and plain forms.
   "version_message": "Update summary and scope sections",
   "sections": [
     { "section": "Summary", "body": "<p>New summary text.</p>" },
-    { "section": "Scope", "body": "<p>Updated scope.</p>" }
+    { "section": "Scope", "body": "<p>Updated scope.</p>" },
+    { "section": "Status", "find_replace": [{ "find": "In review", "replace": "Approved" }] }
   ]
 }
 ```
@@ -177,7 +203,7 @@ In auto-numbered spaces, section names accept both prefixed and plain forms.
 
 ### `prepend_to_page`
 
-Inserts content at the beginning of an existing Confluence page. The caller provides only the new content — the server fetches the existing body and handles concatenation. Safer than `update_page` with `replace_body` for additive operations.
+Inserts content at the beginning of an existing Confluence page. The caller provides only the new content — the server fetches the existing body and handles concatenation. Safer than `update_page` with `replace_body` for additive operations. Content containing `[[epi:` is refused (`INVENTED_TOKEN`): placeholders only mean something in a read of the existing page.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
@@ -193,7 +219,7 @@ Inserts content at the beginning of an existing Confluence page. The caller prov
 
 ### `append_to_page`
 
-Inserts content at the end of an existing Confluence page. The caller provides only the new content — the server fetches the existing body and handles concatenation. Safer than `update_page` with `replace_body` for additive operations.
+Inserts content at the end of an existing Confluence page. The caller provides only the new content — the server fetches the existing body and handles concatenation. Safer than `update_page` with `replace_body` for additive operations. Content containing `[[epi:` is refused (`INVENTED_TOKEN`).
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
@@ -248,12 +274,16 @@ Returns child pages of a given parent page.
 
 ### `search_pages`
 
-Searches pages using CQL (Confluence Query Language). Results include a content excerpt (~300 chars) so you can triage matches without fetching each page.
+Searches pages using CQL (Confluence Query Language). Results include a content excerpt (~300 chars) so you can triage matches without fetching each page. Each result (ID, space, title, excerpt) is wrapped in its own untrusted-content fence, and search highlight markers are removed.
+
+If the profile sets `read_spaces`, the query is restricted to those spaces and the response says so. A query that cannot be restricted safely (unbalanced parentheses, an unterminated string literal, an invalid `ORDER BY`) is refused. If the profile sets `redact_patterns`, matches are replaced with `[redacted]` in titles and excerpts. See [Search Scope and Redaction](../../README.md#search-scope-and-redaction).
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `cql` | string | Yes | CQL query string |
 | `limit` | number | No | Maximum number of results to return (default: 25) |
+| `all_spaces` | boolean | No | Search every space instead of the profile's `read_spaces` (default: false). An error when the profile sets `read_spaces_enforced`. |
+| `excerpts` | boolean | No | Include result excerpts (default: true). Set `false` for titles only. |
 
 Example CQL queries:
 
@@ -317,7 +347,7 @@ Returns filename, attachment ID, media type, and file size for each attachment.
 
 Fetches an attachment's bytes and writes them to a local file, returning the path. The file contents are **not** returned in the tool response — attachments are routinely megabytes of binary, so the bytes go to disk and the agent reads the saved file with its own file tools if it needs the content.
 
-This is a **read** with respect to Confluence: it is annotated `readOnlyHint: true`, works in read-only profiles, and consumes no write budget. The asymmetry is deliberate — the tool writes to the local filesystem, but the read-only posture governs the *remote* side.
+This is a **read** with respect to Confluence: it works in read-only profiles and consumes no write budget. It is annotated `readOnlyHint: false, destructiveHint: true`, because it writes to the local filesystem (and replaces a file when `overwrite: true`); the read-only posture governs the *remote* side only.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
@@ -338,7 +368,8 @@ Saved to: /home/user/project/quarterly-report.pdf
 - When `output_path` is omitted, the attachment's own filename is validated — no path separators, no control characters, no `..`, no leading dot — and **rejected rather than sanitised** if it fails.
 - Symlinks at the destination are never followed — the write opens with `O_NOFOLLOW`, in both overwrite modes — so a symlink planted at the destination cannot redirect the bytes elsewhere on disk.
 - An existing file is never replaced unless `overwrite: true` is passed (the write adds `O_EXCL` otherwise).
-- The file is created with mode `0600`.
+- Any path segment below the working directory that starts with a dot (`.git`, `.claude`, `.github`, `.vscode`, `.env`, ...) is refused, whether it comes from `output_path` or the default filename.
+- The file is created with mode `0600`. Executable, setuid and setgid bits are never set, and are cleared when an existing file is overwritten.
 - Attachments larger than 10 MB are refused before the body is fetched, with an error naming the actual size.
 
 ---
@@ -519,7 +550,7 @@ Returns version number, author, date, and optional version message for each vers
 
 ### `get_page_version`
 
-Gets the content of a page at a specific historical version. Returns sanitised read-only markdown (macros replaced with placeholders). This content is **not** suitable for round-trip updates via `update_page` — the conversion is lossy. To revert a page to a previous version, use `revert_page` instead.
+Gets the content of a page at a specific historical version. Returns sanitised read-only markdown (macros replaced with placeholders, except that the bodies of panel, info, note, warning, tip and expand macros appear as block quotes). This content is **not** suitable for round-trip updates via `update_page` — the conversion is lossy. To revert a page to a previous version, use `revert_page` instead.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
@@ -532,15 +563,15 @@ Historical version bodies are cached separately from current versions.
 
 ### `diff_page_versions`
 
-Compares two versions of a page with a section-aware summary or unified diff. Always operates on sanitised text (macro content replaced with placeholders).
+Compares two versions of a page with a section-aware summary or unified diff. The text views are sanitised: the bodies of panel, info, note, warning, tip and expand macros are shown as block quotes, and other macros are replaced with placeholders. The normalised storage XML is compared too, so when only macro internals or attributes changed the summary says so (for example `No text changes; 2 macro/attribute changes in: Overview`) instead of reporting no changes.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `page_id` | string | Yes | Confluence page ID |
 | `from_version` | number | Yes | Starting version number |
 | `to_version` | number | No | Ending version number (defaults to current version). Must be greater than `from_version`. |
-| `max_length` | number | No | Truncate output after this many characters (applies to `unified` format). |
-| `format` | string | No | `"summary"` (default) or `"unified"`. Summary shows section-level changes; unified shows a standard diff. |
+| `max_length` | number | No | Truncate output after this many characters (applies to `unified` and `storage` formats). |
+| `format` | string | No | `"summary"` (default), `"unified"` or `"storage"`. Summary shows section-level changes; unified shows a standard diff of the text; storage shows a unified diff of the normalised storage XML (read-only; never pass it to a write tool). |
 
 The summary format groups changes by heading — added sections, removed sections, and modified sections with per-section diffs. Costs 2–3 API calls.
 
@@ -574,6 +605,23 @@ Returns `contentId`, `url`, `spaceKey`, and `title` for the matched page.
 ---
 
 ## Server Administration
+
+### `authorise_destructive_writes`
+
+Pre-authorises a batch of destructive writes with one user prompt. Returns a `batch_token` to pass as `batch_token` to later `update_page`, `update_page_section`, `update_page_sections` and `delete_page` calls in place of `confirm_token`. A write tool: it is not registered in read-only profiles. Requires user interaction on every call.
+
+A batch token is bound to the listed pages and is not bound to the exact change, so use it only when the user authorised the batch. Without in-protocol confirmation the first call returns `SOFT_CONFIRMATION_REQUIRED`; ask the user, then repeat the call with `confirm_token`.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `page_ids` | array of strings | Yes | 1-50 page IDs the token is valid for. No wildcards. |
+| `reason` | string | Yes | 10-500 characters; why the batch is being authorised. Shown in the confirmation prompt. |
+| `ttl_seconds` | number | No | Token lifetime, clamped to 60-3600 (default: 900) |
+| `max_operations` | number | No | Total operations the token authorises (default: number of pages; at most twice that) |
+| `source` | string | No | Provenance hint (see `update_page`) |
+| `confirm_token` | string | No | Soft-confirmation token from a prior `SOFT_CONFIRMATION_REQUIRED` response |
+
+---
 
 ### `check_permissions`
 
