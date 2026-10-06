@@ -125,6 +125,21 @@ describe("decideRetry", () => {
     }
   });
 
+  it("treats only exactly GET and HEAD (any case) as retryable; unknown or padded methods are not", () => {
+    for (const m of ["GET", "get", "HEAD", "Head"]) expect(isRetryableMethod(m)).toBe(true);
+    for (const m of ["OPTIONS", "", "GET ", " GET", "GETS", "TRACE", "CONNECT"]) {
+      expect(isRetryableMethod(m)).toBe(false);
+      expect(decideRetry({ ...base, method: m }).retry).toBe(false);
+    }
+  });
+
+  it("property: isRetryableMethod is true only for GET or HEAD", () => {
+    fc.assert(
+      fc.property(fc.string(), (m) => isRetryableMethod(m) === (m.toUpperCase() === "GET" || m.toUpperCase() === "HEAD")),
+      FC,
+    );
+  });
+
   it("does not retry other statuses", () => {
     for (const status of [400, 401, 403, 404, 409, 500, 502, 504]) {
       expect(decideRetry({ ...base, status }).retry).toBe(false);
@@ -233,6 +248,51 @@ describe("Semaphore", () => {
     first();
     await Promise.all([a, b]);
     expect(order).toEqual([1, 2]);
+  });
+
+  it("keeps inFlight at the limit through hand-offs, and a drained semaphore admits exactly `limit` new holders", async () => {
+    const sem = new Semaphore(2, 60_000);
+    const holders = [await sem.acquire(), await sem.acquire()];
+    expect(sem.inFlight).toBe(2);
+
+    // Four waiters queue behind the two holders; each grant lands in `granted`.
+    const granted: Array<() => void> = [];
+    const waiting = Array.from({ length: 4 }, () => sem.acquire().then((rel) => granted.push(rel)));
+    expect(sem.queued).toBe(4);
+
+    // Release the holders in alternating order: each hands its permit on.
+    holders[1]!();
+    await Promise.resolve();
+    expect([sem.inFlight, sem.queued, granted.length]).toEqual([2, 3, 1]);
+    holders[0]!();
+    await Promise.resolve();
+    expect([sem.inFlight, sem.queued, granted.length]).toEqual([2, 2, 2]);
+
+    // Releasing the granted permits drains the queue; `active` never exceeds the limit.
+    granted[0]!();
+    await Promise.resolve();
+    expect([sem.inFlight, sem.queued, granted.length]).toEqual([2, 1, 3]);
+    granted[1]!();
+    await Promise.resolve();
+    expect([sem.inFlight, sem.queued, granted.length]).toEqual([2, 0, 4]);
+    await Promise.all(waiting);
+    granted[2]!();
+    expect(sem.inFlight).toBe(1);
+    granted[3]!();
+    expect(sem.inFlight).toBe(0);
+
+    // A drifted `active` count would let a third holder through here.
+    let resolved = 0;
+    const fresh = Array.from({ length: 3 }, () => sem.acquire().then((rel) => (resolved++, rel)));
+    await Promise.resolve();
+    expect(resolved).toBe(2);
+    expect(sem.inFlight).toBe(2);
+    expect(sem.queued).toBe(1);
+    const first = await fresh[0]!;
+    first();
+    await Promise.all(fresh);
+    expect(resolved).toBe(3);
+    expect(sem.inFlight).toBe(2);
   });
 
   it("rejects with ConcurrencyTimeoutError after the acquire timeout and leaves the queue clean", async () => {

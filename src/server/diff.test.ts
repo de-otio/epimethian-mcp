@@ -176,6 +176,51 @@ describe("diff module", () => {
       expect(result.sections[0].type).toBe("modified");
     });
 
+    it("a duplicate heading cannot mask a change in the first occurrence", () => {
+      const a = "# Notes\n\nold\n\n# Notes\n\nkeep";
+      const b = "# Notes\n\nnew\n\n# Notes\n\nkeep";
+      const result = computeSummaryDiff(a, b);
+      expect(result.summary).not.toBe("No changes.");
+      expect(result.totalAdded).toBeGreaterThan(0);
+      expect(result.totalRemoved).toBeGreaterThan(0);
+      expect(result.sections).toHaveLength(1);
+      expect(result.sections[0]).toMatchObject({ type: "modified", section: "Notes" });
+    });
+
+    it("a duplicate heading cannot mask a change in the second occurrence", () => {
+      const a = "# Notes\n\nold\n\n# Notes\n\nkeep";
+      const b = "# Notes\n\nold\n\n# Notes\n\nchanged";
+      const result = computeSummaryDiff(a, b);
+      expect(result.totalAdded + result.totalRemoved).toBeGreaterThan(0);
+      expect(result.sections).toHaveLength(1);
+      expect(result.sections[0].type).toBe("modified");
+      expect(result.sections[0].section).toContain("Notes");
+      expect(result.sections[0].section).not.toBe("Notes");
+    });
+
+    it("reports a removed duplicate section instead of folding it into the first", () => {
+      const a = "# Notes\n\nsame\n\n# Notes\n\nextra";
+      const b = "# Notes\n\nsame";
+      const result = computeSummaryDiff(a, b);
+      const removed = result.sections.filter((s) => s.type === "removed");
+      expect(removed).toHaveLength(1);
+      expect(removed[0].section).toContain("Notes");
+      expect(removed[0].removed).toBeGreaterThan(0);
+    });
+
+    it("identical pages with duplicate headings still report no changes", () => {
+      const text = "# Notes\n\none\n\n# Notes\n\ntwo\n\n# Notes\n\nthree";
+      expect(computeSummaryDiff(text, text).summary).toBe("No changes.");
+    });
+
+    it("a heading that reads (intro) does not collide with the intro section", () => {
+      const a = "lead\n\n# (intro)\n\nold";
+      const b = "lead\n\n# (intro)\n\nnew";
+      const result = computeSummaryDiff(a, b);
+      expect(result.sections).toHaveLength(1);
+      expect(result.sections[0].type).toBe("modified");
+    });
+
     it("preserves multi-line section content correctly", () => {
       const a = "# Section\n\nLine 1\nLine 2\nLine 3";
       const b = "# Section\n\nLine 1\nLine 2 changed\nLine 3";

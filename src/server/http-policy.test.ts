@@ -28,12 +28,16 @@ import {
   ConfluenceUnexpectedConflictError,
   PageOutcomeUnknownError,
   WriteOutcomeUnknownError,
+  addLabels,
   createFooterComment,
+  createInlineComment,
   deletePage,
   downloadAttachmentBytes,
   formatPage,
   getLabels,
   getPage,
+  removeContentState,
+  removeLabel,
   setContentState,
   uploadAttachment,
 } from "./confluence-client.js";
@@ -218,6 +222,28 @@ describe("R1 retry", () => {
     expect(sleeps).toEqual([]);
   });
 
+  it.each([429, 503])(
+    "a %i on a write is a definite non-write: ConfluenceApiError, cache intact, no outcome-unknown mark",
+    async (status) => {
+      pageCache.set("30", 5, "<p>cached</p>");
+      const f = setFetch(() => json({ message: "busy" }, status));
+      const err = await _rawUpdatePage("30", { title: "T", version: 5, body: "<p>x</p>" }).catch(
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ConfluenceApiError);
+      expect(err).not.toBeInstanceOf(WriteOutcomeUnknownError);
+      expect((err as ConfluenceApiError).status).toBe(status);
+      expect(f).toHaveBeenCalledTimes(1);
+      expect(pageCache.has("30")).toMatchObject({ version: 5 });
+      expect(pageCache.getOutcomeUnknown("30")).toBeUndefined();
+
+      // The same holds for the other write verbs.
+      await expect(createFooterComment("30", "hi")).rejects.not.toBeInstanceOf(WriteOutcomeUnknownError);
+      await expect(deletePage("30")).rejects.not.toBeInstanceOf(WriteOutcomeUnknownError);
+      expect(pageCache.has("30")).toMatchObject({ version: 5 });
+    },
+  );
+
   it("keeps setContentState's own 409 retry (the documented exemption)", async () => {
     let calls = 0;
     const f = setFetch(() => (++calls < 3 ? json({}, 409) : json({})));
@@ -339,6 +365,55 @@ describe("R1 concurrency cap", () => {
     release();
     await held;
   });
+
+  describe("downloads release the permit on every redirect hop", () => {
+    const link = { id: "a1", title: "f.txt", downloadLink: "/download/attachments/30/f.txt" };
+
+    /** /download/... -> 302 /b -> 302 /c -> 200 bytes; `last` overrides the final answer. */
+    function redirectChain(last: () => Response = () => new Response(new Uint8Array([1, 2, 3]))) {
+      return setFetch((url) => {
+        const path = new URL(url).pathname;
+        if (path.endsWith("/download/attachments/30/f.txt")) {
+          return new Response(null, { status: 302, headers: { Location: "/b" } });
+        }
+        if (path === "/b") return new Response(null, { status: 302, headers: { Location: "/c" } });
+        return last();
+      });
+    }
+
+    it("completes a 3-hop chain on a single permit with a short acquire timeout", async () => {
+      _resetHttpStateForTests({ maxConcurrency: 1, acquireTimeoutMs: 50 });
+      const f = redirectChain();
+      const bytes = await downloadAttachmentBytes(link);
+      expect([...bytes]).toEqual([1, 2, 3]);
+      expect(f).toHaveBeenCalledTimes(3);
+    });
+
+    it("lets a second download run alongside the first, and later requests still get the permit", async () => {
+      _resetHttpStateForTests({ maxConcurrency: 1, acquireTimeoutMs: 200 });
+      redirectChain();
+      const [one, two] = await Promise.all([downloadAttachmentBytes(link), downloadAttachmentBytes(link)]);
+      expect(one.byteLength).toBe(3);
+      expect(two.byteLength).toBe(3);
+      setFetch(() => json(pageJson(1)));
+      await expect(getPage("30", false)).resolves.toMatchObject({ id: "30" });
+    });
+
+    it("frees the permit when the last hop is an error, and when a hop throws", async () => {
+      _resetHttpStateForTests({ maxConcurrency: 1, acquireTimeoutMs: 50 });
+      redirectChain(() => json({ message: "gone" }, 404));
+      await expect(downloadAttachmentBytes(link)).rejects.toBeInstanceOf(ConfluenceApiError);
+
+      setFetch((url) => {
+        if (new URL(url).pathname === "/b") throw new TypeError("fetch failed");
+        return new Response(null, { status: 302, headers: { Location: "/b" } });
+      });
+      await expect(downloadAttachmentBytes(link)).rejects.toBeInstanceOf(TypeError);
+
+      setFetch(() => json(pageJson(1)));
+      await expect(getPage("30", false)).resolves.toMatchObject({ id: "30" });
+    });
+  });
 });
 
 // =============================================================================
@@ -427,6 +502,40 @@ describe("R1 outcome-unknown writes", () => {
       throw new TypeError("fetch failed");
     });
     await expect(uploadAttachment("30", Buffer.from("x"), "f.txt")).rejects.toBeInstanceOf(WriteOutcomeUnknownError);
+  });
+
+  describe("comment, label, content-state and upload writes evict the parent page's cache on outcome-unknown", () => {
+    const writes: Array<[string, () => Promise<unknown>]> = [
+      ["createFooterComment", () => createFooterComment("30", "hi")],
+      ["createFooterComment (reply)", () => createFooterComment("30", "hi", "77")],
+      ["createInlineComment (reply)", () => createInlineComment("30", "hi", "text", 0, "77")],
+      ["addLabels", () => addLabels("30", ["x"])],
+      ["removeLabel", () => removeLabel("30", "x")],
+      ["setContentState", () => setContentState("30", "AI-edited", "#FFC400")],
+      ["removeContentState", () => removeContentState("30")],
+      ["uploadAttachment", () => uploadAttachment("30", Buffer.from("x"), "f.txt")],
+    ];
+
+    it.each(writes)("%s: a lost request evicts the cache and sets no version mark", async (_name, write) => {
+      pageCache.set("30", 5, "<p>cached</p>");
+      pageCache.set("31", 2, "<p>other</p>");
+      setFetch(() => {
+        throw new TypeError("fetch failed");
+      });
+      await expect(write()).rejects.toBeInstanceOf(WriteOutcomeUnknownError);
+      expect(pageCache.has("30")).toBeUndefined();
+      expect(pageCache.getOutcomeUnknown("30")).toBeUndefined();
+      // Only the parent page is touched.
+      expect(pageCache.has("31")).toMatchObject({ version: 2 });
+    });
+
+    it.each(writes)("%s: a definite failure (500) leaves the cache alone", async (_name, write) => {
+      pageCache.set("30", 5, "<p>cached</p>");
+      setFetch(() => json({ message: "boom" }, 500));
+      const err = await write().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ConfluenceApiError);
+      expect(pageCache.has("30")).toMatchObject({ version: 5 });
+    });
   });
 
   it("the mutation log record carries outcome: unknown, and only for these errors", () => {
@@ -558,6 +667,22 @@ describe("S7 409 classification", () => {
     const err = await _rawUpdatePage("30", { title: "T", version: 5 }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ConfluenceConflictError);
     expect((err as ConfluenceConflictError).currentVersion).toBeUndefined();
+  });
+
+  it("body version equal to the sent one and the re-read fails: the body is not trusted, non-retryable conflict", async () => {
+    conflictThenRead({ message: "The current version is 5" }, "fail");
+    const err = await _rawUpdatePage("30", { title: "T", version: 5 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceUnexpectedConflictError);
+    expect(err).not.toBeInstanceOf(ConfluenceConflictError);
+    expect((err as Error).message).not.toMatch(/retry your update with version/i);
+    expect((err as Error).message).not.toContain("version 6");
+  });
+
+  it("body version equal to the sent one, approval hint, re-read fails: approval-required, never a retry hint", async () => {
+    conflictThenRead({ message: "The current version is 5; the page requires approval" }, "fail");
+    const err = await _rawUpdatePage("30", { title: "T", version: 5 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConfluenceApprovalRequiredError);
+    expect(err).not.toBeInstanceOf(ConfluenceConflictError);
   });
 
   it("does not retry the PUT", async () => {

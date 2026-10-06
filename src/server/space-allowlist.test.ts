@@ -149,6 +149,64 @@ describe("assertSpaceAllowed (F3)", () => {
     expect(getSpaceKeyById).toHaveBeenCalledOnce();
   });
 
+  it("F3: the page→space cache is keyed per page id (no cross-page leakage)", async () => {
+    (getPage as any).mockImplementation(async (id: string) => ({
+      id,
+      title: "P",
+      spaceId: id === "42" ? "1001" : "1002",
+    }));
+    (getSpaceKeyById as any).mockImplementation(async (sid: string) =>
+      sid === "1001" ? "DOCS" : "OPS",
+    );
+    expect(await resolvePageSpace("42")).toBe("DOCS");
+    expect(await resolvePageSpace("43")).toBe("OPS");
+    // Second visits come from the cache and still round-trip independently.
+    expect(await resolvePageSpace("42")).toBe("DOCS");
+    expect(await resolvePageSpace("43")).toBe("OPS");
+    expect(getPage).toHaveBeenCalledTimes(2);
+    await expect(assertSpaceAllowed({ spaces: ["DOCS"], pageId: "43" })).rejects.toBeInstanceOf(
+      SpaceNotAllowedError,
+    );
+    await expect(
+      assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" }),
+    ).resolves.toBeUndefined();
+  });
+
+  describe("cache TTL", () => {
+    const TTL_MS = 5 * 60 * 1000;
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-10-06T12:00:00Z"));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("F3: still serves the cache at exactly the TTL, then re-resolves a moved page and rejects it", async () => {
+      (getPage as any).mockResolvedValueOnce({ id: "42", title: "P", spaceId: "1001" });
+      (getSpaceKeyById as any).mockResolvedValueOnce("DOCS");
+      expect(await resolvePageSpace("42")).toBe("DOCS");
+
+      // Boundary: exactly TTL old is still fresh.
+      vi.setSystemTime(Date.now() + TTL_MS);
+      await expect(
+        assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" }),
+      ).resolves.toBeUndefined();
+      expect(getPage).toHaveBeenCalledOnce();
+
+      // One millisecond past the TTL the entry is expired; the page has moved.
+      vi.setSystemTime(Date.now() + 1);
+      (getPage as any).mockResolvedValueOnce({ id: "42", title: "P", spaceId: "1002" });
+      (getSpaceKeyById as any).mockResolvedValueOnce("OPS");
+      await expect(assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" })).rejects.toBeInstanceOf(
+        SpaceNotAllowedError,
+      );
+      expect(getPage).toHaveBeenCalledTimes(2);
+      expect(getSpaceKeyById).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("F3: empty spaces array rejects all pageIds (paranoid no-write profile)", async () => {
     (getPage as any).mockResolvedValueOnce({
       id: "42",

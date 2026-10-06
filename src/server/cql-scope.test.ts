@@ -104,6 +104,30 @@ describe("scopeCql", () => {
     expect(reason('title ~ "x" ORDER BY title ORDER BY title')).toMatch(/ORDER BY/);
   });
 
+  it("splits a plain trailing ORDER BY correctly (positive pin for the glued-keyword rejections)", () => {
+    expect(ok("type=page ORDER BY title")).toBe('(type=page) AND space in ("DOCS") ORDER BY title');
+    expect(ok("(type=page) ORDER BY title")).toBe(
+      '((type=page)) AND space in ("DOCS") ORDER BY title',
+    );
+  });
+
+  it("rejects an ORDER BY glued to the preceding text instead of splitting it off", () => {
+    const glued = scopeCql("type=page.order by title", DOCS);
+    expect(glued.ok).toBe(false);
+    expect(reason("foo.order by bar")).toMatch(/ORDER BY/);
+    expect(reason("(type=page)order by title")).toMatch(/ORDER BY/);
+    expect(reason('title ~ "x"order by title')).toMatch(/ORDER BY/);
+  });
+
+  it("rejects an ORDER BY glued to the text after it", () => {
+    expect(reason("type=page ORDER BY(title)")).toMatch(/ORDER BY/);
+    expect(reason("type=page ORDER BY.title")).toMatch(/ORDER BY/);
+  });
+
+  it("does not treat a word merely containing 'order by' as the clause", () => {
+    expect(ok("title ~ reorder")).toBe('(title ~ reorder) AND space in ("DOCS")');
+  });
+
   it("rejects when no spaces are configured", () => {
     expect(reason('title ~ "x"', [])).toMatch(/no spaces/);
   });

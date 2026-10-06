@@ -930,6 +930,23 @@ function noteWriteOutcomeUnknown(
   if (cloudId !== undefined) invalidateForPage(cloudId, pageId);
 }
 
+/**
+ * Run a write that targets a page's surrounding state (comment, label, content
+ * state, attachment). If it ends with an unknown outcome, drop what the write
+ * may have made stale for that page: its cache entry and any confirmation
+ * tokens. No version mark: these writes do not carry a page version.
+ */
+async function guardPageSideWrite<T>(pageId: string, write: () => Promise<T>): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if (err instanceof WriteOutcomeUnknownError) {
+      noteWriteOutcomeUnknown(pageId, (await getConfig()).sealedCloudId);
+    }
+    throw err;
+  }
+}
+
 // --- HTTP helpers ---
 
 // Every outbound request goes through `sendGuarded` (R1): a timeout, a
@@ -1213,6 +1230,11 @@ export async function getSpaceKeyById(spaceId: string): Promise<string | undefin
 /** Testing only. */
 export function _resetSpaceKeyCacheForTests(): void {
   spaceKeyCache.clear();
+}
+
+/** Testing only: drop the memoised config so the next getConfig() re-resolves credentials. */
+export function _resetConfigForTests(): void {
+  _config = null;
 }
 
 export async function getPage(
@@ -1935,18 +1957,20 @@ export async function uploadAttachment(
   // POST: a transfer-length timeout, the shared permit, and no automatic
   // retry (a repeated upload would add a second copy or version). A failure
   // after the request was sent surfaces as WriteOutcomeUnknownError.
-  const raw = await sendGuarded(
-    attachUrl,
-    {
-      method: "POST",
-      headers: {
-        Authorization: cfg.authHeader,
-        "X-Atlassian-Token": "nocheck",
+  const raw = await guardPageSideWrite(pageId, () =>
+    sendGuarded(
+      attachUrl,
+      {
+        method: "POST",
+        headers: {
+          Authorization: cfg.authHeader,
+          "X-Atlassian-Token": "nocheck",
+        },
+        body: form,
       },
-      body: form,
-    },
-    "transfer",
-    (res) => res.json() as Promise<unknown>
+      "transfer",
+      (res) => res.json() as Promise<unknown>
+    )
   );
   const data = UploadResultSchema.parse(raw);
   const att = data.results[0];
@@ -2040,10 +2064,12 @@ export async function addLabels(
   labels: string[]
 ): Promise<void> {
   const cfg = await getConfig();
-  await confluenceSend(`${cfg.apiV1}/content/${pageId}/label`, {
-    method: "POST",
-    body: JSON.stringify(labels.map((name) => ({ prefix: "global", name }))),
-  });
+  await guardPageSideWrite(pageId, () =>
+    confluenceSend(`${cfg.apiV1}/content/${pageId}/label`, {
+      method: "POST",
+      body: JSON.stringify(labels.map((name) => ({ prefix: "global", name }))),
+    })
+  );
 }
 
 export async function removeLabel(
@@ -2053,7 +2079,7 @@ export async function removeLabel(
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/label`);
   url.searchParams.set("name", label);
-  await confluenceSend(url.toString(), { method: "DELETE" });
+  await guardPageSideWrite(pageId, () => confluenceSend(url.toString(), { method: "DELETE" }));
 }
 
 // --- Site settings (default locale) ---
@@ -2138,10 +2164,12 @@ export async function setContentState(
   const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
   url.searchParams.set("status", "current");
   try {
-    await confluenceSend(url.toString(), {
-      method: "PUT",
-      body: JSON.stringify({ name, color }),
-    });
+    await guardPageSideWrite(pageId, () =>
+      confluenceSend(url.toString(), {
+        method: "PUT",
+        body: JSON.stringify({ name, color }),
+      })
+    );
   } catch (err) {
     // R1 exemption: the only automatic retry of a PUT. Setting a status is
     // idempotent (same name and colour), so a repeat cannot double-apply.
@@ -2158,7 +2186,7 @@ export async function removeContentState(pageId: string): Promise<void> {
   const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
   url.searchParams.set("status", "current");
   try {
-    await confluenceSend(url.toString(), { method: "DELETE" });
+    await guardPageSideWrite(pageId, () => confluenceSend(url.toString(), { method: "DELETE" }));
   } catch (err) {
     // Idempotent — removing a status that doesn't exist is not an error
     if (err instanceof ConfluenceApiError && (err.status === 404 || err.status === 409)) return;
@@ -2227,7 +2255,7 @@ export async function createFooterComment(
         body: { representation: "storage", value: attributed },
       };
 
-  const raw = await v2Post("/footer-comments", payload);
+  const raw = await guardPageSideWrite(pageId, () => v2Post("/footer-comments", payload));
   return CommentSchema.parse(raw);
 }
 
@@ -2246,10 +2274,12 @@ export async function createInlineComment(
     : `<p><em>[AI-generated via Epimethian]</em></p>${sanitized}`;
 
   if (parentCommentId) {
-    const raw = await v2Post("/inline-comments", {
-      parentCommentId,
-      body: { representation: "storage", value: attributed },
-    });
+    const raw = await guardPageSideWrite(pageId, () =>
+      v2Post("/inline-comments", {
+        parentCommentId,
+        body: { representation: "storage", value: attributed },
+      })
+    );
     return CommentSchema.parse(raw);
   }
 
@@ -2276,15 +2306,17 @@ export async function createInlineComment(
     );
   }
 
-  const raw = await v2Post("/inline-comments", {
-    pageId,
-    body: { representation: "storage", value: attributed },
-    inlineCommentProperties: {
-      textSelection,
-      textSelectionMatchCount: count,
-      textSelectionMatchIndex,
-    },
-  });
+  const raw = await guardPageSideWrite(pageId, () =>
+    v2Post("/inline-comments", {
+      pageId,
+      body: { representation: "storage", value: attributed },
+      inlineCommentProperties: {
+        textSelection,
+        textSelectionMatchCount: count,
+        textSelectionMatchIndex,
+      },
+    })
+  );
   return CommentSchema.parse(raw);
 }
 
