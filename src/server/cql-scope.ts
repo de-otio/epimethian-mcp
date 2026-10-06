@@ -13,8 +13,10 @@
  *   - a quoted literal (`'` or `"`, backslash escapes) is not terminated;
  *   - parenthesis depth goes below zero at any point, or ends non-zero
  *     (outside literals);
- *   - `ORDER BY` appears inside parentheses, or the trailing `ORDER BY`
- *     clause is not `field [ASC|DESC] (, field [ASC|DESC])*`.
+ *   - `ORDER BY` appears inside parentheses, is glued to the text before or
+ *     after it (must start the string or follow whitespace, and be followed
+ *     by whitespace), or the trailing `ORDER BY` clause is not
+ *     `field [ASC|DESC] (, field [ASC|DESC])*`.
  *
  * A trailing `ORDER BY` is split off before wrapping, because it is only valid
  * at the end of a CQL query. Pure; no I/O.
@@ -30,6 +32,7 @@ export type ScopeResult =
   | { readonly ok: false; readonly reason: string };
 
 const WORD_CHAR_RE = /[A-Za-z0-9_]/;
+const WHITESPACE_RE = /\s/;
 const ORDER_BY_RE = /order\s+by\b/iy;
 const ORDER_FIELD = "[A-Za-z_][A-Za-z0-9_.]*";
 const ORDER_TERM = `${ORDER_FIELD}(?:\\s+(?:asc|desc))?`;
@@ -66,6 +69,15 @@ export function scopeCql(cql: string, spaceKeys: readonly string[]): ScopeResult
     } else if ((ch === "o" || ch === "O") && (i === 0 || !WORD_CHAR_RE.test(cql[i - 1]))) {
       ORDER_BY_RE.lastIndex = i;
       if (ORDER_BY_RE.test(cql)) {
+        // `foo.order by x` or `a)order by x` is ambiguous (a dotted field? the
+        // clause?). Splitting it would silently drop the glued tail, so reject.
+        if (i > 0 && !WHITESPACE_RE.test(cql[i - 1])) {
+          return reject("ORDER BY must be preceded by whitespace");
+        }
+        const next = cql[ORDER_BY_RE.lastIndex];
+        if (next !== undefined && !WHITESPACE_RE.test(next)) {
+          return reject("ORDER BY must be followed by whitespace");
+        }
         if (depth !== 0) return reject("ORDER BY is only allowed at the end of the query");
         orderByAt = i;
         break;
