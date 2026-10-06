@@ -92,6 +92,23 @@ describe("find_replace entries (R3)", () => {
     ]);
   });
 
+  it("an empty or whitespace-only body entry is refused, never spliced as a blank section", async () => {
+    // The shape check counts body: "" as a body; the post-transform body
+    // guard inside safePrepareBody is what refuses it (defence in depth).
+    for (const body of ["", "  \n\t"]) {
+      const err = await thrown(
+        safePrepareMultiSectionBody({
+          currentStorage: "<h2>A</h2><p>keep</p><h2>B</h2><p>b</p>",
+          sections: [{ section: "B", body: "<p>fine</p>" }, { section: "A", body }],
+        }),
+      );
+      expect(err).toBeInstanceOf(MultiSectionError);
+      const failures = (err as MultiSectionError).failures;
+      expect(failures).toEqual([expect.objectContaining({ section: "A", reason: "prepare" })]);
+      expect(failures[0].message).toContain("Post-transform body is empty");
+    }
+  });
+
   it("a failing find_replace entry rejects the whole call", async () => {
     const err = await thrown(
       safePrepareMultiSectionBody({
@@ -107,6 +124,62 @@ describe("find_replace entries (R3)", () => {
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({ section: "A", reason: "prepare" });
     expect(failures[0].message).toContain("FIND_REPLACE_AMBIGUOUS");
+  });
+});
+
+describe("section range guards (no splice into the wrong byte range)", () => {
+  it("two names resolving to the same empty section are refused, not both inserted", async () => {
+    // "1. A" matches exactly, "A" through the outline-prefix fallback: the
+    // same heading, whose body range is empty (bodyStart === bodyEnd).
+    const err = await thrown(
+      safePrepareMultiSectionBody({
+        currentStorage: "<h2>1. A</h2><h2>B</h2><p>b</p>",
+        sections: [
+          { section: "1. A", body: "<p>x</p>" },
+          { section: "A", body: "<p>y</p>" },
+        ],
+      }),
+    );
+    expect(err).toBeInstanceOf(MultiSectionError);
+    expect((err as MultiSectionError).failures).toEqual([
+      expect.objectContaining({ reason: "ambiguous" }),
+    ]);
+    expect((err as Error).message).toContain("overlaps with");
+  });
+
+  it("a section whose bytes also occur earlier (inside a code macro) is ambiguous", async () => {
+    // The heading inside CDATA is not a heading, so extractSection finds one
+    // section — but its exact bytes occur twice, and the first occurrence is
+    // inside the code macro. Splicing at indexOf() would edit the code.
+    const decoy =
+      '<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[<h2>A</h2><p>x</p>]]></ac:plain-text-body></ac:structured-macro>';
+    const err = await thrown(
+      safePrepareMultiSectionBody({
+        currentStorage: `${decoy}<h2>A</h2><p>x</p>`,
+        sections: [{ section: "A", find_replace: [{ find: "x", replace: "y" }] }],
+      }),
+    );
+    expect(err).toBeInstanceOf(MultiSectionError);
+    const failures = (err as MultiSectionError).failures;
+    expect(failures).toEqual([expect.objectContaining({ section: "A", reason: "ambiguous" })]);
+    expect(failures[0].message).toContain("more than once in the page");
+  });
+
+  it("a parent section and its nested child in one call overlap and are refused", async () => {
+    const err = await thrown(
+      safePrepareMultiSectionBody({
+        currentStorage:
+          "<h2>Parent</h2><p>p</p><h3>Child</h3><p>c</p><h2>Next</h2><p>n</p>",
+        sections: [
+          { section: "Parent", body: "<p>new parent</p>" },
+          { section: "Child", body: "<p>new child</p>" },
+        ],
+      }),
+    );
+    expect(err).toBeInstanceOf(MultiSectionError);
+    const failures = (err as MultiSectionError).failures;
+    expect(failures).toEqual([expect.objectContaining({ section: "Child", reason: "ambiguous" })]);
+    expect(failures[0].message).toContain('overlaps with "Parent"');
   });
 });
 
@@ -181,6 +254,51 @@ describe("section-qualified token ids", () => {
     expect(failures).toHaveLength(1);
     expect(failures[0].section).toBe("B");
     expect(failures[0].message).toContain("would delete 1 preserved element");
+  });
+
+  it("routes acks by exact section name when a heading contains '#'", async () => {
+    const hashSource =
+      `<h2>A</h2><p>a ${EMOTICON} a2</p>` +
+      `<h2>A#B</h2><p>b ${EMOTICON} b2</p>`;
+    const sections = [
+      { section: "A", find_replace: [{ find: "a [[epi:T0001]] a2", replace: "a a2" }] },
+      { section: "A#B", find_replace: [{ find: "b [[epi:T0001]] b2", replace: "b b2" }] },
+    ];
+    const out = await safePrepareMultiSectionBody({
+      currentStorage: hashSource,
+      sections,
+      confirmDeletions: ["A#T0001", "A#B#T0001"],
+    });
+    expect(out.aggregatedDeletedTokens.map((t) => t.id)).toEqual(["A#T0001", "A#B#T0001"]);
+    expect(out.finalStorage).toBe("<h2>A</h2><p>a a2</p><h2>A#B</h2><p>b b2</p>");
+
+    // "A#B#T0001" alone acknowledges section "A#B" only, never "A".
+    const err = await thrown(
+      safePrepareMultiSectionBody({
+        currentStorage: hashSource,
+        sections,
+        confirmDeletions: ["A#B#T0001"],
+      }),
+    );
+    expect(err).toBeInstanceOf(MultiSectionError);
+    const failures = (err as MultiSectionError).failures;
+    expect(failures.map((f) => f.section)).toEqual(["A"]);
+    expect(failures[0].message).toContain("would delete 1 preserved element");
+  });
+
+  it("rejects an ack whose part after the last '#' is not a token id", async () => {
+    const err = await thrown(
+      safePrepareMultiSectionBody({
+        currentStorage: source,
+        sections: dropBoth,
+        confirmDeletions: ["A#T0001", "B#T0001", "A#B"],
+      }),
+    );
+    expect(err).toBeInstanceOf(MultiSectionError);
+    expect((err as MultiSectionError).failures[0]).toMatchObject({
+      section: "(confirm_deletions)",
+      reason: "invalid",
+    });
   });
 
   it("rejects an ack naming a section that is not in the call", async () => {
