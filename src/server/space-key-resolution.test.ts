@@ -20,6 +20,7 @@ vi.mock("../shared/keychain.js", () => ({
 
 import {
   ConfluenceNotFoundError,
+  _resetConfigForTests,
   _resetSpaceKeyCacheForTests,
   getSpaceKeyById,
 } from "./confluence-client.js";
@@ -86,6 +87,37 @@ describe("getSpaceKeyById", () => {
     await expect(getSpaceKeyById("98765")).rejects.toBeInstanceOf(ConfluenceNotFoundError);
     await expect(getSpaceKeyById("98765")).rejects.toBeInstanceOf(ConfluenceNotFoundError);
     expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("isolates the cache per tenant: the same id on another tenant is looked up again", async () => {
+    const fetchFn = vi.fn(async (input: unknown) => {
+      const url = new URL(String(input));
+      const key = url.host === "test.atlassian.net" ? "DOCS" : "ADMIN";
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ...SPACE_98765, key }),
+        text: async () => "",
+      };
+    });
+    vi.stubGlobal("fetch", fetchFn);
+    const originalUrl = process.env.CONFLUENCE_URL;
+    try {
+      await expect(getSpaceKeyById("98765")).resolves.toBe("DOCS");
+
+      // Point the process at a second tenant WITHOUT clearing the space-key cache.
+      process.env.CONFLUENCE_URL = "https://other.atlassian.net";
+      process.env.CONFLUENCE_EMAIL = "user@example.com";
+      process.env.CONFLUENCE_API_TOKEN = "other-token";
+      _resetConfigForTests();
+
+      await expect(getSpaceKeyById("98765")).resolves.toBe("ADMIN");
+      expect(fetchFn).toHaveBeenCalledTimes(2);
+    } finally {
+      process.env.CONFLUENCE_URL = originalUrl;
+      process.env.CONFLUENCE_API_TOKEN = "test-token";
+      _resetConfigForTests();
+    }
   });
 
   it("refuses a non-numeric id without making a request (the id is spliced into a path)", async () => {
