@@ -71,6 +71,7 @@ import { isValidAttachmentFilename } from "./converter/filename-validator.js";
 import { safeWriteFile } from "../shared/safe-fs.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
+import { settleInChunks, DEFAULT_MAX_CONCURRENCY } from "./request-policy.js";
 import { markPageUnverified } from "./provenance.js";
 import {
   MultiSectionError,
@@ -3653,11 +3654,17 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
 
         if (include_replies) {
           // Fetch replies using allSettled to capture per-comment errors
-          const footerRepliesResults = await Promise.allSettled(
-            footerComments.map((c) => getCommentReplies(c.id, "footer"))
+          // R1: one request per comment, chunked so a long thread cannot queue
+          // more work than the shared concurrency cap can absorb.
+          const footerRepliesResults = await settleInChunks(
+            footerComments,
+            DEFAULT_MAX_CONCURRENCY,
+            (c) => getCommentReplies(c.id, "footer")
           );
-          const inlineRepliesResults = await Promise.allSettled(
-            inlineComments.map((c) => getCommentReplies(c.id, "inline"))
+          const inlineRepliesResults = await settleInChunks(
+            inlineComments,
+            DEFAULT_MAX_CONCURRENCY,
+            (c) => getCommentReplies(c.id, "inline")
           );
 
           // Assemble per-comment results with success/error shape

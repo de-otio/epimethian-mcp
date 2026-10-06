@@ -12,6 +12,15 @@ import { fenceUntrusted } from "./converter/untrusted-fence.js";
 
 declare const __PKG_VERSION__: string;
 import { pageCache } from "./page-cache.js";
+import { invalidateForPage } from "./confirmation-tokens.js";
+import {
+  Semaphore,
+  decideRetry,
+  httpTimeoutMs,
+  DEFAULT_MAX_CONCURRENCY,
+  DEFAULT_ACQUIRE_TIMEOUT_MS,
+  type HttpKind,
+} from "./request-policy.js";
 import {
   resolvePosture,
   resolveEffectivePosture,
@@ -293,8 +302,7 @@ export async function probeWriteCapability(): Promise<"write" | "read-only" | "i
       permUrl.searchParams.set("targetType", "page");
 
       try {
-        const res = await confluenceRequest(permUrl.toString());
-        const raw = (await res.json()) as unknown;
+        const raw = (await confluenceJson(permUrl.toString())) as unknown;
         // The response is typically { operation: { operation: "create", targetType: "page" }, havePermission: boolean }
         // When operationKey+targetType are specified, Confluence returns a single permission object.
         if (raw && typeof raw === "object") {
@@ -329,7 +337,7 @@ export async function probeWriteCapability(): Promise<"write" | "read-only" | "i
 
   // --- Fallback strategy: dry-run PUT against a non-existent page ---
   try {
-    await confluenceRequest(`${cfg.apiV2}/pages/999999999999`, {
+    await confluenceSend(`${cfg.apiV2}/pages/999999999999`, {
       method: "PUT",
       body: JSON.stringify({}),
     });
@@ -835,29 +843,280 @@ export class ConfluenceConflictError extends Error {
   }
 }
 
+/**
+ * A page PUT was rejected with 409 although the page is still at the version
+ * the caller sent, so the version check was not the cause. The caller must
+ * NOT retry with another version number: the cause is a space policy, not a
+ * stale read.
+ */
+export class ConfluenceUnexpectedConflictError extends Error {
+  readonly pageId: string;
+  readonly version: number;
+  constructor(pageId: string, version: number) {
+    super(
+      `Confluence rejected the update of page ${pageId} with a conflict (409), but the page is ` +
+        `still at version ${version}, the version you sent, so this is not a stale-version ` +
+        `conflict. The update was not applied. Retrying with a different version number will ` +
+        `not help; check for another page with the same title in the space, the space's ` +
+        `approval settings and the page's edit restrictions. If the page was edited moments ` +
+        `ago, get_page shows its current state.`
+    );
+    this.name = "ConfluenceUnexpectedConflictError";
+    this.pageId = pageId;
+    this.version = version;
+  }
+}
+
+/**
+ * Same situation as ConfluenceUnexpectedConflictError, and the 409 body
+ * mentions approval or publishing: the space very likely requires publishing
+ * approval for direct edits. The body text is only a hint, so the message
+ * says "appears".
+ */
+export class ConfluenceApprovalRequiredError extends Error {
+  readonly pageId: string;
+  readonly version: number;
+  constructor(pageId: string, version: number) {
+    super(
+      `Confluence rejected the update of page ${pageId} (409) although the page is still at ` +
+        `version ${version}, the version you sent. This space appears to require approval ` +
+        `before changes are published, which direct API edits cannot satisfy. The update was ` +
+        `not applied and retrying will not help; make the change through the Confluence ` +
+        `editor and its approval flow.`
+    );
+    this.name = "ConfluenceApprovalRequiredError";
+    this.pageId = pageId;
+    this.version = version;
+  }
+}
+
+/** Hint only: does a 409 body talk about approval or publishing? */
+const APPROVAL_HINT_RE = /\b(approv\w*|publish\w*)\b/i;
+
+/**
+ * Raised, before any request is sent, when this process's last write to the
+ * page ended with an unknown outcome and the agent has not re-read the page
+ * since. Without this, a retry that resolves `version: "current"` would read
+ * the already-updated page and apply the same change a second time.
+ */
+export class PageOutcomeUnknownError extends Error {
+  readonly pageId: string;
+  constructor(pageId: string) {
+    super(
+      `An earlier write to page ${pageId} ended without a response, so it may or may not have ` +
+        `been applied. Call get_page to see the page as it is now, then decide whether the ` +
+        `change is still needed. This write was not sent.`
+    );
+    this.name = "PageOutcomeUnknownError";
+    this.pageId = pageId;
+  }
+}
+
+/** Drop what an unknown-outcome write may have made stale. */
+function noteWriteOutcomeUnknown(
+  pageId: string,
+  cloudId: string | undefined,
+  attemptedVersion?: number
+): void {
+  pageCache.delete(pageId);
+  if (attemptedVersion !== undefined) {
+    pageCache.markOutcomeUnknown(pageId, attemptedVersion);
+  }
+  // Tokens minted against the old content must not authorise a write now.
+  if (cloudId !== undefined) invalidateForPage(cloudId, pageId);
+}
+
 // --- HTTP helpers ---
 
-async function confluenceRequest(
-  url: string,
-  options: RequestInit = {}
-): Promise<Response> {
-  const cfg = await getConfig();
-  const res = await fetch(url, { headers: cfg.jsonHeaders, ...options });
-  if (!res.ok) {
-    const body = await res.text();
-    console.error(`Confluence API error (${res.status}): ${sanitizeError(body)}`);
+// Every outbound request goes through `sendGuarded` (R1): a timeout, a
+// process-wide concurrency cap and, for GET/HEAD only, a bounded retry on
+// 429/503 that honours `Retry-After`. The policy decisions live in
+// request-policy.ts; this file applies them.
+//
+// Retry exemptions, deliberately kept: `setContentState` and `resolveComment`
+// retry a 409 themselves, because each retry re-reads the version first.
+// Nothing else retries a PUT, POST or DELETE.
 
-    if (res.status === 401) {
-      throw new ConfluenceAuthError(res.status, body);
-    } else if (res.status === 403) {
-      throw new ConfluencePermissionError(res.status, body);
-    } else if (res.status === 404) {
-      throw new ConfluenceNotFoundError(res.status, body);
-    } else {
-      throw new ConfluenceApiError(res.status, body);
-    }
+/**
+ * The request timed out or failed AFTER a write was sent, or the response to
+ * a write could not be read. The write may have been applied. Never retried
+ * automatically: a blind retry could append or replace twice.
+ */
+export class WriteOutcomeUnknownError extends Error {
+  /** Duck-typed by mutation-log's `errorRecord` to stamp `outcome: "unknown"`. */
+  readonly outcomeUnknown = true as const;
+  readonly method: string;
+  constructor(method: string, url: string, cause: unknown, phase: "request" | "response") {
+    const reason = isAbortLike(cause)
+      ? "timed out"
+      : `failed (${sanitizeError(cause instanceof Error ? cause.message : String(cause))})`;
+    const what = phase === "request" ? "the request" : "reading the response";
+    super(
+      `Confluence ${method} ${pathOf(url)}: ${what} ${reason} after the write was sent. ` +
+        `The write may have been applied. Check the current state (get_page, or search_pages ` +
+        `after a create) before retrying; do not repeat the write blindly.`
+    );
+    this.name = "WriteOutcomeUnknownError";
+    this.method = method;
+    this.cause = cause;
   }
-  return res;
+}
+
+/** A read (GET/HEAD) hit its timeout. Nothing was written. */
+export class ConfluenceTimeoutError extends Error {
+  constructor(method: string, url: string, timeoutMs: number) {
+    super(
+      `Confluence ${method} ${pathOf(url)} timed out after ${Math.round(timeoutMs / 1000)}s. ` +
+        `Nothing was changed; try again.`
+    );
+    this.name = "ConfluenceTimeoutError";
+  }
+}
+
+/** Path only: the query string can carry titles or CQL. */
+function pathOf(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "(unparseable url)";
+  }
+}
+
+function isAbortLike(err: unknown): boolean {
+  return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+}
+
+/** Injectable clock, sleep and random for the retry path. */
+interface HttpHooks {
+  sleep: (ms: number) => Promise<void>;
+  random: () => number;
+  now: () => number;
+}
+
+const defaultHttpHooks = (): HttpHooks => ({
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  random: Math.random,
+  now: Date.now,
+});
+
+// Module singletons (mutated only by the test hook below).
+let httpHooks: HttpHooks = defaultHttpHooks();
+let httpSemaphore = new Semaphore(DEFAULT_MAX_CONCURRENCY, DEFAULT_ACQUIRE_TIMEOUT_MS);
+
+/** Test hook: reset the semaphore and hooks, optionally overriding them. */
+export function _resetHttpStateForTests(
+  over: Partial<HttpHooks> & { maxConcurrency?: number; acquireTimeoutMs?: number } = {}
+): void {
+  const { maxConcurrency, acquireTimeoutMs, ...hooks } = over;
+  httpHooks = { ...defaultHttpHooks(), ...hooks };
+  httpSemaphore = new Semaphore(
+    maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
+    acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS
+  );
+}
+
+function apiErrorFor(status: number, body: string): ConfluenceApiError {
+  if (status === 401) return new ConfluenceAuthError(status, body);
+  if (status === 403) return new ConfluencePermissionError(status, body);
+  if (status === 404) return new ConfluenceNotFoundError(status, body);
+  return new ConfluenceApiError(status, body);
+}
+
+type Step<T> = { done: true; value: T } | { done: false; delayMs: number };
+
+/**
+ * Send one request under the policy and hand a 2xx response to `consume`
+ * while the concurrency permit is still held, so the body read is covered by
+ * both the permit and the timeout.
+ *
+ * Failure semantics:
+ *   - reads: a timeout becomes ConfluenceTimeoutError; other transport errors
+ *     propagate unchanged;
+ *   - writes: ANY failure after the request was sent (transport error,
+ *     timeout, or an unreadable 2xx body) becomes WriteOutcomeUnknownError;
+ *   - a non-2xx status is a definite answer and becomes a ConfluenceApiError.
+ */
+async function sendGuarded<T>(
+  url: string,
+  init: RequestInit,
+  kind: HttpKind,
+  consume: (res: Response) => Promise<T>
+): Promise<T> {
+  const method = (init.method ?? "GET").toUpperCase();
+  const isRead = method === "GET" || method === "HEAD";
+  const timeoutMs = httpTimeoutMs(kind, process.env.EPIMETHIAN_HTTP_TIMEOUT_MS);
+
+  for (let attempt = 1; ; attempt++) {
+    // The permit covers one attempt and is released before any Retry-After
+    // sleep. No request is made while a permit is held.
+    const step = await httpSemaphore.run(async (): Promise<Step<T>> => {
+      let res: Response;
+      try {
+        res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+      } catch (err) {
+        if (!isRead) throw new WriteOutcomeUnknownError(method, url, err, "request");
+        if (isAbortLike(err)) throw new ConfluenceTimeoutError(method, url, timeoutMs);
+        throw err;
+      }
+
+      if (res.ok) {
+        try {
+          return { done: true, value: await consume(res) };
+        } catch (err) {
+          if (!isRead) throw new WriteOutcomeUnknownError(method, url, err, "response");
+          if (isAbortLike(err)) throw new ConfluenceTimeoutError(method, url, timeoutMs);
+          throw err;
+        }
+      }
+
+      const body = await res.text().catch(() => "");
+      console.error(`Confluence API error (${res.status}): ${sanitizeError(body)}`);
+      const decision = decideRetry({
+        method,
+        status: res.status,
+        // Fake responses in tests may lack `headers`.
+        retryAfterHeader: res.headers?.get("retry-after"),
+        attempt,
+        nowMs: httpHooks.now(),
+        random: httpHooks.random,
+      });
+      if (decision.retry) return { done: false, delayMs: decision.delayMs };
+      // A gateway error on a write (502/504) says the proxy gave up, not that
+      // the origin did nothing: the write may have been applied.
+      if (!isRead && (res.status === 502 || res.status === 504)) {
+        throw new WriteOutcomeUnknownError(method, url, new Error(`HTTP ${res.status}`), "response");
+      }
+      throw apiErrorFor(res.status, body);
+    });
+    if (step.done) return step.value;
+    await httpHooks.sleep(step.delayMs);
+  }
+}
+
+async function confluenceFetch<T>(
+  url: string,
+  options: RequestInit,
+  consume: (res: Response) => Promise<T>
+): Promise<T> {
+  const cfg = await getConfig();
+  const method = (options.method ?? "GET").toUpperCase();
+  const kind: HttpKind = method === "GET" || method === "HEAD" ? "read" : "write";
+  return sendGuarded(url, { headers: cfg.jsonHeaders, ...options }, kind, consume);
+}
+
+/** Send a request and return its parsed JSON body. */
+async function confluenceJson(url: string, options: RequestInit = {}): Promise<unknown> {
+  return confluenceFetch(url, options, (res) => res.json() as Promise<unknown>);
+}
+
+/**
+ * Send a request whose response body is not needed (DELETE, label POST, ...).
+ * The body is released unread so the socket is freed.
+ */
+async function confluenceSend(url: string, options: RequestInit = {}): Promise<void> {
+  await confluenceFetch(url, options, async (res) => {
+    await Promise.resolve(res.body?.cancel?.()).catch(() => {});
+  });
 }
 
 async function v2Get(
@@ -871,31 +1130,28 @@ async function v2Get(
       url.searchParams.set(k, String(v));
     }
   }
-  const res = await confluenceRequest(url.toString());
-  return res.json();
+  return confluenceJson(url.toString());
 }
 
 async function v2Post(path: string, body: unknown): Promise<unknown> {
   const cfg = await getConfig();
-  const res = await confluenceRequest(`${cfg.apiV2}${path}`, {
+  return confluenceJson(`${cfg.apiV2}${path}`, {
     method: "POST",
     body: JSON.stringify(body),
   });
-  return res.json();
 }
 
 async function v2Put(path: string, body: unknown): Promise<unknown> {
   const cfg = await getConfig();
-  const res = await confluenceRequest(`${cfg.apiV2}${path}`, {
+  return confluenceJson(`${cfg.apiV2}${path}`, {
     method: "PUT",
     body: JSON.stringify(body),
   });
-  return res.json();
 }
 
 async function v2Delete(path: string): Promise<void> {
   const cfg = await getConfig();
-  await confluenceRequest(`${cfg.apiV2}${path}`, { method: "DELETE" });
+  await confluenceSend(`${cfg.apiV2}${path}`, { method: "DELETE" });
 }
 
 // --- Public API ---
@@ -908,7 +1164,29 @@ export async function resolveSpaceId(spaceKey: string): Promise<string> {
   return space.id;
 }
 
+/**
+ * An unknown-outcome mark is moot once the server shows the version that
+ * write was based on: the write was not applied, and the version check still
+ * protects any later write. A higher version stays marked until the agent
+ * re-reads the page (see `formatPage`).
+ */
+function observeVersionForOutcome(page: PageData): void {
+  const mark = pageCache.getOutcomeUnknown(page.id);
+  if (mark && page.version?.number === mark.attemptedVersion) {
+    pageCache.clearOutcomeUnknown(page.id);
+  }
+}
+
 export async function getPage(
+  pageId: string,
+  includeBody: boolean
+): Promise<PageData> {
+  const page = await getPageUnobserved(pageId, includeBody);
+  observeVersionForOutcome(page);
+  return page;
+}
+
+async function getPageUnobserved(
   pageId: string,
   includeBody: boolean
 ): Promise<PageData> {
@@ -967,7 +1245,13 @@ export async function _rawCreatePage(
   };
   if (parentId) payload.parentId = parentId;
   const raw = await v2Post("/pages", payload);
-  const page = PageSchema.parse(raw);
+  let page: PageData;
+  try {
+    page = PageSchema.parse(raw);
+  } catch (err) {
+    // The POST succeeded; an unreadable answer must not read as "not created".
+    throw new WriteOutcomeUnknownError("POST", `${cfg.apiV2}/pages`, err, "response");
+  }
 
   // Cache the body we just sent (new pages start at version 1)
   pageCache.set(page.id, page.version?.number ?? 1, pageBody);
@@ -1040,6 +1324,15 @@ export async function _rawUpdatePage(
     };
   }
 
+  // R1: after a write whose outcome is unknown, refuse a write based on a
+  // newer version until the agent has re-read the page. A write based on the
+  // marked version itself stays allowed: if the earlier write landed, the
+  // version check rejects this one with a 409.
+  const unknownMark = pageCache.getOutcomeUnknown(pageId);
+  if (unknownMark && opts.version > unknownMark.attemptedVersion) {
+    throw new PageOutcomeUnknownError(pageId);
+  }
+
   // Pre-write snapshot for recovery
   if (opts.previousBody !== undefined) {
     pageCache.setSnapshot(pageId, opts.version, opts.previousBody);
@@ -1049,19 +1342,33 @@ export async function _rawUpdatePage(
   try {
     raw = await v2Put(`/pages/${pageId}`, payload);
   } catch (err) {
+    if (err instanceof WriteOutcomeUnknownError) {
+      noteWriteOutcomeUnknown(pageId, cfg.sealedCloudId, opts.version);
+      throw err;
+    }
     if (err instanceof ConfluenceApiError && err.status === 409) {
       // C2: best-effort extraction of the current server version so the
-      // caller can retry without an extra get_page round-trip. If the
-      // response body doesn't expose it, fall back to a follow-up GET.
+      // caller can retry without an extra get_page round-trip.
       let currentVersion = parseConflictCurrentVersion(err.rawBody);
-      if (currentVersion === undefined) {
+      // S7: a body-parsed version equal to the one the caller sent is
+      // ambiguous (a stale conflict would report a newer one), so confirm it
+      // with a fresh read. Also the fallback when the body has no version.
+      if (currentVersion === undefined || currentVersion === opts.version) {
         try {
           const refresh = await v2Get(`/pages/${pageId}`, {});
           const parsed = PageSchema.parse(refresh);
-          currentVersion = parsed.version?.number;
+          currentVersion = parsed.version?.number ?? currentVersion;
         } catch {
-          // Swallow — currentVersion stays undefined.
+          // Swallow — currentVersion stays as parsed (possibly undefined).
         }
+      }
+      // S7: the page is still at the version the caller sent, yet the PUT
+      // (version + 1) got a 409. That is not a stale-version conflict, so
+      // never suggest "retry with version N". The body text is only a hint.
+      if (currentVersion === opts.version) {
+        throw APPROVAL_HINT_RE.test(err.rawBody)
+          ? new ConfluenceApprovalRequiredError(pageId, opts.version)
+          : new ConfluenceUnexpectedConflictError(pageId, opts.version);
       }
       throw new ConfluenceConflictError(pageId, {
         currentVersion,
@@ -1070,7 +1377,17 @@ export async function _rawUpdatePage(
     }
     throw err;
   }
-  const page = PageSchema.parse(raw);
+  let page: PageData;
+  try {
+    page = PageSchema.parse(raw);
+  } catch (err) {
+    // The PUT returned 2xx; an unreadable answer must not read as "not written".
+    noteWriteOutcomeUnknown(pageId, cfg.sealedCloudId, opts.version);
+    throw new WriteOutcomeUnknownError("PUT", `${cfg.apiV2}/pages/${pageId}`, err, "response");
+  }
+
+  // The write is confirmed, so any earlier unknown outcome is settled.
+  pageCache.clearOutcomeUnknown(pageId);
 
   // Cache the body we just sent (reuse pre-computed pageBody)
   if (pageBody !== undefined) {
@@ -1110,7 +1427,16 @@ export async function deletePage(
       });
     }
   }
-  await v2Delete(`/pages/${pageId}`);
+  try {
+    await v2Delete(`/pages/${pageId}`);
+  } catch (err) {
+    if (err instanceof WriteOutcomeUnknownError) {
+      // No mark: a later write to a deleted page 404s, and a page that
+      // survived is an ordinary page. Only drop what may now be stale.
+      noteWriteOutcomeUnknown(pageId, (await getConfig()).sealedCloudId);
+    }
+    throw err;
+  }
   pageCache.delete(pageId);
 }
 
@@ -1123,8 +1449,7 @@ export async function searchPages(
   const url = new URL(`${cfg.url}/wiki/rest/api/search`);
   url.searchParams.set("cql", cql);
   url.searchParams.set("limit", String(limit));
-  const res = await confluenceRequest(url.toString());
-  const raw = await res.json() as any;
+  const raw = await confluenceJson(url.toString()) as any;
   // /rest/api/search nests page data under `content` with excerpt at result level
   // Flatten into PageSchema-compatible shape
   const results: PageData[] = [];
@@ -1227,8 +1552,7 @@ export async function searchUsers(
   const url = new URL(`${cfg.apiV1}/search/user`);
   url.searchParams.set("cql", `user.fullname~"${escapeCqlString(query)}"`);
   url.searchParams.set("limit", String(Math.min(limit, 10)));
-  const res = await confluenceRequest(url.toString());
-  const raw = await res.json();
+  const raw = await confluenceJson(url.toString());
   const data = UserSearchResultSchema.parse(raw);
   return data.results.map((r) => ({
     accountId: r.user.accountId,
@@ -1260,8 +1584,7 @@ export async function searchPagesByTitle(
   url.searchParams.set("cql", cql);
   url.searchParams.set("limit", "10");
   url.searchParams.set("expand", "space");
-  const res = await confluenceRequest(url.toString());
-  const raw = (await res.json()) as any;
+  const raw = (await confluenceJson(url.toString())) as any;
 
   const results: PageLinkResult[] = [];
   for (const r of raw.results ?? []) {
@@ -1292,8 +1615,7 @@ export async function getAttachments(
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/child/attachment`);
   url.searchParams.set("limit", String(limit));
-  const res = await confluenceRequest(url.toString());
-  const raw = await res.json();
+  const raw = await confluenceJson(url.toString());
   return AttachmentsResultSchema.parse(raw).results;
 }
 
@@ -1391,9 +1713,12 @@ export function resolveDownloadUrl(downloadLink: string, siteUrl: string): strin
 /**
  * Fetch the bytes of an attachment described by `meta`.
  *
- * Deliberately does not go through `confluenceRequest`: that helper sets
+ * Deliberately does not go through `confluenceFetch`: that helper sets
  * `Content-Type: application/json` and treats any non-2xx as an error, and
- * this request must handle redirects itself. Confluence redirects downloads
+ * this request must handle redirects itself. It still obeys the R1 policy by
+ * hand: one transfer-length timeout for the whole download, and a concurrency
+ * permit held per hop and through the body read. No automatic retry: a 429
+ * surfaces as an error. Confluence redirects downloads
  * to a media host whose URL carries its own signed token — forwarding the
  * `Authorization` header there would leak the site credentials to a different
  * origin, so the header is dropped the moment the hop leaves the site origin.
@@ -1424,42 +1749,58 @@ export async function downloadAttachmentBytes(
   // re-attach it on a site → third-party → site chain, which is exactly the
   // shape an open redirect would take.
   let credentialed = true;
-  let res: Response | null = null;
+  const timeoutMs = httpTimeoutMs("transfer", process.env.EPIMETHIAN_HTTP_TIMEOUT_MS);
+  // One timeout for the whole download, redirects and body included.
+  const signal = AbortSignal.timeout(timeoutMs);
 
-  for (let hop = 0; hop <= MAX_DOWNLOAD_REDIRECTS; hop++) {
-    const current: Response = await fetch(url, {
-      headers: credentialed ? { Authorization: cfg.authHeader } : {},
-      redirect: "manual",
-    });
-    const isRedirect = current.status >= 300 && current.status < 400;
-    const location = isRedirect ? current.headers.get("location") : null;
-    if (!location) {
-      res = current;
-      break;
+  try {
+    for (let hop = 0; hop <= MAX_DOWNLOAD_REDIRECTS; hop++) {
+      // The permit covers one hop; the final hop keeps it through the body read.
+      const outcome = await httpSemaphore.run(
+        async (): Promise<{ bytes: Buffer } | { next: string; credentialed: boolean }> => {
+          const current: Response = await fetch(url, {
+            headers: credentialed ? { Authorization: cfg.authHeader } : {},
+            redirect: "manual",
+            signal,
+          });
+          const isRedirect = current.status >= 300 && current.status < 400;
+          const location = isRedirect ? current.headers.get("location") : null;
+          if (!location) return { bytes: await readDownloadResponse(current, meta) };
+          // A 3xx under `redirect: "manual"` may still carry a body. Release it
+          // rather than leaking the socket for the rest of the chain.
+          await current.body?.cancel().catch(() => {});
+          const next = new URL(location, url);
+          return {
+            next: next.toString(),
+            credentialed: credentialed && next.origin === siteOrigin,
+          };
+        }
+      );
+      if ("bytes" in outcome) return outcome.bytes;
+      url = outcome.next;
+      credentialed = outcome.credentialed;
     }
-    // A 3xx under `redirect: "manual"` may still carry a body. Release it
-    // rather than leaking the socket for the rest of the chain.
-    await current.body?.cancel().catch(() => {});
-    const next = new URL(location, url);
-    credentialed = credentialed && next.origin === siteOrigin;
-    url = next.toString();
+  } catch (err) {
+    if (isAbortLike(err)) throw new ConfluenceTimeoutError("GET", url, timeoutMs);
+    throw err;
   }
 
-  if (!res) {
-    throw new Error(
-      `Too many redirects while downloading attachment ${meta.id}.`
-    );
-  }
+  throw new Error(
+    `Too many redirects while downloading attachment ${meta.id}.`
+  );
+}
 
+/** Validate a final download response and read its bytes under the size ceiling. */
+async function readDownloadResponse(
+  res: Response,
+  meta: AttachmentMetadata
+): Promise<Buffer> {
   if (!res.ok) {
     // Error bodies are text, not the attachment payload. sanitizeError
     // truncates and strips any credential material before it reaches a log.
     const body = await res.text();
     console.error(`Confluence API error (${res.status}): ${sanitizeError(body)}`);
-    if (res.status === 401) throw new ConfluenceAuthError(res.status, body);
-    if (res.status === 403) throw new ConfluencePermissionError(res.status, body);
-    if (res.status === 404) throw new ConfluenceNotFoundError(res.status, body);
-    throw new ConfluenceApiError(res.status, body);
+    throw apiErrorFor(res.status, body);
   }
 
   const declared = Number(res.headers.get("content-length"));
@@ -1503,8 +1844,7 @@ export async function getPageVersions(
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/version`);
   url.searchParams.set("limit", String(limit));
-  const res = await confluenceRequest(url.toString());
-  const raw = await res.json();
+  const raw = await confluenceJson(url.toString());
   const data = VersionsResultSchema.parse(raw);
   // Truncate messages (untrusted user content)
   return data.results.map((v) => ({
@@ -1531,8 +1871,7 @@ export async function getPageVersionBody(
   const url = new URL(`${cfg.apiV1}/content/${pageId}`);
   url.searchParams.set("version", String(version));
   url.searchParams.set("expand", "body.storage,version");
-  const res = await confluenceRequest(url.toString());
-  const raw = await res.json();
+  const raw = await confluenceJson(url.toString());
   const data = V1PageVersionSchema.parse(raw);
   const rawBody = data.body.storage.value;
 
@@ -1555,20 +1894,23 @@ export async function uploadAttachment(
   if (comment) form.append("comment", comment);
 
   const attachUrl = `${cfg.apiV1}/content/${pageId}/child/attachment`;
-  const res = await fetch(attachUrl, {
-    method: "POST",
-    headers: {
-      Authorization: cfg.authHeader,
-      "X-Atlassian-Token": "nocheck",
+  // POST: a transfer-length timeout, the shared permit, and no automatic
+  // retry (a repeated upload would add a second copy or version). A failure
+  // after the request was sent surfaces as WriteOutcomeUnknownError.
+  const raw = await sendGuarded(
+    attachUrl,
+    {
+      method: "POST",
+      headers: {
+        Authorization: cfg.authHeader,
+        "X-Atlassian-Token": "nocheck",
+      },
+      body: form,
     },
-    body: form,
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    console.error(`Confluence API error (${res.status}): ${sanitizeError(body)}`);
-    throw new ConfluenceApiError(res.status, body);
-  }
-  const data = UploadResultSchema.parse(await res.json());
+    "transfer",
+    (res) => res.json() as Promise<unknown>
+  );
+  const data = UploadResultSchema.parse(raw);
   const att = data.results[0];
   if (!att) throw new Error("Attachment uploaded but no details returned.");
   return { title: att.title, id: att.id, fileSize: att.extensions?.fileSize };
@@ -1649,10 +1991,9 @@ export function normalizeBodyForSubmit(body: string): string {
 
 export async function getLabels(pageId: string): Promise<LabelData[]> {
   const cfg = await getConfig();
-  const res = await confluenceRequest(
-    `${cfg.apiV1}/content/${pageId}/label`
+  const data = LabelsResultSchema.parse(
+    await confluenceJson(`${cfg.apiV1}/content/${pageId}/label`)
   );
-  const data = LabelsResultSchema.parse(await res.json());
   return data.results;
 }
 
@@ -1661,7 +2002,7 @@ export async function addLabels(
   labels: string[]
 ): Promise<void> {
   const cfg = await getConfig();
-  await confluenceRequest(`${cfg.apiV1}/content/${pageId}/label`, {
+  await confluenceSend(`${cfg.apiV1}/content/${pageId}/label`, {
     method: "POST",
     body: JSON.stringify(labels.map((name) => ({ prefix: "global", name }))),
   });
@@ -1674,7 +2015,7 @@ export async function removeLabel(
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/label`);
   url.searchParams.set("name", label);
-  await confluenceRequest(url.toString(), { method: "DELETE" });
+  await confluenceSend(url.toString(), { method: "DELETE" });
 }
 
 // --- Site settings (default locale) ---
@@ -1707,8 +2048,7 @@ export async function getSiteDefaultLocale(cfg: Config): Promise<string | undefi
 
   const promise = (async () => {
     try {
-      const res = await confluenceRequest(`${cfg.apiV1}/settings/systemInfo`);
-      const data = (await res.json()) as { defaultLocale?: unknown };
+      const data = (await confluenceJson(`${cfg.apiV1}/settings/systemInfo`)) as { defaultLocale?: unknown };
       const raw = typeof data?.defaultLocale === "string" ? data.defaultLocale : undefined;
       if (!raw) return undefined;
       // Confluence returns "en_GB"/"de_DE"; normalize to "en"/"de".
@@ -1731,8 +2071,7 @@ export async function getContentState(
   const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
   url.searchParams.set("status", "current");
   try {
-    const res = await confluenceRequest(url.toString());
-    const data = await res.json();
+    const data = await confluenceJson(url.toString());
     // Confluence Cloud returns the state wrapped:
     //   { "contentState": { "id": …, "name": …, "color": … }, "lastUpdated": … }
     // When no state is set: { "contentState": null } (or an older shape with
@@ -1761,11 +2100,13 @@ export async function setContentState(
   const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
   url.searchParams.set("status", "current");
   try {
-    await confluenceRequest(url.toString(), {
+    await confluenceSend(url.toString(), {
       method: "PUT",
       body: JSON.stringify({ name, color }),
     });
   } catch (err) {
+    // R1 exemption: the only automatic retry of a PUT. Setting a status is
+    // idempotent (same name and colour), so a repeat cannot double-apply.
     if (err instanceof ConfluenceApiError && err.status === 409 && attempt < 2) {
       await new Promise((resolve) => setTimeout(resolve, 200));
       return setContentState(pageId, name, color, attempt + 1);
@@ -1779,7 +2120,7 @@ export async function removeContentState(pageId: string): Promise<void> {
   const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
   url.searchParams.set("status", "current");
   try {
-    await confluenceRequest(url.toString(), { method: "DELETE" });
+    await confluenceSend(url.toString(), { method: "DELETE" });
   } catch (err) {
     // Idempotent — removing a status that doesn't exist is not an error
     if (err instanceof ConfluenceApiError && (err.status === 404 || err.status === 409)) return;
@@ -1937,6 +2278,8 @@ export async function resolveComment(
   try {
     result = await v2Put(`/inline-comments/${commentId}`, putPayload);
   } catch (err) {
+    // R1 exemption: retried on 409 only, and each retry re-reads the comment
+    // version first; setting `resolved` is idempotent.
     if (err instanceof ConfluenceApiError && err.status === 409 && attempt < 2) {
       return resolveComment(commentId, resolved, attempt + 1);
     }
@@ -2477,6 +2820,10 @@ export async function formatPage(
       : optionsOrIncludeBody;
 
   const { includeBody = false, headingsOnly = false } = options;
+
+  // R1: rendering a page that carries its body is the agent-visible re-read
+  // that settles an unknown-outcome write mark (see `_rawUpdatePage`).
+  if (page.body !== undefined) pageCache.clearOutcomeUnknown(page.id);
 
   const cfg = await getConfig();
   const spaceKey = page.spaceId ?? page.space?.key ?? "N/A";

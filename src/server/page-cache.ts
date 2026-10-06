@@ -10,6 +10,13 @@ export class PageCache {
   private cache = new Map<string, { version: number; body: string }>();
   /** Separate map for pre-write snapshots to avoid eviction pressure (Finding 10). */
   private snapshots = new Map<string, { version: number; body: string }>();
+  /**
+   * Pages whose last write ended with an unknown outcome (timeout or network
+   * error after the request was sent), with the base version that write used.
+   * Cleared by an agent-visible read, by observing that base version, or by a
+   * later successful write.
+   */
+  private unknownOutcome = new Map<string, { attemptedVersion: number }>();
   private maxSize: number;
   private maxSnapshotSize: number;
 
@@ -114,10 +121,33 @@ export class PageCache {
     return undefined;
   }
 
+  /**
+   * Record that a write based on `attemptedVersion` may or may not have been
+   * applied. Bounded like the other maps; the oldest mark is dropped first.
+   */
+  markOutcomeUnknown(pageId: string, attemptedVersion: number): void {
+    this.unknownOutcome.delete(pageId);
+    if (this.unknownOutcome.size >= this.maxSnapshotSize * 4) {
+      const oldest = this.unknownOutcome.keys().next().value!;
+      this.unknownOutcome.delete(oldest);
+    }
+    this.unknownOutcome.set(pageId, { attemptedVersion });
+  }
+
+  /** The unknown-outcome mark for a page, if any. */
+  getOutcomeUnknown(pageId: string): { attemptedVersion: number } | undefined {
+    return this.unknownOutcome.get(pageId);
+  }
+
+  clearOutcomeUnknown(pageId: string): void {
+    this.unknownOutcome.delete(pageId);
+  }
+
   /** Empty the cache. */
   clear(): void {
     this.cache.clear();
     this.snapshots.clear();
+    this.unknownOutcome.clear();
   }
 
   get size(): number {
