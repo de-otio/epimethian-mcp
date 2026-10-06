@@ -92,6 +92,16 @@ describe("scopeCql", () => {
     expect(reason('title ~ "x\\')).toMatch(/unterminated/);
   });
 
+  it("rejects a backslash outside a quoted literal (scanner/CQL lexer desync payload)", () => {
+    // A lexer that reads `\"` outside a literal as an escaped quote would see
+    // the `)` below as closing the wrapper, and AND binds tighter than OR.
+    const payload = 'title ~ a\\" ) OR space = SECRET OR ( title ~ " b \\" c "';
+    expect(reason(payload)).toMatch(/backslash/);
+    expect(reason("title ~ a\\b")).toMatch(/backslash/);
+    expect(reason("title ~ x\\")).toMatch(/backslash/);
+    expect(reason('title ~ "ok" AND \\')).toMatch(/backslash/);
+  });
+
   it("rejects ORDER BY inside parentheses", () => {
     expect(reason('(title ~ "x" ORDER BY title)')).toMatch(/ORDER BY/);
   });
