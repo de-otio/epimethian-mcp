@@ -271,8 +271,14 @@ If a write times out, the connection drops, or a gateway answers 502 or
 applied it. It raises `WriteOutcomeUnknownError`, logs the mutation with
 `outcome: "unknown"`, evicts the cached page, invalidates tokens for that
 page and refuses further writes based on a newer version until the page
-has been re-read. It does not retry: a blind retry of an append or a
-replace could apply the change twice.
+has been re-read in full. Only a complete body read counts: a truncated
+body, a section, `headings_only` or a read without a body leaves the mark
+in place, because the part the write added may be exactly what was not
+shown. Observing the old version does not clear it either, since a slow
+write can still land afterwards. The read that clears the mark carries a
+server-authored note naming the version the lost write was based on and the
+version the page is at now. It does not retry: a blind retry of an append
+or a replace could apply the change twice.
 
 What remains for the agent or user: read the page and decide. The
 protection covers this process only. A second server process, or a human

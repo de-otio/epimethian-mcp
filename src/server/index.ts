@@ -32,6 +32,7 @@ import {
   type PageData,
   extractSection,
   extractSectionBody,
+  settleOutcomeUnknown,
   replaceSection,
   truncateStorageFormat,
   toMarkdownView,
@@ -390,22 +391,32 @@ async function renderPageRead(
   const truncation = origLen > effectiveMax ? { origLen } : undefined;
   const capped = truncation ? truncateStorageFormat(body, effectiveMax) : body;
 
+  // Only a COMPLETE body read settles the mark left by a write whose outcome
+  // was unknown: a truncated body may hide exactly the part that write added.
+  // Headings-only and section reads (above) never settle it. When a mark is
+  // cleared the agent is told, in server-authored text outside the fence.
+  const settleNote = truncation === undefined ? settleOutcomeUnknown(page) : undefined;
+  const withNote = (text: string): string =>
+    settleNote === undefined ? text : `${text}\n\n${settleNote}`;
+
   if (format === "markdown") {
     const { markdown, sidecar } = storageToMarkdown(capped);
     return toolResult(
-      await renderBodyResult(page, formatMarkdownBody(markdown, sidecar), {
-        kind: "markdown",
-        truncation,
-      })
+      withNote(
+        await renderBodyResult(page, formatMarkdownBody(markdown, sidecar), {
+          kind: "markdown",
+          truncation,
+        })
+      )
     );
   }
 
   if (body.length === 0) {
     // Nothing to fence; formatPage omits the Content block for an empty body.
-    return toolResult(await formatPage(page, { includeBody: true }));
+    return toolResult(withNote(await formatPage(page, { includeBody: true })));
   }
   return toolResult(
-    await renderBodyResult(page, capped, { kind: "storage", truncation })
+    withNote(await renderBodyResult(page, capped, { kind: "storage", truncation }))
   );
 }
 

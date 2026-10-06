@@ -519,3 +519,62 @@ describe("heading-ambiguity error does not echo raw tenant text (S2 item 4)", ()
   });
 });
 
+// ---------------------------------------------------------------------------
+// Unknown-outcome marks: only a complete body read settles them (R2.3)
+// ---------------------------------------------------------------------------
+
+describe("unknown-outcome mark and reads", () => {
+  // The page is at version 3 in the fixture; the lost write was based on 2.
+  beforeEach(() => {
+    pageCache.markOutcomeUnknown(PAGE_ID, 2);
+  });
+
+  it("a truncated body read keeps the mark and shows no note", async () => {
+    const { text } = await callTool("get_page", { max_length: 60 });
+    expect(text).toContain("[truncated:");
+    expect(text).not.toContain("unknown outcome");
+    expect(pageCache.getOutcomeUnknown(PAGE_ID)).toEqual({ attemptedVersion: 2 });
+  });
+
+  it("a section read keeps the mark", async () => {
+    await callTool("get_page", { section: "Setup" });
+    expect(pageCache.getOutcomeUnknown(PAGE_ID)).toBeDefined();
+  });
+
+  it("headings_only keeps the mark", async () => {
+    await callTool("get_page", { headings_only: true });
+    expect(pageCache.getOutcomeUnknown(PAGE_ID)).toBeDefined();
+  });
+
+  it("a read without a body keeps the mark", async () => {
+    await callTool("get_page", { include_body: false });
+    expect(pageCache.getOutcomeUnknown(PAGE_ID)).toBeDefined();
+  });
+
+  for (const format of ["storage", "markdown"] as const) {
+    it(`a complete ${format} read clears the mark and says so outside the fence`, async () => {
+      const { text } = await callTool("get_page", { format });
+      expect(pageCache.getOutcomeUnknown(PAGE_ID)).toBeUndefined();
+      const { outside } = splitFences(text);
+      expect(outside).toContain("an earlier write to this page, based on version 2, ended with an unknown outcome");
+      expect(outside).toContain("the page is now at version 3");
+      expectBodyOnlyInsideFence(text, format === "markdown" ? "markdown" : "body");
+    });
+  }
+
+  it("get_page_by_title behaves the same: truncated keeps, complete clears with a note", async () => {
+    const truncated = await callTool("get_page_by_title", { max_length: 60 });
+    expect(truncated.text).not.toContain("unknown outcome");
+    expect(pageCache.getOutcomeUnknown(PAGE_ID)).toBeDefined();
+    const full = await callTool("get_page_by_title", { max_length: 0 });
+    expect(full.text).toContain("ended with an unknown outcome");
+    expect(pageCache.getOutcomeUnknown(PAGE_ID)).toBeUndefined();
+  });
+
+  it("with no mark there is no note", async () => {
+    pageCache.clearOutcomeUnknown(PAGE_ID);
+    const { text } = await callTool("get_page", {});
+    expect(text).not.toContain("unknown outcome");
+  });
+});
+
