@@ -61,6 +61,7 @@ import {
   ProfileNotConfiguredError,
 } from "./confluence-client.js";
 import {
+  computeStorageDiff,
   computeSummaryDiff,
   computeUnifiedDiff,
   MAX_DIFF_SIZE,
@@ -71,6 +72,7 @@ import { isValidAttachmentFilename } from "./converter/filename-validator.js";
 import { safeWriteFile } from "../shared/safe-fs.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
+import { settleInChunks, DEFAULT_MAX_CONCURRENCY } from "./request-policy.js";
 import { markPageUnverified } from "./provenance.js";
 import {
   MultiSectionError,
@@ -3653,11 +3655,17 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
 
         if (include_replies) {
           // Fetch replies using allSettled to capture per-comment errors
-          const footerRepliesResults = await Promise.allSettled(
-            footerComments.map((c) => getCommentReplies(c.id, "footer"))
+          // R1: one request per comment, chunked so a long thread cannot queue
+          // more work than the shared concurrency cap can absorb.
+          const footerRepliesResults = await settleInChunks(
+            footerComments,
+            DEFAULT_MAX_CONCURRENCY,
+            (c) => getCommentReplies(c.id, "footer")
           );
-          const inlineRepliesResults = await Promise.allSettled(
-            inlineComments.map((c) => getCommentReplies(c.id, "inline"))
+          const inlineRepliesResults = await settleInChunks(
+            inlineComments,
+            DEFAULT_MAX_CONCURRENCY,
+            (c) => getCommentReplies(c.id, "inline")
           );
 
           // Assemble per-comment results with success/error shape
@@ -3914,7 +3922,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         "Costs 1 API call." +
         "\n\n" +
         "Returns sanitized read-only markdown, NOT raw Confluence storage format. " +
-        "Macros are replaced with placeholders. This content is NOT suitable for round-trip " +
+        "Macros are replaced with placeholders, except that the bodies of " +
+        "info/note/warning/tip/panel/expand appear as block quotes. This content is NOT suitable for round-trip " +
         "updates via update_page — the conversion is lossy. " +
         "To revert a page to a previous version, use revert_page instead."
       ),
@@ -3958,8 +3967,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     {
       description: withUntrustedNote(
         "Compare two versions of a Confluence page. Returns a section-aware change " +
-        "summary or unified diff. Always operates on sanitized text (macro content " +
-        "replaced with placeholders). Costs 2-3 API calls."
+        "summary, a unified diff of the text, or (format: storage) a unified diff of " +
+        "the storage XML with regenerated ids removed. The text views show the bodies of " +
+        "info/note/warning/tip/panel/expand macros and replace other macros with " +
+        "placeholders; when only macro internals or attributes changed, the summary " +
+        "says so rather than reporting no changes. Costs 2-3 API calls."
       ),
       inputSchema: {
         page_id: pageIdSchema.describe("Confluence page ID"),
@@ -3983,11 +3995,12 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "Max characters for unified diff output. Excess is truncated."
           ),
         format: z
-          .enum(["summary", "unified"])
+          .enum(["summary", "unified", "storage"])
           .default("summary")
           .describe(
             "Output format: 'summary' (default) for section-level change list, " +
-            "'unified' for a unified text diff"
+            "'unified' for a unified text diff, 'storage' for a unified diff of the " +
+            "storage XML (read-only; never pass it to a write tool)"
           ),
       },
       annotations: { readOnlyHint: true },
@@ -4033,8 +4046,9 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         }
 
         // Convert to sanitized text
-        const textA = toMarkdownView(fromResult.rawBody);
-        const textB = toMarkdownView(toResult.rawBody);
+        // The storage format compares the XML itself; skip the markdown pass.
+        const textA = format === "storage" ? "" : toMarkdownView(fromResult.rawBody);
+        const textB = format === "storage" ? "" : toMarkdownView(toResult.rawBody);
 
         const titleFenced = fenceUntrusted(fromResult.title, {
           pageId: page_id,
@@ -4042,7 +4056,22 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         });
         const versionTag = `${from_version}-${actualToVersion}`;
 
-        if (format === "unified") {
+        if (format === "storage") {
+          const result = computeStorageDiff(fromResult.rawBody, toResult.rawBody, max_length);
+          const header = `Storage diff: v${from_version} → v${actualToVersion}`;
+          const body = result.identical
+            ? "No changes (ignoring regenerated local-id and macro-id attributes)."
+            : result.diff;
+          const truncNote = result.truncated ? "\n[output truncated]" : "";
+          const diffFenced = fenceUntrusted(body, {
+            pageId: page_id,
+            field: "diff",
+            version: versionTag,
+          });
+          return toolResult(
+            `${header}\nTitle:\n${titleFenced}\n\n${diffFenced}${truncNote}` + echo
+          );
+        } else if (format === "unified") {
           const result = computeUnifiedDiff(textA, textB, max_length);
           const header = `Diff: v${from_version} → v${actualToVersion}`;
           const truncNote = result.truncated ? "\n[output truncated]" : "";
@@ -4055,9 +4084,25 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             `${header}\nTitle:\n${titleFenced}\n\n${diffFenced}${truncNote}` + echo
           );
         } else {
-          const result = computeSummaryDiff(textA, textB);
+          const result = computeSummaryDiff(textA, textB, {
+            a: fromResult.rawBody,
+            b: toResult.rawBody,
+          });
           const header = `Diff summary: v${from_version} → v${actualToVersion}`;
           const lines = [header, "Title:", titleFenced, "", result.summary];
+          if (result.storage && result.storage.macros.length > 0) {
+            // Macro names come from the page, so they are fenced like any
+            // other tenant text, even though their alphabet is restricted.
+            const more =
+              result.storage.moreMacros > 0 ? ` (+${result.storage.moreMacros} more)` : "";
+            lines.push(
+              fenceUntrusted(result.storage.macros.join(", ") + more, {
+                pageId: page_id,
+                field: "diff",
+                version: versionTag,
+              })
+            );
+          }
           if (result.sections.length > 0) {
             lines.push("", "Section changes:");
             for (const s of result.sections) {

@@ -86,6 +86,12 @@ export interface MutationRecord {
    * ID, the freshly-emitted creation-side token ID, and the macro kind.
    */
   regeneratedTokens?: Array<{ oldId: string; newId: string; kind: string }>;
+  /**
+   * R1: set to "unknown" when the request was sent but no usable response
+   * came back (timeout, network error), so the write may or may not have been
+   * applied. A forensic audit must not read such a record as "not written".
+   */
+  outcome?: "unknown";
   error?: string;
 }
 
@@ -202,6 +208,14 @@ export function logMutation(record: MutationRecord): void {
   }
 }
 
+function isOutcomeUnknown(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { outcomeUnknown?: unknown }).outcomeUnknown === true
+  );
+}
+
 /**
  * Build a MutationRecord for an error case with sanitized error message.
  */
@@ -216,6 +230,9 @@ export function errorRecord(
     operation,
     pageId,
     error: sanitizeErrorMessage(err),
+    // Duck-typed (WriteOutcomeUnknownError lives in confluence-client.ts,
+    // which would make this import circular).
+    ...(isOutcomeUnknown(err) ? { outcome: "unknown" as const } : {}),
     ...extra,
   };
 }
