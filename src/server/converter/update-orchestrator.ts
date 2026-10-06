@@ -15,12 +15,13 @@
  * will wire it into `update_page`.
  */
 
-import { tokeniseStorage } from "./tokeniser.js";
+import { placeholderLiteralSurplus, tokeniseStorage } from "./tokeniser.js";
 import { restoreFromTokens } from "./restore.js";
 import { markdownToStorage } from "./md-to-storage.js";
 import { diffTokens } from "./diff.js";
 import {
   ConverterError,
+  PLACEHOLDER_LITERAL_IN_PAGE,
   type ConverterOptions,
   type TokenDiff,
   type TokenId,
@@ -393,6 +394,18 @@ export function planUpdate(params: PlanUpdateInput): UpdatePlan {
 
   // 2. Tokenise the current storage to discover what must be preserved.
   const { canonical, sidecar } = tokeniseStorage(currentStorage);
+
+  // 2b. `[[epi:` literals in the page text are indistinguishable from real
+  //     placeholders once the caller's markdown comes back: restore would
+  //     expand them into macro copies and drop the literal text. Refuse.
+  if (placeholderLiteralSurplus(canonical, sidecar) > 0) {
+    throw new ConverterError(
+      "The current content contains literal `[[epi:` text outside any macro, " +
+        "so placeholders cannot be restored unambiguously. Edit this content " +
+        "with a Confluence storage-format body instead of markdown.",
+      PLACEHOLDER_LITERAL_IN_PAGE
+    );
+  }
 
   // 3. Diff caller's markdown against the canonical pre-edit markdown.
   const diff: TokenDiff = diffTokens(canonical, callerMarkdown, sidecar);

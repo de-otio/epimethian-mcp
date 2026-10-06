@@ -72,9 +72,9 @@ vi.mock("./mutation-log.js", async (importOriginal) => {
   };
 });
 
+import { applyFindReplace } from "./converter/find-replace-engine.js";
 import {
   emitDestructiveBanner,
-  findReplaceInSection,
   MultiSectionError,
   safePrepareBody,
   safePrepareMultiSectionBody,
@@ -2469,6 +2469,14 @@ describe("safePrepareMultiSectionBody (D1)", () => {
 // ---------------------------------------------------------------------------
 
 describe("findReplaceInSection (D2)", () => {
+  // 7.0.0: the substitution moved into the find/replace engine; these D2
+  // cases still hold for its output body. New S1 behaviour is covered in
+  // converter/find-replace-engine.test.ts.
+  const findReplaceInSection = (
+    body: string,
+    pairs: Parameters<typeof applyFindReplace>[1],
+  ) => applyFindReplace(body, pairs).body;
+
   it("replaces a plain-text literal in a simple section body", () => {
     const body = "<p>Hello world. See <strong>1. Overview</strong> for more.</p>";
     const result = findReplaceInSection(body, [

@@ -67,6 +67,7 @@ import {
   type PageData,
 } from "./confluence-client.js";
 import {
+  computeDiffHash,
   validateToken,
   invalidateForPage,
 } from "./confirmation-tokens.js";
@@ -88,9 +89,25 @@ import {
   errorRecord,
   type MutationRecord,
 } from "./mutation-log.js";
-import { tokeniseStorage } from "./converter/tokeniser.js";
-import { recentSignalsTracker } from "./converter/untrusted-fence.js";
-import { detectUntrustedFenceInWrite } from "./session-canary.js";
+import {
+  TOKEN_LITERAL_PREFIX,
+  tokeniseStorage,
+} from "./converter/tokeniser.js";
+import {
+  CLOSE_FENCE,
+  OPEN_FENCE_PREFIX,
+  recentSignalsTracker,
+} from "./converter/untrusted-fence.js";
+import {
+  detectUntrustedFenceInWrite,
+  getSessionCanary,
+} from "./session-canary.js";
+import {
+  applyFindReplace,
+  type FindReplacePair,
+  type FindReplacePairOutcome,
+} from "./converter/find-replace-engine.js";
+import { createHash } from "node:crypto";
 import { writeBudget } from "./write-budget.js";
 import {
   canonicaliseToken,
@@ -530,6 +547,8 @@ export const DELETION_ACK_MISMATCH = "DELETION_ACK_MISMATCH";
 export const POST_TRANSFORM_BODY_REJECTED = "POST_TRANSFORM_BODY_REJECTED";
 /** Thrown when the caller passes read-only markdown. */
 export const READ_ONLY_MARKDOWN_ROUND_TRIP = "READ_ONLY_MARKDOWN_ROUND_TRIP";
+/** Substring of the marker get_page puts into `format: markdown` output. */
+const READ_ONLY_MARKDOWN_MARKER_TEXT = "epimethian:read-only-markdown";
 /** Thrown when body contains BOTH Confluence storage tags and markdown structural patterns. */
 export const MIXED_INPUT_DETECTED = "MIXED_INPUT_DETECTED";
 /** Thrown when the caller-supplied body exceeds MAX_INPUT_BODY. */
@@ -544,10 +563,19 @@ export const WRITE_CONTAINS_UNTRUSTED_FENCE = "WRITE_CONTAINS_UNTRUSTED_FENCE";
  */
 export const MULTI_SECTION_FAILED = "MULTI_SECTION_FAILED";
 /**
- * Thrown by findReplaceInSection when a find string does not appear in the
- * section body (after tokenising). No silent no-op — the page is not modified.
+ * find_replace error codes live with the engine (converter/find-replace-
+ * engine.ts); re-exported here so handlers and tests keep one import site.
  */
-export const FIND_REPLACE_MATCH_FAILED = "FIND_REPLACE_MATCH_FAILED";
+export {
+  DUPLICATED_TOKEN,
+  FIND_REPLACE_AMBIGUOUS,
+  FIND_REPLACE_INVALID,
+  FIND_REPLACE_MATCH_FAILED,
+  FORGED_TOKEN,
+  type FindReplacePair,
+  type FindReplacePairOutcome,
+} from "./converter/find-replace-engine.js";
+export { PLACEHOLDER_LITERAL_IN_PAGE } from "./converter/types.js";
 
 // ---------------------------------------------------------------------------
 // confirm_token helpers (Phase 2 / v6.6.0)
@@ -1225,6 +1253,46 @@ function warnBlanketDeletionAck(tokens: DeletedToken[]): void {
   );
 }
 
+/**
+ * The confirm_deletions gate shared by every token-aware write path (body
+ * mode and find_replace). `subject` names what is deleting the tokens in
+ * the DELETIONS_NOT_CONFIRMED message ("caller markdown" for body mode, so
+ * that message stays byte-identical to planUpdate's).
+ */
+function enforceDeletionAck(
+  deletedTokens: DeletedToken[],
+  confirmDeletions: string[] | true | undefined,
+  subject: string,
+): void {
+  if (deletedTokens.length > 0) {
+    if (confirmDeletions === undefined) {
+      // Match the current DELETIONS_NOT_CONFIRMED error shape from
+      // planUpdate so migrating handlers don't need to update assertions.
+      const summary = deletedTokens
+        .map((d) => `${d.id} (${d.fingerprint})`)
+        .join(", ");
+      const noun = deletedTokens.length === 1 ? "element" : "elements";
+      throw new ConverterError(
+        `${subject} would delete ${deletedTokens.length} preserved ${noun}: ${summary}. ` +
+          `Re-submit with confirm_deletions: true to acknowledge the removal.`,
+        "DELETIONS_NOT_CONFIRMED",
+      );
+    }
+    if (confirmDeletions === true) {
+      // Deprecated blanket ack — accepted, but the warning lists the
+      // specific IDs for the next call.
+      warnBlanketDeletionAck(deletedTokens);
+    } else {
+      // Itemised ack — must exactly match the actual deletion set.
+      assertDeletionAckMatches(confirmDeletions, deletedTokens);
+    }
+  } else if (Array.isArray(confirmDeletions) && confirmDeletions.length > 0) {
+    // Caller acked deletions that didn't happen. Surface the mismatch so
+    // stale ack lists don't go unnoticed.
+    assertDeletionAckMatches(confirmDeletions, deletedTokens);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // safePrepareBody
 // ---------------------------------------------------------------------------
@@ -1313,7 +1381,7 @@ export async function safePrepareBody(
   // 1. Read-only-markdown rejection — hard guard, no opt-out. Mirrors the
   //    identical check in create_page / update_page / update_page_section
   //    handlers; consolidating it here lets those handlers drop their copies.
-  if (body.includes("epimethian:read-only-markdown")) {
+  if (body.includes(READ_ONLY_MARKDOWN_MARKER_TEXT)) {
     throw new ConverterError(
       "The body contains content produced by get_page with format: 'markdown', which is a " +
         "read-only rendering not suitable for round-trip updates (tables, macros, and rich " +
@@ -1379,6 +1447,19 @@ export async function safePrepareBody(
     // Token diff doesn't make sense for additive ops (the current body
     // round-trips unchanged). Content guards still run post-concat inside
     // safeSubmitPage. If markdown, convert the caller's addition only.
+    //
+    // Placeholders mean nothing here (there is no sidecar to restore from),
+    // and an appended `[[epi:` literal would make every later token-aware
+    // edit of that content ambiguous (PLACEHOLDER_LITERAL_IN_PAGE).
+    if (body.includes(TOKEN_LITERAL_PREFIX)) {
+      throw new ConverterError(
+        "The content contains `[[epi:` placeholder text. Placeholders from a " +
+          "markdown read cannot be appended or prepended: there is no macro " +
+          "to restore them from. Remove them, or write the macro in storage " +
+          "format.",
+        "INVENTED_TOKEN",
+      );
+    }
     finalStorage = isMarkdown ? markdownToStorage(body, converterOptions) : body;
   } else if (isMarkdown) {
     const hasExistingTokens =
@@ -1480,33 +1561,7 @@ export async function safePrepareBody(
   // Deletion acknowledgement check. `replaceBody` bypasses the token-diff
   // path entirely (planUpdate returns deletedTokens: []), so this block
   // only fires when a genuine diff reported deletions.
-  if (deletedTokens.length > 0) {
-    if (confirmDeletions === undefined) {
-      // Match the current DELETIONS_NOT_CONFIRMED error shape from
-      // planUpdate so migrating handlers don't need to update assertions.
-      const summary = deletedTokens
-        .map((d) => `${d.id} (${d.fingerprint})`)
-        .join(", ");
-      const noun = deletedTokens.length === 1 ? "element" : "elements";
-      throw new ConverterError(
-        `caller markdown would delete ${deletedTokens.length} preserved ${noun}: ${summary}. ` +
-          `Re-submit with confirm_deletions: true to acknowledge the removal.`,
-        "DELETIONS_NOT_CONFIRMED",
-      );
-    }
-    if (confirmDeletions === true) {
-      // Deprecated blanket ack — accepted, but the warning lists the
-      // specific IDs for the next call.
-      warnBlanketDeletionAck(deletedTokens);
-    } else {
-      // Itemised ack — must exactly match the actual deletion set.
-      assertDeletionAckMatches(confirmDeletions, deletedTokens);
-    }
-  } else if (Array.isArray(confirmDeletions) && confirmDeletions.length > 0) {
-    // Caller acked deletions that didn't happen. Surface the mismatch so
-    // stale ack lists don't go unnoticed.
-    assertDeletionAckMatches(confirmDeletions, deletedTokens);
-  }
+  enforceDeletionAck(deletedTokens, confirmDeletions, "caller markdown");
 
   // 5. Content safety guards.
   //
@@ -1880,78 +1935,244 @@ export async function safeSubmitPage(
 }
 
 // ---------------------------------------------------------------------------
-// findReplaceInSection (D2: find_replace mode for update_page_section)
+// find_replace (S1: update_page_section / update_page_sections)
 // ---------------------------------------------------------------------------
 
 /**
- * One find/replace pair supplied by the caller.
+ * Thrown when `version: "current"` is combined with a placeholder in any
+ * find or replace string. Placeholder ids are positional (T0001 is the
+ * first macro of the section at read time); a write that skips the version
+ * check could apply them to a page whose macros have shifted since.
  */
-export interface FindReplacePair {
-  /** Literal string to find (not a regex). */
-  find: string;
-  /** Replacement string (may contain Confluence storage syntax). */
-  replace: string;
+export const PLACEHOLDER_NEEDS_PINNED_VERSION = "PLACEHOLDER_NEEDS_PINNED_VERSION";
+
+/** Reject `version: "current"` when any pair references a placeholder. */
+export function assertFindReplaceVersionPinned(
+  pairs: readonly FindReplacePair[],
+  version: number | "current",
+): void {
+  if (version !== "current") return;
+  const usesPlaceholder = pairs.some(
+    (p) =>
+      p.find.includes(TOKEN_LITERAL_PREFIX) ||
+      p.replace.includes(TOKEN_LITERAL_PREFIX),
+  );
+  if (usesPlaceholder) {
+    throw new ConverterError(
+      `${PLACEHOLDER_NEEDS_PINNED_VERSION}: ` +
+        'find_replace with `[[epi:` placeholders requires a numeric version, not "current": ' +
+        "placeholder ids are positional and can point at a different macro " +
+        "if the page changed since your read. Pass the version from that read.",
+      PLACEHOLDER_NEEDS_PINNED_VERSION,
+    );
+  }
+}
+
+export interface SafePrepareFindReplaceInput {
+  /** Current section body (heading excluded — contract 1's placeholder base). */
+  sectionBody: string;
+  pairs: readonly FindReplacePair[];
+  /** Same semantics as SafePrepareBodyInput.confirmDeletions. */
+  confirmDeletions?: string[] | true;
+}
+
+export interface SafePrepareFindReplaceOutput {
+  /** The section body with every pair applied (storage format). */
+  newSectionBody: string;
+  /** Macros whose placeholder the pairs removed; already acknowledged. */
+  deletedTokens: DeletedToken[];
+  /** Per-pair match kind and count, in input order. */
+  perPair: FindReplacePairOutcome[];
+  /** Deletion note for the version message ("" when nothing was removed). */
+  versionMessage: string;
 }
 
 /**
- * Apply a sequence of literal find/replace substitutions to a Confluence
- * storage-format section body.
+ * Prepare a find_replace section edit. Pure; no API calls.
  *
- * DATA-LOSS GUARD: substitutions are ONLY applied to plain-text tokens, never
- * inside macro attribute values or CDATA bodies. The section body is first
- * tokenised with tokeniseStorage(), which replaces every outer <ac:*>, <ri:*>,
- * and <time> element with an opaque placeholder. Substitutions run on the
- * placeholder-bearing canonical form, so they can only touch text that exists
- * outside any macro boundary. The sidecar is then restored verbatim.
- *
- * Semantics:
- *   - Each pair's `find` is a LITERAL string (not a regex). We use
- *     `split(find).join(replace)` to avoid any regex-special-char hazards.
- *   - Substitutions are applied IN ORDER; each subsequent `find` searches the
- *     partially-substituted canonical, so chained substitutions work as
- *     expected.
- *   - If a `find` string does not appear in the canonical BEFORE that step is
- *     applied, the call FAILS with a structured error. No silent no-op. The
- *     page is NOT modified.
- *
- * @returns The storage-format body with all substitutions applied.
- * @throws ConverterError (code FIND_REPLACE_MATCH_FAILED) if any find string
- *   is absent from the (partially-substituted) canonical.
+ * Deliberately NOT routed through safePrepareBody: the replace strings are
+ * storage fragments, and safePrepareBody would markdown-convert a bare text
+ * fragment. Instead the same guards run here explicitly:
+ *   1. size cap on every find/replace string (MAX_INPUT_BODY);
+ *   2. fence/canary echo and read-only-markdown checks on each replace and
+ *      on their concatenation (a canary split across two pairs is caught);
+ *   3. the engine (exactly-once matching, placeholder invariants, single-
+ *      pass restore — see converter/find-replace-engine.ts);
+ *   4. lost placeholders → DeletedToken[] → the confirm_deletions gate,
+ *      exactly as body mode.
+ * Page-level checks (marker non-growth, content-safety guards) need the
+ * spliced full page and run in enforceFindReplacePageGuards.
  */
-export function findReplaceInSection(
-  sectionBody: string,
-  pairs: readonly FindReplacePair[],
-): string {
-  // Tokenise: replace all macro elements with opaque placeholders.
-  // This is the key safety step — substitutions cannot touch macro internals.
-  const { canonical: tokenised, sidecar } = tokeniseStorage(sectionBody);
+export function safePrepareFindReplace(
+  input: SafePrepareFindReplaceInput,
+): SafePrepareFindReplaceOutput {
+  const { sectionBody, pairs, confirmDeletions } = input;
 
-  // Apply each pair in order against the running tokenised form.
-  let working = tokenised;
-  for (const { find, replace } of pairs) {
-    if (!working.includes(find)) {
-      const err = new ConverterError(
-        `find_replace: the find string ${JSON.stringify(find)} does not appear ` +
-          `in the section body (after macro tokenisation). No changes were made. ` +
-          `Check that the find string matches text outside macro/attribute boundaries.`,
-        FIND_REPLACE_MATCH_FAILED,
+  for (const p of pairs) {
+    if (p.find.length > MAX_INPUT_BODY || p.replace.length > MAX_INPUT_BODY) {
+      throw new ConverterError(
+        `find_replace strings are limited to ${MAX_INPUT_BODY.toLocaleString()} characters each.`,
+        INPUT_BODY_TOO_LARGE,
       );
-      throw err;
     }
-    // Literal replacement: split on the literal string, rejoin with replacement.
-    // This avoids any regex special-character hazards in `find`.
-    working = working.split(find).join(replace);
   }
 
-  // Restore macro tokens verbatim from the sidecar.
-  // Any token literal that was inside a `find` match would not have been in
-  // the sidecar since sidecar keys are the placeholder forms, not the inner
-  // text — so restoration is always consistent.
-  for (const [id, xml] of Object.entries(sidecar)) {
-    working = working.split(`[[epi:${id}]]`).join(xml);
+  const replaces = [...pairs.map((p) => p.replace), pairs.map((p) => p.replace).join("")];
+  for (const r of replaces) {
+    const echoMarker = detectUntrustedFenceInWrite(r);
+    if (echoMarker !== undefined) {
+      throw new ConverterError(
+        `find_replace replacement contains "${echoMarker}" — this indicates it ` +
+          `was copied from a read-tool response (fenced tenant content with a ` +
+          `per-session canary). Remove the fence markers and canary comments, ` +
+          `or compose the replacement from scratch.`,
+        WRITE_CONTAINS_UNTRUSTED_FENCE,
+      );
+    }
+    if (r.includes(READ_ONLY_MARKDOWN_MARKER_TEXT)) {
+      throw new ConverterError(
+        "find_replace replacement contains content produced by get_page with " +
+          "format: 'markdown', which is a read-only rendering. Compose the " +
+          "replacement in storage format instead.",
+        READ_ONLY_MARKDOWN_ROUND_TRIP,
+      );
+    }
   }
 
-  return working;
+  const outcome = applyFindReplace(sectionBody, pairs);
+  const deletedTokens = buildDeletedTokens(outcome.lostTokens, outcome.sidecar);
+  enforceDeletionAck(deletedTokens, confirmDeletions, "find_replace");
+
+  const versionMessage =
+    deletedTokens.length > 0
+      ? `Removed ${deletedTokens.length} preserved element${deletedTokens.length === 1 ? "" : "s"}: ` +
+        deletedTokens.map((d) => `${d.id} (${d.fingerprint})`).join(", ")
+      : "";
+
+  return {
+    newSectionBody: outcome.body,
+    deletedTokens,
+    perPair: outcome.perPair,
+    versionMessage,
+  };
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+/**
+ * Page-level guards for a find_replace write, run on the spliced full page.
+ *
+ *   - The number of fence markers, canaries and read-only-markdown markers
+ *     must not grow. Pages that merely contain such text stay editable; a
+ *     replacement that completes a marker with neighbouring text does not.
+ *   - enforceContentSafetyGuards, page-relative, with the same flags and
+ *     meaning as body mode (confirmDeletions bypasses macro/table loss only).
+ */
+export function enforceFindReplacePageGuards(input: {
+  oldStorage: string;
+  newStorage: string;
+  confirmShrinkage?: boolean;
+  confirmStructureLoss?: boolean;
+  confirmDeletions?: boolean;
+}): void {
+  const { oldStorage, newStorage } = input;
+  for (const marker of [
+    OPEN_FENCE_PREFIX,
+    CLOSE_FENCE,
+    getSessionCanary(),
+    READ_ONLY_MARKDOWN_MARKER_TEXT,
+  ]) {
+    if (countOccurrences(newStorage, marker) > countOccurrences(oldStorage, marker)) {
+      throw new ConverterError(
+        `find_replace would add "${marker}" to the page. Read-tool fence ` +
+          `markers, the session canary and the read-only-markdown marker ` +
+          `must never be written back to Confluence.`,
+        WRITE_CONTAINS_UNTRUSTED_FENCE,
+      );
+    }
+  }
+  enforceContentSafetyGuards({
+    oldStorage,
+    newStorage,
+    confirmShrinkage: input.confirmShrinkage,
+    confirmStructureLoss: input.confirmStructureLoss,
+    confirmDeletions: input.confirmDeletions,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Confirmation binding for section writes (H1)
+// ---------------------------------------------------------------------------
+
+/** One section of a section write, as it enters the confirmation hash. */
+export interface SectionWriteHashEntry {
+  section: string;
+  body?: string;
+  find_replace?: readonly FindReplacePair[];
+}
+
+/**
+ * Markdown conversion mints a random `ac:macro-id` for every new code and
+ * expand macro, so two preparations of the same call differ only there.
+ * Blank the values before hashing so a confirmation token minted on the
+ * first call still matches the identical retry. Everything else in the
+ * resulting storage stays bound.
+ */
+function storageForHash(storage: string): string {
+  return storage.replace(/\bac:macro-id="[^"]*"/g, 'ac:macro-id=""');
+}
+
+/**
+ * Diff hash for every section write (update_page_section in body and
+ * find_replace mode, update_page_sections). Covers canonical JSON of the
+ * tool, page id, page version, every entry (section name plus its body or
+ * its pairs with their replace_all flags), the destructive flags, and the
+ * SHA-256 of the resulting full storage. A token minted for one call is
+ * therefore rejected for a call that differs in any of these.
+ *
+ * The JSON is canonical by construction: every object is built here with a
+ * fixed key order and arrays keep input order.
+ */
+export function computeSectionWriteDiffHash(input: {
+  tool: string;
+  pageId: string;
+  pageVersion: number;
+  entries: readonly SectionWriteHashEntry[];
+  flags: {
+    confirmDeletions: boolean;
+    confirmShrinkage: boolean;
+    confirmStructureLoss: boolean;
+  };
+  resultingStorage: string;
+}): string {
+  const payload = JSON.stringify({
+    tool: input.tool,
+    page_id: input.pageId,
+    page_version: input.pageVersion,
+    entries: input.entries.map((e) =>
+      e.find_replace !== undefined
+        ? {
+            section: e.section,
+            find_replace: e.find_replace.map((p) => ({
+              find: p.find,
+              replace: p.replace,
+              replace_all: p.replace_all === true,
+            })),
+          }
+        : { section: e.section, body: e.body ?? "" },
+    ),
+    flags: {
+      confirm_deletions: input.flags.confirmDeletions,
+      confirm_shrinkage: input.flags.confirmShrinkage,
+      confirm_structure_loss: input.flags.confirmStructureLoss,
+    },
+    result_sha256: createHash("sha256")
+      .update(storageForHash(input.resultingStorage))
+      .digest("hex"),
+  });
+  return computeDiffHash(payload, input.pageVersion);
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,8 +2185,19 @@ export function findReplaceInSection(
 export interface MultiSectionInput {
   /** Heading text identifying the section. */
   section: string;
-  /** New body content (markdown or storage). */
-  body: string;
+  /** New body content (markdown or storage). Exactly one of body / find_replace. */
+  body?: string;
+  /** Literal substitutions in the section's storage (R3). */
+  find_replace?: readonly FindReplacePair[];
+}
+
+/**
+ * Qualify a per-section token id with its section name. Ids restart at
+ * T0001 in every section (each is tokenised on its own), so the aggregate
+ * list and itemised acks use `<section>#<id>`.
+ */
+export function qualifyTokenId(section: string, id: string): string {
+  return `${section}#${id}`;
 }
 
 /**
@@ -1978,8 +2210,10 @@ export interface MultiSectionResult {
   section: string;
   /** The heading text as it appears in the page (after tolerant match). */
   matchedHeading: string;
-  /** Token deletions reported by the per-section safePrepareBody call. */
+  /** Token deletions in this section (ids local to the section, e.g. T0001). */
   deletedTokens: DeletedToken[];
+  /** find_replace entries only: per-pair match kind and count. */
+  perPair?: FindReplacePairOutcome[];
   /** Byte-equivalent regenerated tokens (C1) for this section. */
   regeneratedTokens: RegeneratedTokenPair[];
 }
@@ -1994,9 +2228,11 @@ export interface MultiSectionFailure {
    *   - "duplicate" — the section name appears more than once in the input.
    *   - "missing"   — heading not present in the page.
    *   - "ambiguous" — heading matched multiple candidates in the page.
-   *   - "prepare"   — the per-section safePrepareBody call threw.
+   *   - "prepare"   — the per-section prepare (body or find_replace) threw.
+   *   - "invalid"   — the entry has both or neither of body / find_replace,
+   *                   or an itemised ack names a section not in the call.
    */
-  reason: "duplicate" | "missing" | "ambiguous" | "prepare";
+  reason: "duplicate" | "missing" | "ambiguous" | "prepare" | "invalid";
   /** Human-readable detail (e.g. ambiguity list, prepare error message). */
   message: string;
 }
@@ -2032,7 +2268,8 @@ export interface MultiSectionPrepareOutput {
   /**
    * Aggregated deleted tokens across all sections — what the user must
    * acknowledge through the confirm_deletions gate. The gate runs ONCE on
-   * this list, not per-section.
+   * this list, not per-section. Ids are section-qualified
+   * (`<section>#T0001`, see qualifyTokenId) because ids repeat per section.
    */
   aggregatedDeletedTokens: DeletedToken[];
   /** Aggregated regenerated tokens (C1). */
@@ -2145,6 +2382,11 @@ function locateSectionRange(
  * tool (D1). Runs every section's prepare against the ORIGINAL page
  * contents, then merges all splices into a single final document.
  *
+ * Each entry is `{section, body}` (markdown or storage, through
+ * safePrepareBody) or `{section, find_replace}` (through
+ * safePrepareFindReplace — the same engine and guards as
+ * update_page_section), exactly one of the two (R3).
+ *
  * Atomicity: either every section applies cleanly or the whole call throws
  * MultiSectionError. No partial writes — the caller submits one document
  * to safeSubmitPage, which produces one version bump.
@@ -2166,16 +2408,24 @@ function locateSectionRange(
  * silently corrupt pages on partial failure. Mitigations:
  *   1. Locate every section against the ORIGINAL page first; failures are
  *      collected and reported together via MultiSectionError.
- *   2. Each per-section safePrepareBody is invoked in isolation; any throw
- *      is captured into the failure list. If ANY section fails, NO splice
+ *   2. Each per-section prepare is invoked in isolation; any throw is
+ *      captured into the failure list. If ANY section fails, NO splice
  *      is performed, NO submit happens.
  *   3. The deletion-gate runs once on the AGGREGATED deletion list — a
  *      caller cannot bypass the gate by spreading deletions across sections.
+ *   4. Aggregate guard (M10): per-section guards are page-relative, so five
+ *      sections each removing 15% would each pass. enforceContentSafetyGuards
+ *      (plus the marker non-growth check) runs once more on the merged page.
+ *
+ * confirmDeletions: `true` acknowledges every deletion (as before). A
+ * `string[]` is an itemised ack of section-qualified ids
+ * (`<section>#T0001`, see qualifyTokenId); each section is checked against
+ * its own ids, and an ack naming a section not in the call is rejected.
  */
 export async function safePrepareMultiSectionBody(input: {
   currentStorage: string;
   sections: readonly MultiSectionInput[];
-  confirmDeletions?: boolean;
+  confirmDeletions?: boolean | string[];
   confirmShrinkage?: boolean;
   confirmStructureLoss?: boolean;
   allowRawHtml?: boolean;
@@ -2202,6 +2452,25 @@ export async function safePrepareMultiSectionBody(input: {
     ]);
   }
 
+  // 0. Shape check — each entry carries exactly one of body / find_replace.
+  const shapeFailures: MultiSectionFailure[] = [];
+  for (const s of sections) {
+    const hasBody = s.body !== undefined;
+    const hasPairs = s.find_replace !== undefined && s.find_replace.length > 0;
+    if (hasBody === hasPairs) {
+      shapeFailures.push({
+        section: s.section,
+        reason: "invalid",
+        message: hasBody
+          ? "provide exactly one of `body` or `find_replace`, not both"
+          : "provide exactly one of `body` or `find_replace` (neither was provided)",
+      });
+    }
+  }
+  if (shapeFailures.length > 0) {
+    throw new MultiSectionError(shapeFailures);
+  }
+
   // 1. Dedup check — duplicate section names are an ambiguous-intent signal
   //    and must be rejected before any processing. Collect every duplicate
   //    in one pass so the error message lists them all.
@@ -2225,15 +2494,41 @@ export async function safePrepareMultiSectionBody(input: {
     throw new MultiSectionError(dupFailures);
   }
 
+  // 1b. Itemised acks must each name a section of this call.
+  if (Array.isArray(confirmDeletions)) {
+    const stray = confirmDeletions.filter(
+      (ack) => !sections.some((s) => ack.startsWith(`${s.section}#`)),
+    );
+    if (stray.length > 0) {
+      throw new MultiSectionError([
+        {
+          section: "(confirm_deletions)",
+          reason: "invalid",
+          message:
+            `acknowledgement(s) ${stray.join(", ")} do not name a section in ` +
+            `this call; use <section>#<token id>`,
+        },
+      ]);
+    }
+  }
+  const ackFor = (section: string): string[] | true | undefined => {
+    if (!Array.isArray(confirmDeletions)) return confirmDeletions ? true : undefined;
+    const prefix = `${section}#`;
+    const ids = confirmDeletions
+      .filter((ack) => ack.startsWith(prefix))
+      .map((ack) => ack.slice(prefix.length));
+    return ids.length > 0 ? ids : undefined;
+  };
+
   // 2. Locate every section against the ORIGINAL page and collect failures.
   //    Heading-resolution failures are collected here, BEFORE any prepare
   //    runs. This guarantees the per-section prepare step (which is the
   //    expensive part — markdown conversion etc.) only fires when every
   //    section is known to exist in the source.
   type Located = {
+    entry: MultiSectionInput;
     section: string;
     body: string;
-    inputBody: string;
     bodyStart: number;
     bodyEnd: number;
     matchedHeading: string;
@@ -2251,9 +2546,9 @@ export async function safePrepareMultiSectionBody(input: {
       continue;
     }
     located.push({
+      entry: s,
       section: s.section,
       body: r.currentBody,
-      inputBody: s.body,
       bodyStart: r.bodyStart,
       bodyEnd: r.bodyEnd,
       matchedHeading: r.matchedHeading,
@@ -2289,10 +2584,10 @@ export async function safePrepareMultiSectionBody(input: {
     }
   }
 
-  // 4. Per-section safePrepareBody. Each call is isolated against its own
-  //    section body. Failures are captured into the failure list; we only
-  //    throw the aggregated error AFTER all sections have been attempted,
-  //    so the caller sees every problem in one round-trip.
+  // 4. Per-section prepare. Each call is isolated against its own section
+  //    body. Failures are captured into the failure list; we only throw the
+  //    aggregated error AFTER all sections have been attempted, so the
+  //    caller sees every problem in one round-trip.
   const perSectionResults: MultiSectionResult[] = [];
   const prepareFailures: MultiSectionFailure[] = [];
   const splices: { bodyStart: number; bodyEnd: number; replacement: string }[] = [];
@@ -2301,20 +2596,58 @@ export async function safePrepareMultiSectionBody(input: {
   const aggregatedRegenerated: RegeneratedTokenPair[] = [];
 
   for (const loc of located) {
-    let prepared;
+    let replacement: string;
+    let deletedTokens: DeletedToken[];
+    let regeneratedTokens: RegeneratedTokenPair[] = [];
+    let versionMessage: string;
+    let perPair: FindReplacePairOutcome[] | undefined;
     try {
-      prepared = await safePrepareBody({
-        body: loc.inputBody,
-        currentBody: loc.body,
-        scope: "section",
-        confirmDeletions: confirmDeletions ? true : undefined,
-        confirmShrinkage,
-        confirmStructureLoss,
-        // Measure each section's guards page-relative (see safePrepareBody).
-        fullPageBody: currentStorage,
-        ...(allowRawHtml !== undefined ? { allowRawHtml } : {}),
-        ...(confluenceBaseUrl !== undefined ? { confluenceBaseUrl } : {}),
-      });
+      if (loc.entry.find_replace !== undefined) {
+        const fr = safePrepareFindReplace({
+          sectionBody: loc.body,
+          pairs: loc.entry.find_replace,
+          confirmDeletions: ackFor(loc.section),
+        });
+        // Same page-relative guards as update_page_section's find_replace.
+        enforceFindReplacePageGuards({
+          oldStorage: currentStorage,
+          newStorage:
+            currentStorage.slice(0, loc.bodyStart) +
+            fr.newSectionBody +
+            currentStorage.slice(loc.bodyEnd),
+          confirmShrinkage,
+          confirmStructureLoss,
+          confirmDeletions: confirmDeletions !== undefined && confirmDeletions !== false,
+        });
+        replacement = fr.newSectionBody;
+        deletedTokens = fr.deletedTokens;
+        versionMessage = fr.versionMessage;
+        perPair = fr.perPair;
+      } else {
+        const prepared = await safePrepareBody({
+          body: loc.entry.body,
+          currentBody: loc.body,
+          scope: "section",
+          confirmDeletions: ackFor(loc.section),
+          confirmShrinkage,
+          confirmStructureLoss,
+          // Measure each section's guards page-relative (see safePrepareBody).
+          fullPageBody: currentStorage,
+          ...(allowRawHtml !== undefined ? { allowRawHtml } : {}),
+          ...(confluenceBaseUrl !== undefined ? { confluenceBaseUrl } : {}),
+        });
+        if (prepared.finalStorage === undefined) {
+          // safePrepareBody returned title-only — meaningless for a section
+          // splice. Treat as a prepare failure.
+          throw new Error(
+            "safePrepareBody returned undefined finalStorage; sections require a body",
+          );
+        }
+        replacement = prepared.finalStorage;
+        deletedTokens = prepared.deletedTokens;
+        regeneratedTokens = prepared.regeneratedTokens;
+        versionMessage = prepared.versionMessage;
+      }
     } catch (err) {
       prepareFailures.push({
         section: loc.section,
@@ -2323,33 +2656,25 @@ export async function safePrepareMultiSectionBody(input: {
       });
       continue;
     }
-    if (prepared.finalStorage === undefined) {
-      // safePrepareBody returned title-only — meaningless for a section
-      // splice. Treat as a prepare failure.
-      prepareFailures.push({
-        section: loc.section,
-        reason: "prepare",
-        message:
-          "safePrepareBody returned undefined finalStorage; sections require a body",
-      });
-      continue;
-    }
     perSectionResults.push({
       section: loc.section,
       matchedHeading: loc.matchedHeading,
-      deletedTokens: prepared.deletedTokens,
-      regeneratedTokens: prepared.regeneratedTokens,
+      deletedTokens,
+      regeneratedTokens,
+      ...(perPair !== undefined ? { perPair } : {}),
     });
     splices.push({
       bodyStart: loc.bodyStart,
       bodyEnd: loc.bodyEnd,
-      replacement: prepared.finalStorage,
+      replacement,
     });
-    if (prepared.versionMessage) {
-      versionMessageParts.push(`${loc.section}: ${prepared.versionMessage}`);
+    if (versionMessage) {
+      versionMessageParts.push(`${loc.section}: ${versionMessage}`);
     }
-    aggregatedDeleted.push(...prepared.deletedTokens);
-    aggregatedRegenerated.push(...prepared.regeneratedTokens);
+    aggregatedDeleted.push(
+      ...deletedTokens.map((d) => ({ ...d, id: qualifyTokenId(loc.section, d.id) })),
+    );
+    aggregatedRegenerated.push(...regeneratedTokens);
   }
   if (prepareFailures.length > 0) {
     throw new MultiSectionError(prepareFailures);
@@ -2364,6 +2689,27 @@ export async function safePrepareMultiSectionBody(input: {
   for (const sp of splices) {
     merged =
       merged.slice(0, sp.bodyStart) + sp.replacement + merged.slice(sp.bodyEnd);
+  }
+
+  // 6. Aggregate guard (M10) on the merged page. The marker non-growth part
+  //    is redundant for body entries (their input was already checked) and
+  //    harmless; it matters for find_replace entries.
+  try {
+    enforceFindReplacePageGuards({
+      oldStorage: currentStorage,
+      newStorage: merged,
+      confirmShrinkage,
+      confirmStructureLoss,
+      confirmDeletions: confirmDeletions !== undefined && confirmDeletions !== false,
+    });
+  } catch (err) {
+    if (err instanceof ConverterError) {
+      throw new ConverterError(
+        `Across all ${sections.length} sections combined: ${err.message}`,
+        err.code,
+      );
+    }
+    throw err;
   }
 
   return {
