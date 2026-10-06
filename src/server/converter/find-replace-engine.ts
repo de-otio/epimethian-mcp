@@ -14,7 +14,10 @@
  *
  * Matching (plans/field-session-findings-2026-10.md §3 contract 2):
  *   - An exact byte match is tried first. The fence-equivalent "view" match
- *     is used only when the exact count is 0.
+ *     is used only when the exact count is 0. When the exact count is 1,
+ *     `replace_all` is not set and the find is fence-stable (it could have
+ *     been copied from a read), the view count must be 1 too; otherwise the
+ *     pair is ambiguous (R2.1: the read showed the agent several copies).
  *   - The view transform is V(s) = concat over code points c of NFKD(c),
  *     minus the fence strip set (whatever `sanitiseTenantText` deletes).
  *     The fence applies NFKC and the strip set, and NFKD(NFKC(x)) = NFKD(x),
@@ -113,6 +116,19 @@ class FindReplaceError extends ConverterError {
 
 /** Upper bound on occurrences examined per pair (keeps counting linear-ish). */
 export const MAX_FIND_OCCURRENCES = 10_000;
+
+/**
+ * R2.2: the section tools number placeholders per section (contract 1),
+ * while a full-page markdown read numbers them across the page. Appended to
+ * the FORGED_TOKEN and deletion-gate messages of every section write.
+ */
+export const SECTION_LOCAL_IDS_NOTE =
+  "Placeholder ids are section-local here: take them from get_page with " +
+  "`section` and format: markdown. Ids from a full-page read name other " +
+  "macros; re-read the section rather than confirming.";
+
+/** Upper bound on pairs per section (R1.7); the tool schemas use it too. */
+export const MAX_FIND_REPLACE_PAIRS = 50;
 
 // ---------------------------------------------------------------------------
 // View transform
@@ -450,7 +466,7 @@ function assertOnlyKnownPlaceholders(
         `find_replace ${where} contains a placeholder that is not part of ` +
           `this section (${JSON.stringify(m ? m[0] : s.slice(i, i + 16))}). ` +
           `Placeholders can only move or remove macros that already exist ` +
-          `in the section; they cannot be invented.`,
+          `in the section; they cannot be invented. ${SECTION_LOCAL_IDS_NOTE}`,
         FORGED_TOKEN,
       );
     }
@@ -467,6 +483,120 @@ function countPlaceholders(s: string): Map<TokenId, number> {
 }
 
 // ---------------------------------------------------------------------------
+// Opaque regions (R1.1)
+// ---------------------------------------------------------------------------
+
+/** A region of storage whose content Confluence treats as text or drops. */
+interface OpaqueRegion {
+  start: number;
+  end: number;
+  kind: "comment" | "cdata" | "plain-text-body";
+}
+
+// The attribute part is bounded so a long run of unterminated tags cannot
+// make the search quadratic.
+const OPAQUE_OPEN_RE = /<!--|<!\[CDATA\[|<ac:plain-text-(?:link-)?body(?=[\s/>])[^>]{0,256}>/g;
+const PLAIN_TEXT_BODY_INNER_RE = /<!\[CDATA\[|<!--|<\/ac:plain-text-(?:link-)?body\s*>/g;
+
+/**
+ * Top-level comments, CDATA sections and `<ac:plain-text-body>` /
+ * `<ac:plain-text-link-body>` elements, in order, as an XML reader sees them:
+ * a comment ends at the first "-->", a CDATA section at the first "]]>", and
+ * a plain-text body at its closing tag outside any CDATA or comment inside
+ * it (a "]]><!--" breakout inside a code body hides what follows). An
+ * unterminated region runs to the end. Linear: every scan resumes where the
+ * previous one stopped.
+ */
+function opaqueRegions(s: string): OpaqueRegion[] {
+  const out: OpaqueRegion[] = [];
+  const open = new RegExp(OPAQUE_OPEN_RE.source, "g");
+  const inner = new RegExp(PLAIN_TEXT_BODY_INNER_RE.source, "g");
+  let m: RegExpExecArray | null;
+  while ((m = open.exec(s)) !== null) {
+    const start = m.index;
+    let end: number;
+    let kind: OpaqueRegion["kind"];
+    if (m[0] === "<!--" || m[0] === "<![CDATA[") {
+      kind = m[0] === "<!--" ? "comment" : "cdata";
+      const close = kind === "comment" ? "-->" : "]]>";
+      const at = s.indexOf(close, start + m[0].length);
+      end = at === -1 ? s.length : at + close.length;
+    } else if (m[0].endsWith("/>")) {
+      // Self-closing: an empty body hides nothing.
+      continue;
+    } else {
+      kind = "plain-text-body";
+      end = s.length;
+      inner.lastIndex = start + m[0].length;
+      let n: RegExpExecArray | null;
+      while ((n = inner.exec(s)) !== null) {
+        if (n[0] === "<![CDATA[" || n[0] === "<!--") {
+          const close = n[0] === "<!--" ? "-->" : "]]>";
+          const at = s.indexOf(close, n.index + n[0].length);
+          if (at === -1) break;
+          inner.lastIndex = at + close.length;
+          continue;
+        }
+        end = n.index + n[0].length;
+        break;
+      }
+    }
+    out.push({ start, end, kind });
+    open.lastIndex = Math.max(end, start + 1);
+  }
+  return out;
+}
+
+/** Placeholders that start inside an opaque region (see opaqueRegions). */
+function hiddenPlaceholders(s: string): Set<TokenId> {
+  const regions = opaqueRegions(s);
+  const hidden = new Set<TokenId>();
+  if (regions.length === 0) return hidden;
+  let r = 0;
+  for (const m of s.matchAll(PLACEHOLDER_RE)) {
+    const at = m.index!;
+    while (r < regions.length && regions[r].end <= at) r++;
+    if (r < regions.length && regions[r].start <= at) hidden.add(m[1]);
+  }
+  return hidden;
+}
+
+/**
+ * CDATA delimiters that are not part of a plain-text body: a CDATA section
+ * at top level counts its "<![CDATA[" and, when closed, its "]]>"; a stray
+ * "]]>" outside every region counts too. Inside a code or link body CDATA
+ * is expected, and inside a comment it is just text. The find_replace page
+ * guard requires this not to grow, so inserting a link or a code macro still
+ * works but wrapping page content in CDATA does not.
+ */
+export function countBareCdataDelimiters(s: string): number {
+  let n = 0;
+  let cursor = 0;
+  // `next` only moves forward, so the scan stays linear however many
+  // regions there are.
+  let next = s.indexOf("]]>");
+  const strayClosers = (from: number, to: number) => {
+    if (next !== -1 && next < from) next = s.indexOf("]]>", from);
+    while (next !== -1 && next + 3 <= to) {
+      n++;
+      next = s.indexOf("]]>", next + 3);
+    }
+  };
+  for (const region of opaqueRegions(s)) {
+    strayClosers(cursor, region.start);
+    if (region.kind === "cdata") {
+      const closed =
+        region.end - region.start >= "<![CDATA[]]>".length &&
+        s.startsWith("]]>", region.end - 3);
+      n += closed ? 2 : 1;
+    }
+    cursor = region.end;
+  }
+  strayClosers(cursor, s.length);
+  return n;
+}
+
+// ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
 
@@ -474,6 +604,7 @@ function applyPair(
   working: string,
   pair: FindReplacePair,
   index: number,
+  maxLength: number,
 ): { next: string; outcome: FindReplacePairOutcome } {
   const { find, replace } = pair;
   const replaceAll = pair.replace_all === true;
@@ -484,12 +615,35 @@ function applyPair(
   let matched: FindReplaceMatchKind = "exact";
   let workingMap: ViewMap | undefined;
   let occurrences = exactOccurrences(working, find, spans, label);
+  const viewFind = toFenceView(find);
   if (occurrences.length === 0) {
-    const viewFind = toFenceView(find);
     if (viewFind.length > 0) {
       workingMap = buildViewMap(working);
       occurrences = viewOccurrences(workingMap, viewFind, spans, label);
       matched = "normalised";
+    }
+  } else if (
+    occurrences.length === 1 &&
+    !replaceAll &&
+    viewFind.length > 0 &&
+    sanitiseTenantText(find) === find
+  ) {
+    // R2.1: reads are fenced, and the fence folds NBSP, ellipses, ligatures
+    // and so on, so the agent cannot tell an exact copy from a folded twin.
+    // One exact hit next to a twin that looks identical in the read is
+    // ambiguous: the agent may have copied the twin. A find the fence would
+    // change (it holds an NBSP, say) was not copied from a read; its bytes
+    // are deliberate, so the exact hit stands.
+    const viewCount = viewOccurrences(buildViewMap(working), viewFind, spans, label).length;
+    if (viewCount > occurrences.length) {
+      throw new FindReplaceError(
+        `find_replace ${label} matches exactly 1 time byte-for-byte but ` +
+          `${viewCount} times after Unicode compatibility normalisation (which ` +
+          `is how reads show the text, e.g. a non-breaking space as a space), ` +
+          `so it is ambiguous. Extend the find string with surrounding text ` +
+          `that differs between the copies. No changes were made.`,
+        FIND_REPLACE_AMBIGUOUS,
+      );
     }
   }
 
@@ -525,16 +679,31 @@ function applyPair(
   const repMap = matched === "normalised" ? buildViewMap(replace) : undefined;
   const parts: string[] = [];
   let cursor = 0;
+  // R1.7: the result length is tracked before the parts are joined, so a
+  // replace_all of a large string over many matches is refused before the
+  // join allocates it.
+  let length = 0;
+  const push = (part: string) => {
+    length += part.length;
+    if (length > maxLength) {
+      throw new FindReplaceError(
+        `find_replace ${label} would grow the section past ` +
+          `${maxLength.toLocaleString()} characters. No changes were made.`,
+        FIND_REPLACE_INVALID,
+      );
+    }
+    parts.push(part);
+  };
   for (const occ of occurrences) {
-    parts.push(working.slice(cursor, occ.start));
-    parts.push(
+    push(working.slice(cursor, occ.start));
+    push(
       matched === "exact"
         ? replace
         : preservingReplacement(working, workingMap!, occ, replace, repMap!),
     );
     cursor = occ.end;
   }
-  parts.push(working.slice(cursor));
+  push(working.slice(cursor));
   return {
     next: parts.join(""),
     outcome: { matched, count: occurrences.length },
@@ -544,6 +713,10 @@ function applyPair(
 /**
  * Apply `pairs` in order to a storage-format section body.
  *
+ * `options.maxLength` caps the running (tokenised) text after every pair
+ * (R1.7). A section that is already longer may be edited as long as no pair
+ * grows it past its own starting length.
+ *
  * @throws ConverterError — FIND_REPLACE_INVALID, FIND_REPLACE_MATCH_FAILED,
  *   FIND_REPLACE_AMBIGUOUS, PLACEHOLDER_LITERAL_IN_PAGE, FORGED_TOKEN,
  *   DUPLICATED_TOKEN. On any throw the caller must not write.
@@ -551,8 +724,20 @@ function applyPair(
 export function applyFindReplace(
   sectionBody: string,
   pairs: readonly FindReplacePair[],
+  options: { maxLength?: number } = {},
 ): FindReplaceOutcome {
+  if (pairs.length > MAX_FIND_REPLACE_PAIRS) {
+    throw new FindReplaceError(
+      `find_replace accepts at most ${MAX_FIND_REPLACE_PAIRS} pairs per section ` +
+        `(got ${pairs.length}). Split the edit, or use a body.`,
+      FIND_REPLACE_INVALID,
+    );
+  }
   const { canonical, sidecar } = tokeniseStorage(sectionBody);
+  const maxLength = Math.max(
+    options.maxLength ?? Number.POSITIVE_INFINITY,
+    canonical.length,
+  );
 
   if (placeholderLiteralSurplus(canonical, sidecar) > 0) {
     throw new FindReplaceError(
@@ -577,7 +762,7 @@ export function applyFindReplace(
   let working = canonical;
   const perPair: FindReplacePairOutcome[] = [];
   pairs.forEach((pair, i) => {
-    const { next, outcome } = applyPair(working, pair, i);
+    const { next, outcome } = applyPair(working, pair, i, maxLength);
     working = next;
     perPair.push(outcome);
   });
@@ -598,7 +783,16 @@ export function applyFindReplace(
       DUPLICATED_TOKEN,
     );
   }
-  const lostTokens = Object.keys(sidecar).filter((id) => !counts.has(id));
+  // R1.1: a placeholder that survives but now sits inside a comment, a CDATA
+  // section or a plain-text body is a macro Confluence will no longer render.
+  // Treat it as lost so the deletion gate runs. Placeholders already inside
+  // such a region in the original are left alone (malformed legacy pages
+  // stay editable).
+  const hiddenBefore = hiddenPlaceholders(canonical);
+  const hidden = [...hiddenPlaceholders(working)].filter((id) => !hiddenBefore.has(id));
+  const lostTokens = Object.keys(sidecar).filter(
+    (id) => !counts.has(id) || hidden.includes(id),
+  );
 
   return {
     body: restoreFromTokens(working, sidecar),

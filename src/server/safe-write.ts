@@ -26,6 +26,8 @@
  *       attribute (panel, info, warning, code, ...).
  *     * For `ac:emoticon`, the value of the outer `ac:name` attribute.
  *     * For any other token, no name suffix is emitted.
+ *   - `name` is tenant text, shown unfenced: it passes through
+ *     safeMacroLabel ([A-Za-z0-9 _.-], at most 64 characters, `?` if empty).
  *
  * Examples:
  *   drawio[architecture.drawio]
@@ -76,7 +78,7 @@ import {
   validateBatchToken,
 } from "./batch-tokens.js";
 import { markdownToStorage } from "./converter/md-to-storage.js";
-import { planUpdate } from "./converter/update-orchestrator.js";
+import { planUpdate, safeMacroLabel } from "./converter/update-orchestrator.js";
 import { enforceContentSafetyGuards } from "./converter/content-safety-guards.js";
 import {
   ConverterError,
@@ -104,6 +106,8 @@ import {
 } from "./session-canary.js";
 import {
   applyFindReplace,
+  countBareCdataDelimiters,
+  SECTION_LOCAL_IDS_NOTE,
   type FindReplacePair,
   type FindReplacePairOutcome,
 } from "./converter/find-replace-engine.js";
@@ -572,6 +576,8 @@ export {
   FIND_REPLACE_INVALID,
   FIND_REPLACE_MATCH_FAILED,
   FORGED_TOKEN,
+  MAX_FIND_REPLACE_PAIRS,
+  SECTION_LOCAL_IDS_NOTE,
   type FindReplacePair,
   type FindReplacePairOutcome,
 } from "./converter/find-replace-engine.js";
@@ -1063,12 +1069,12 @@ function computeFingerprint(xml: string | undefined): { tag: string; fingerprint
       /<ac:parameter\s+ac:name="diagramName"[^>]*>([^<]+)<\/ac:parameter>/,
     )?.[1];
     const name = displayName ?? diagramName ?? "drawio";
-    return { tag, fingerprint: `drawio[${name}]` };
+    return { tag, fingerprint: `drawio[${safeMacroLabel(name)}]` };
   }
 
   // Generic structured-macro or emoticon with an ac:name attribute.
   if (acNameFromOpenTag) {
-    return { tag, fingerprint: `${bareTag}[${acNameFromOpenTag}]` };
+    return { tag, fingerprint: `${bareTag}[${safeMacroLabel(acNameFromOpenTag)}]` };
   }
 
   // Any other token: no name suffix available.
@@ -1257,12 +1263,14 @@ function warnBlanketDeletionAck(tokens: DeletedToken[]): void {
  * The confirm_deletions gate shared by every token-aware write path (body
  * mode and find_replace). `subject` names what is deleting the tokens in
  * the DELETIONS_NOT_CONFIRMED message ("caller markdown" for body mode, so
- * that message stays byte-identical to planUpdate's).
+ * that message stays byte-identical to planUpdate's). `note` is appended to
+ * that message (section writes name the placeholder id scope, R2.2).
  */
 function enforceDeletionAck(
   deletedTokens: DeletedToken[],
   confirmDeletions: string[] | true | undefined,
   subject: string,
+  note?: string,
 ): void {
   if (deletedTokens.length > 0) {
     if (confirmDeletions === undefined) {
@@ -1274,7 +1282,8 @@ function enforceDeletionAck(
       const noun = deletedTokens.length === 1 ? "element" : "elements";
       throw new ConverterError(
         `${subject} would delete ${deletedTokens.length} preserved ${noun}: ${summary}. ` +
-          `Re-submit with confirm_deletions: true to acknowledge the removal.`,
+          `Re-submit with confirm_deletions: true to acknowledge the removal.` +
+          (note ? ` ${note}` : ""),
         "DELETIONS_NOT_CONFIRMED",
       );
     }
@@ -1307,8 +1316,36 @@ function enforceDeletionAck(
  *   4. Link rewriting (inside markdownToStorage when confluenceBaseUrl set).
  *   5. Content safety guards (shrinkage, structure, empty, macro/table loss).
  *   6. Post-transform body guard.
+ *
+ * For `scope: "section"` the placeholder-id errors (DELETIONS_NOT_CONFIRMED,
+ * INVENTED_TOKEN, FORGED_TOKEN) also say that ids are section-local (R2.2):
+ * an id copied from a full-page read names a different macro there.
  */
 export async function safePrepareBody(
+  input: SafePrepareBodyInput,
+): Promise<SafePrepareBodyOutput> {
+  try {
+    return await prepareBody(input);
+  } catch (err) {
+    if (
+      input.scope === "section" &&
+      err instanceof ConverterError &&
+      SECTION_ID_ERROR_CODES.has(err.code)
+    ) {
+      throw new ConverterError(`${err.message} ${SECTION_LOCAL_IDS_NOTE}`, err.code);
+    }
+    throw err;
+  }
+}
+
+/** Errors whose meaning depends on which placeholder ids the caller used. */
+const SECTION_ID_ERROR_CODES: ReadonlySet<string> = new Set([
+  "DELETIONS_NOT_CONFIRMED",
+  "INVENTED_TOKEN",
+  "FORGED_TOKEN",
+]);
+
+async function prepareBody(
   input: SafePrepareBodyInput,
 ): Promise<SafePrepareBodyOutput> {
   const {
@@ -2057,9 +2094,10 @@ export function safePrepareFindReplace(
     }
   }
 
-  const outcome = applyFindReplace(sectionBody, pairs);
+  const outcome = applyFindReplace(sectionBody, pairs, { maxLength: MAX_INPUT_BODY });
   const deletedTokens = buildDeletedTokens(outcome.lostTokens, outcome.sidecar);
-  enforceDeletionAck(deletedTokens, confirmDeletions, "find_replace");
+  // find_replace exists only on the section tools, so ids are section-local.
+  enforceDeletionAck(deletedTokens, confirmDeletions, "find_replace", SECTION_LOCAL_IDS_NOTE);
 
   const versionMessage =
     deletedTokens.length > 0
@@ -2074,6 +2112,17 @@ export function safePrepareFindReplace(
     versionMessage,
   };
 }
+
+/** A find_replace would add an XML comment or CDATA delimiter (R1.1). */
+export const FIND_REPLACE_OPAQUE_MARKUP = "FIND_REPLACE_OPAQUE_MARKUP";
+
+/**
+ * Comment delimiters, whose raw count a find_replace may not increase (R1.1).
+ * CDATA delimiters are counted by countBareCdataDelimiters instead, which
+ * skips the CDATA of code and link bodies: inserting a link
+ * (`<ac:plain-text-link-body><![CDATA[…]]>`) is a core find_replace use.
+ */
+const COMMENT_DELIMITERS = ["<!--", "-->"] as const;
 
 function countOccurrences(haystack: string, needle: string): number {
   return haystack.split(needle).length - 1;
@@ -2104,6 +2153,15 @@ function countLiveFenceMarkers(haystack: string, marker: string): number {
  *     Fence markers are counted twice: as substrings, and as live markers
  *     (so turning an inert escaped `<<<<…` into a live `<<<…` is caught
  *     even though the substring count stays equal).
+ *   - XML comment delimiters, and CDATA delimiters outside a code or link
+ *     body, must not grow either (R1.1): with them a replacement could hide a
+ *     macro, a heading or text from Confluence while every placeholder
+ *     survives, so the deletion gate never runs. (The engine also treats a
+ *     placeholder that ends up inside such a region as lost.) Pages that
+ *     already contain comments or code macros stay editable, and inserting a
+ *     link or a code macro still works. Off for the update_page_sections
+ *     aggregate check (`opaqueMarkers: false`): body entries legitimately add
+ *     code macros, and each find_replace entry was already checked on its own.
  *   - enforceContentSafetyGuards, page-relative, with the same flags and
  *     meaning as body mode (confirmDeletions bypasses macro/table loss only).
  */
@@ -2113,10 +2171,38 @@ export function enforceFindReplacePageGuards(input: {
   confirmShrinkage?: boolean;
   confirmStructureLoss?: boolean;
   confirmDeletions?: boolean;
+  /** Check comment/CDATA delimiter non-growth (default true). */
+  opaqueMarkers?: boolean;
 }): void {
   const { oldStorage, newStorage } = input;
   const grows = (count: (s: string, m: string) => number, marker: string) =>
     count(newStorage, marker) > count(oldStorage, marker);
+  if (input.opaqueMarkers !== false) {
+    const delimiters: [string, number, number][] = [
+      ...COMMENT_DELIMITERS.map((m): [string, number, number] => [
+        m,
+        countOccurrences(oldStorage, m),
+        countOccurrences(newStorage, m),
+      ]),
+      [
+        "<![CDATA[ / ]]> outside a code or link body",
+        countBareCdataDelimiters(oldStorage),
+        countBareCdataDelimiters(newStorage),
+      ],
+    ];
+    for (const [marker, before, after] of delimiters) {
+      if (after > before) {
+        throw new ConverterError(
+          `${FIND_REPLACE_OPAQUE_MARKUP}: find_replace would add "${marker}" to ` +
+            `the page (${before} → ${after}). find_replace cannot add XML ` +
+            `comment delimiters or CDATA outside a code or link body: they can ` +
+            `hide macros and text. Write text such as an arrow escaped ` +
+            `("--&gt;"), or make this edit with a storage-format \`body\` instead.`,
+          FIND_REPLACE_OPAQUE_MARKUP,
+        );
+      }
+    }
+  }
   for (const marker of [
     OPEN_FENCE_PREFIX,
     CLOSE_FENCE,
@@ -2752,9 +2838,12 @@ export async function safePrepareMultiSectionBody(input: {
       merged.slice(0, sp.bodyStart) + sp.replacement + merged.slice(sp.bodyEnd);
   }
 
-  // 6. Aggregate guard (M10) on the merged page. The marker non-growth part
-  //    is redundant for body entries (their input was already checked) and
-  //    harmless; it matters for find_replace entries.
+  // 6. Aggregate guard (M10) on the merged page. The fence/canary non-growth
+  //    part is redundant for body entries (their input was already checked)
+  //    and harmless; it matters for find_replace entries. The comment/CDATA
+  //    part is off here: a body entry may add a code macro, and every
+  //    find_replace entry passed it on its own in step 4 (entries are
+  //    separated by headings, so two of them cannot form one delimiter).
   try {
     enforceFindReplacePageGuards({
       oldStorage: currentStorage,
@@ -2762,6 +2851,7 @@ export async function safePrepareMultiSectionBody(input: {
       confirmShrinkage,
       confirmStructureLoss,
       confirmDeletions: confirmDeletions !== undefined && confirmDeletions !== false,
+      opaqueMarkers: false,
     });
   } catch (err) {
     if (err instanceof ConverterError) {

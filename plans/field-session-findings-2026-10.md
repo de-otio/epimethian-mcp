@@ -80,6 +80,13 @@ Why each edge exists:
    of the view, which gives the offset map. `NFKD(NFKC(x)) = NFKD(x)`, so text folded by the
    fence matches its source. Rules:
    - Try an exact byte match first. Use the view match only if the exact count is 0.
+   - When the exact count is 1 or more, also count in view space. If the view count is higher
+     than the exact count and `replace_all` is not set, throw `FIND_REPLACE_AMBIGUOUS` with both
+     counts: the agent read the text through the fence and cannot tell the exact copy from a
+     folded twin (e.g. NBSP vs space). Exact-first only picks the bytes when the counts agree.
+     Exception: a `find` the fence would change (it holds an NBSP, an ellipsis, a zero-width
+     character…) was not copied from a read, so its bytes are deliberate and the exact match
+     stands. (In practice only an exact count of 1 needs the check; 2+ is already ambiguous.)
    - A view match must start and end on code-point piece boundaries and must not partly overlap
      a placeholder.
    - "Exactly once" is counted in the space that matched, **including overlapping occurrences**.

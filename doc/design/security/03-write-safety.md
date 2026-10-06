@@ -50,13 +50,19 @@ with a human-readable reason.
 
 ### Macro-loss guard
 
-- **Trigger:** `oldMacros > 0` and `newMacros == 0`.
+- **Trigger (7.0.0):** `newMacros < oldMacros` — any drop, not only "all
+  gone". Macros inside a comment or a code body do not count, so hiding a
+  macro counts as losing it.
 - **Error code:** `MACRO_LOSS_NOT_CONFIRMED`.
-- **Opt-out:** `confirm_shrinkage: true` (shared flag — macro loss is
-  usually a specialised form of shrinkage).
+- **Opt-out:** `confirm_deletions: true` (or `replace_body`, and revert).
+  Before 7.0.0 `confirm_shrinkage` also opted out; it no longer does.
 - Catches cases the shrinkage guard misses: a page made almost entirely of
   macros can be replaced by similar-length plain text and fall under the
-  50% threshold.
+  50% threshold. It is also the only deletion check for storage-format
+  bodies, which have no placeholder diff.
+- find_replace writes also refuse new XML comment delimiters and new CDATA
+  outside a code or link body, and treat a placeholder that ends up inside a
+  comment, CDATA section or plain-text body as deleted (deletion gate).
 
 ### Table-loss guard
 

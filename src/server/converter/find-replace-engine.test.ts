@@ -236,11 +236,25 @@ describe("fence-equivalent (view) matching", () => {
     expect(out.body).toBe("<p>Wait… a b (new) x² y​z end</p>");
   });
 
-  it("an exact match wins over a view match", () => {
-    const body = "<p>a b and a b</p>";
-    const out = applyFindReplace(body, [{ find: "a b", replace: "X" }]);
-    expect(out.perPair[0].matched).toBe("exact");
-    expect(out.body).toBe("<p>a b and X</p>");
+  it("one exact match next to a folded twin is ambiguous (R2.1)", () => {
+    // Reads fold the NBSP, so the agent saw "a b" twice and may have copied
+    // either. Before the 7.0.0 final review this silently edited the exact one.
+    const body = "<p>a\u00a0b and a b</p>";
+    let err: unknown;
+    try {
+      applyFindReplace(body, [{ find: "a b", replace: "X" }]);
+    } catch (e) {
+      err = e;
+    }
+    expect((err as { code?: string }).code).toBe(FIND_REPLACE_AMBIGUOUS);
+    expect((err as Error).message).toMatch(/exactly 1 time byte-for-byte but 2 times/);
+  });
+
+  it("with replace_all, an exact match still wins over view matches", () => {
+    const body = "<p>a\u00a0b and a b</p>";
+    const out = applyFindReplace(body, [{ find: "a b", replace: "X", replace_all: true }]);
+    expect(out.perPair[0]).toEqual({ matched: "exact", count: 1 });
+    expect(out.body).toBe("<p>a\u00a0b and X</p>");
   });
 
   it("view occurrences that start inside an expansion are not counted", () => {

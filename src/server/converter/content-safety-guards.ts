@@ -255,19 +255,20 @@ export function enforceContentSafetyGuards(input: ContentSafetyInput): void {
 
   // 1D: Macro loss guard — detects when macros are silently stripped.
   // This catches cases the shrinkage guard misses, e.g. a page whose
-  // body is entirely macros being rewritten to plain text of similar length.
+  // body is entirely macros being rewritten to plain text of similar length,
+  // and macros that a storage body or a find_replace hides inside a comment
+  // or a code body (countMacros skips both). ANY drop needs confirm_deletions:
+  // a storage-format write has no token diff, so this is its only deletion
+  // check. confirm_shrinkage does not acknowledge it (it is about size).
   const oldMacros = countMacros(oldStorage);
   const newMacros = countMacros(newStorage);
-  if (
-    oldMacros > 0 &&
-    newMacros === 0 &&
-    !confirmShrinkage &&
-    !confirmDeletions
-  ) {
+  if (newMacros < oldMacros && !confirmDeletions) {
     throw new ConverterError(
-      `All ${oldMacros} Confluence macro(s) would be removed from the page. ` +
-        `This may indicate accidental content loss (e.g. a lossy markdown round-trip). ` +
-        `Re-submit with confirm_shrinkage: true if this is intentional.`,
+      `${MACRO_LOSS_NOT_CONFIRMED}: Confluence macro count would drop from ` +
+        `${oldMacros} to ${newMacros} (removed, or hidden inside a comment or ` +
+        `code body). This may indicate accidental content loss (e.g. a lossy ` +
+        `markdown round-trip). Re-submit with confirm_deletions: true if this ` +
+        `is intentional.`,
       MACRO_LOSS_NOT_CONFIRMED,
     );
   }
