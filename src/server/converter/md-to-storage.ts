@@ -14,7 +14,7 @@
 import MarkdownIt from "markdown-it";
 import taskLists from "markdown-it-task-lists";
 import container from "markdown-it-container";
-import matter from "gray-matter";
+import { splitFrontmatter } from "./frontmatter.js";
 import { randomUUID } from "crypto";
 import { escapeXmlAttr, escapeXmlText, escapeCdata } from "./escape.js";
 // Note: `parseConfluenceUrl` is no longer imported — B2 (plain-anchor strategy)
@@ -704,11 +704,29 @@ function extractInlineDirectives(md: string, mdi: MarkdownIt): {
  */
 interface ParsedFrontmatter {
   toc?: {
-    maxLevel?: number;
-    minLevel?: number;
+    maxLevel?: number | string;
+    minLevel?: number | string;
     style?: string;
   };
   headingOffset?: number;
+}
+
+/**
+ * Copy the recognised ToC fields, keeping only scalar values. A field written
+ * as a map or sequence (or an alias to one) is dropped rather than
+ * stringified into the macro parameter.
+ */
+function pickTocFields(raw: Record<string, unknown>): NonNullable<ParsedFrontmatter["toc"]> {
+  const scalar = (v: unknown): string | number | undefined =>
+    typeof v === "string" || typeof v === "number" ? v : undefined;
+  const maxLevel = scalar(raw["maxLevel"]);
+  const minLevel = scalar(raw["minLevel"]);
+  const style = scalar(raw["style"]);
+  return {
+    ...(maxLevel !== undefined && { maxLevel }),
+    ...(minLevel !== undefined && { minLevel }),
+    ...(style !== undefined && { style: String(style) }),
+  };
 }
 
 /**
@@ -1085,26 +1103,22 @@ export function markdownToStorage(md: string, opts?: ConverterOptions): string {
   let bodyMd = md;
   let frontmatter: ParsedFrontmatter = {};
 
-  // Only parse frontmatter if the string starts with '---' followed by
-  // a newline and has a closing '---' or '...' delimiter. This prevents
-  // a bare '---' (horizontal rule in markdown) from being swallowed by
-  // gray-matter as an empty frontmatter block.
-  const frontmatterRe = /^---\r?\n[\s\S]*?\r?\n(---|\.\.\.)(\r?\n|$)/;
-  if (frontmatterRe.test(md.trimStart())) {
-    try {
-      const parsed = matter(md);
-      bodyMd = parsed.content;
-      // Extract recognized keys.
-      const data = parsed.data as Record<string, unknown>;
-      if (data["toc"] && typeof data["toc"] === "object") {
-        frontmatter.toc = data["toc"] as ParsedFrontmatter["toc"];
-      }
-      if (typeof data["headingOffset"] === "number") {
-        frontmatter.headingOffset = data["headingOffset"];
-      }
-    } catch {
-      // If frontmatter parsing fails, proceed with the original content.
-      bodyMd = md;
+  // Frontmatter needs an opening `---` line and a closing `---` / `...` line;
+  // a bare `---` (horizontal rule) is never swallowed. See frontmatter.ts for
+  // what is, and is not, stripped.
+  const split = splitFrontmatter(md);
+  if (split !== undefined) {
+    bodyMd = split.body;
+    // Extract recognized keys.
+    const data = split.data;
+    if (data["toc"] && typeof data["toc"] === "object") {
+      frontmatter.toc = pickTocFields(data["toc"] as Record<string, unknown>);
+    }
+    // Integers only: `.nan` / `1.5` would otherwise reach the heading level
+    // arithmetic and emit an invalid `<h...>` tag.
+    const offset = data["headingOffset"];
+    if (typeof offset === "number" && Number.isInteger(offset)) {
+      frontmatter.headingOffset = offset;
     }
   }
 
