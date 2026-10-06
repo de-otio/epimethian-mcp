@@ -27,9 +27,11 @@ Plan: `plans/field-session-findings-2026-10.md`.
   edit (`PLACEHOLDER_LITERAL_IN_PAGE`). `[[epi:` in an `append_to_page` or
   `prepend_to_page` body is refused (`INVENTED_TOKEN`).
 - **`version: "current"` with placeholders is refused.** A `find_replace`
-  whose find or replace string contains a placeholder must pass a numeric
-  version (`PLACEHOLDER_NEEDS_PINNED_VERSION`). This applies to
-  `find_replace` only in this release.
+  pair, or a body (`update_page`, `update_page_section`, or an
+  `update_page_sections` body entry), that contains a `[[epi:` placeholder
+  must pass a numeric version (`PLACEHOLDER_NEEDS_PINNED_VERSION`).
+  Placeholder ids are positional, so they are only meaningful against the
+  version that showed them.
 - **Section-write confirmation tokens are bound to the call.** A token is
   bound to the tool, page, section entries (body or pairs, with flags), the
   resulting storage hash and the page version; a token for one call no

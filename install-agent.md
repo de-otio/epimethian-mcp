@@ -749,8 +749,8 @@ positional and numbered from the section body (not the heading), so the ids in a
   soft-confirmation / `batch_token` flow), as in body mode. In
   `update_page_sections` the deletion list uses section-qualified ids such as
   `Summary#T0001`.
-- With `version: "current"`, a `find_replace` pair containing `[[epi:` is refused
-  (`PLACEHOLDER_NEEDS_PINNED_VERSION`). Pass the version from your read.
+- With `version: "current"`, a `find_replace` pair or a body containing `[[epi:` is
+  refused (`PLACEHOLDER_NEEDS_PINNED_VERSION`). Pass the version from your read.
 - If the page's own prose contains literal `[[epi:Tnnnn]]` text, `find_replace`
   and markdown body writes refuse (`PLACEHOLDER_LITERAL_IN_PAGE`); use storage
   format for that page.

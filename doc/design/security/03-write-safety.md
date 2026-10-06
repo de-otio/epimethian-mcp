@@ -370,9 +370,9 @@ spliced full page.
   replace string contains a placeholder
   (`PLACEHOLDER_NEEDS_PINNED_VERSION`). Placeholder ids are positional, so
   a write that skips the version check could apply them to a page whose
-  macros have shifted. This check is specific to `find_replace`;
-  body-mode markdown writes with `version: "current"` are not covered by
-  it in this release.
+  macros have shifted. The same check runs before any fetch for bodies:
+  `update_page`, `update_page_section` body mode and each
+  `update_page_sections` body entry.
 - **View fallback.** When a `find` has no exact match, it is retried on
   the fence's view of the text (NFKD per code point, minus the characters
   the fence strips), so text copied from a fenced read matches its source.

@@ -91,7 +91,7 @@ Updates a single section of a page by heading name. The rest of the page is unto
 - If the exact bytes are not found, the engine retries on the same normalised view that reads use, so text copied from a fenced read (NBSP, `…`, `²`, zero-width characters) still matches. The result says when this happened, and unchanged text at the start and end of `find` keeps its stored bytes.
 - A placeholder may not appear twice in the result (`DUPLICATED_TOKEN`) and may not be one the section does not contain (`FORGED_TOKEN`). Dropping a placeholder removes the macro and goes through the same `confirm_deletions` gate as body mode (elicitation, soft-confirmation token or `batch_token`).
 - If the page's own text contains a literal `[[epi:` string, the edit is refused (`PLACEHOLDER_LITERAL_IN_PAGE`).
-- `version: "current"` is refused when any find or replace string contains a placeholder (`PLACEHOLDER_NEEDS_PINNED_VERSION`): placeholder ids are positional, so pass the version from the read that showed them.
+- `version: "current"` is refused when any find or replace string, or any body (`update_page`, `update_page_section`, `update_page_sections` entries), contains a placeholder (`PLACEHOLDER_NEEDS_PINNED_VERSION`): placeholder ids are positional, so pass the version from the read that showed them.
 
 In `get_page` markdown section views, placeholder ids are numbered from the section body (the heading is excluded and rendered separately), so ids in the view match the ids `find_replace` and body mode use.
 
