@@ -6,6 +6,8 @@
 
 A security-focused [MCP](https://modelcontextprotocol.io/) server that gives AI agents safe, multi-tenant access to Confluence Cloud. It provides some features not available in the official MCP server, like support for draw.io diagrams, macros, etc.
 
+**What's new (v7.0.0):** `find_replace` now requires each `find` to match exactly once (opt in to several with `replace_all: true`), and `update_page_sections` accepts `find_replace` per section. Every body returned by `get_page` and `get_page_by_title` sits inside the untrusted-content fence. `search_pages` can be scoped to a profile's `read_spaces` and redact `redact_patterns` from titles and excerpts. HTTP requests have timeouts and bounded retries, and a write whose outcome is unknown blocks `version: "current"` writes to that page until a fresh read. Every tool declares annotations. Breaking changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
 **What's new (v6.8.0):** `authorise_destructive_writes` + `batch_token` field on every destructive tool — pre-authorise a batch of destructive writes with a single user prompt, then fan out the actual writes (sub-agent fan-out, bulk doc refreshes) without each one going through its own elicitation. Page-id-scoped (no wildcards), TTL-bounded, operation-bounded; validation failures fall through transparently to the per-call gate. v6.7.2 flipped `EPIMETHIAN_TOKEN_IN_TEXT` to default-on (opt out via `EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true`), closing the under-configured-install gap for Claude Code users. v6.6.0–6.6.3 introduced soft-confirmation token round-trip for clients without working elicitation: single-use, diff-bound tokens; fast-decline auto-detection (the Claude Code "fakes elicitation" bug now Just Works without `EPIMETHIAN_BYPASS_ELICITATION`); `outputSchema` so spec-compliant clients forward the structured payload to the agent; SDK-compat hotfix for `z.object` output schemas. v6.5 added per-client setup CLI snippets (`epimethian-mcp setup --client …`). v6.4.1 added atomic multi-section updates and find-replace mode. See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ## Why use this?
@@ -156,6 +158,36 @@ CONFLUENCE_PROFILE=my-profile epimethian-mcp permissions my-profile
 
 For the full posture resolution matrix and error remediation design, see [doc/design/14-api-permission-handling.md](doc/design/14-api-permission-handling.md).
 
+## Search Scope and Redaction
+
+Three profile settings limit what `search_pages` shows the agent. They live in the profile registry JSON (like `spaces`); there is no CLI flag. Restart running servers after editing.
+
+```jsonc
+// ~/.config/epimethian-mcp/profiles.json
+{
+  "profiles": ["my-profile"],
+  "settings": {
+    "my-profile": {
+      "read_spaces": ["DOCS", "TEAM"],
+      "read_spaces_enforced": true,
+      "redact_patterns": ["project-x", "internal.example.com"]
+    }
+  }
+}
+```
+
+| Setting | Type | Purpose |
+|---|---|---|
+| `read_spaces` | string[] (max 100 keys) | Default search scope. CQL is combined with `space in (...)`, and the result says the search was restricted. An empty list means no space is searchable by default. |
+| `read_spaces_enforced` | boolean (default `false`) | Requires `read_spaces`. When `true`, `search_pages` with `all_spaces: true` returns an error. When `false`, the agent may widen a call with `all_spaces: true`. |
+| `redact_patterns` | string[] (max 100, 1–200 chars each) | Literal strings replaced with `[redacted]` in search result titles and excerpts. Matching is case-insensitive after entity decoding and Unicode normalisation. Patterns are never treated as regular expressions and never appear in errors. |
+
+Notes:
+
+- A query that cannot be scoped safely (unbalanced parentheses, an unterminated string literal, an invalid `ORDER BY`) is refused when scoping applies, rather than sent unscoped.
+- Redaction applies to search titles and excerpts only, not to page bodies. It is hygiene, not a security boundary: it cannot hide that a result exists. `read_spaces_enforced` limits `search_pages` only; use `spaces` to restrict writes.
+- Invalid values disable `search_pages` with an error naming the setting, while the other tools keep working.
+
 ## Provenance: AI-Edited Badge
 
 Any page **created or modified** by this MCP is automatically tagged with a yellow "AI-edited" content-status badge. The badge appears as a colored pill in the Confluence page view and space index, signaling that the page has been touched by an AI agent and has not yet been reviewed by a human. A human can clear it in one click after review.
@@ -217,11 +249,11 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 
 - **Drill-down pattern** — Use `headings_only` to get a page outline (~500 tokens), then `section` to read just the part you need in storage format. No need to fetch the full page body.
 - **Section-level editing** — `update_page_section` replaces content under a single heading. The rest of the page is never touched, eliminating the need to send the full body on updates.
-- **Multi-section atomic updates** — `update_page_sections` (v6.4.0+) updates multiple sections in one version bump, eliminating version conflicts and intermediate reads during tree-building workflows.
-- **Find-replace mode** — `update_page_section` and `update_page_sections` accept optional `find_replace: [{find, replace}, ...]` (v6.4.0+) for literal-string substitutions without resending section bodies. Macro-safe: substitutions cannot match inside macro boundaries.
+- **Multi-section atomic updates** — `update_page_sections` updates multiple sections in one request and one version bump, eliminating version conflicts and intermediate reads during tree-building workflows. Each entry takes either `body` or `find_replace`. The content-safety guards also run on the merged page, so several small section edits cannot together remove most of a page.
+- **Find-replace mode** — `update_page_section` and `update_page_sections` accept optional `find_replace: [{find, replace, replace_all?}, ...]` for literal-string substitutions without resending section bodies. Each `find` must match exactly once; set `replace_all: true` on a pair to replace several occurrences (overlapping matches are rejected either way). Zero matches fails with `FIND_REPLACE_MATCH_FAILED`, several with `FIND_REPLACE_AMBIGUOUS` (the error gives the count). Macro-safe: substitutions cannot match inside macro boundaries, duplicating or forging a macro placeholder is rejected, and removing one goes through the `confirm_deletions` gate. Text copied from a fenced read (non-breaking spaces, `…`, `²`, zero-width characters) still matches when the exact bytes do not, and unchanged text keeps its stored bytes. `version: "current"` is refused when a pair contains a `[[epi:` placeholder.
 - **Skip-read shortcut** — `update_page`, `update_page_section`, and `update_page_sections` accept `version: "current"` to skip the read of the latest version when the next operation will be an update (v6.3.0+).
 - **Page cache** — An in-memory, version-keyed cache eliminates redundant API calls during iterative editing. After updating a page, subsequent reads serve from cache (~90% fewer tokens on repeated reads).
-- **Search excerpts** — Search results include content previews so the agent can triage results without calling `get_page` on each one.
+- **Search excerpts** — Search results include content previews so the agent can triage results without calling `get_page` on each one. Pass `excerpts: false` for titles only.
 - **Markdown view** — `format: "markdown"` returns a compact read-only rendering where macros become `[macro: name]` placeholders. The server rejects any attempt to write markdown back — storage format is the only accepted write format.
 - **Truncation** — `max_length` cuts the body at an element boundary with a `[truncated at N of M characters]` marker.
 
@@ -236,13 +268,14 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `update_page_section` | Update a single section by heading name                                |
 | `update_page_sections` | Update multiple sections atomically in one version bump                |
 | `delete_page`         | Delete a page                                                          |
+| `authorise_destructive_writes` | Pre-authorise a batch of destructive writes (returns a `batch_token`) |
 | `list_pages`          | List pages in a space                                                  |
 | `get_page_children`   | Get child pages                                                        |
-| `search_pages`        | Search via CQL (includes content excerpts)                             |
+| `search_pages`        | Search via CQL (excerpts; scoped by the profile's `read_spaces`)       |
 | `get_spaces`          | List available spaces                                                  |
 | `add_attachment`      | Upload a file attachment                                               |
 | `get_attachments`     | List attachments on a page                                             |
-| `download_attachment` | Download an attachment's bytes to a local file (read-only)             |
+| `download_attachment` | Download an attachment's bytes to a local file (works in read-only profiles) |
 | `add_drawio_diagram`  | Add a draw.io diagram                                                  |
 | `get_labels`          | Get all labels on a page                                               |
 | `add_label`           | Add one or more labels to a page                                       |
@@ -263,6 +296,8 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `lookup_user`         | Search for Atlassian users by name or email                            |
 | `resolve_page_link`   | Resolve a page title + space key to a stable page ID and URL           |
 | `get_version`         | Return the server version                                              |
+| `check_permissions`   | Report the profile's access mode and the token's capabilities          |
+| `upgrade`             | Upgrade to the latest version (restart required)                       |
 
 ## Environment Variables
 
@@ -275,11 +310,16 @@ Configuration via environment variables (all optional; sensible defaults provide
 | `EPIMETHIAN_WRITE_BUDGET_SESSION` | 250 writes | Session-scoped write limit. |
 | `EPIMETHIAN_SUPPRESS_EQUIVALENT_DELETIONS` | `false` | Opt-in feature flag. When `true`, suppress `confirm_deletions` for macro byte-equivalent round-trips (e.g. re-rendered `<ac:link>` with reordered attributes). |
 | `EPIMETHIAN_BYPASS_ELICITATION` | `false` | Escape hatch for MCP clients that advertise elicitation support but never honour it. When `true`, skips the in-protocol confirmation prompt. The harness's permission allow-list still gates writes. |
+| `EPIMETHIAN_HTTP_TIMEOUT_MS` | 30000 | Read timeout for Confluence requests, in milliseconds; clamped to 5000–300000. Write requests get twice this, attachment transfers four times (60 s and 120 s by default). Invalid values fall back to the default. |
 | `EPIMETHIAN_MUTATION_LOG` | `false` | Opt-in logging. Write JSONL records to `~/.epimethian/logs/` for every write operation. |
 | `EPIMETHIAN_AUTO_UPGRADE` | `check-only` | Set to `patches` for automatic patch-version installs (same npm provenance verification). |
 | `CONFLUENCE_READ_ONLY` | *(deprecated)* | Legacy alias for `posture: "read-only"` in profile settings. Use the profile config instead. |
 | `CONFLUENCE_UNVERIFIED_STATUS` | `true` | Master toggle for AI-edited badge. Set to `false` to disable. |
 | `CONFLUENCE_UNVERIFIED_STATUS_LOCALE` | Confluence site default → `en` | Language for the badge label (10 locales: en/fr/de/es/pt/it/nl/ja/zh/ko). |
+
+Network behaviour: `GET` and `HEAD` requests are retried up to 3 attempts on 429 and 503, honouring `Retry-After` up to 60 s. Writes are never retried automatically. At most 6 requests run at once per process. If a write times out or fails after the request was sent (network error, 502, 504), the outcome is unknown: the mutation log records it as `unknown`, the page cache entry is dropped, pending confirmation tokens are invalidated, and `version: "current"` writes to that page are refused until you read the page again.
+
+Tool annotations: every tool declares a title and `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`, and `delete_page`, `revert_page`, `delete_comment`, `authorise_destructive_writes` and `upgrade` also set `_meta["anthropic/requiresUserInteraction"]`, which makes Claude Code prompt on every call. The hints are advisory; the server-side guards do not depend on them. See [install-agent.md](install-agent.md#tool-descriptions-and-annotations-700) for details.
 
 For CI/headless environments without OS keychain, set all three: `CONFLUENCE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`.
 
