@@ -539,6 +539,32 @@ describe("R1 outcome-unknown writes", () => {
     });
   });
 
+  describe("a 2xx answer that does not parse is an unknown outcome, not a failed write", () => {
+    const writes: Array<[string, () => Promise<unknown>]> = [
+      ["createFooterComment", () => createFooterComment("30", "hi")],
+      ["createFooterComment (reply)", () => createFooterComment("30", "hi", "77")],
+      ["createInlineComment (reply)", () => createInlineComment("30", "hi", "text", 0, "77")],
+      ["createInlineComment (selection)", () => createInlineComment("30", "hi", "text", 0)],
+      ["uploadAttachment", () => uploadAttachment("30", Buffer.from("x"), "f.txt")],
+    ];
+    const routed = (init?: RequestInit) =>
+      init?.method === "POST"
+        ? json({ unexpected: "shape", results: "not-an-array" })
+        : json({ id: "30", title: "T", version: { number: 5 }, body: { storage: { value: "<p>text</p>" } } });
+
+    it.each(writes)("%s: rejects with WriteOutcomeUnknownError and evicts the parent page's cache", async (_name, write) => {
+      setFetch((_url, init) => routed(init));
+      pageCache.set("30", 5, "<p>text</p>");
+      pageCache.set("31", 2, "<p>other</p>");
+      const err = await write().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(WriteOutcomeUnknownError);
+      expect((err as Error).message).toContain("may have been applied");
+      expect(pageCache.has("30")).toBeUndefined();
+      expect(pageCache.getOutcomeUnknown("30")).toBeUndefined();
+      expect(pageCache.has("31")).toMatchObject({ version: 2 });
+    });
+  });
+
   it("the mutation log record carries outcome: unknown, and only for these errors", () => {
     const unknown = new WriteOutcomeUnknownError("PUT", `${API_V2}/pages/30`, new TypeError("x"), "request");
     expect(errorRecord("update_page", "30", unknown).outcome).toBe("unknown");
