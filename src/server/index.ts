@@ -129,7 +129,7 @@ import { getProfileSettings } from "../shared/profiles.js";
 import { assertSpaceAllowed } from "./space-allowlist.js";
 import { resolveReadScope } from "./read-scope.js";
 import { scopeCql } from "./cql-scope.js";
-import { cleanSearchText } from "./search-redact.js";
+import { cleanSearchText, safeIdentifier } from "./search-redact.js";
 import { buildCheckPermissionsPayload } from "./check-permissions.js";
 import {
   checkForUpdates,
@@ -2906,14 +2906,15 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (scopeNote !== undefined) lines.push(scopeNote);
         lines.push("");
         for (const p of results) {
-          // T5: one fence per result (title, excerpt and metadata together),
-          // so the canary appears once per result, not once per field.
+          // T5: one fence per result (title and excerpt together), so the
+          // canary appears once per result, not once per field. The ID and
+          // Space are server-authored identifiers and stay OUTSIDE the fence,
+          // on their own line: inside it, tenant text could imitate them and
+          // make a fake hit that looks like a real one. Title and excerpt are
+          // collapsed to one line each for the same reason.
           const spaceKey = p.spaceId ?? p.space?.key ?? "N/A";
-          const block = [
-            `ID: ${p.id}`,
-            `Space: ${spaceKey}`,
-            `Title: ${cleanSearchText(p.title, readScope.redactor)}`,
-          ];
+          lines.push(`- ID: ${safeIdentifier(p.id)}, Space: ${safeIdentifier(spaceKey)}`);
+          const block = [`Title: ${cleanSearchText(p.title, readScope.redactor)}`];
           if (excerpts !== false && p.excerpt) {
             block.push(`Excerpt: ${cleanSearchText(p.excerpt, readScope.redactor)}`);
           }
