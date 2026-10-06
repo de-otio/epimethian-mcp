@@ -89,12 +89,14 @@ describe("diff module", () => {
       expect(result.summary).toBe("No changes.");
     });
 
-    it("builds human-readable summary string with section names", () => {
-      const a = "# A\n\nOld";
-      const b = "# A\n\nNew";
+    it("builds a human-readable summary with counts and no section names", () => {
+      const a = "# Secret heading\n\nOld";
+      const b = "# Secret heading\n\nNew";
       const result = computeSummaryDiff(a, b);
       expect(result.summary).toContain("lines added");
-      expect(result.summary).toContain("Changes in sections: A");
+      expect(result.summary).toContain("1 section(s) changed (listed below)");
+      expect(result.summary).not.toContain("Secret heading");
+      expect(result.sections[0]?.section).toBe("Secret heading");
     });
   });
 
