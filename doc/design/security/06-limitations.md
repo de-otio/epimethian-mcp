@@ -227,6 +227,90 @@ If you deploy an agent against a tenant with many untrusted authors
 profile for reads and a separate read-write profile gated by human
 approval for writes.
 
+## 16. Tool annotations and `_meta` are untrusted hints
+
+Every tool carries `readOnlyHint`, `destructiveHint`, `idempotentHint` and
+`openWorldHint`, and five tools carry
+`_meta["anthropic/requiresUserInteraction"]`. These are statements the
+server makes to the client; the client decides what to do with them. A
+client may ignore them, and an MCP spec revision may change their meaning.
+Nothing in Epimethian's safety depends on a client honouring them: the
+guards, tokens, elicitation and profile allowlists run server-side
+regardless. Treat the annotations as UX (a prompt on every `delete_page`
+in clients that support it), not as a control. Conversely, do not rely on
+`readOnlyHint` from another server to judge what a tool can do.
+`download_attachment` shows why: it is a read against Confluence but
+writes a local file, so it is annotated `readOnlyHint: false,
+destructiveHint: true`.
+
+## 17. Read scope is hygiene unless enforced
+
+`read_spaces` narrows what `search_pages` queries by default, and
+`redact_patterns` removes literal text from search titles and excerpts.
+Neither is a data boundary:
+
+- With `read_spaces` alone, an agent can pass `all_spaces: true`.
+  `read_spaces_enforced` turns that into an error.
+- Even when enforced, scoping applies to `search_pages` only. `get_page`,
+  `get_page_by_title`, `list_pages` and the version tools read any page
+  the token can read. To keep an agent out of a space, use a token with
+  no access to it.
+- Scoping is a request rewrite. It trusts Confluence to honour the
+  `space in (...)` clause and does not inspect results.
+- Redaction only sees search output. The same text is returned unredacted
+  by `get_page`, and a redacted result still shows that a page matched.
+  Unicode and entity tricks are normalised away, but a pattern cannot
+  match text that is split across an excerpt boundary or paraphrased.
+
+## 18. Writes can end with an unknown outcome
+
+If a write times out, the connection drops, or a gateway answers 502 or
+504 after the request was sent, the server cannot know whether Confluence
+applied it. It raises `WriteOutcomeUnknownError`, logs the mutation with
+`outcome: "unknown"`, evicts the cached page, invalidates tokens for that
+page and refuses further writes based on a newer version until the page
+has been re-read. It does not retry: a blind retry of an append or a
+replace could apply the change twice.
+
+What remains for the agent or user: read the page and decide. The
+protection covers this process only. A second server process, or a human
+retrying from another client, does not see the mark. Creates are the
+weakest case: after an unknown `create_page`, a retry may create a
+duplicate title, so search before retrying.
+
+## 19. NFKC folding of reads and the fence-view fallback
+
+Everything the fence returns is folded to NFKC and stripped of zero-width,
+bidi and control characters. That closes spoofing of the fence markers, but
+it means the text an agent sees is not byte-identical to what Confluence
+stores: a non-breaking space reads as a space, `…` as `...`, `²` as `2`.
+
+`find_replace` copes with this by first matching the exact bytes and, only
+if there is no exact match, matching on the fence's view (NFKD per code
+point, minus the stripped characters). When that fallback is used the
+result says so, and unchanged text at the edges of `find` keeps its stored
+bytes. Limits:
+
+- The fallback cannot match combining marks stored in a non-canonical
+  order; such text only matches exactly.
+- Text inside macros is never matched, with or without the fallback.
+- A fold can in principle make two different stored strings look the same.
+  Exactly-once matching still applies in the matched space, so an
+  ambiguous fold fails with `FIND_REPLACE_AMBIGUOUS` rather than editing
+  the wrong occurrence.
+
+## 20. Open question: parameter-description truncation
+
+Tool descriptions are capped at 1,800 characters, with the safety text
+first, so that a client that cuts descriptions at a fixed length cuts
+examples rather than warnings. It is **not known** whether MCP clients
+truncate individual *parameter* descriptions (the `describe()` text on each
+argument). The server cannot find out. Parameter descriptions are kept
+short as a precaution, and safety-relevant wording (for example "must come
+from the user's original request") is placed in the tool description, not
+only in a parameter description. If a client does truncate parameter
+descriptions, long ones could lose their tail.
+
 ## v6.0.0 — which limitations above are now materially mitigated
 
 This release (see `CHANGELOG.md` and the

@@ -335,3 +335,109 @@ registration at startup. `spaces` gates every write-path handler —
 the page's space via a cached metadata fetch (5-min TTL). Unknown
 tool names abort startup with `InvalidToolAllowlistError`. Out-of-
 allowlist writes throw `SpaceNotAllowedError`.
+
+## v7.0.0 additions
+
+Sourced from `plans/field-session-findings-2026-10.md`.
+
+### `find_replace` gate (S1)
+
+`update_page_section` and `update_page_sections` accept `find_replace`
+pairs as an alternative to `body`. The engine
+(`src/server/converter/find-replace-engine.ts`) works on the section's
+tokenised storage, where every `<ac:*>`, `<ri:*>` and `<time>` element is
+an opaque `[[epi:Tnnnn]]` placeholder, so text inside a macro is never
+matched. `safePrepareFindReplace` runs the same guards body mode runs:
+the 2 MB size cap, the fence/canary echo check on every replacement (and
+on their concatenation, so a canary split across two pairs is caught),
+then the engine, then the deletion gate. Page-level checks (macro
+non-growth, shrinkage, structure and content-floor guards) run on the
+spliced full page.
+
+- **Exactly-once matching.** Each `find` must match once
+  (`FIND_REPLACE_MATCH_FAILED` for none, `FIND_REPLACE_AMBIGUOUS` with the
+  count for several). `replace_all: true` per pair opts in to several;
+  overlapping occurrences are rejected even then. A match may not split a
+  surrogate pair or partly overlap a placeholder.
+- **Placeholder invariants.** A placeholder that occurs twice in the
+  result is rejected (`DUPLICATED_TOKEN`: a copy would duplicate the macro
+  and its `ac:macro-id`). A `[[epi:` string that is not a placeholder of
+  this section is rejected (`FORGED_TOKEN`). Neither has an opt-out.
+- **Dropped placeholders** are the macros being removed. They go through
+  the same `confirm_deletions` gate as body mode: elicitation, a
+  soft-confirmation token, or a `batch_token`.
+- **Pinned version.** `version: "current"` is refused when any find or
+  replace string contains a placeholder
+  (`PLACEHOLDER_NEEDS_PINNED_VERSION`). Placeholder ids are positional, so
+  a write that skips the version check could apply them to a page whose
+  macros have shifted. This check is specific to `find_replace`;
+  body-mode markdown writes with `version: "current"` are not covered by
+  it in this release.
+- **View fallback.** When a `find` has no exact match, it is retried on
+  the fence's view of the text (NFKD per code point, minus the characters
+  the fence strips), so text copied from a fenced read matches its source.
+  The result notes when this was used, and the common prefix and suffix of
+  `find` and `replace` keep their stored bytes.
+
+### Placeholder literals and single-pass restore
+
+Placeholders are restored from the sidecar in a single pass. Earlier
+versions restored in several passes, so a literal `[[epi:Tnnnn]]` inside a
+code macro could be expanded into another macro's XML. Now XML restored
+from one macro is never rescanned. Because a literal `[[epi:` in a page's
+prose would be indistinguishable from a placeholder, `find_replace` and
+markdown body writes refuse such a page
+(`PLACEHOLDER_LITERAL_IN_PAGE`), and `[[epi:` in an `append_to_page` or
+`prepend_to_page` body is refused (`INVENTED_TOKEN`).
+
+### Confirmation binding for section writes
+
+The diff hash behind a section-write confirmation token covers the tool
+name, page id, page version, every entry (section name plus its body, or
+its pairs with their `replace_all` flags), the three `confirm_*` flags and
+the SHA-256 of the resulting full storage. `ac:macro-id` values are blanked
+before hashing, because markdown conversion mints a random id per new code
+or expand macro and an identical retry would otherwise never match. A token
+minted for one call is rejected for any call that differs in one of those
+fields. Tokens are single-use.
+
+### `requiresUserInteraction`
+
+`delete_page`, `revert_page`, `delete_comment`,
+`authorise_destructive_writes` and `upgrade` set
+`_meta["anthropic/requiresUserInteraction"]`. Clients that honour it
+prompt the user on every call. This is a client-side hint layered on top
+of the server's own gates, not a replacement for them; a client that
+ignores the key still reaches the elicitation and token gates.
+
+### Outcome-unknown writes
+
+A write that fails after the request was sent (timeout, network error, a
+502 or 504, or a 2xx response that cannot be read) may or may not have been
+applied. The server raises `WriteOutcomeUnknownError`, never retries the
+write, and then:
+
+- records the mutation-log entry with `outcome: "unknown"`;
+- evicts the page from the cache;
+- invalidates confirmation tokens minted for the page;
+- marks the page, so a later write to it that is based on a newer version
+  (which is what `version: "current"` resolves to after the earlier write
+  landed) is refused with `PageOutcomeUnknownError` until the agent has
+  re-read the page. A write based on the marked version itself is still
+  allowed: if the earlier write landed, Confluence rejects it with a 409.
+
+Reads (GET/HEAD) are different: they time out with
+`ConfluenceTimeoutError`, and 429/503 are retried up to three attempts,
+honouring `Retry-After` up to 60 s. Timeouts default to 30 s for reads,
+60 s for writes and 120 s for transfers; `EPIMETHIAN_HTTP_TIMEOUT_MS`
+scales them, clamped to 5 to 300 s. A process-wide cap limits concurrent
+requests. See `src/server/request-policy.ts`.
+
+### 409 triage
+
+A 409 on a page update is treated as a version conflict only if the page
+has moved past the version the caller sent. If the page is still at that
+version, the 409 is something else: `ConfluenceApprovalRequiredError` when
+the response points at a space that requires approval, otherwise
+`ConfluenceUnexpectedConflictError`. Neither is retried, and neither tells
+the agent to retry with a new version number.

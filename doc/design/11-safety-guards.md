@@ -1092,3 +1092,30 @@ describe('revert_page', () => {
 | Write-ahead log disk usage                    | Accumulated log files over time                                               | Log files are small (~200 bytes/record). Per-process naming limits individual file size. Document the cleanup expectation or add auto-rotation.                                 |
 | `revert_page` version mismatch                | Historical version may not exist (e.g., version 0, or version beyond history) | The v1 API will return 404, which propagates as a clear error message.                                                                                                          |
 | Pre-write snapshot cache pressure             | 16 parallel updates = 16 extra cache entries                                  | Consider increasing cache size from 50 to 100, or using a separate map for snapshots.                                                                                           |
+
+---
+
+## Addendum: guards added in 7.0.0
+
+The plan above is the original design and is kept as written. The guards
+that followed it are described in `doc/design/security/03-write-safety.md`;
+the ones that extend this plan's pipeline are:
+
+- **`find_replace` section edits** run the same fence/canary, size and
+  content-safety guards as body mode, plus exactly-once matching and the
+  placeholder checks (`FIND_REPLACE_MATCH_FAILED`, `FIND_REPLACE_AMBIGUOUS`,
+  `DUPLICATED_TOKEN`, `FORGED_TOKEN`, `PLACEHOLDER_LITERAL_IN_PAGE`,
+  `PLACEHOLDER_NEEDS_PINNED_VERSION`). Macros a pair removes go through the
+  `confirm_deletions` gate exactly as the deletions of 1A's body path do.
+- **`update_page_sections`** applies its sections in one PUT and runs the
+  shrinkage (1A), structure (1B) and content-floor guards once on the merged
+  page, so several small edits cannot add up to a large loss.
+- **Confirmation tokens** for section writes are bound to the tool, page,
+  version, entries, flags and the SHA-256 of the resulting storage.
+- **Unknown write outcomes** (timeout, dropped connection, 502/504 after
+  send) are never retried; the page is marked and later writes based on a
+  newer version are refused until it is re-read. The write-ahead log (1E)
+  records them as `outcome: "unknown"`.
+- **Pre-write snapshots** (1F) are unchanged. An unknown outcome evicts the
+  page from the cache; the snapshot taken before the PUT stays available
+  for recovery.

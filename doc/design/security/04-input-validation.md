@@ -102,12 +102,69 @@ access.
 See the schemas in `src/server/confluence-client.ts:207+` (`PageSchema`,
 `CommentSchema`, etc.).
 
-## 8. CQL queries (user responsibility, documented)
+## 8. CQL queries (scoping and redaction)
 
 `search_pages` takes a CQL string from the AI agent. Confluence's CQL is
-not SQL and the attack surface is limited to the Atlassian backend, but the
-server does **not** attempt to parse or validate CQL — it is passed through
-as-is. The tool description warns the agent about this.
+not SQL and the attack surface is limited to the Atlassian backend, so the
+server does **not** try to validate CQL in general: without scoping it is
+passed through as-is, and the tool description warns the agent about this.
+
+When a profile sets `read_spaces` (and the call does not pass
+`all_spaces: true`), the query is scoped before it is sent. `scopeCql`
+wraps it as
+
+```
+(<cql>) AND space in ("K1","K2") [ORDER BY ...]
+```
+
+The parentheses make the restriction bind to the whole query, so
+`a OR b` cannot widen it. That only holds if the caller's text cannot
+close the wrapper early or hide a token inside a literal, so the query is
+scanned first and **refused** (not repaired) when:
+
+- a quoted literal (`'` or `"`, with backslash escapes) is not terminated;
+- parenthesis depth goes below zero, or ends above zero, outside literals;
+- `ORDER BY` appears inside parentheses, or the trailing `ORDER BY` is not
+  `field [ASC|DESC] (, field [ASC|DESC])*`.
+
+A trailing `ORDER BY` is split off before wrapping, because CQL only
+allows it at the end. Space keys are escaped with `escapeCqlString`. When
+`read_spaces_enforced` is set, `all_spaces: true` is an error rather than
+a widening. The profile settings are validated at runtime; an invalid
+combination disables `search_pages` with a message naming the field, and
+never echoes values.
+
+Scoping is request-side only. It trusts Confluence to honour the
+`space in (...)` conjunct and does not filter result bodies, so it limits
+what an agent searches by default; it is not a data boundary.
+
+### Search result redaction
+
+Search results are cleaned in a fixed pipeline
+(`src/server/search-redact.ts`), applied to titles and excerpts only:
+
+1. Strip the `@@@hl@@@` / `@@@endhl@@@` highlight markers the v1 search
+   endpoint adds. This always runs, whether or not redaction is configured.
+2. If the profile sets `redact_patterns`: decode HTML entities, so
+   `se&#99;ret` is seen as `secret`.
+3. Normalise to NFKC, remove the fence strip set (zero-width, bidi, tag
+   characters) and a few more invisible characters such as the soft hyphen.
+4. Repeat steps 1 to 3 until the text stops changing, because each can
+   build the input of another (`&#64;` decodes to a marker character). Text
+   that has not settled after a fixed number of passes is hiding something
+   and is replaced entirely.
+5. Match each pattern as an escaped literal, case-insensitively with
+   Unicode case folding (flags `giu`), longest pattern first. A pattern is
+   never interpreted as a regular expression, so it cannot cause ReDoS.
+6. Replace every match with `[redacted]`.
+
+Patterns get the same normalisation as the text. A pattern that normalises
+to nothing is rejected at configuration time. Patterns are never written to
+errors or logs. Each result is then fenced as its own untrusted block
+(ID, Space, Title, Excerpt).
+
+Redaction is hygiene, not a security boundary: it only sees what the search
+endpoint returns, and it does not hide that a result exists.
 
 ## 9. Child-process invocation
 
@@ -135,3 +192,25 @@ Raw error bodies are still logged to **stderr** (server logs, not tool
 output) to aid debugging. Treat server stderr as sensitive — if your MCP
 client surfaces stderr to a user-visible channel, credentials could leak
 via a novel error format that `sanitizeError` doesn't catch.
+
+## 11. Download destinations
+
+`download_attachment` writes Confluence-controlled bytes to a local path,
+so the destination is validated before anything is fetched or written:
+
+- The resolved path must be under `process.cwd()`.
+- When `output_path` is omitted, the attachment's own filename is checked
+  with the rules in section 4 and rejected, not sanitised.
+- **Dot-segment rule.** Any path segment below the working directory that
+  starts with `.` is refused: `.git`, `.claude`, `.github`, `.vscode`,
+  `.env` and any other dot-file or dot-directory. These are the places an
+  attacker-controlled file would be executed or trusted by tooling
+  (hooks, workflows, agent settings, environment files).
+- Files are never created executable, and an overwrite clears any execute,
+  setuid and setgid bits the old file had.
+- The file is opened with `O_NOFOLLOW | O_EXCL`, so a symlink at the
+  destination is not followed and an existing file is not replaced unless
+  `overwrite: true`.
+
+See `src/shared/safe-fs.ts` and the `download_attachment` section of
+[../03-tools.md](../03-tools.md).
