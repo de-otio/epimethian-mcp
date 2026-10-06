@@ -23,7 +23,7 @@
 import { promises as fsPromises, constants as fsConstants } from "node:fs";
 import { open as fsOpen } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 // `O_NOFOLLOW` is POSIX. Fall back to 0 on Windows so the open call still
 // succeeds — we accept that symlink protection is POSIX-only.
@@ -89,6 +89,31 @@ export async function safeOpenAppend(path: string, data: string): Promise<void> 
 }
 
 /**
+ * Find the first `.`-prefixed path segment of `path` below `root`
+ * (`.git`, `.claude`, `.github`, `.vscode`, `.env`, ...), or `undefined` when
+ * there is none. Pure; no filesystem access.
+ *
+ * Segments are taken relative to `root`, so a project that itself lives under
+ * a dot-directory (a worktree at `.claude/worktrees/x`) is not refused for it.
+ * A path outside `root` is reported as its first `..` segment, so a caller
+ * that forgot the containment check still fails closed.
+ *
+ * Why this exists: a downloaded attachment is attacker-influenced content, and
+ * dot-directories and dot-files are where tools look for configuration and
+ * hooks (`.git/hooks`, `.claude/settings.json`, `.vscode/tasks.json`,
+ * `.github/workflows`). Writing there turns a download into code execution.
+ */
+export function findDotSegment(path: string, root: string): string | undefined {
+  const rel = relative(resolve(root), resolve(path));
+  if (rel === "") return undefined;
+  if (isAbsolute(rel)) return rel; // different drive/root: fail closed
+  for (const segment of rel.split(sep)) {
+    if (segment === ".." || segment.startsWith(".")) return segment;
+  }
+  return undefined;
+}
+
+/**
  * Write `data` to `path` without ever following a symlink at the final
  * component.
  *
@@ -99,8 +124,12 @@ export async function safeOpenAppend(path: string, data: string): Promise<void> 
  * are still responsible for validating the *parent* directory (see
  * `verifyDirChain`, or a `realpath` containment check).
  *
+ * Never produces an executable file: a new file is created `0o600`, and when
+ * `overwrite` replaces an existing file, any execute, setuid, setgid or sticky
+ * bits it had are cleared, so downloaded bytes cannot inherit "runnable".
+ *
  * Throws:
- *   - EEXIST when the destination exists and `overwrite` is false.
+ *   - EEXIST when the destination exists and `overwrite` is not set.
  *   - ELOOP when `path` is a symlink.
  */
 export async function safeWriteFile(
@@ -115,6 +144,14 @@ export async function safeWriteFile(
     (opts.overwrite ? fsConstants.O_TRUNC : fsConstants.O_EXCL);
   const handle = await fsOpen(path, flags, 0o600);
   try {
+    if (opts.overwrite && process.platform !== "win32") {
+      // The mode argument to open() only applies to a newly created file, so
+      // an overwritten file keeps whatever it had. Strip the executable bits.
+      const { mode } = await handle.stat();
+      if ((mode & 0o7111) !== 0) {
+        await handle.chmod(mode & 0o666);
+      }
+    }
     // `writeFile` on the handle, not `write`: a raw `write(2)` may complete
     // having written fewer bytes than requested, and a single unchecked call
     // would leave a silently truncated file that the caller reports as a

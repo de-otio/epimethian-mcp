@@ -7,6 +7,7 @@ import {
   safeOpenAppend,
   safeWriteFile,
   verifyDirChain,
+  findDotSegment,
   SAFE_FS_HAS_O_NOFOLLOW,
 } from "./safe-fs.js";
 
@@ -242,5 +243,119 @@ posixOnly("safeWriteFile (download_attachment write path)", () => {
     const path = join(dir, "empty.bin");
     await safeWriteFile(path, new Uint8Array(0));
     expect((await stat(path)).size).toBe(0);
+  });
+});
+
+describe("findDotSegment (download_attachment dot-directory rule, H5)", () => {
+  const root = "/work/project";
+
+  it.each([
+    [".git", "/work/project/.git/hooks/pre-commit", ".git"],
+    [".claude", "/work/project/.claude/settings.json", ".claude"],
+    [".github", "/work/project/.github/workflows/ci.yml", ".github"],
+    [".vscode", "/work/project/.vscode/tasks.json", ".vscode"],
+    ["any other dot-directory", "/work/project/docs/.cache/x.bin", ".cache"],
+    ["a dot-file in the root", "/work/project/.env", ".env"],
+    ["a dot-file in a subdirectory", "/work/project/out/.npmrc", ".npmrc"],
+    ["a deeply nested dot-directory", "/work/project/a/b/c/.hidden/d/e.bin", ".hidden"],
+    ["a dot-directory with a trailing dot name", "/work/project/..data/x", "..data"],
+  ])("refuses %s", (_label, path, segment) => {
+    expect(findDotSegment(path, root)).toBe(segment);
+  });
+
+  it("reports the FIRST dot segment when there are several", () => {
+    expect(findDotSegment("/work/project/.git/.hooks/x", root)).toBe(".git");
+  });
+
+  it.each([
+    "/work/project/report.pdf",
+    "/work/project/out/report.v2.pdf",
+    "/work/project/docs/a.b/c.txt",
+    "/work/project/out/file.",
+  ])("allows %s", (path) => {
+    expect(findDotSegment(path, root)).toBeUndefined();
+  });
+
+  it("allows the root itself", () => {
+    expect(findDotSegment(root, root)).toBeUndefined();
+  });
+
+  it("measures segments below the root, so a root inside a dot-directory is not refused for it", () => {
+    const dotRoot = "/home/user/.claude/worktrees/lane";
+    expect(findDotSegment(`${dotRoot}/out/file.bin`, dotRoot)).toBeUndefined();
+    expect(findDotSegment(`${dotRoot}/.git/config`, dotRoot)).toBe(".git");
+  });
+
+  it("normalises '..' and '.' before judging, so traversal cannot hide a segment", () => {
+    expect(findDotSegment("/work/project/out/../.git/config", root)).toBe(".git");
+    expect(findDotSegment("/work/project/./out/./file.bin", root)).toBeUndefined();
+  });
+
+  it("fails closed for a path outside the root", () => {
+    expect(findDotSegment("/elsewhere/file.bin", root)).toBe("..");
+    expect(findDotSegment("/work/other/file.bin", root)).toBe("..");
+  });
+});
+
+posixOnly("safeWriteFile never produces executable files (H5)", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "safe-fs-exec-"));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("creates new files with no execute bit even under a permissive umask", async () => {
+    const { stat } = await import("node:fs/promises");
+    const previous = process.umask(0);
+    try {
+      const path = join(dir, "new.sh");
+      await safeWriteFile(path, new TextEncoder().encode("#!/bin/sh\necho hi\n"));
+      expect((await stat(path)).mode & 0o7111).toBe(0);
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+    } finally {
+      process.umask(previous);
+    }
+  });
+
+  it("clears execute bits when overwrite replaces an executable file", async () => {
+    const { stat, readFile } = await import("node:fs/promises");
+    const path = join(dir, "tool.sh");
+    await writeFile(path, "#!/bin/sh\n", { mode: 0o755 });
+    await chmod(path, 0o755);
+    expect((await stat(path)).mode & 0o111).not.toBe(0);
+
+    await safeWriteFile(path, new TextEncoder().encode("replaced"), { overwrite: true });
+
+    const after = await stat(path);
+    expect(after.mode & 0o7111).toBe(0);
+    // Read/write bits the file already had are kept.
+    expect(after.mode & 0o644).toBe(0o644);
+    expect(await readFile(path, "utf-8")).toBe("replaced");
+  });
+
+  it("clears setuid and setgid bits as well when overwriting", async () => {
+    const { stat } = await import("node:fs/promises");
+    const path = join(dir, "suid.bin");
+    await writeFile(path, "x", { mode: 0o600 });
+    await chmod(path, 0o6755);
+
+    await safeWriteFile(path, new TextEncoder().encode("y"), { overwrite: true });
+
+    expect((await stat(path)).mode & 0o7111).toBe(0);
+  });
+
+  it("leaves a non-executable file's mode alone when overwriting", async () => {
+    const { stat } = await import("node:fs/promises");
+    const path = join(dir, "plain.txt");
+    await writeFile(path, "x", { mode: 0o640 });
+    await chmod(path, 0o640);
+
+    await safeWriteFile(path, new TextEncoder().encode("y"), { overwrite: true });
+
+    expect((await stat(path)).mode & 0o777).toBe(0o640);
   });
 });
