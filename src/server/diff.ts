@@ -52,24 +52,44 @@ export interface DiffUnifiedResult {
   truncated: boolean;
 }
 
+interface Section {
+  /** Name shown to the caller: the heading text, plus the occurrence number from the 2nd on. */
+  label: string;
+  content: string;
+}
+
 /**
- * Split markdown text into named sections by headings.
- * Content before any heading is keyed as "(intro)".
+ * Split markdown text into sections by headings. Content before any heading is
+ * the "(intro)" section.
+ *
+ * Sections are keyed by heading text AND occurrence (the 1st `# Notes`, the 2nd
+ * `# Notes`, ...), so two sections with the same heading cannot overwrite each
+ * other and hide a change in one of them. The intro has its own key, so a
+ * heading that reads "(intro)" cannot collide with it.
  */
-function splitBySections(text: string): Map<string, string> {
-  const sections = new Map<string, string>();
+function splitBySections(text: string): Map<string, Section> {
+  const sections = new Map<string, Section>();
+  const seen = new Map<string, number>();
   const lines = text.split("\n");
-  let currentKey = "(intro)";
+  let current: { key: string; label: string } = { key: "intro", label: "(intro)" };
   let currentLines: string[] = [];
+
+  const flush = (): void => {
+    sections.set(current.key, { label: current.label, content: currentLines.join("\n") });
+  };
 
   for (const line of lines) {
     const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
     if (headingMatch) {
       // Flush previous section
-      if (currentLines.length > 0 || currentKey !== "(intro)") {
-        sections.set(currentKey, currentLines.join("\n"));
-      }
-      currentKey = headingMatch[2].trim();
+      if (currentLines.length > 0 || current.key !== "intro") flush();
+      const heading = headingMatch[2].trim();
+      const occurrence = (seen.get(heading) ?? 0) + 1;
+      seen.set(heading, occurrence);
+      current = {
+        key: `heading:${occurrence}:${heading}`,
+        label: occurrence === 1 ? heading : `${heading} (#${occurrence})`,
+      };
       currentLines = [line];
     } else {
       currentLines.push(line);
@@ -78,9 +98,7 @@ function splitBySections(text: string): Map<string, string> {
 
   // Flush final section
   const content = currentLines.join("\n");
-  if (content.trim().length > 0 || currentKey !== "(intro)") {
-    sections.set(currentKey, content);
-  }
+  if (content.trim().length > 0 || current.key !== "intro") flush();
 
   return sections;
 }
@@ -102,18 +120,21 @@ export function computeSummaryDiff(
   let totalRemoved = 0;
 
   for (const key of allKeys) {
-    const contentA = sectionsA.get(key);
-    const contentB = sectionsB.get(key);
+    const secA = sectionsA.get(key);
+    const secB = sectionsB.get(key);
+    const contentA = secA?.content;
+    const contentB = secB?.content;
+    const label = (secB ?? secA)!.label;
 
     if (contentA === undefined && contentB !== undefined) {
       const lines = contentB.split("\n").filter((l) => l.trim()).length;
-      changes.push({ type: "added", section: key, added: lines, removed: 0 });
+      changes.push({ type: "added", section: label, added: lines, removed: 0 });
       totalAdded += lines;
     } else if (contentA !== undefined && contentB === undefined) {
       const lines = contentA.split("\n").filter((l) => l.trim()).length;
       changes.push({
         type: "removed",
-        section: key,
+        section: label,
         added: 0,
         removed: lines,
       });
@@ -130,7 +151,7 @@ export function computeSummaryDiff(
         if (part.removed) removed += lines;
       }
       if (added > 0 || removed > 0) {
-        changes.push({ type: "modified", section: key, added, removed });
+        changes.push({ type: "modified", section: label, added, removed });
         totalAdded += added;
         totalRemoved += removed;
       }
