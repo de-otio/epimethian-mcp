@@ -8,6 +8,23 @@ import {
 
 const FC = { seed: 20261006, numRuns: 200 };
 
+/**
+ * Text outside tags, for comparing generated fixtures before and after
+ * attribute stripping. A character walk rather than a tag-stripping regex:
+ * this is a test oracle, not a sanitiser, and the generated text never
+ * contains `<` or `>`.
+ */
+function textOutsideTags(html: string): string {
+  let out = "";
+  let inTag = false;
+  for (const ch of html) {
+    if (ch === "<") inTag = true;
+    else if (ch === ">") inTag = false;
+    else if (!inTag) out += ch;
+  }
+  return out;
+}
+
 describe("stripVolatileAttributes", () => {
   it("removes local-id, ac:local-id and ac:macro-id from start tags", () => {
     const html =
@@ -93,7 +110,7 @@ describe("stripVolatileAttributes", () => {
         expect(stripVolatileAttributes(once)).toBe(once);
         expect(once).not.toMatch(/\s(?:ac:local-id|ac:macro-id|local-id)\s*=/);
         // Everything that is not a volatile attribute is preserved.
-        expect(once.replace(/<[^>]*>/g, "")).toBe(html.replace(/<[^>]*>/g, ""));
+        expect(textOutsideTags(once)).toBe(textOutsideTags(html));
       }),
       FC,
     );
