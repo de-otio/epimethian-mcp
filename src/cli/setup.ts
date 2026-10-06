@@ -9,6 +9,7 @@ import {
 } from "../shared/keychain.js";
 import { addToProfileRegistry, setProfileSettings } from "../shared/profiles.js";
 import { renderConfigSnippet, knownClientIds } from "./client-configs.js";
+import { KNOWN_TOOLS } from "../server/tool-allowlist.js";
 
 /** Resolve the absolute path to the running epimethian-mcp binary. */
 function resolveBinPath(): string {
@@ -35,21 +36,13 @@ function resolveBinPath(): string {
   return "<absolute path to epimethian-mcp>";
 }
 
-const TOOLS = [
-  "create_page",
-  "get_page",
-  "get_page_by_title",
-  "update_page",
-  "update_page_section",
-  "delete_page",
-  "list_pages",
-  "get_page_children",
-  "search_pages",
-  "get_spaces",
-  "add_attachment",
-  "get_attachments",
-  "add_drawio_diagram",
-];
+/**
+ * The tool list printed after setup. Derived from the server's registry so it
+ * cannot drift (it listed 13 of 37 tools before 7.0.0); `tool-surface.test.ts`
+ * checks it against the tools the server actually registers. Which of these a
+ * given profile exposes depends on its posture and tool filters.
+ */
+export const TOOLS: readonly string[] = KNOWN_TOOLS;
 
 function readPassword(prompt: string): Promise<string> {
   stdout.write(prompt);

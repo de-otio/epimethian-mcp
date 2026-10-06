@@ -832,12 +832,13 @@ describe("get_attachments tool", () => {
 // mocking the filesystem. The whole point of the tool's guards — cwd
 // containment via realpath(dirname), O_NOFOLLOW against a planted symlink,
 // O_EXCL vs O_TRUNC — is kernel behaviour, and a mocked fs would assert only
-// that we called ourselves. `.tmp/` is gitignored, so the scratch dirs never
-// reach a commit.
+// that we called ourselves. The scratch root is `tmp/` (gitignored, so it never
+// reaches a commit) and deliberately NOT `.tmp/`: since 7.0.0 the tool refuses
+// any destination under a dot-directory.
 // ---------------------------------------------------------------------------
 
 describe("download_attachment tool", () => {
-  const TMP_ROOT = join(process.cwd(), ".tmp");
+  const TMP_ROOT = join(process.cwd(), "tmp");
   let tmpDir: string;
   let getAttachmentMetadata: any;
   let downloadAttachmentBytes: any;
@@ -1194,10 +1195,13 @@ describe("download_attachment tool", () => {
 
   // --- Registration shape --------------------------------------------------
 
-  it("is registered read-only and consumes no write permission", async () => {
+  it("is registered with write hints but consumes no write permission", async () => {
     const entry = registeredTools.get("download_attachment")!;
     expect(entry).toBeDefined();
-    expect(entry.schema.annotations?.readOnlyHint).toBe(true);
+    // H5 (7.0.0): it writes, and with overwrite replaces, a LOCAL file, so the
+    // hints say so even though the Confluence side is a pure read.
+    expect(entry.schema.annotations?.readOnlyHint).toBe(false);
+    expect(entry.schema.annotations?.destructiveHint).toBe(true);
 
     const { WRITE_TOOLS } = await import("./index.js");
     expect(WRITE_TOOLS.has("download_attachment")).toBe(false);
@@ -1207,17 +1211,12 @@ describe("download_attachment tool", () => {
     const { KNOWN_TOOLS } = await import("./tool-allowlist.js");
     const known = new Set<string>(KNOWN_TOOLS);
 
-    // Pre-existing drift, NOT sanctioned by this test: these four are
-    // registered but absent from KNOWN_TOOLS, so naming any of them in a
-    // profile's allowed_tools/denied_tools aborts startup with "unknown tool
-    // name". Recorded explicitly so the invariant below still catches *new*
-    // drift instead of being deleted; remove entries as they are fixed.
-    const knownGaps = new Set([
-      "authorise_destructive_writes",
-      "check_permissions",
-      "setup_profile",
-      "update_page_sections",
-    ]);
+    // `setup_profile` belongs to the recovery server (no profile, so no
+    // allowlist to hold it) and is deliberately absent from KNOWN_TOOLS.
+    // The other three former gaps (authorise_destructive_writes,
+    // check_permissions, update_page_sections) were fixed in 7.0.0;
+    // tool-surface.test.ts pins the equality against the real server.
+    const knownGaps = new Set(["setup_profile"]);
 
     const missing = [...registeredTools.keys()].filter(
       (name) => !known.has(name) && !knownGaps.has(name),
@@ -5167,9 +5166,12 @@ describe("Track O2 — Conditional tool registration", () => {
     }
   });
 
-  it("O2-7: WRITE_TOOLS set contains exactly the 17 expected write tools", async () => {
+  it("O2-7: WRITE_TOOLS set contains exactly the 18 expected write tools", async () => {
     const { WRITE_TOOLS } = await import("./index.js");
     const expected = new Set([
+      // 7.0.0: always failed in a read-only profile (writeGuard), so it is no
+      // longer exposed there.
+      "authorise_destructive_writes",
       "create_page", "update_page", "append_to_page", "prepend_to_page",
       "update_page_section", "update_page_sections",
       "delete_page", "add_drawio_diagram", "revert_page",
@@ -6626,7 +6628,7 @@ describe("download_attachment in a read-only profile", () => {
       Buffer.from("ro-bytes"),
     );
 
-    const tmpRoot = join(process.cwd(), ".tmp");
+    const tmpRoot = join(process.cwd(), "tmp");
     mkdirSync(tmpRoot, { recursive: true });
     const dir = mkdtempSync(join(tmpRoot, "download-attachment-ro-"));
     try {
@@ -6652,7 +6654,8 @@ describe("download_attachment in a read-only profile", () => {
     const { WRITE_TOOLS } = await import("./index.js");
     expect(WRITE_TOOLS.has("download_attachment")).toBe(false);
     // Guard the count too: adding it to WRITE_TOOLS would silently unregister
-    // the tool in read-only profiles.
-    expect(WRITE_TOOLS.size).toBe(17);
+    // the tool in read-only profiles. (18 = the 17 body/label/comment/status
+    // writers plus authorise_destructive_writes, added in 7.0.0.)
+    expect(WRITE_TOOLS.size).toBe(18);
   });
 });

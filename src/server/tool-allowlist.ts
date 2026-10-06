@@ -21,8 +21,10 @@ import type { ProfileSettings } from "../shared/profiles.js";
 
 /**
  * The complete set of tool names this server can register. Keep in sync
- * with `registerTools()` — a test enforces the invariant so a new tool
- * without an entry here surfaces at CI time.
+ * with `registerTools()` — `tool-surface.test.ts` boots the real server and
+ * enforces the invariant, so a new tool without an entry here surfaces at CI
+ * time. (`setup_profile` is the recovery server's only tool and is not
+ * filterable: that server has no profile to hold a filter.)
  */
 export const KNOWN_TOOLS = [
   "create_page",
@@ -30,6 +32,9 @@ export const KNOWN_TOOLS = [
   "update_page",
   "delete_page",
   "update_page_section",
+  "update_page_sections",
+  "authorise_destructive_writes",
+  "check_permissions",
   "prepend_to_page",
   "append_to_page",
   "search_pages",
