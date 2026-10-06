@@ -136,20 +136,20 @@ export interface ProfileSettings {
    */
   spaces?: string[];
   /**
-   * Read scope for `search_pages`: when set, CQL is conjoined with
+   * Read scope for `search_pages` and `get_recent_changes`: when set, CQL is conjoined with
    * `space in (<these keys>)` unless the call passes `all_spaces: true`.
    * Set by editing the profile registry JSON, like `spaces`. An empty array
    * means "no space is searchable by default". Hygiene only unless
    * `read_spaces_enforced` is true, and even then it covers `search_pages`
-   * only, not page reads.
+   * and `get_recent_changes` only, not page reads.
    */
   read_spaces?: string[];
   /**
-   * When true, `all_spaces: true` on `search_pages` is an error, so the agent
+   * When true, `all_spaces: true` on `search_pages` and `get_recent_changes` is an error, so the agent
    * cannot widen the search scope. Requires `read_spaces`. Default false
    * (scope is a convenience, and the agent may widen it per call).
    *
-   * This scopes `search_pages` ONLY. It is NOT a read boundary: `get_page`,
+   * This scopes `search_pages` and `get_recent_changes` ONLY. It is NOT a read boundary: `get_page`,
    * `get_page_by_title`, `list_pages`, `get_page_children`,
    * `resolve_page_link` and the version tools read any space the token can
    * see. To keep an agent out of a space, use a token without access to it.
@@ -157,7 +157,8 @@ export interface ProfileSettings {
   read_spaces_enforced?: boolean;
   /**
    * Literal strings (1-200 chars each, at most 100) replaced with
-   * `[redacted]` in `search_pages` titles and excerpts. Matching is
+   * `[redacted]` in `search_pages` titles and excerpts and in
+   * `get_recent_changes` titles. Matching is
    * case-insensitive after entity decoding and Unicode normalisation. Never
    * applied to page bodies. Hygiene, not a security boundary.
    */

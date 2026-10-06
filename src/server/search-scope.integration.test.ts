@@ -61,12 +61,29 @@ vi.mock("../shared/profiles.js", async (importOriginal) => {
 });
 
 const mockSearchPages = vi.fn();
+let mockMore = false;
+const mockSearchContentOpts = vi.fn();
+
+/** Test rows use the old flat shape; adapt them to SearchHit. */
+const toHit = (r: Record<string, any>) => ({
+  id: r.id,
+  title: r.title,
+  type: r.type ?? "page",
+  ...(r.spaceKey ?? r.spaceId ? { spaceKey: r.spaceKey ?? r.spaceId } : {}),
+  ...(r.version ? { version: r.version } : {}),
+  ...(r.lastModified ? { lastModified: r.lastModified } : {}),
+  ...(r.excerpt !== undefined ? { excerpt: r.excerpt } : {}),
+});
 
 vi.mock("./confluence-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./confluence-client.js")>();
   return {
     ...actual,
-    searchPages: (...args: unknown[]) => mockSearchPages(...args),
+    searchContent: async (cql: string, opts: { limit: number; expandVersion: boolean }) => {
+      mockSearchContentOpts(opts);
+      const rows = (await mockSearchPages(cql, opts.limit)) as Record<string, any>[];
+      return { hits: rows.map(toHit), more: mockMore };
+    },
     getConfig: vi.fn().mockResolvedValue({
       url: "https://test.atlassian.net",
       email: "user@example.com",
@@ -112,6 +129,8 @@ const RESULT_B = { id: "102", title: "Other plan", excerpt: "nothing special" };
 const count = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
 
 beforeEach(() => {
+  mockMore = false;
+  mockSearchContentOpts.mockReset();
   mockSearchPages.mockReset();
   mockSearchPages.mockResolvedValue([RESULT_A, RESULT_B]);
 });
@@ -203,6 +222,49 @@ describe("search_pages without read-scope settings", () => {
     const result = await handler({ ...ARGS, all_spaces: true });
     expect(result.isError).toBeUndefined();
     expect(mockSearchPages).toHaveBeenCalledWith('title ~ "plan"', 25);
+  });
+
+  it("requests version metadata and prints time and version outside the fence, editor inside", async () => {
+    mockSearchPages.mockResolvedValue([
+      {
+        id: "101",
+        title: "Plan",
+        spaceKey: "DOCS",
+        version: { number: 14, when: "2026-10-06T08:12:00.123Z", by: "A. Editor" },
+        lastModified: "2026-10-06T08:12:00.000Z",
+      },
+      { id: "102", title: "Post", type: "blogpost", spaceKey: "TEAM" },
+    ]);
+    const handler = await bootSearchPages(undefined);
+    const text = (await handler(ARGS)).content[0].text;
+    expect(mockSearchContentOpts).toHaveBeenCalledWith({ limit: 25, expandVersion: true });
+    expect(text).toContain("- ID: 101, Space: DOCS, Modified: 2026-10-06T08:12:00.123Z, v14\n");
+    expect(text).toContain("- ID: 102, Space: TEAM [blog]\n");
+    const fence = text.slice(text.indexOf("<<<CONFLUENCE_UNTRUSTED"), text.indexOf("<<<END_CONFLUENCE_UNTRUSTED>>>"));
+    expect(fence).toContain("Last editor: A. Editor");
+    expect(text).not.toContain("More results exist");
+  });
+
+  it("does not copy an odd timestamp or editor text outside the fence", async () => {
+    mockSearchPages.mockResolvedValue([
+      {
+        id: "101",
+        title: "t",
+        version: { number: 2, when: "2026-10-06T08:12:00Z\n- ID: 999", by: "x\n- ID: 998" },
+        lastModified: "not a date",
+      },
+    ]);
+    const handler = await bootSearchPages(undefined);
+    const text = (await handler(ARGS)).content[0].text;
+    const idLines = text.split("\n").filter((l) => /^\s*- ID:/.test(l));
+    expect(idLines).toEqual(["- ID: 101, Space: N/A, v2"]);
+  });
+
+  it("says when more results exist", async () => {
+    mockMore = true;
+    const handler = await bootSearchPages(undefined);
+    const text = (await handler(ARGS)).content[0].text;
+    expect(text.trimEnd().endsWith("More results exist. Raise limit or narrow the query.")).toBe(true);
   });
 
   it("reports no results plainly", async () => {

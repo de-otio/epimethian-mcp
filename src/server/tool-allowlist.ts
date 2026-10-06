@@ -59,6 +59,7 @@ export const KNOWN_TOOLS = [
   "get_page_versions",
   "get_page_version",
   "diff_page_versions",
+  "get_recent_changes",
   "revert_page",
   "lookup_user",
   "resolve_page_link",

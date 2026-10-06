@@ -12,7 +12,8 @@ import {
   resolveSpaceId,
   getPage,
   deletePage,
-  searchPages,
+  searchContent,
+  getVersionStorage,
   listPages,
   getPageChildren,
   getSpaces,
@@ -132,6 +133,22 @@ import { assertSpaceAllowed } from "./space-allowlist.js";
 import { resolveReadScope } from "./read-scope.js";
 import { scopeCql } from "./cql-scope.js";
 import { cleanSearchText, safeIdentifier } from "./search-redact.js";
+import {
+  MAX_WINDOW_HOURS,
+  VERSION_FETCH_LIMIT,
+  resolveWindow,
+  resolveEffectiveSpaces,
+  buildRecentChangesCql,
+  hitModifiedMs,
+  filterToWindow,
+  summariseVersions,
+  condenseDiff,
+  sortEntries,
+  formatReport,
+  type DiffOutcome,
+  type ReportEntry,
+  type VersionSummary,
+} from "./recent-changes.js";
 import { buildCheckPermissionsPayload } from "./check-permissions.js";
 import {
   checkForUpdates,
@@ -685,6 +702,7 @@ export const READ_ONLY_TOOLS = new Set([
   "get_page_versions",
   "get_page_version",
   "diff_page_versions",
+  "get_recent_changes",
   "get_version",
   "upgrade",
   "lookup_user",
@@ -2887,8 +2905,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           ),
         limit: z
           .number()
+          .int()
+          .min(1)
+          .max(200)
           .default(25)
-          .describe("Maximum results to return (default: 25)"),
+          .describe("Maximum results to return (default: 25, max: 200)"),
         all_spaces: z
           .boolean()
           .default(false)
@@ -2936,13 +2957,15 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           }
         }
 
-        const results = await searchPages(effectiveCql, limit);
+        const { hits: results, more } = await searchContent(effectiveCql, {
+          limit,
+          expandVersion: true,
+        });
         if (results.length === 0) {
-          return toolResult(
-            scopeNote === undefined
-              ? "No pages found matching the query."
-              : `No pages found matching the query.\n${scopeNote}`
-          );
+          const none = more
+            ? "No pages found in the results read so far. More results exist (other content types are skipped); narrow the query."
+            : "No pages found matching the query.";
+          return toolResult(scopeNote === undefined ? none : `${none}\n${scopeNote}`);
         }
         const lines = [`Found ${results.length} page(s):`];
         if (scopeNote !== undefined) lines.push(scopeNote);
@@ -2954,14 +2977,26 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           // on their own line: inside it, tenant text could imitate them and
           // make a fake hit that looks like a real one. Title and excerpt are
           // collapsed to one line each for the same reason.
-          const spaceKey = p.spaceId ?? p.space?.key ?? "N/A";
-          lines.push(`- ID: ${safeIdentifier(p.id)}, Space: ${safeIdentifier(spaceKey)}`);
+          // The modified time is re-rendered from a parsed number, never
+          // copied from the response, so it is safe outside the fence.
+          const modifiedMs = hitModifiedMs(p);
+          const version = p.version?.number;
+          lines.push(
+            `- ID: ${safeIdentifier(p.id)}, Space: ${safeIdentifier(p.spaceKey ?? "N/A")}` +
+              (p.type === "blogpost" ? " [blog]" : "") +
+              (modifiedMs !== undefined ? `, Modified: ${new Date(modifiedMs).toISOString()}` : "") +
+              (version !== undefined && Number.isSafeInteger(version) ? `, v${version}` : "")
+          );
           const block = [`Title: ${cleanSearchText(p.title, readScope.redactor)}`];
+          if (p.version?.by) {
+            block.push(`Last editor: ${cleanSearchText(p.version.by, readScope.redactor)}`);
+          }
           if (excerpts !== false && p.excerpt) {
             block.push(`Excerpt: ${cleanSearchText(p.excerpt, readScope.redactor)}`);
           }
           lines.push(fenceUntrusted(block.join("\n"), { pageId: p.id, field: "title" }));
         }
+        if (more) lines.push("", "More results exist. Raise limit or narrow the query.");
         return toolResult(lines.join("\n"));
       } catch (err) {
         return toolError(err);
@@ -4328,6 +4363,162 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (err instanceof ConfluenceApiError && (err.status === 403 || err.status === 404)) {
           return toolError(new Error("Page not found or inaccessible"));
         }
+        return toolError(err);
+      }
+    }
+  );
+
+  // get_recent_changes (plans/recent-changes-report.md)
+  server.registerTool(
+    "get_recent_changes",
+    {
+      description: withUntrustedNote(
+        "Report the pages and blog posts changed in a time window: one line per item, " +
+          "grouped by space, newest first. The header says 'complete' or that more exist; " +
+          "a page whose versions cannot be read is listed as unavailable, never dropped. " +
+          "detail 'list' (default) costs 1-2 API calls; 'versions' adds 1 call per item " +
+          "(edit count, editors, new page); 'summary' also diffs the first max_diffs items " +
+          "(up to 2 calls each) into a one-line section summary. A profile's read_spaces, " +
+          "read_spaces_enforced and redact_patterns apply as in search_pages. Deleted pages, " +
+          "comments and attachments are not reported."
+      ),
+      inputSchema: {
+        hours: z
+          .number()
+          .positive()
+          .max(MAX_WINDOW_HOURS)
+          .optional()
+          .describe("Window length in hours, counted back from now (max 720 = 30 days)"),
+        since: z
+          .string()
+          .datetime({ offset: true })
+          .optional()
+          .describe("Window start as ISO 8601 with offset (e.g. 2026-10-05T09:00:00Z); alternative to hours"),
+        spaces: z
+          .array(z.string())
+          .optional()
+          .describe("Space keys to include (default: the profile's read_spaces, else all spaces)"),
+        all_spaces: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Report every space instead of the profile's read_spaces. Rejected when the profile enforces read_spaces."
+          ),
+        include_blogposts: z
+          .boolean()
+          .default(true)
+          .describe("Include blog posts, marked [blog] (default: true)"),
+        detail: z
+          .enum(["list", "versions", "summary"])
+          .default("list")
+          .describe("'list' (default), 'versions' (edits and editors in the window) or 'summary' (plus a condensed diff)"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .default(50)
+          .describe("Maximum items to report (default: 50, max: 200)"),
+        max_diffs: z
+          .number()
+          .int()
+          .min(1)
+          .max(25)
+          .default(10)
+          .describe("detail 'summary' only: how many items get a diff (default: 10, max: 25)"),
+      },
+      ...readOnlyTool("Get recent changes"),
+    },
+    async ({ hours, since, spaces, all_spaces, include_blogposts, detail, limit, max_diffs }) => {
+      try {
+        if (!readScope.ok) return toolError(new Error(readScope.error));
+        const resolved = resolveWindow({ hours, since }, Date.now());
+        if (!resolved.ok) return toolError(new Error(resolved.error));
+        const window = resolved.window;
+        const scope = resolveEffectiveSpaces({
+          readSpaces: readScope.readSpaces,
+          enforced: readScope.enforced,
+          spaces,
+          allSpaces: all_spaces,
+        });
+        if (!scope.ok) return toolError(new Error(scope.error));
+        const scopeNote = scope.restrictedByProfile
+          ? "Restricted to the profile's read_spaces." +
+            (readScope.enforced ? "" : " Pass all_spaces: true to report every space.")
+          : undefined;
+
+        const cql = buildRecentChangesCql(window, scope.spaces, include_blogposts);
+        const { hits, more, unreadable } = await searchContent(cql, { limit, expandVersion: true });
+        const { inWindow, undated, older } = filterToWindow(hits, window.sinceMs);
+        let entries: ReportEntry[] = inWindow.map((hit) => ({ hit, modifiedMs: hitModifiedMs(hit) }));
+
+        const failure = (reason: unknown): string =>
+          reason instanceof ConfluenceApiError ? `HTTP ${reason.status}` : "error";
+
+        if (detail !== "list") {
+          const settled = await settleInChunks(entries, DEFAULT_MAX_CONCURRENCY, (e) =>
+            getPageVersions(e.hit.id, VERSION_FETCH_LIMIT)
+          );
+          entries = entries.map((e, i) => {
+            const s = settled[i];
+            const versions: VersionSummary =
+              s.status === "fulfilled"
+                ? summariseVersions(s.value, window.sinceMs, VERSION_FETCH_LIMIT)
+                : { kind: "unavailable", reason: failure(s.reason) };
+            return { ...e, versions };
+          });
+        }
+
+        let diffsSkipped = 0;
+        if (detail === "summary") {
+          // Diff the first max_diffs items in report order that have a
+          // numeric baseline; new pages say so instead of diffing.
+          const eligible = sortEntries(entries).filter(
+            (e) => e.versions?.kind === "edits" && typeof e.versions.baseline === "number"
+          );
+          const targets = eligible.slice(0, max_diffs);
+          diffsSkipped = eligible.length - targets.length;
+          const outcomes = await settleInChunks(targets, DEFAULT_MAX_CONCURRENCY, async (e) => {
+            const v = e.versions as Extract<VersionSummary, { kind: "edits" }>;
+            const from = await getVersionStorage(e.hit.id, v.baseline as number);
+            const to = await getVersionStorage(e.hit.id, v.current);
+            if (from.length > MAX_DIFF_SIZE || to.length > MAX_DIFF_SIZE) {
+              return { kind: "tooLarge" } as DiffOutcome;
+            }
+            const r = computeSummaryDiff(toMarkdownView(from), toMarkdownView(to), { a: from, b: to });
+            return { kind: "changed", text: condenseDiff(r) } as DiffOutcome;
+          });
+          const byEntry = new Map<ReportEntry, DiffOutcome>();
+          targets.forEach((e, i) => {
+            const o = outcomes[i];
+            byEntry.set(
+              e,
+              o.status === "fulfilled" ? o.value : { kind: "unavailable", reason: failure(o.reason) }
+            );
+          });
+          entries = entries.map((e) => (byEntry.has(e) ? { ...e, diff: byEntry.get(e) } : e));
+        }
+
+        const report = formatReport(
+          {
+            window,
+            spaces: scope.spaces,
+            ...(scopeNote !== undefined ? { scopeNote } : {}),
+            entries,
+            more,
+            limit,
+            ...(detail === "summary" ? { maxDiffs: max_diffs } : {}),
+            diffsSkipped,
+            undated,
+            older,
+            unreadable,
+            tenantEcho: echo.replace(/^\n/, ""),
+          },
+          (content, attrs) => fenceUntrusted(content, attrs),
+          (s) => cleanSearchText(s, readScope.redactor)
+        );
+        return toolResult(report);
+      } catch (err) {
         return toolError(err);
       }
     }

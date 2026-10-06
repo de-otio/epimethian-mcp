@@ -178,6 +178,7 @@ const GOLDEN_TOOL_ORDER = [
   "get_page_versions",
   "get_page_version",
   "diff_page_versions",
+  "get_recent_changes",
   "revert_page",
   "lookup_user",
   "resolve_page_link",
@@ -257,6 +258,7 @@ const ANNOTATION_TABLE: Readonly<Record<(typeof GOLDEN_TOOL_ORDER)[number], Row>
   get_page_versions: RO("Get page versions"),
   get_page_version: RO("Get page version"),
   diff_page_versions: RO("Diff page versions"),
+  get_recent_changes: RO("Get recent changes"),
   revert_page: DE("Revert page", false, true),
   lookup_user: RO("Look up user"),
   resolve_page_link: RO("Resolve page link"),
@@ -284,6 +286,7 @@ const UNTRUSTED_NOTE_TOOLS = [
   "get_page_versions",
   "get_page_version",
   "diff_page_versions",
+  "get_recent_changes",
   "lookup_user",
   "resolve_page_link",
 ];

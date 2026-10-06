@@ -103,6 +103,8 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     _rawUpdatePage: vi.fn(),
     deletePage: vi.fn(),
     searchPages: vi.fn(),
+    searchContent: vi.fn(),
+    getVersionStorage: vi.fn(),
     listPages: vi.fn(),
     getPageChildren: vi.fn(),
     getSpaces: vi.fn(),
@@ -689,11 +691,11 @@ describe("add_drawio_diagram placement (P3)", () => {
 
 describe("search_pages tool", () => {
   it("formats results correctly", async () => {
-    const { searchPages } = await import("./confluence-client.js");
-    (searchPages as any).mockResolvedValueOnce([
-      { id: "1", title: "Page A", spaceId: "SP" },
-      { id: "2", title: "Page B", space: { key: "SP2" } },
-    ]);
+    const { searchContent } = await import("./confluence-client.js");
+    (searchContent as any).mockResolvedValueOnce({ hits: [
+      { id: "1", title: "Page A", spaceKey: "SP" },
+      { id: "2", title: "Page B", spaceKey: "SP2" },
+    ], more: false });
 
     const handler = registeredTools.get("search_pages")!.handler;
     const result = await handler({ cql: 'title ~ "test"', limit: 25 });
@@ -703,8 +705,8 @@ describe("search_pages tool", () => {
   });
 
   it("returns message when no results found", async () => {
-    const { searchPages } = await import("./confluence-client.js");
-    (searchPages as any).mockResolvedValueOnce([]);
+    const { searchContent } = await import("./confluence-client.js");
+    (searchContent as any).mockResolvedValueOnce({ hits: [], more: false });
 
     const handler = registeredTools.get("search_pages")!.handler;
     const result = await handler({ cql: "nothing", limit: 25 });
@@ -712,10 +714,10 @@ describe("search_pages tool", () => {
   });
 
   it("includes excerpt when present", async () => {
-    const { searchPages } = await import("./confluence-client.js");
-    (searchPages as any).mockResolvedValueOnce([
-      { id: "1", title: "Page A", spaceId: "SP", excerpt: "This is a preview of the page" },
-    ]);
+    const { searchContent } = await import("./confluence-client.js");
+    (searchContent as any).mockResolvedValueOnce({ hits: [
+      { id: "1", title: "Page A", spaceKey: "SP", excerpt: "This is a preview of the page" },
+    ], more: false });
 
     const handler = registeredTools.get("search_pages")!.handler;
     const result = await handler({ cql: "test", limit: 25 });
@@ -723,10 +725,10 @@ describe("search_pages tool", () => {
   });
 
   it("omits excerpt line when excerpt is missing", async () => {
-    const { searchPages } = await import("./confluence-client.js");
-    (searchPages as any).mockResolvedValueOnce([
-      { id: "1", title: "Page A", spaceId: "SP" },
-    ]);
+    const { searchContent } = await import("./confluence-client.js");
+    (searchContent as any).mockResolvedValueOnce({ hits: [
+      { id: "1", title: "Page A", spaceKey: "SP" },
+    ], more: false });
 
     const handler = registeredTools.get("search_pages")!.handler;
     const result = await handler({ cql: "test", limit: 25 });
@@ -736,10 +738,10 @@ describe("search_pages tool", () => {
   });
 
   it("omits excerpt line when excerpt is empty string", async () => {
-    const { searchPages } = await import("./confluence-client.js");
-    (searchPages as any).mockResolvedValueOnce([
-      { id: "1", title: "Page A", spaceId: "SP", excerpt: "" },
-    ]);
+    const { searchContent } = await import("./confluence-client.js");
+    (searchContent as any).mockResolvedValueOnce({ hits: [
+      { id: "1", title: "Page A", spaceKey: "SP", excerpt: "" },
+    ], more: false });
 
     const handler = registeredTools.get("search_pages")!.handler;
     const result = await handler({ cql: "test", limit: 25 });

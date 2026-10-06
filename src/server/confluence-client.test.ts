@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import fc from "fast-check";
 
 // Set env vars BEFORE module evaluation via vi.hoisted (runs before imports)
 vi.hoisted(() => {
@@ -31,6 +32,8 @@ import {
   _rawUpdatePage,
   deletePage,
   searchPages,
+  searchContent,
+  MAX_SEARCH_REQUESTS,
   listPages,
   getPageChildren,
   getSpaces,
@@ -73,6 +76,7 @@ import {
   type CommentData,
   getPageVersions,
   getPageVersionBody,
+  getVersionStorage,
   setClientLabel,
   probeWriteCapability,
   validateStartup,
@@ -1699,6 +1703,229 @@ describe("searchPages", () => {
   });
 });
 
+describe("searchContent", () => {
+  const hit = (id: string, extra: Record<string, unknown> = {}, type?: string) => ({
+    content: { id, title: `T${id}`, ...(type ? { type } : {}), space: { key: "DOCS" }, ...extra },
+  });
+  const urlOf = (fetchFn: any, i: number) => fetchFn.mock.calls[i][0] as string;
+
+  it("encodes cql, limit and expand (expandVersion true)", async () => {
+    global.fetch = mockFetchResponse({ results: [] });
+    await searchContent('type = page AND text ~ "a&b"', { limit: 7, expandVersion: true });
+    const u = new URL(urlOf(global.fetch, 0));
+    expect(`${u.origin}${u.pathname}`).toBe("https://test.atlassian.net/wiki/rest/api/search");
+    expect(u.searchParams.get("cql")).toBe('type = page AND text ~ "a&b"');
+    expect(u.searchParams.get("limit")).toBe("7");
+    expect(u.searchParams.get("expand")).toBe("content.space,content.version");
+    expect(urlOf(global.fetch, 0)).toContain("a%26b");
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses expand=content.space and caps the first limit at 100 (expandVersion false)", async () => {
+    global.fetch = mockFetchResponse({ results: [] });
+    await searchContent("x", { limit: 250, expandVersion: false });
+    const u = new URL(urlOf(global.fetch, 0));
+    expect(u.searchParams.get("expand")).toBe("content.space");
+    expect(u.searchParams.get("limit")).toBe("100");
+  });
+
+  it("follows next across pages and applies the /wiki context prefix", async () => {
+    global.fetch = mockFetchSequence([
+      { body: { results: [hit("1")], _links: { next: "/rest/api/search?cursor=abc&limit=1" } } },
+      { body: { results: [hit("2")] } },
+    ]);
+    const r = await searchContent("x", { limit: 5, expandVersion: false });
+    expect(r.hits.map((h) => h.id)).toEqual(["1", "2"]);
+    expect(r.more).toBe(false);
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    expect(urlOf(global.fetch, 1)).toBe(
+      "https://test.atlassian.net/wiki/rest/api/search?cursor=abc&limit=1",
+    );
+  });
+
+  it("does not double the /wiki prefix", async () => {
+    global.fetch = mockFetchSequence([
+      { body: { results: [hit("1")], _links: { next: "/wiki/rest/api/search?cursor=abc" } } },
+      { body: { results: [hit("2")] } },
+    ]);
+    await searchContent("x", { limit: 5, expandVersion: false });
+    expect(urlOf(global.fetch, 1)).toBe(
+      "https://test.atlassian.net/wiki/rest/api/search?cursor=abc",
+    );
+  });
+
+  it("stops at limit without another fetch; more true because next remained", async () => {
+    global.fetch = mockFetchSequence([
+      { body: { results: [hit("1"), hit("2")], _links: { next: "/rest/api/search?c=1" } } },
+      { body: { results: [hit("3")] } },
+    ]);
+    const r = await searchContent("x", { limit: 2, expandVersion: false });
+    expect(r.hits.map((h) => h.id)).toEqual(["1", "2"]);
+    expect(r.more).toBe(true);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("more is true when results beyond limit were dropped, even with no next", async () => {
+    global.fetch = mockFetchResponse({ results: [hit("1"), hit("2"), hit("3")] });
+    const r = await searchContent("x", { limit: 2, expandVersion: false });
+    expect(r.hits).toHaveLength(2);
+    expect(r.more).toBe(true);
+  });
+
+  it("more is false when limit is met exactly with nothing left", async () => {
+    global.fetch = mockFetchResponse({ results: [hit("1"), hit("2")] });
+    const r = await searchContent("x", { limit: 2, expandVersion: false });
+    expect(r.hits).toHaveLength(2);
+    expect(r.more).toBe(false);
+  });
+
+  it("caps at MAX_SEARCH_REQUESTS fetches and reports more", async () => {
+    expect(MAX_SEARCH_REQUESTS).toBe(10);
+    let n = 0;
+    global.fetch = vi.fn().mockImplementation(async () => {
+      const body = { results: [hit(String(++n))], _links: { next: "/rest/api/search?c=1" } };
+      return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
+    });
+    const r = await searchContent("x", { limit: 50, expandVersion: false });
+    expect(global.fetch).toHaveBeenCalledTimes(10);
+    expect(r.hits).toHaveLength(10);
+    expect(r.more).toBe(true);
+  });
+
+  it("stops after a page with no pages or blog posts and reports more", async () => {
+    global.fetch = mockFetchSequence([
+      { body: { results: [{ content: { id: "1", type: "comment", title: "c" } }], _links: { next: "/rest/api/search?c=1" } } },
+      { body: { results: [hit("2")] } },
+    ]);
+    const r = await searchContent("x", { limit: 5, expandVersion: false });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ hits: [], more: true, unreadable: 0 });
+  });
+
+  it("counts unreadable results and rejects non-numeric ids", async () => {
+    global.fetch = mockFetchSequence([
+      { body: { results: [hit("1"), { content: { id: "../x", type: "page", title: "t" } }, { content: { type: "page" } }] } },
+    ]);
+    const r = await searchContent("x", { limit: 5, expandVersion: false });
+    expect(r.hits.map((h) => h.id)).toEqual(["1"]);
+    expect(r.unreadable).toBe(2);
+    expect(r.more).toBe(false);
+  });
+
+  it("throws on a response without a results array instead of reporting nothing", async () => {
+    global.fetch = mockFetchSequence([{ body: { _links: {} } }]);
+    await expect(searchContent("x", { limit: 5, expandVersion: false })).rejects.toThrow(/no results array/);
+  });
+
+  it("property: every fetched URL stays on the configured origin", async () => {
+    const prefixes = ["/", "//", "/\\", "/%5C", "/%2F%2F", "/@", "/wiki/", "\\", "https://", "/..//", "/\t/", ""];
+    await fc.assert(
+      fc.asyncProperty(fc.constantFrom(...prefixes), fc.string({ maxLength: 30 }), async (pre, rest) => {
+        const urls: string[] = [];
+        let n = 0;
+        global.fetch = vi.fn().mockImplementation(async (url: string) => {
+          urls.push(url);
+          n++;
+          const body = { results: [hit(String(n))], _links: n === 1 ? { next: pre + rest + "evil.example.com/x" } : {} };
+          return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
+        });
+        const r = await searchContent("x", { limit: 5, expandVersion: false });
+        for (const u of urls) expect(new URL(u).origin).toBe("https://test.atlassian.net");
+        // Either the link was followed on-origin, or paging stopped and says more may exist.
+        if (urls.length === 1) expect(r.more).toBe(true);
+      }),
+      { seed: 42, numRuns: 300 },
+    );
+  });
+
+  it.each([
+    ["backslash host", "/\\evil.example.com/x"],
+    ["absolute URL", "https://evil.example.com/x"],
+    ["protocol-relative", "//evil.example.com/x"],
+    ["backslash", "/a\\b"],
+    ["embedded scheme", "/redirect?u=https://evil.example.com"],
+    ["non-string", 42],
+  ])("never follows an unsafe next (%s)", async (_n, next) => {
+    global.fetch = mockFetchSequence([
+      { body: { results: [hit("1")], _links: { next } } },
+      { body: { results: [hit("2")] } },
+    ]);
+    const r = await searchContent("x", { limit: 5, expandVersion: false });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(r.hits.map((h) => h.id)).toEqual(["1"]);
+    expect(r.more).toBe(true);
+  });
+
+  it("skips attachment and comment results without counting them toward limit", async () => {
+    global.fetch = mockFetchResponse({
+      results: [
+        hit("a", {}, "attachment"),
+        hit("c", {}, "comment"),
+        hit("1", {}, "page"),
+        hit("2", {}, "blogpost"),
+      ],
+    });
+    const r = await searchContent("x", { limit: 2, expandVersion: false });
+    expect(r.hits.map((h) => [h.id, h.type])).toEqual([
+      ["1", "page"],
+      ["2", "blogpost"],
+    ]);
+    expect(r.more).toBe(false);
+  });
+
+  it("keeps a hit whose version lacks when/by, carries lastModified and excerpt", async () => {
+    global.fetch = mockFetchResponse({
+      results: [
+        {
+          ...hit("1", { version: { number: 4 } }),
+          lastModified: "2026-10-01T10:00:00.000Z",
+          excerpt: "snippet",
+        },
+        hit("2", { version: { number: 2, when: "2026-10-02T10:00:00.000Z", by: { displayName: "A. Editor" } } }),
+        hit("3", { version: { when: "x" } }),
+      ],
+    });
+    const r = await searchContent("x", { limit: 10, expandVersion: true });
+    expect(r.hits[0]).toEqual({
+      id: "1",
+      title: "T1",
+      type: "page",
+      spaceKey: "DOCS",
+      version: { number: 4 },
+      lastModified: "2026-10-01T10:00:00.000Z",
+      excerpt: "snippet",
+    });
+    expect(r.hits[0].version?.when).toBeUndefined();
+    expect(r.hits[0].version?.by).toBeUndefined();
+    expect(r.hits[1].version).toEqual({ number: 2, when: "2026-10-02T10:00:00.000Z", by: "A. Editor" });
+    expect(r.hits[2].version).toBeUndefined();
+    expect(r.hits[2].id).toBe("3");
+  });
+
+  it("skips unparseable results instead of throwing", async () => {
+    global.fetch = mockFetchResponse({
+      results: [null, "str", { content: { id: 5, title: "numeric id" } }, { content: { id: "9" } }, hit("1")],
+    });
+    const r = await searchContent("x", { limit: 10, expandVersion: false });
+    expect(r.hits.map((h) => h.id)).toEqual(["1"]);
+  });
+
+  it("passes totalSize through when finite and omits it otherwise", async () => {
+    global.fetch = mockFetchResponse({ results: [], totalSize: 42 });
+    expect((await searchContent("x", { limit: 5, expandVersion: false })).totalSize).toBe(42);
+    global.fetch = mockFetchResponse({ results: [], totalSize: "42" });
+    const r = await searchContent("x", { limit: 5, expandVersion: false });
+    expect("totalSize" in r).toBe(false);
+    global.fetch = mockFetchResponse({ results: [] });
+    expect("totalSize" in (await searchContent("x", { limit: 5, expandVersion: false }))).toBe(false);
+  });
+
+  it("propagates an HTTP 500 as an error", async () => {
+    global.fetch = mockFetchResponse({ message: "boom" }, 500);
+    await expect(searchContent("x", { limit: 5, expandVersion: false })).rejects.toThrow();
+  });
+});
+
 describe("listPages", () => {
   it("passes params correctly", async () => {
     global.fetch = mockFetchResponse({ results: [{ id: "1", title: "P" }] });
@@ -3016,6 +3243,36 @@ describe("Comments", () => {
   // ---------------------------------------------------------------------------
   // getPageVersionBody
   // ---------------------------------------------------------------------------
+  describe("getVersionStorage", () => {
+    it("fetches the v1 body for the version (works for blog posts) and caches it", async () => {
+      global.fetch = mockFetchResponse({
+        id: "20",
+        title: "A blog post",
+        version: { number: 4 },
+        body: { storage: { value: "<p>v4</p>" } },
+      });
+      expect(await getVersionStorage("20", 4)).toBe("<p>v4</p>");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V1}/content/20`);
+      expect(url).toContain("version=4");
+      expect(url).not.toContain("/api/v2/");
+      expect(pageCache.getVersioned("20", 4)).toBe("<p>v4</p>");
+    });
+
+    it("throws on a 403 instead of returning an empty body", async () => {
+      global.fetch = mockFetchSequence([{ status: 403, body: { message: "no" } }]);
+      await expect(getVersionStorage("20", 4)).rejects.toMatchObject({ status: 403 });
+      expect(pageCache.getVersioned("20", 4)).toBeUndefined();
+    });
+
+    it("costs no request on a cache hit", async () => {
+      pageCache.setVersioned("20", 4, "<p>cached</p>");
+      global.fetch = vi.fn() as any;
+      expect(await getVersionStorage("20", 4)).toBe("<p>cached</p>");
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+  });
+
   describe("getPageVersionBody", () => {
     const v1Response = {
       id: "10",

@@ -1,11 +1,11 @@
 /**
  * Resolve the read-scope profile settings (`read_spaces`,
- * `read_spaces_enforced`, `redact_patterns`) into what `search_pages` needs.
+ * `read_spaces_enforced`, `redact_patterns`) into what `search_pages` and `get_recent_changes` need.
  *
  * Unlike `spaces`, these are validated at runtime: a malformed value must not
  * silently drop a boundary the operator thought they had configured. An
  * invalid combination yields `{ ok: false }` and `search_pages` refuses every
- * call with the message, while the rest of the server keeps working. Messages
+ * call (and so does `get_recent_changes`) with the message, while the rest of the server keeps working. Messages
  * name the offending field and never echo values (patterns in particular).
  */
 

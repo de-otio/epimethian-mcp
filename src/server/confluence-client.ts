@@ -689,10 +689,12 @@ const UploadResultSchema = z.object({
 
 const VersionMetadataSchema = z.object({
   number: z.number(),
+  // Anonymous or deleted users may lack either field; one such version must
+  // not make the whole history unreadable.
   by: z.object({
-    displayName: z.string(),
-    accountId: z.string(),
-  }),
+    displayName: z.string().default("unknown user"),
+    accountId: z.string().default(""),
+  }).default({}),
   when: z.string(),
   message: z.string().default(""),
   minorEdit: z.boolean(),
@@ -1533,29 +1535,184 @@ export async function deletePage(
   pageCache.delete(pageId);
 }
 
+/**
+ * One page or blog post from `/rest/api/search`, normalised. Every field
+ * except `id` and `type` is tenant data or optional server metadata; the
+ * caller decides what is fenced.
+ */
+export interface SearchHit {
+  readonly id: string;
+  readonly title: string;
+  readonly type: "page" | "blogpost";
+  readonly spaceKey?: string;
+  readonly version?: { readonly number: number; readonly when?: string; readonly by?: string };
+  /** Result-level `lastModified` (ISO, whole seconds). */
+  readonly lastModified?: string;
+  readonly excerpt?: string;
+}
+
+const SearchContentSchema = z.object({
+  // Content ids are numeric; anything else is not used in a request path.
+  id: z.string().regex(/^\d{1,32}$/),
+  title: z.string(),
+  type: z.string().optional().catch(undefined),
+  space: z
+    .object({ key: z.string() })
+    .optional()
+    .catch(undefined),
+  version: z
+    .object({
+      number: z.number(),
+      when: z.string().optional().catch(undefined),
+      by: z
+        .object({ displayName: z.string().optional().catch(undefined) })
+        .optional()
+        .catch(undefined),
+    })
+    .optional()
+    .catch(undefined),
+});
+
+const SearchHitSchema = z.object({
+  content: SearchContentSchema,
+  lastModified: z.string().optional().catch(undefined),
+  excerpt: z.string().optional().catch(undefined),
+});
+
+/**
+ * Raw `/rest/api/search` result -> SearchHit; "other" for a result that is
+ * not a page or blog post; "unreadable" for one that does not parse.
+ */
+function normaliseSearchResult(r: unknown): SearchHit | "other" | "unreadable" {
+  const wrapped = r && typeof r === "object" && "content" in r ? r : { content: r };
+  const rawType = (wrapped as { content?: { type?: unknown } }).content?.type;
+  if (typeof rawType === "string" && rawType !== "page" && rawType !== "blogpost") return "other";
+  const parsed = SearchHitSchema.safeParse(wrapped);
+  if (!parsed.success) return "unreadable";
+  const { content, lastModified, excerpt } = parsed.data;
+  const type = content.type ?? "page";
+  if (type !== "page" && type !== "blogpost") return "other";
+  const v = content.version;
+  const by = v?.by?.displayName;
+  return {
+    id: content.id,
+    title: content.title,
+    type,
+    ...(content.space ? { spaceKey: content.space.key } : {}),
+    ...(v
+      ? {
+          version: {
+            number: v.number,
+            ...(v.when !== undefined ? { when: v.when } : {}),
+            ...(by !== undefined ? { by } : {}),
+          },
+        }
+      : {}),
+    ...(lastModified !== undefined ? { lastModified } : {}),
+    ...(excerpt !== undefined ? { excerpt } : {}),
+  };
+}
+
+export const MAX_SEARCH_REQUESTS = 10;
+
+/**
+ * Resolve a `_links.next` value to a same-origin URL, or null when it is not
+ * provably safe to follow (credentials must never leave the tenant origin).
+ */
+function resolveSearchNext(next: unknown, baseUrl: string): string | null {
+  if (typeof next !== "string") return null;
+  if (!next.startsWith("/") || next.startsWith("//")) return null;
+  if (next.includes("://") || next.includes("\\")) return null;
+  try {
+    // Build on the origin, not the configured URL, so a base URL with a path
+    // or trailing slash cannot double the `/wiki` context.
+    const origin = new URL(baseUrl).origin;
+    const prefix = next.startsWith("/wiki/") ? "" : "/wiki";
+    const full = `${origin}${prefix}${next}`;
+    return new URL(full).origin === origin ? full : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function searchContent(
+  cql: string,
+  opts: { limit: number; expandVersion: boolean },
+): Promise<{ hits: readonly SearchHit[]; more: boolean; unreadable: number; totalSize?: number }> {
+  const cfg = await getConfig();
+  const hits: SearchHit[] = [];
+  let more = false;
+  let unreadable = 0;
+  let totalSize: number | undefined;
+  let url: string | null = null;
+
+  for (let request = 0; request < MAX_SEARCH_REQUESTS; request++) {
+    if (url === null) {
+      const first = new URL(`${cfg.url}/wiki/rest/api/search`);
+      first.searchParams.set("cql", cql);
+      first.searchParams.set("limit", String(Math.min(opts.limit - hits.length, 100)));
+      first.searchParams.set(
+        "expand",
+        opts.expandVersion ? "content.space,content.version" : "content.space",
+      );
+      url = first.toString();
+    }
+    const raw = (await confluenceJson(url)) as any;
+    if (request === 0 && typeof raw?.totalSize === "number" && Number.isFinite(raw.totalSize)) {
+      totalSize = raw.totalSize;
+    }
+    if (!Array.isArray(raw?.results)) {
+      // An empty list would read as "nothing changed"; fail loudly instead.
+      throw new Error("Unexpected search response: no results array.");
+    }
+    const results: unknown[] = raw.results;
+    let usable = 0;
+    for (const r of results) {
+      const hit = normaliseSearchResult(r);
+      if (hit === "unreadable") unreadable++;
+      if (typeof hit === "string") continue;
+      usable++;
+      if (hits.length >= opts.limit) {
+        more = true; // results beyond the limit were dropped
+        break;
+      }
+      hits.push(hit);
+    }
+    const next = raw?._links?.next;
+    const hasNext = next !== undefined && next !== null && next !== "";
+    if (hits.length >= opts.limit) {
+      more = more || hasNext;
+      break;
+    }
+    if (!hasNext) break;
+    if (results.length > 0 && usable === 0) {
+      // A whole page of comments or attachments: stop rather than scan up to
+      // MAX_SEARCH_REQUESTS pages for nothing. More may exist, so say so.
+      more = true;
+      break;
+    }
+    const resolved = resolveSearchNext(next, cfg.url);
+    if (resolved === null || request === MAX_SEARCH_REQUESTS - 1) {
+      more = true; // unsafe link or request cap: cannot prove completeness
+      break;
+    }
+    url = resolved;
+  }
+  return { hits, more, unreadable, ...(totalSize !== undefined ? { totalSize } : {}) };
+}
+
 export async function searchPages(
   cql: string,
   limit: number
 ): Promise<PageData[]> {
-  // Use /rest/api/search (not /content/search) to get excerpts
-  const cfg = await getConfig();
-  const url = new URL(`${cfg.url}/wiki/rest/api/search`);
-  url.searchParams.set("cql", cql);
-  url.searchParams.set("limit", String(limit));
-  const raw = await confluenceJson(url.toString()) as any;
-  // /rest/api/search nests page data under `content` with excerpt at result level
-  // Flatten into PageSchema-compatible shape
-  const results: PageData[] = [];
-  for (const r of raw.results ?? []) {
-    const page = r.content ?? r;
-    if (r.excerpt) page.excerpt = r.excerpt;
-    try {
-      results.push(PageSchema.parse(page));
-    } catch {
-      // Skip unparseable results (e.g., attachments, comments)
-    }
-  }
-  return results;
+  const { hits } = await searchContent(cql, { limit, expandVersion: false });
+  return hits.map((h) => ({
+    id: h.id,
+    title: h.title,
+    ...(h.spaceKey ? { space: { key: h.spaceKey } } : {}),
+    ...(h.version ? { version: { number: h.version.number } } : {}),
+    ...(h.excerpt !== undefined ? { excerpt: h.excerpt } : {}),
+  }));
 }
 
 export async function listPages(
@@ -1960,6 +2117,24 @@ export async function getPageVersionBody(
   }
 
   // Cache miss — full v1 fetch with body
+  return fetchV1VersionBody(pageId, version);
+}
+
+/**
+ * Storage body of a page or blog post at `version`. Unlike
+ * `getPageVersionBody`, a cache hit costs no request (no title lookup), and
+ * only v1 endpoints are used, so blog posts work too.
+ */
+export async function getVersionStorage(pageId: string, version: number): Promise<string> {
+  const cached = pageCache.getVersioned(pageId, version);
+  if (cached !== undefined) return cached;
+  return (await fetchV1VersionBody(pageId, version)).rawBody;
+}
+
+async function fetchV1VersionBody(
+  pageId: string,
+  version: number
+): Promise<{ title: string; rawBody: string; version: number }> {
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}`);
   url.searchParams.set("version", String(version));
