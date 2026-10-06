@@ -36,18 +36,30 @@ Plan: `plans/field-session-findings-2026-10.md`.
   bound to the tool, page, section entries (body or pairs, with flags), the
   resulting storage hash and the page version; a token for one call no
   longer validates another.
-- **Every read path is fenced.** `get_page` and `get_page_by_title` return
-  section storage, section markdown, markdown and truncated bodies inside
-  the untrusted-content fence with its canary (fence fields `body`,
+- **Every page-body read is fenced.** `get_page` and `get_page_by_title`
+  return section storage, section markdown, markdown and truncated bodies
+  inside the untrusted-content fence with its canary (fence fields `body`,
   `section`, `markdown`). Reads are NFKC-folded and stripped of zero-width,
-  bidi and control characters, as full reads already were.
+  bidi and control characters, as full reads already were. Page titles in
+  `list_pages` and child listings are not fenced yet (planned for 7.1.0).
 - **Markdown section view numbers placeholders from the section body.** The
   heading is rendered separately, so ids now match `find_replace` and body
   mode.
 - `get_page_by_title` applies the same default `max_length` cap as
   `get_page`.
-- **Search results are fenced per result** (ID, Space, Title, Excerpt), and
-  the v1 highlight markers are stripped.
+- **Search results are fenced per result.** A server-authored `ID` /
+  `Space` line precedes each result's fence; only the title and excerpt are
+  fenced, each collapsed to one line, so page text cannot imitate a result
+  field. The v1 highlight markers are stripped.
+- **The macro-loss guard fires on any drop in the macro count**, not only
+  when every macro is removed, in every write mode (`update_page`,
+  `update_page_section`, `update_page_sections`, `add_drawio_diagram` with
+  `append: false`). `confirm_deletions: true` acknowledges the drop;
+  `confirm_shrinkage` no longer does. Macros hidden inside a comment or a
+  code body count as removed.
+- **`find_replace` limits.** At most 50 pairs per section
+  (`update_page_section`, and each `update_page_sections` entry), and a pair
+  may not grow the section past 2,000,000 characters.
 - **Tool annotations.** Every tool has a title and `readOnlyHint`,
   `destructiveHint`, `idempotentHint` and `openWorldHint`. `update_page`,
   `update_page_section(s)`, `add_drawio_diagram`, `revert_page`,
@@ -87,8 +99,10 @@ Plan: `plans/field-session-findings-2026-10.md`.
   `read_spaces_enforced` (makes `all_spaces` an error) and `redact_patterns`
   (literal, case-insensitive, Unicode-normalised; applied to search titles
   and excerpts only; patterns are never echoed). CQL that cannot be scoped
-  safely (unbalanced parentheses, unterminated literals, invalid
-  `ORDER BY`) is refused when scoping applies.
+  safely (unbalanced parentheses, unterminated literals, a backslash outside
+  a literal, invalid `ORDER BY`) is refused when scoping applies. These
+  settings scope `search_pages` only; they are not a read boundary for
+  `get_page`, `list_pages`, `get_page_by_title` or the other read tools.
 - **`diff_page_versions` sees macro-only changes.** It compares normalised
   storage too (`No text changes; N macro/attribute changes in: …`) and
   accepts `format: "storage"` for a unified diff of normalised storage.
@@ -104,8 +118,12 @@ Plan: `plans/field-session-findings-2026-10.md`.
   network error, or gets a 502 or 504 after being sent raises
   `WriteOutcomeUnknownError`, is logged with outcome `unknown`, evicts the
   cached page and invalidates tokens. Writes to that page based on a newer
-  version, including `version: "current"`, are refused until the page is
-  re-read. These writes are never retried.
+  version, including `version: "current"`, are refused until a complete,
+  untruncated `get_page` / `get_page_by_title` body read; that read carries a
+  note naming the earlier write's base version and the page's current
+  version. Truncated, section, `headings_only` and no-body reads leave the
+  mark in place. These writes are never retried. An unparseable 2xx answer
+  to a page write, comment or attachment upload is treated the same way.
 - **409 triage.** A 409 where the page has not moved past the sent version
   raises `ConfluenceApprovalRequiredError` for approval-required spaces and
   `ConfluenceUnexpectedConflictError` otherwise. Neither is retried or
@@ -119,6 +137,23 @@ Plan: `plans/field-session-findings-2026-10.md`.
 - **Placeholder restore is single-pass.** XML restored from one macro is
   never rescanned for further placeholders.
 - The setup tool list and `KNOWN_TOOLS` match the registered tools.
+- **`find_replace` refuses new comment delimiters and bare CDATA.** Adding
+  `<!--`, `-->`, or CDATA outside a code or link body fails with
+  `FIND_REPLACE_OPAQUE_MARKUP` (no opt-out). Write arrows as `--&gt;`, or use
+  a storage `body`. Inserting links and code macros still works.
+- **`find_replace` ambiguity counts what reads show.** A `find` that matches
+  once byte-for-byte but more than once as a fenced read shows the text (an
+  NBSP twin, for example) is `FIND_REPLACE_AMBIGUOUS`, with both counts. A
+  `find` that itself contains such characters still targets its exact
+  bytes.
+- **Placeholder ids say where they apply.** Full-page markdown reads say
+  their ids are for `update_page` only; section reads say theirs are local
+  to that section. The section tools' descriptions and their
+  `DELETIONS_NOT_CONFIRMED`, `INVENTED_TOKEN` and `FORGED_TOKEN` errors say
+  the same.
+- `diff_page_versions` (summary format) reports a section count instead of
+  repeating heading text in the unfenced summary line; the names stay in the
+  fenced `Section changes` list.
 
 ### Fixed
 
@@ -133,6 +168,10 @@ Plan: `plans/field-session-findings-2026-10.md`.
   multi-pass restore into another macro's XML. Restore is now single-pass.
 - `KNOWN_TOOLS` no longer omits `update_page_sections`,
   `authorise_destructive_writes` and `check_permissions`.
+- The `diff_page_versions` storage macro-name scan is linear on unterminated
+  macro tags and CDATA/comment openers and no longer reads inside CDATA or
+  comments; a crafted page could previously block the event loop for
+  seconds.
 
 ### Security
 
@@ -143,13 +182,25 @@ Plan: `plans/field-session-findings-2026-10.md`.
 - `npm audit fix` updates `proxy-addr` (critical), `source-map-js` (high),
   `fast-uri` and `ip-address`, reached through the SDK and dev tooling.
   `npm audit` reports 0 vulnerabilities.
+- `find_replace` can no longer hide a macro by wrapping it in a comment, a
+  CDATA section or a plain-text body; a placeholder that ends up inside one
+  is a deletion and goes through the `confirm_deletions` gate.
+- Macro and diagram names shown in deletion errors, success notes and
+  version messages are reduced to `[A-Za-z0-9 _.-]`, at most 64 characters.
+- Closed two prompt-injection channels on read paths (tenant headings in the
+  unfenced diff summary; forged `ID:` / `Space:` lines inside a search
+  result fence), a CQL scope bypass via a backslash outside a literal, and a
+  double-apply path after an unknown-outcome write.
 
 ### Planned
 
 See `plans/field-session-findings-2026-10.md`. 7.1.0: `move_page`,
 `delete_attachment`, new attachment versions, `insert_section`,
-`rename_heading`, `grep`, a label memo and low-risk reads. 7.2.0: compact
-reads, entity-tolerant matching and, if its precondition is resolved, R4.
+`rename_heading`, `grep`, a label memo, low-risk reads, fenced page titles
+in listings, `read_spaces_enforced` on reads, confirmation before
+`download_attachment` overwrites build or agent-instruction files, and
+duplicate-heading disambiguation. 7.2.0: compact reads, entity-tolerant
+matching and, if its precondition is resolved, R4.
 
 ## [6.10.1] - 2026-09-23 - code scanning fixes
 
