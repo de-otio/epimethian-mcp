@@ -131,7 +131,7 @@ A trailing `ORDER BY` is split off before wrapping, because CQL only
 allows it at the end. Space keys are escaped with `escapeCqlString`. When
 `read_spaces_enforced` is set, `all_spaces: true` is an error rather than
 a widening. The profile settings are validated at runtime; an invalid
-combination disables `search_pages` with a message naming the field, and
+combination disables `search_pages` and `get_recent_changes` with a message naming the field, and
 never echoes values.
 
 Scoping is request-side only. It trusts Confluence to honour the

@@ -1,8 +1,8 @@
 # Tools Reference
 
-The Epimethian MCP server provides **37 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
+The Epimethian MCP server provides **38 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
 
-_Last updated: 2026-10-06 — v7.0.0_
+_Last updated: 2026-10-06 — v7.1.0_
 
 Every tool declares a title and the annotation hints `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`. The hints are advisory; the server's own guards never depend on them. `update_page`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `revert_page`, `download_attachment`, `remove_label`, `set_page_status`, `remove_page_status` and `upgrade` declare `destructiveHint: true`. `delete_page`, `revert_page`, `delete_comment`, `authorise_destructive_writes` and `upgrade` also set `_meta["anthropic/requiresUserInteraction"]`, so Claude Code asks for approval on every call.
 
@@ -274,14 +274,16 @@ Returns child pages of a given parent page.
 
 ### `search_pages`
 
-Searches pages using CQL (Confluence Query Language). Results include a content excerpt (~300 chars) so you can triage matches without fetching each page. Each result (ID, space, title, excerpt) is wrapped in its own untrusted-content fence, and search highlight markers are removed.
+Searches pages using CQL (Confluence Query Language). Results include a content excerpt (~300 chars) so you can triage matches without fetching each page. Only pages and blog posts are returned; attachments and comments are skipped. Each result has one line outside the fence, `- ID: 123, Space: DOCS, Modified: 2026-10-06T08:12:00.000Z, v14` (`Modified` and the version appear when known). The title, the last editor (`Last editor: …`) and the excerpt sit inside the result's own untrusted-content fence, and search highlight markers are removed.
+
+Results are paged through until `limit` is reached (at most 10 requests; paging also stops after a page that held no pages or blog posts). When more matches exist, the output ends with `More results exist. Raise limit or narrow the query.`, and an empty result says that more results exist rather than "No pages found". To find what changed recently in one call, see `get_recent_changes`.
 
 If the profile sets `read_spaces`, the query is restricted to those spaces and the response says so. A query that cannot be restricted safely (unbalanced parentheses, an unterminated string literal, an invalid `ORDER BY`) is refused. If the profile sets `redact_patterns`, matches are replaced with `[redacted]` in titles and excerpts. See [Search Scope and Redaction](../../README.md#search-scope-and-redaction).
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `cql` | string | Yes | CQL query string |
-| `limit` | number | No | Maximum number of results to return (default: 25) |
+| `limit` | number | No | Maximum number of results to return (1–200, default: 25) |
 | `all_spaces` | boolean | No | Search every space instead of the profile's `read_spaces` (default: false). An error when the profile sets `read_spaces_enforced`. |
 | `excerpts` | boolean | No | Include result excerpts (default: true). Set `false` for titles only. |
 
@@ -292,6 +294,61 @@ space = "DEV" AND title ~ "architecture"
 space = "DEV" AND label = "approved"
 title = "My Page" AND space.key = "TEAM"
 ```
+
+---
+
+### `get_recent_changes`
+
+Reports the pages and blog posts that changed in a time window, in one call. Read-only. Use it for questions such as "what changed in the last 24 hours?" instead of a search followed by `get_page_versions` and `diff_page_versions` for every hit.
+
+Example prompt: "Give me a concise report of the pages that changed in the last 24 hours".
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `hours` | number | One of `hours` or `since` | Window length in hours, counted back from now (greater than 0, at most 720) |
+| `since` | string | One of `hours` or `since` | Window start as ISO 8601 with an offset (for example `2026-10-05T09:00:00Z`). Must be in the past and no more than 720 hours ago. |
+| `spaces` | array of strings | No | Space keys to include (default: the profile's `read_spaces`, else all spaces) |
+| `all_spaces` | boolean | No | Include every space instead of the profile's `read_spaces` (default: false). An error when the profile sets `read_spaces_enforced`. |
+| `include_blogposts` | boolean | No | Include blog posts, marked `[blog]` (default: true) |
+| `detail` | string | No | `list` (default), `versions` or `summary`. See the cost table below. |
+| `limit` | number | No | Maximum number of pages to report (1–200, default: 50) |
+| `max_diffs` | number | No | `summary` only: how many pages get a section-level diff (1–25, default: 10) |
+
+Set exactly one of `hours` and `since`.
+
+| `detail` | What you get | API calls |
+|----------|--------------|-----------|
+| `list` | ID, version, time and title per page | 1–2 searches |
+| `versions` | `list`, plus the edit count in the window, the editors and `new page` | `list` + 1 per page |
+| `summary` | `versions`, plus a condensed section-level diff for the first `max_diffs` pages | `versions` + up to 2 per diffed page |
+
+Per-page calls run at most 6 at a time, so a 200-page `versions` report takes about 34 round trips.
+
+**Window.** The server sends a relative CQL bound (`lastmodified >= now("-Nm")`) and filters exactly on its side, so the Confluence user's profile timezone does not shift the window.
+
+**Scope and redaction.** The profile's `read_spaces`, `read_spaces_enforced` and `redact_patterns` apply as for `search_pages`. Spaces default to `read_spaces`, and a `spaces` argument is intersected with `read_spaces`. When `read_spaces_enforced` is set, a space outside `read_spaces` and `all_spaces: true` are errors. Redaction applies to titles. See [Search Scope and Redaction](../../README.md#search-scope-and-redaction).
+
+**Output.** The first line says whether the report is complete: `Changes since 2026-10-05T09:00:00Z (24h) · 3 item(s) · complete`. A truncated report says `· showing 50, more exist (raise limit ≤200, narrow spaces, or shorten the window)` and never says `complete`. When per-page version fetches or diffs failed, the header adds `· N with versions unavailable` or `· N with diff unavailable`. It also says when search results could not be read (`· N unreadable search result(s) not listed`) and when CQL matched a page whose times are earlier than the window (`· N matched with an earlier time (metadata change?)`); such pages are still listed. A failed page still gets a line; it is never dropped. Pages are grouped by space key, newest first. Each page has one line outside the fence (ID, version, time and the change) and one fence with the title, the editors and the changed sections. The change reads `3 edits (v12–v14)`, `new page`, `metadata change only (no new version)`, `versions unavailable (…)`, `too large to diff` or `diff unavailable (…)`. With `summary`, a note says how many pages were listed without a diff because of `max_diffs`. The report ends with the tenant line.
+
+```
+Changes since 2026-10-05T09:00:00Z (24h) · 3 item(s) · complete
+Spaces: DOCS, TEAM
+
+DOCS
+- ID: 123456, v14, 2026-10-06T08:12:00Z, 3 edits (v12–v14)
+  <fence>Title: Release checklist
+  Editors: A. Editor, B. Editor
+  Changed: Rollback (+4 −1), Sign-off (added)</fence>
+- ID: 123999, v1, 2026-10-06T07:40:00Z, new page
+  <fence>Title: Onboarding notes
+  Editors: C. Editor</fence>
+TEAM
+- ID: 124001, v7, 2026-10-05T15:02:00Z, metadata change only (no new version)
+  <fence>Title: Team calendar</fence>
+<tenant line>
+```
+
+Not covered: deleted or trashed pages, comment-only changes and attachment-only changes.
 
 ---
 

@@ -5,7 +5,7 @@
 **Base:** `master` at f03ee8a (6.10.1).
 **Status:** revision 2. A security review and a correctness/parallelisation review of revision 1
 were folded in (§9 lists every finding and where it went). Release 7.0.0 is executed by this
-plan; 7.1.0 and 7.2.0 are specified here and run later.
+plan; 7.2.0 and 7.3.0 are specified here and run later.
 
 ## 1. Releases
 
@@ -15,8 +15,9 @@ four new tools, breaking read changes) is more than one verifiable release. Spli
 | Release | Contents | Why grouped |
 |---|---|---|
 | **7.0.0** (this run) | S1 + placeholder/restore fixes, S2, S7, R1, R3, S5, T5, S6, S3/S4/R5/A3/T6 metadata sweep, A5, dependency and vulnerability fixes | Safety fixes and the breaking changes ship together; no new tools, so the metadata sweep sees the final tool set |
-| 7.1.0 (later) | A2 (`move_page` same-space, `delete_attachment` trash-only, attachment new version), T3 (`insert_section`, `rename_heading`), T2 (`grep`), R2 (label memo only), A1 low-risk reads (`/direct-children`, versions list, attachments list). From the 7.0.0 final review: repeated exact headings become an ambiguity error once a disambiguation syntax exists (warn until then); `resolve_comment` / `delete_comment` fetch the comment's page id first, then run `checkSpaceAllowed` and the outcome-unknown eviction; `download_attachment` overwrite of build and agent-instruction files (`package.json`, `Makefile`, `CLAUDE.md`, `AGENTS.md`, `node_modules/…`) needs confirmation, and overwrite writes a temp file then renames; check whether `createInlineComment` bumps the page version (live), and evict the cache if not; enforce `read_spaces_enforced` on reads that take a space key; fence page titles in `list_pages` / child listings; namespace placeholder ids by base so a full-page id sent to a section tool is rejected | Additive tools; get annotations from `tool-meta.ts` from the start |
-| 7.2.0 (later) | T1 `compact` (strip `local-id`/`ac:local-id` only, with a read-only marker), T4 entity-tolerant matching on the tokenised canonical, R4 if the badge-version issue is resolved | Write-path matching changes, isolated so they can be verified alone |
+| 7.1.0 (shipped) | The recent-changes report: `search_pages` gains time/version/editor and a "more results" marker, plus the new `get_recent_changes` tool (`plans/recent-changes-report.md`) | Read-only; no write path |
+| 7.2.0 (later) | A2 (`move_page` same-space, `delete_attachment` trash-only, attachment new version), T3 (`insert_section`, `rename_heading`), T2 (`grep`), R2 (label memo only), A1 low-risk reads (`/direct-children`, versions list, attachments list). From the 7.0.0 final review: repeated exact headings become an ambiguity error once a disambiguation syntax exists (warn until then); `resolve_comment` / `delete_comment` fetch the comment's page id first, then run `checkSpaceAllowed` and the outcome-unknown eviction; `download_attachment` overwrite of build and agent-instruction files (`package.json`, `Makefile`, `CLAUDE.md`, `AGENTS.md`, `node_modules/…`) needs confirmation, and overwrite writes a temp file then renames; check whether `createInlineComment` bumps the page version (live), and evict the cache if not; enforce `read_spaces_enforced` on reads that take a space key; fence page titles in `list_pages` / child listings; namespace placeholder ids by base so a full-page id sent to a section tool is rejected. | Additive tools; get annotations from `tool-meta.ts` from the start |
+| 7.3.0 (later) | T1 `compact` (strip `local-id`/`ac:local-id` only, with a read-only marker), T4 entity-tolerant matching on the tokenised canonical, R4 if the badge-version issue is resolved | Write-path matching changes, isolated so they can be verified alone |
 
 **Deferred indefinitely (with reason):** A1 historical-body reads (`revert_page` writes what this
 read returns; open question 2 needs live verification); attachment purge (irreversible); A4
@@ -394,7 +395,7 @@ never resolved by taking one side wholesale.
   - `CHANGELOG.md` 7.0.0 with a **Breaking** section.
 - **D3 (Haiku, low):**
   - the A5 correction in `investigate-bulk-operations.md`;
-  - the investigation's status, set to "7.0.0 implemented: …; 7.1.0/7.2.0 planned: …; deferred: …"
+  - the investigation's status, set to "7.0.0 implemented: …; 7.2.0/7.3.0 planned: …; deferred: …"
     with links to this plan.
 - **W-REVIEW (Opus, high, read-only, two agents):** a security review, and a data-loss walk of
   every mutation path in `git diff master...release/7.0.0` (read/write races, API semantics,
@@ -457,39 +458,39 @@ Security review (S) and correctness review (C):
 |---|---|
 | S-H1 / C3 token not bound to pairs or section | W-FR 7, W-MULTI 4 |
 | S-H2 / C5 literal placeholders, multi-pass restore | Contract 3, W-FR 2–3, 8 |
-| S-H3 normaliser on raw storage, numeric entities | 7.2.0 T4 on the tokenised canonical; excludes every form of `< > & " '`, invalid code points, bidi/control |
-| S-H4 `move_page` exposure | 7.1.0: same-space only, inherited-restriction comparison with gate, `destructiveHint` + `requiresUserInteraction`, evict space cache |
+| S-H3 normaliser on raw storage, numeric entities | 7.3.0 T4 on the tokenised canonical; excludes every form of `< > & " '`, invalid code points, bidi/control |
+| S-H4 `move_page` exposure | 7.2.0: same-space only, inherited-restriction comparison with gate, `destructiveHint` + `requiresUserInteraction`, evict space cache |
 | S-H5 `download_attachment` hints and path | W-META 1, 3 |
 | S-M1 / C6 guard routing | W-FR 6 |
 | S-M2 overlap counting, "current" + placeholders | Contract 2, W-FR 5 |
 | S-M3 / C2 NFKC read vs match | Contract 2 (view transform, byte preservation) |
-| S-M4 / C12 compact strips macro-id | 7.2.0: `local-id` only, read-only marker, CDATA-aware |
-| S-M5 / C7 badge skip | R2 badge skip dropped; 7.1.0 memoises only the legacy-label check; R4 → 7.2.0, conditional |
+| S-M4 / C12 compact strips macro-id | 7.3.0: `local-id` only, read-only marker, CDATA-aware |
+| S-M5 / C7 badge skip | R2 badge skip dropped; 7.2.0 memoises only the legacy-label check; R4 → 7.3.0, conditional |
 | S-M6 outcome unknown, semaphore | W-HTTP 2, 4 |
 | S-M7 / C17 CQL depth, redaction | W-SCOPE 3, 5; `read_spaces_enforced` added |
-| S-M8 delete_attachment / replace_existing | 7.1.0: container fail-closed, page id + version check, admin-only trash restore stated, sanitised filename in prompt, budget + log for uploads, filename lookup by filter |
-| S-M9 / C15 non-body writes | §7 rule restated; 7.1.0 shared wrapper (budget, log, `invalidateForPage`) and raw functions added to `no-direct-raw-writer.test.ts` |
+| S-M8 delete_attachment / replace_existing | 7.2.0: container fail-closed, page id + version check, admin-only trash restore stated, sanitised filename in prompt, budget + log for uploads, filename lookup by filter |
+| S-M9 / C15 non-body writes | §7 rule restated; 7.2.0 shared wrapper (budget, log, `invalidateForPage`) and raw functions added to `no-direct-raw-writer.test.ts` |
 | S-M10 aggregate guard, id collisions | W-MULTI 2–3 |
-| S-M11 structural edits | 7.1.0: byte-equal prefix/suffix, `after_heading` = end of that heading's section, no level takeover, tokenised heading rename, escaped and fence-checked headings, duplicate warning |
+| S-M11 structural edits | 7.2.0: byte-equal prefix/suffix, `after_heading` = end of that heading's section, no level takeover, tokenised heading rename, escaped and fence-checked headings, duplicate warning |
 | S-M12 / C18 wrappers at end, flags, upgrade | W-META 2, 4 |
 | S-M13 / C15 spaceId vs key | W-SCOPE 1 |
-| S-L1 tenant text in errors | W-READ 4 (rest with each 7.1.0 tool) |
+| S-L1 tenant text in errors | W-READ 4 (rest with each 7.2.0 tool) |
 | S-L2 / S-L3 diff names, size, regex | W-DIFF 2–4 |
-| S-L4 grep byte cap | 7.1.0 T2 |
-| S-L5 R4 cache holds sent body | 7.2.0 note |
+| S-L4 grep byte cap | 7.2.0 T2 |
+| S-L5 R4 cache holds sent body | 7.3.0 note |
 | S-L6 fast accept | Deferred (§1) |
 | S-L7 language fingerprint | Phase 0 step 2 |
 | C1 eight concurrent test agents | Four lanes (§2) |
 | C4 numbering location, body mode | Contract 1, W-READ 2, W-FR 9 |
 | C8 output-validation trap | Contract 4 |
-| C9 shared registries, test mocks, install-agent check | Contract 5, W-META 5; new tools move to 7.1.0 |
+| C9 shared registries, test mocks, install-agent check | Contract 5, W-META 5; new tools move to 7.2.0 |
 | C10 fetch sites, 409 hunk overlap | W-HTTP owns all fetch sites; W-DIFF serialised in the same lane |
 | C11 S7 classification | W-HTTP 5 |
 | C13 duplicated attribute stripping, nested regex | W-DIFF 1, 4 (`storage-normalise.ts`) |
 | C14 W-READ assumptions | W-READ 1, 3, 5 |
-| C16 W-STRUCT spec | 7.1.0 (see S-M11), reuse `locateSectionRange` |
+| C16 W-STRUCT spec | 7.2.0 (see S-M11), reuse `locateSectionRange` |
 | C19 DAG fixes | §2 |
-| C20 dropped items | A1 low-risk → 7.1.0; open question 1 → W-META 6; structuredContent → W-META 7; T6 trade-off noted under 7.1.0 (+4 tools) |
+| C20 dropped items | A1 low-risk → 7.2.0; open question 1 → W-META 6; structuredContent → W-META 7; T6 trade-off noted under 7.2.0 (+4 tools) |
 | C21 `allow_duplicate_macros` | Dropped (W-FR 4) |
 | C22 setup.ts TOOLS | W-META 5 |
 | SDK: validation already `isError` | W-META 5 regression test only |

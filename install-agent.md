@@ -760,13 +760,13 @@ to the tool, page, section, the pairs or body and flags, the resulting storage
 and the page version. Re-issue the same call with the token; changing anything
 requires a new token.
 
-**Search scope.** If the profile sets `read_spaces`, `search_pages` is limited to
+**Search scope.** If the profile sets `read_spaces`, `search_pages` and `get_recent_changes` are limited to
 those spaces and says so in the result. `all_spaces: true` widens one call unless
 the profile sets `read_spaces_enforced`, where it is an error; do not try to work
 around it. A query that cannot be scoped (unbalanced parentheses, an unterminated
 string literal, an invalid `ORDER BY`) is refused. Titles and excerpts may
 contain `[redacted]` where the profile's `redact_patterns` matched. Use
-`excerpts: false` for a titles-only listing. These settings are edited in the
+`excerpts: false` for a titles-only listing. `search_pages` pages through results up to `limit` (at most 200) and ends with `More results exist.` when it stopped short; a `get_recent_changes` header says `complete` only when nothing was cut off. These settings are edited in the
 profile registry JSON; see the README section "Search Scope and Redaction".
 
 **Unknown write outcome.** If a write times out or fails after being sent
@@ -811,7 +811,7 @@ established whether MCP clients truncate long parameter descriptions in the
 tool schema, or at what length. Until that is measured, parameter descriptions
 are kept short and the rules that matter live in the tool description.
 
-## Available Tools (37)
+## Available Tools (38)
 
 | Tool | Description |
 |------|-------------|
@@ -829,7 +829,7 @@ are kept short and the rules that matter live in the tool description.
 | `revert_page` | Revert a page to a previous version |
 | `list_pages` | List pages in a space |
 | `get_page_children` | Get child pages of a page |
-| `search_pages` | Search pages using CQL (Confluence Query Language) |
+| `search_pages` | Search pages using CQL (Confluence Query Language); shows last-modified time, version and last editor |
 | `get_spaces` | List available Confluence spaces |
 | `add_attachment` | Upload a file attachment to a page |
 | `get_attachments` | List attachments on a page |
@@ -848,6 +848,7 @@ are kept short and the rules that matter live in the tool description.
 | `get_page_versions` | List version history for a page |
 | `get_page_version` | Get page content at a specific historical version |
 | `diff_page_versions` | Compare two versions of a page |
+| `get_recent_changes` | Report the pages and blog posts changed in a time window (`hours` or `since`; `detail`: `list`, `versions` or `summary`) |
 | `lookup_user` | Search for Atlassian users by name or email to resolve accountId for inline mentions |
 | `resolve_page_link` | Resolve a page title + space key to a stable contentId and URL for page links |
 | `get_version` | Return the epimethian-mcp server version and report available updates |

@@ -6,6 +6,8 @@
 
 A security-focused [MCP](https://modelcontextprotocol.io/) server that gives AI agents safe, multi-tenant access to Confluence Cloud. It provides some features not available in the official MCP server, like support for draw.io diagrams, macros, etc.
 
+**What's new (v7.1.0):** `get_recent_changes` reports the pages and blog posts changed in the last N hours in one call, grouped by space, with edit counts, editors and a condensed diff on request, and says whether the list is complete. `search_pages` results now show the last-modified time, version and last editor, page through to `limit` (max 200) and say when more results exist. See [CHANGELOG.md](CHANGELOG.md).
+
 **What's new (v7.0.0):** `find_replace` now requires each `find` to match exactly once (opt in to several with `replace_all: true`), and `update_page_sections` accepts `find_replace` per section. Every body returned by `get_page` and `get_page_by_title` sits inside the untrusted-content fence. `search_pages` can be scoped to a profile's `read_spaces` and redact `redact_patterns` from titles and excerpts. HTTP requests have timeouts and bounded retries, and a write whose outcome is unknown blocks `version: "current"` writes to that page until a fresh read. Every tool declares annotations. Breaking changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 **What's new (v6.8.0):** `authorise_destructive_writes` + `batch_token` field on every destructive tool — pre-authorise a batch of destructive writes with a single user prompt, then fan out the actual writes (sub-agent fan-out, bulk doc refreshes) without each one going through its own elicitation. Page-id-scoped (no wildcards), TTL-bounded, operation-bounded; validation failures fall through transparently to the per-call gate. v6.7.2 flipped `EPIMETHIAN_TOKEN_IN_TEXT` to default-on (opt out via `EPIMETHIAN_HIDE_TOKEN_IN_TEXT=true`), closing the under-configured-install gap for Claude Code users. v6.6.0–6.6.3 introduced soft-confirmation token round-trip for clients without working elicitation: single-use, diff-bound tokens; fast-decline auto-detection (the Claude Code "fakes elicitation" bug now Just Works without `EPIMETHIAN_BYPASS_ELICITATION`); `outputSchema` so spec-compliant clients forward the structured payload to the agent; SDK-compat hotfix for `z.object` output schemas. v6.5 added per-client setup CLI snippets (`epimethian-mcp setup --client …`). v6.4.1 added atomic multi-section updates and find-replace mode. See [CHANGELOG.md](CHANGELOG.md) for full details.
@@ -160,7 +162,7 @@ For the full posture resolution matrix and error remediation design, see [doc/de
 
 ## Search Scope and Redaction
 
-Three profile settings limit what `search_pages` shows the agent. They live in the profile registry JSON (like `spaces`); there is no CLI flag. Restart running servers after editing.
+Three profile settings limit what `search_pages` and `get_recent_changes` show the agent. They live in the profile registry JSON (like `spaces`); there is no CLI flag. Restart running servers after editing.
 
 ```jsonc
 // ~/.config/epimethian-mcp/profiles.json
@@ -178,15 +180,15 @@ Three profile settings limit what `search_pages` shows the agent. They live in t
 
 | Setting | Type | Purpose |
 |---|---|---|
-| `read_spaces` | string[] (max 100 keys) | Default search scope. CQL is combined with `space in (...)`, and the result says the search was restricted. An empty list means no space is searchable by default. |
-| `read_spaces_enforced` | boolean (default `false`) | Requires `read_spaces`. When `true`, `search_pages` with `all_spaces: true` returns an error. When `false`, the agent may widen a call with `all_spaces: true`. Scopes `search_pages` only: it is not a read boundary for `get_page`, `list_pages`, `get_page_by_title` and the other read tools. |
-| `redact_patterns` | string[] (max 100, 1–200 chars each) | Literal strings replaced with `[redacted]` in search result titles and excerpts. Matching is case-insensitive after entity decoding and Unicode normalisation. Patterns are never treated as regular expressions and never appear in errors. |
+| `read_spaces` | string[] (max 100 keys) | Default search scope for `search_pages` and `get_recent_changes`. CQL is combined with `space in (...)`, and the result says the search was restricted. An empty list means no space is searchable by default. |
+| `read_spaces_enforced` | boolean (default `false`) | Requires `read_spaces`. When `true`, `search_pages` and `get_recent_changes` with `all_spaces: true` return an error. When `false`, the agent may widen a call with `all_spaces: true`. Scopes `search_pages` and `get_recent_changes` only: it is not a read boundary for `get_page`, `list_pages`, `get_page_by_title` and the other read tools. |
+| `redact_patterns` | string[] (max 100, 1–200 chars each) | Literal strings replaced with `[redacted]` in search result titles and excerpts, and in `get_recent_changes` titles. Matching is case-insensitive after entity decoding and Unicode normalisation. Patterns are never treated as regular expressions and never appear in errors. |
 
 Notes:
 
 - A query that cannot be scoped safely (unbalanced parentheses, an unterminated string literal, a backslash outside a quoted string, an invalid `ORDER BY`) is refused when scoping applies, rather than sent unscoped.
-- Redaction applies to search titles and excerpts only, not to page bodies. It is hygiene, not a security boundary: it cannot hide that a result exists. `read_spaces_enforced` limits `search_pages` only and does not restrict `get_page`, `list_pages`, `get_page_by_title` or any other read tool; to keep an agent out of a space, use a token without access to it. Use `spaces` to restrict writes.
-- Invalid values disable `search_pages` with an error naming the setting, while the other tools keep working.
+- Redaction applies to search titles and excerpts (and `get_recent_changes` titles) only, not to page bodies. It is hygiene, not a security boundary: it cannot hide that a result exists. `read_spaces_enforced` limits `search_pages` and `get_recent_changes` only and does not restrict `get_page`, `list_pages`, `get_page_by_title` or any other read tool; to keep an agent out of a space, use a token without access to it. Use `spaces` to restrict writes.
+- Invalid values disable `search_pages` and `get_recent_changes` with an error naming the setting, while the other tools keep working.
 
 ## Provenance: AI-Edited Badge
 
@@ -271,7 +273,7 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `authorise_destructive_writes` | Pre-authorise a batch of destructive writes (returns a `batch_token`) |
 | `list_pages`          | List pages in a space                                                  |
 | `get_page_children`   | Get child pages                                                        |
-| `search_pages`        | Search via CQL (excerpts; scoped by the profile's `read_spaces`)       |
+| `search_pages`        | Search via CQL (excerpts, last-modified time and editor; scoped by the profile's `read_spaces`) |
 | `get_spaces`          | List available spaces                                                  |
 | `add_attachment`      | Upload a file attachment                                               |
 | `get_attachments`     | List attachments on a page                                             |
@@ -290,6 +292,7 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `get_page_versions`   | List version history for a page                                        |
 | `get_page_version`    | Get page content at a specific historical version (read-only markdown) |
 | `diff_page_versions`  | Compare two versions of a page                                         |
+| `get_recent_changes`  | Report the pages and blog posts changed in a time window (scoped like `search_pages`) |
 | `prepend_to_page`     | Insert content at the beginning of a page (additive, safe)             |
 | `append_to_page`      | Insert content at the end of a page (additive, safe)                   |
 | `revert_page`         | Revert a page to a previous version (lossless)                         |

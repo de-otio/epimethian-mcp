@@ -245,13 +245,14 @@ destructiveHint: true`.
 
 ## 17. Read scope is hygiene unless enforced
 
-`read_spaces` narrows what `search_pages` queries by default, and
-`redact_patterns` removes literal text from search titles and excerpts.
+`read_spaces` narrows what `search_pages` and `get_recent_changes` query
+by default, and `redact_patterns` removes literal text from their titles
+(and from search excerpts).
 Neither is a data boundary:
 
 - With `read_spaces` alone, an agent can pass `all_spaces: true`.
   `read_spaces_enforced` turns that into an error.
-- Even when enforced, scoping applies to `search_pages` only.
+- Even when enforced, scoping applies to `search_pages` and `get_recent_changes` only.
   `read_spaces_enforced` is not a read boundary: `get_page`,
   `get_page_by_title`, `list_pages`, `get_page_children`,
   `resolve_page_link` and the version tools read any page the token can

@@ -14,7 +14,7 @@ Every tool carries a `title` and the four hints below (`openWorldHint` is `true`
 
 | Tool | readOnlyHint | destructiveHint | idempotentHint |
 |------|:---:|:---:|:---:|
-| `get_page`, `get_page_by_title`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_attachments`, `get_labels`, `get_comments`, `get_page_status`, `get_page_versions`, `get_page_version`, `diff_page_versions`, `get_version`, `check_permissions`, `lookup_user`, `resolve_page_link` | yes | no | yes |
+| `get_page`, `get_page_by_title`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_attachments`, `get_labels`, `get_comments`, `get_page_status`, `get_page_versions`, `get_page_version`, `diff_page_versions`, `get_recent_changes`, `get_version`, `check_permissions`, `lookup_user`, `resolve_page_link` | yes | no | yes |
 | `create_page`, `add_attachment`, `create_comment`, `prepend_to_page`, `append_to_page` | no | no | no |
 | `add_label`, `resolve_comment` | no | no | yes |
 | `update_page`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `revert_page`, `download_attachment`, `authorise_destructive_writes` | no | yes | no |
@@ -41,7 +41,7 @@ Every description, measured after the safety wrappers are applied, is at most 1,
 | `update_page_sections` | page_id, sections (each `{section, body?` or `find_replace?}`), version, version_message?, confirm_*?, confirm_token?, batch_token? | Update several sections in one PUT and one version. Applies the "AI-edited" provenance badge. Requires write permission. |
 | `authorise_destructive_writes` | page_ids, ttl_seconds?, max_operations?, reason? | Mint a batch token that pre-authorises a bounded set of destructive writes. A write tool: not registered in the read-only posture. |
 | `delete_page` | page_id | Delete a page by ID. Requires delete permission. |
-| `search_pages` | cql, limit?, all_spaces?, excerpts? | Search using CQL, scoped to the profile's `read_spaces` when set |
+| `search_pages` | cql, limit? (1-200), all_spaces?, excerpts? | Search using CQL, scoped to the profile's `read_spaces` when set. Shows last-modified time, version and last editor. |
 | `list_pages` | space_key, limit?, status? | List pages in a space |
 | `get_page_children` | page_id, limit? | Get child pages |
 | `get_spaces` | limit?, type? | List available spaces |
@@ -63,6 +63,7 @@ Every description, measured after the safety wrappers are applied, is at most 1,
 | `get_page_versions` | page_id, limit? | List version history for a page |
 | `get_page_version` | page_id, version | Get page content at a specific historical version |
 | `diff_page_versions` | page_id, from_version, to_version?, max_length?, format? | Compare two versions of a page (`summary`, `unified` or `storage`) |
+| `get_recent_changes` | hours or since, spaces?, all_spaces?, include_blogposts?, detail?, limit?, max_diffs? | Report the pages and blog posts changed in a time window, scoped like `search_pages` |
 | `prepend_to_page` | page_id, version, content, separator?, version_message?, allow_raw_html?, confluence_base_url? | Insert content at the beginning of an existing page. Applies the "AI-edited" provenance badge. Requires write permission. |
 | `append_to_page` | page_id, version, content, separator?, version_message?, allow_raw_html?, confluence_base_url? | Insert content at the end of an existing page. Applies the "AI-edited" provenance badge. Requires write permission. |
 | `revert_page` | page_id, target_version, current_version, confirm_shrinkage?, confirm_structure_loss?, version_message? | Revert page to a previous version (lossless, uses raw storage). Applies the "AI-edited" provenance badge. Requires write permission. |
@@ -108,6 +109,31 @@ Deletes a page by ID. Returns confirmation text.
 Searches using CQL (Confluence Query Language). Uses the v1 `/rest/api/search` endpoint (not `/content/search`) to include content excerpts in results. Example CQL: `space = "DEV" AND title ~ "architecture"`.
 
 When the profile sets `read_spaces`, the query is wrapped as `(<cql>) AND space in (...)` before it is sent; `all_spaces: true` searches every space instead, unless the profile also sets `read_spaces_enforced`, in which case `all_spaces` is an error. `excerpts: false` returns titles only. Result titles and excerpts have the v1 highlight markers removed and, when the profile sets `redact_patterns`, matching text replaced with `[redacted]`. Each result is fenced as its own untrusted block (ID, Space, Title, Excerpt). See [security/04-input-validation.md](security/04-input-validation.md) for the CQL scoping rules and the redaction pipeline.
+
+Since 7.1.0 the request expands `content.space` and `content.version`, and the client follows the `_links.next` cursor until `limit` hits are collected (the cap is 200; the default is 25). Only pages and blog posts are kept. The unfenced line per result is `- ID: 123, Space: DOCS, Modified: <ISO>, v14`; `Modified` and the version appear when known, and the timestamp outside the fence is re-rendered by the server from the parsed time (the later of `lastModified` and `version.when`), never copied from the response. The last editor's display name is tenant text, so it is shown inside the fence as `Last editor: …`. When more matches exist, the output ends with `More results exist. Raise limit or narrow the query.`
+
+### get_recent_changes
+Reports the pages and blog posts changed in a time window, in one call. Read-only; it never calls the write guard. Added in 7.1.0 (plan: `plans/recent-changes-report.md`).
+
+Input: exactly one of `hours` (0 < h ≤ 720) or `since` (ISO 8601 with offset, in the past, at most 720 hours ago); `spaces`; `all_spaces` (default false); `include_blogposts` (default true); `detail` (`list`, `versions` or `summary`; default `list`); `limit` (1-200, default 50); `max_diffs` (1-25, default 10, `summary` only).
+
+**Window.** CQL reads absolute dates in the Confluence user's profile timezone, so the server always sends a relative bound, `lastmodified >= now("-Nm")`, with 10 minutes of slack for clock skew, and then filters exactly on its own side against the requested start. Only hits inside the slack band are dropped; a hit CQL matched with an earlier time is kept and counted in the header (`matched with an earlier time (metadata change?)`). The clock is injected so tests can freeze it. The CQL is built by a pure function; space keys go through `escapeCqlString`.
+
+**Scope.** It uses the same read scope as `search_pages`: `read_spaces` is the default, a `spaces` argument is intersected with it, and with `read_spaces_enforced` a space outside `read_spaces` or `all_spaces: true` is an error. `redact_patterns` applies to titles. These settings scope `search_pages` and `get_recent_changes`, not the other read tools.
+
+**Detail levels and cost.** P is the number of pages reported and D is `min(P, max_diffs)`.
+
+| `detail` | HTTP calls |
+|---|---|
+| `list` | One search request per result page (1 for most reports). The search expands version metadata, so no per-page calls are needed. |
+| `versions` | `list` + P calls to `getPageVersions(id, 50)`. A pure summariser counts the in-window versions, lists the editors and finds the baseline version, or `new page` when version 1 is in the window. |
+| `summary` | `versions` + at most 2D calls: the first `max_diffs` pages with a numeric baseline are diffed `baseline → current` with the existing body cache and `computeSummaryDiff`, then condensed to `Changed: <sections> (+a −r)`. |
+
+Per-page work runs through `settleInChunks` and the process-wide semaphore (6 in flight). A page whose version fetch fails still gets a line (`versions unavailable (<status>)`), and the header counts these. A page that matched the CQL but has no version in the window is reported as `metadata change only (no new version)`. When all 50 fetched versions fall in the window, the count reads `≥50 edits`. Bodies over the diff size limit say `too large to diff`.
+
+**Output.** Plain text. The header says `complete` or `showing N, more exist (...)`; a truncated report never says `complete`. Pages are grouped by space key, then newest first, and blog posts carry `[blog]` after the ID. Per page, the unfenced line holds the ID, version, time and change; one fence holds the title, editors and changed sections. A note says how many pages were listed without a diff because of `max_diffs`. The output ends with the tenant echo.
+
+Out of scope: deleted or trashed pages, comment-only changes and attachment-only changes.
 
 ### list_pages
 Lists pages in a space by space key. Supports filtering by status (default: "current") and limiting result count.

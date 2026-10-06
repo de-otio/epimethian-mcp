@@ -81,7 +81,7 @@ The `profile posture` setting is a tri-state: `"read-only"` | `"read-write"` | `
 Registered tools (the existing `READ_ONLY_TOOLS` allowlist plus the new `check_permissions`):
 
 - All `get_*` read tools (`get_page`, `get_spaces`, `get_comments`, `get_attachments`, `get_labels`, `get_page_status`, `get_page_versions`, `get_page_version`, `get_page_children`, `get_page_by_title`)
-- Search and list (`search_pages`, `list_pages`, `resolve_page_link`, `diff_page_versions`, `lookup_user`)
+- Search and list (`search_pages`, `list_pages`, `resolve_page_link`, `diff_page_versions`, `get_recent_changes`, `lookup_user`)
 - `check_permissions` — always available
 
 Write tools (`create_page`, `update_page`, `append_to_page`, `prepend_to_page`, `update_page_section`, `delete_page`, `add_drawio_diagram`, `revert_page`, `add_attachment`, `add_label`, `remove_label`, `create_comment`, `delete_comment`, `resolve_comment`, `set_page_status`, `remove_page_status`) are **not registered**.
