@@ -2644,39 +2644,126 @@ const SAFE_MACRO_PARAMS = new Set([
 ]);
 
 /**
- * Convert Confluence storage format HTML to a read-only markdown rendering.
- * Confluence-specific elements (macros, layouts, images) are replaced with
- * human-readable placeholders. This is a one-way, lossy conversion — the
- * output must never be written back to Confluence.
+ * Macros whose body is ordinary rich text. The markdown view renders these as
+ * labelled block quotes so an edit inside a panel or expand is visible to a
+ * diff; every other macro stays a one-line placeholder.
  */
-export function toMarkdownView(storageHtml: string): string {
-  let confluenceElementCount = 0;
-  let processed = storageHtml;
+const RICH_TEXT_MACROS: ReadonlySet<string> = new Set([
+  "info", "note", "warning", "tip", "panel", "expand",
+]);
 
-  // Replace <ac:structured-macro> blocks with placeholders
-  processed = processed.replace(
-    /<ac:structured-macro[^>]*ac:name="([^"]*)"[^>]*>[\s\S]*?<\/ac:structured-macro>/gi,
-    (_match, name) => {
-      confluenceElementCount++;
-      // Extract safe parameters from the match
-      const paramRe = /<ac:parameter ac:name="([^"]*)"[^>]*>([^<]*)<\/ac:parameter>/gi;
-      const params: string[] = [];
-      let pm;
-      while ((pm = paramRe.exec(_match)) !== null) {
-        if (SAFE_MACRO_PARAMS.has(pm[1])) {
-          params.push(`${pm[1]}=${pm[2]}`);
-        }
-      }
-      const paramStr = params.length > 0 ? ` (${params.join(", ")})` : "";
-      return `\n\n[macro: ${name}${paramStr}]\n\n`;
+/**
+ * Nesting depth at which rich-text macros stop being expanded and fall back
+ * to a placeholder. Real pages nest two or three deep; the cap keeps parse
+ * work linear on adversarial input.
+ */
+const MAX_MACRO_NESTING = 20;
+
+/** Counts Confluence elements the view could not show (drives the footer). */
+interface ViewState {
+  hiddenElements: number;
+}
+
+type DomElement = import("node-html-parser").HTMLElement;
+type DomNode = import("node-html-parser").Node;
+
+function isElement(node: DomNode): node is DomElement {
+  return node.nodeType === 1;
+}
+
+function isTag(el: DomElement, tag: string): boolean {
+  return el.rawTagName?.toLowerCase() === tag;
+}
+
+/**
+ * The outermost `ac:structured-macro` elements, in document order. Iterative:
+ * a page with thousands of nested elements must not overflow the call stack.
+ */
+function outermostMacros(root: DomElement): DomElement[] {
+  const found: DomElement[] = [];
+  const stack: DomNode[] = [...root.childNodes].reverse();
+  for (let node = stack.pop(); node !== undefined; node = stack.pop()) {
+    if (!isElement(node)) continue;
+    if (isTag(node, "ac:structured-macro")) {
+      found.push(node);
+      continue;
     }
+    for (let i = node.childNodes.length - 1; i >= 0; i--) stack.push(node.childNodes[i]!);
+  }
+  return found;
+}
+
+/** `[macro: name (safe=params)]`, built from this macro's own parameters only. */
+function macroLabel(el: DomElement): string {
+  const name = el.getAttribute("ac:name") ?? "unknown";
+  const params: string[] = [];
+  for (const child of el.childNodes) {
+    if (!isElement(child) || !isTag(child, "ac:parameter")) continue;
+    // Only plain-text parameters; a parameter wrapping an element (a user
+    // mention, say) has nothing safe to show.
+    if (!child.childNodes.every((n) => n.nodeType === 3)) continue;
+    const paramName = child.getAttribute("ac:name");
+    if (paramName !== undefined && SAFE_MACRO_PARAMS.has(paramName)) {
+      params.push(`${paramName}=${child.text}`);
+    }
+  }
+  const paramStr = params.length > 0 ? ` (${params.join(", ")})` : "";
+  // The label is embedded in HTML that turndown parses, so escape it.
+  return `[macro: ${escapeXmlText(name)}${escapeXmlText(paramStr)}]`;
+}
+
+/** The inner storage of a macro's `ac:rich-text-body`, or undefined when it has none. */
+function richTextBodyOf(el: DomElement, storage: string): string | undefined {
+  const body = el.childNodes.find(
+    (n): n is DomElement => isElement(n) && isTag(n, "ac:rich-text-body"),
   );
+  if (!body) return undefined;
+  // Slice the ORIGINAL storage (the parse ran on a CDATA-masked copy of the
+  // same length) and strip the wrapper tags.
+  const m = storage
+    .slice(body.range[0], body.range[1])
+    .match(/^<ac:rich-text-body\b[^>]*>([\s\S]*)<\/ac:rich-text-body\s*>$/i);
+  return m ? m[1] : "";
+}
+
+function renderMacro(el: DomElement, storage: string, state: ViewState, depth: number): string {
+  const label = macroLabel(el);
+  const name = (el.getAttribute("ac:name") ?? "").toLowerCase();
+  if (RICH_TEXT_MACROS.has(name) && depth < MAX_MACRO_NESTING) {
+    const inner = richTextBodyOf(el, storage);
+    if (inner !== undefined) {
+      return `\n\n<blockquote><p>${label}</p>${prepareForMarkdown(inner, state, depth + 1)}</blockquote>\n\n`;
+    }
+  }
+  state.hiddenElements++;
+  return `\n\n${label}\n\n`;
+}
+
+/** Replace every outermost macro in `storage`; nested rich-text macros recurse. */
+function replaceStructuredMacros(storage: string, state: ViewState, depth: number): string {
+  if (!/<ac:structured-macro/i.test(storage)) return storage;
+  const { parse } = require("node-html-parser") as typeof import("node-html-parser");
+  // Parse a CDATA-masked copy (same length) so code bodies cannot derail the
+  // structure; slice the original by the reported offsets.
+  const macros = outermostMacros(parse(maskCdataForParse(storage)));
+  let out = "";
+  let last = 0;
+  for (const el of macros) {
+    out += storage.slice(last, el.range[0]) + renderMacro(el, storage, state, depth);
+    last = el.range[1];
+  }
+  return out + storage.slice(last);
+}
+
+/** Everything `toMarkdownView` does before turndown, applied at one nesting level. */
+function prepareForMarkdown(storage: string, state: ViewState, depth: number): string {
+  let processed = replaceStructuredMacros(storage, state, depth);
 
   // Replace <ac:layout> blocks with column count placeholders
   processed = processed.replace(
     /<ac:layout>[\s\S]*?<\/ac:layout>/gi,
     (match) => {
-      confluenceElementCount++;
+      state.hiddenElements++;
       const cellCount = (match.match(/<ac:layout-cell/gi) || []).length;
       return `\n\n[layout: ${cellCount}-column]\n\n`;
     }
@@ -2686,7 +2773,7 @@ export function toMarkdownView(storageHtml: string): string {
   processed = processed.replace(
     /<ac:image[^>]*>[\s\S]*?<\/ac:image>/gi,
     (match) => {
-      confluenceElementCount++;
+      state.hiddenElements++;
       const filenameMatch = match.match(/ri:filename="([^"]*)"/);
       const name = filenameMatch ? filenameMatch[1] : "unknown";
       return `[image: ${name}]`;
@@ -2697,7 +2784,7 @@ export function toMarkdownView(storageHtml: string): string {
   processed = processed.replace(
     /<ri:attachment ri:filename="([^"]*)"[^>]*\/>/gi,
     (_match, filename) => {
-      confluenceElementCount++;
+      state.hiddenElements++;
       return `[attachment: ${filename}]`;
     }
   );
@@ -2706,10 +2793,25 @@ export function toMarkdownView(storageHtml: string): string {
   processed = processed.replace(
     /<ac:emoticon[^>]*ac:name="([^"]*)"[^>]*\/>/gi,
     (_match, name) => {
-      confluenceElementCount++;
+      state.hiddenElements++;
       return `[emoticon: ${name}]`;
     }
   );
+
+  return processed;
+}
+
+/**
+ * Convert Confluence storage format HTML to a read-only markdown rendering.
+ * Confluence-specific elements (macros, layouts, images) are replaced with
+ * human-readable placeholders, except that the rich-text bodies of
+ * info/note/warning/tip/panel/expand are rendered as labelled block quotes.
+ * This is a one-way, lossy conversion — the output must never be written
+ * back to Confluence.
+ */
+export function toMarkdownView(storageHtml: string): string {
+  const state: ViewState = { hiddenElements: 0 };
+  const processed = prepareForMarkdown(storageHtml, state, 0);
 
   // Convert remaining HTML to markdown
   const turndown = new TurndownService({
@@ -2722,8 +2824,8 @@ export function toMarkdownView(storageHtml: string): string {
   markdown = markdown.replace(/\\\[([^\]]*)\\\]/g, "[$1]");
 
   // Append element count footer
-  if (confluenceElementCount > 0) {
-    markdown += `\n\n---\n[Page contains ${confluenceElementCount} Confluence element${confluenceElementCount === 1 ? "" : "s"} not shown in this view. Use format: storage to see full content.]`;
+  if (state.hiddenElements > 0) {
+    markdown += `\n\n---\n[Page contains ${state.hiddenElements} Confluence element${state.hiddenElements === 1 ? "" : "s"} not shown in this view. Use format: storage to see full content.]`;
   }
 
   return markdown;
