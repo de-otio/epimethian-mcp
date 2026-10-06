@@ -16,10 +16,11 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
   return {
     ...actual,
     getPage: vi.fn(),
+    getSpaceKeyById: vi.fn(),
   };
 });
 
-import { getPage } from "./confluence-client.js";
+import { getPage, getSpaceKeyById } from "./confluence-client.js";
 import {
   SPACE_NOT_ALLOWED,
   SpaceNotAllowedError,
@@ -60,6 +61,7 @@ describe("assertSpaceAllowed (F3)", () => {
   beforeEach(() => {
     pageSpaceCache._resetForTest();
     (getPage as any).mockReset();
+    (getSpaceKeyById as any).mockReset();
   });
 
   afterEach(() => {
@@ -95,20 +97,23 @@ describe("assertSpaceAllowed (F3)", () => {
     (getPage as any).mockResolvedValueOnce({
       id: "42",
       title: "P",
-      spaceId: "DOCS",
+      spaceId: "1001",
     });
+    (getSpaceKeyById as any).mockResolvedValueOnce("DOCS");
     await expect(
       assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" }),
     ).resolves.toBeUndefined();
     expect(getPage).toHaveBeenCalledOnce();
+    expect(getSpaceKeyById).toHaveBeenCalledWith("1001");
   });
 
   it("F3: rejects pageId whose space is outside the allowlist", async () => {
     (getPage as any).mockResolvedValueOnce({
       id: "42",
       title: "P",
-      spaceId: "OPS",
+      spaceId: "1002",
     });
+    (getSpaceKeyById as any).mockResolvedValueOnce("OPS");
     await expect(
       assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" }),
     ).rejects.toBeInstanceOf(SpaceNotAllowedError);
@@ -133,21 +138,24 @@ describe("assertSpaceAllowed (F3)", () => {
     (getPage as any).mockResolvedValueOnce({
       id: "42",
       title: "P",
-      spaceId: "DOCS",
+      spaceId: "1001",
     });
+    (getSpaceKeyById as any).mockResolvedValueOnce("DOCS");
     await assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" });
     await assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" });
     await assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" });
     // Only the first resolve hits the network; subsequent hit the cache.
     expect(getPage).toHaveBeenCalledOnce();
+    expect(getSpaceKeyById).toHaveBeenCalledOnce();
   });
 
   it("F3: empty spaces array rejects all pageIds (paranoid no-write profile)", async () => {
     (getPage as any).mockResolvedValueOnce({
       id: "42",
       title: "P",
-      spaceId: "DOCS",
+      spaceId: "1001",
     });
+    (getSpaceKeyById as any).mockResolvedValueOnce("DOCS");
     await expect(
       assertSpaceAllowed({ spaces: [], pageId: "42" }),
     ).rejects.toBeInstanceOf(SpaceNotAllowedError);
@@ -158,14 +166,16 @@ describe("resolvePageSpace (F3)", () => {
   beforeEach(() => {
     pageSpaceCache._resetForTest();
     (getPage as any).mockReset();
+    (getSpaceKeyById as any).mockReset();
   });
 
-  it("F3: reads spaceId from v2 page metadata", async () => {
+  it("F3: resolves the v2 numeric spaceId to its space key", async () => {
     (getPage as any).mockResolvedValueOnce({
       id: "1",
       title: "T",
-      spaceId: "DOCS",
+      spaceId: "1001",
     });
+    (getSpaceKeyById as any).mockResolvedValueOnce("DOCS");
     expect(await resolvePageSpace("1")).toBe("DOCS");
   });
 

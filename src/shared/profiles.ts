@@ -135,6 +135,27 @@ export interface ProfileSettings {
    * still allowing reads).
    */
   spaces?: string[];
+  /**
+   * Read scope for `search_pages`: when set, CQL is conjoined with
+   * `space in (<these keys>)` unless the call passes `all_spaces: true`.
+   * Set by editing the profile registry JSON, like `spaces`. An empty array
+   * means "no space is searchable by default". Hygiene only unless
+   * `read_spaces_enforced` is true.
+   */
+  read_spaces?: string[];
+  /**
+   * When true, `read_spaces` is a boundary: `all_spaces: true` is an error.
+   * Requires `read_spaces`. Default false (scope is a convenience, and the
+   * agent may widen it per call).
+   */
+  read_spaces_enforced?: boolean;
+  /**
+   * Literal strings (1-200 chars each, at most 100) replaced with
+   * `[redacted]` in `search_pages` titles and excerpts. Matching is
+   * case-insensitive after entity decoding and Unicode normalisation. Never
+   * applied to page bodies. Hygiene, not a security boundary.
+   */
+  redact_patterns?: string[];
 }
 
 interface ProfileRegistry {
