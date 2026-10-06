@@ -109,6 +109,51 @@ describe("compileRedactor", () => {
     expect(redact(["secret"], nested)).toBe(REDACTED);
   });
 
+  it("keeps longest-first matching across case folds", () => {
+    expect(redact(["secret", "secret plan"], "the Secret Plan")).toBe(`the ${REDACTED}`);
+    expect(redact(["secret plan", "secret"], "the SECRET PLAN")).toBe(`the ${REDACTED}`);
+    expect(redact(["secret", "secret plan"], "the Ｓecret plan and Secret")).toBe(
+      `the ${REDACTED} and ${REDACTED}`,
+    );
+  });
+
+  describe("MAX_CANONICAL_PASSES boundary", () => {
+    // `se` + `&` + `amp;`*n + `#99;` + `ret`: each pass peels one `amp;`, and one
+    // more pass decodes `&#99;`, so the text needs n + 1 changing passes.
+    const nested = (n: number): string => `hello se&${"amp;".repeat(n)}#99;ret world`;
+
+    it("sanity: the construction needs the number of passes it claims", () => {
+      const passes = (text: string): number => {
+        let out = text;
+        let n = 0;
+        for (;;) {
+          const next = stripHighlightMarkers(decodeEntitiesOnce(out));
+          if (next === out) return n;
+          out = next;
+          n++;
+        }
+      };
+      expect(passes(nested(14))).toBe(15);
+      expect(passes(nested(16))).toBe(17);
+    });
+
+    it("redacts normally text that settles in 15 passes", () => {
+      expect(redact(["secret"], nested(14))).toBe(`hello ${REDACTED} world`);
+    });
+
+    it("hides the whole text from 16 passes up: the cap is 16 iterations, and the last must confirm stability", () => {
+      // 16 changing passes use every iteration, so stability is never confirmed.
+      expect(redact(["secret"], nested(15))).toBe(REDACTED);
+      expect(redact(["secret"], nested(16))).toBe(REDACTED);
+    });
+
+    it("terminates quickly on a 100-deep hostile nesting", () => {
+      const started = Date.now();
+      expect(redact(["secret"], nested(100))).toBe(REDACTED);
+      expect(Date.now() - started).toBeLessThan(1000);
+    });
+  });
+
   it("does not redact unrelated text", () => {
     expect(redact(["secret"], "nothing to see")).toBe("nothing to see");
   });
@@ -144,6 +189,45 @@ describe("compileRedactor", () => {
           if (out === REDACTED) return true;
           const lowered = out.toLowerCase();
           return patterns.every((p) => !lowered.includes(p));
+        },
+      ),
+      { seed: 20261006, numRuns: 500 },
+    );
+  });
+
+  it("property: mixed-case patterns survive in no encoding (case, fullwidth, numeric entity, markers)", () => {
+    const fullwidth = (s: string): string =>
+      [...s].map((c) => String.fromCodePoint(c.codePointAt(0)! + 0xfee0)).join("");
+    const entities = (s: string): string =>
+      [...s].map((c) => `&#${c.codePointAt(0)};`).join("");
+    const split = (s: string): string => `${s.slice(0, 1)}@@@hl@@@${s.slice(1)}`;
+    const forms = (p: string): string[] => [
+      p,
+      p.toUpperCase(),
+      p.toLowerCase(),
+      fullwidth(p),
+      entities(p),
+      entities(p.toUpperCase()),
+      split(p),
+      split(p.toUpperCase()),
+      `${p.slice(0, 1)}${ZWSP}${p.slice(1)}`,
+    ];
+    const pattern = fc.stringMatching(/^[A-Za-z]{2,10}$/);
+    fc.assert(
+      fc.property(
+        fc.array(pattern, { minLength: 1, maxLength: 3 }),
+        fc.array(fc.nat(8), { minLength: 1, maxLength: 12 }),
+        fc.nat(2),
+        (patterns, picks, which) => {
+          const text = picks
+            .map((k, i) => forms(patterns[(i + which) % patterns.length]!)[k]!)
+            .join(" ");
+          const out = compileRedactor(patterns)!(text);
+          if (out === REDACTED) return true;
+          // Compare the pieces between redaction marks so the mark itself cannot match.
+          return out
+            .split(REDACTED)
+            .every((piece) => patterns.every((p) => !piece.toLowerCase().includes(p.toLowerCase())));
         },
       ),
       { seed: 20261006, numRuns: 500 },
