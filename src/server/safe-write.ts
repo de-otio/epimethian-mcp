@@ -2185,8 +2185,19 @@ export function computeSectionWriteDiffHash(input: {
 export interface MultiSectionInput {
   /** Heading text identifying the section. */
   section: string;
-  /** New body content (markdown or storage). */
-  body: string;
+  /** New body content (markdown or storage). Exactly one of body / find_replace. */
+  body?: string;
+  /** Literal substitutions in the section's storage (R3). */
+  find_replace?: readonly FindReplacePair[];
+}
+
+/**
+ * Qualify a per-section token id with its section name. Ids restart at
+ * T0001 in every section (each is tokenised on its own), so the aggregate
+ * list and itemised acks use `<section>#<id>`.
+ */
+export function qualifyTokenId(section: string, id: string): string {
+  return `${section}#${id}`;
 }
 
 /**
@@ -2199,8 +2210,10 @@ export interface MultiSectionResult {
   section: string;
   /** The heading text as it appears in the page (after tolerant match). */
   matchedHeading: string;
-  /** Token deletions reported by the per-section safePrepareBody call. */
+  /** Token deletions in this section (ids local to the section, e.g. T0001). */
   deletedTokens: DeletedToken[];
+  /** find_replace entries only: per-pair match kind and count. */
+  perPair?: FindReplacePairOutcome[];
   /** Byte-equivalent regenerated tokens (C1) for this section. */
   regeneratedTokens: RegeneratedTokenPair[];
 }
@@ -2215,9 +2228,11 @@ export interface MultiSectionFailure {
    *   - "duplicate" — the section name appears more than once in the input.
    *   - "missing"   — heading not present in the page.
    *   - "ambiguous" — heading matched multiple candidates in the page.
-   *   - "prepare"   — the per-section safePrepareBody call threw.
+   *   - "prepare"   — the per-section prepare (body or find_replace) threw.
+   *   - "invalid"   — the entry has both or neither of body / find_replace,
+   *                   or an itemised ack names a section not in the call.
    */
-  reason: "duplicate" | "missing" | "ambiguous" | "prepare";
+  reason: "duplicate" | "missing" | "ambiguous" | "prepare" | "invalid";
   /** Human-readable detail (e.g. ambiguity list, prepare error message). */
   message: string;
 }
@@ -2253,7 +2268,8 @@ export interface MultiSectionPrepareOutput {
   /**
    * Aggregated deleted tokens across all sections — what the user must
    * acknowledge through the confirm_deletions gate. The gate runs ONCE on
-   * this list, not per-section.
+   * this list, not per-section. Ids are section-qualified
+   * (`<section>#T0001`, see qualifyTokenId) because ids repeat per section.
    */
   aggregatedDeletedTokens: DeletedToken[];
   /** Aggregated regenerated tokens (C1). */
@@ -2366,6 +2382,11 @@ function locateSectionRange(
  * tool (D1). Runs every section's prepare against the ORIGINAL page
  * contents, then merges all splices into a single final document.
  *
+ * Each entry is `{section, body}` (markdown or storage, through
+ * safePrepareBody) or `{section, find_replace}` (through
+ * safePrepareFindReplace — the same engine and guards as
+ * update_page_section), exactly one of the two (R3).
+ *
  * Atomicity: either every section applies cleanly or the whole call throws
  * MultiSectionError. No partial writes — the caller submits one document
  * to safeSubmitPage, which produces one version bump.
@@ -2387,16 +2408,24 @@ function locateSectionRange(
  * silently corrupt pages on partial failure. Mitigations:
  *   1. Locate every section against the ORIGINAL page first; failures are
  *      collected and reported together via MultiSectionError.
- *   2. Each per-section safePrepareBody is invoked in isolation; any throw
- *      is captured into the failure list. If ANY section fails, NO splice
+ *   2. Each per-section prepare is invoked in isolation; any throw is
+ *      captured into the failure list. If ANY section fails, NO splice
  *      is performed, NO submit happens.
  *   3. The deletion-gate runs once on the AGGREGATED deletion list — a
  *      caller cannot bypass the gate by spreading deletions across sections.
+ *   4. Aggregate guard (M10): per-section guards are page-relative, so five
+ *      sections each removing 15% would each pass. enforceContentSafetyGuards
+ *      (plus the marker non-growth check) runs once more on the merged page.
+ *
+ * confirmDeletions: `true` acknowledges every deletion (as before). A
+ * `string[]` is an itemised ack of section-qualified ids
+ * (`<section>#T0001`, see qualifyTokenId); each section is checked against
+ * its own ids, and an ack naming a section not in the call is rejected.
  */
 export async function safePrepareMultiSectionBody(input: {
   currentStorage: string;
   sections: readonly MultiSectionInput[];
-  confirmDeletions?: boolean;
+  confirmDeletions?: boolean | string[];
   confirmShrinkage?: boolean;
   confirmStructureLoss?: boolean;
   allowRawHtml?: boolean;
@@ -2423,6 +2452,25 @@ export async function safePrepareMultiSectionBody(input: {
     ]);
   }
 
+  // 0. Shape check — each entry carries exactly one of body / find_replace.
+  const shapeFailures: MultiSectionFailure[] = [];
+  for (const s of sections) {
+    const hasBody = s.body !== undefined;
+    const hasPairs = s.find_replace !== undefined && s.find_replace.length > 0;
+    if (hasBody === hasPairs) {
+      shapeFailures.push({
+        section: s.section,
+        reason: "invalid",
+        message: hasBody
+          ? "provide exactly one of `body` or `find_replace`, not both"
+          : "provide exactly one of `body` or `find_replace` (neither was provided)",
+      });
+    }
+  }
+  if (shapeFailures.length > 0) {
+    throw new MultiSectionError(shapeFailures);
+  }
+
   // 1. Dedup check — duplicate section names are an ambiguous-intent signal
   //    and must be rejected before any processing. Collect every duplicate
   //    in one pass so the error message lists them all.
@@ -2446,15 +2494,41 @@ export async function safePrepareMultiSectionBody(input: {
     throw new MultiSectionError(dupFailures);
   }
 
+  // 1b. Itemised acks must each name a section of this call.
+  if (Array.isArray(confirmDeletions)) {
+    const stray = confirmDeletions.filter(
+      (ack) => !sections.some((s) => ack.startsWith(`${s.section}#`)),
+    );
+    if (stray.length > 0) {
+      throw new MultiSectionError([
+        {
+          section: "(confirm_deletions)",
+          reason: "invalid",
+          message:
+            `acknowledgement(s) ${stray.join(", ")} do not name a section in ` +
+            `this call; use <section>#<token id>`,
+        },
+      ]);
+    }
+  }
+  const ackFor = (section: string): string[] | true | undefined => {
+    if (!Array.isArray(confirmDeletions)) return confirmDeletions ? true : undefined;
+    const prefix = `${section}#`;
+    const ids = confirmDeletions
+      .filter((ack) => ack.startsWith(prefix))
+      .map((ack) => ack.slice(prefix.length));
+    return ids.length > 0 ? ids : undefined;
+  };
+
   // 2. Locate every section against the ORIGINAL page and collect failures.
   //    Heading-resolution failures are collected here, BEFORE any prepare
   //    runs. This guarantees the per-section prepare step (which is the
   //    expensive part — markdown conversion etc.) only fires when every
   //    section is known to exist in the source.
   type Located = {
+    entry: MultiSectionInput;
     section: string;
     body: string;
-    inputBody: string;
     bodyStart: number;
     bodyEnd: number;
     matchedHeading: string;
@@ -2472,9 +2546,9 @@ export async function safePrepareMultiSectionBody(input: {
       continue;
     }
     located.push({
+      entry: s,
       section: s.section,
       body: r.currentBody,
-      inputBody: s.body,
       bodyStart: r.bodyStart,
       bodyEnd: r.bodyEnd,
       matchedHeading: r.matchedHeading,
@@ -2510,10 +2584,10 @@ export async function safePrepareMultiSectionBody(input: {
     }
   }
 
-  // 4. Per-section safePrepareBody. Each call is isolated against its own
-  //    section body. Failures are captured into the failure list; we only
-  //    throw the aggregated error AFTER all sections have been attempted,
-  //    so the caller sees every problem in one round-trip.
+  // 4. Per-section prepare. Each call is isolated against its own section
+  //    body. Failures are captured into the failure list; we only throw the
+  //    aggregated error AFTER all sections have been attempted, so the
+  //    caller sees every problem in one round-trip.
   const perSectionResults: MultiSectionResult[] = [];
   const prepareFailures: MultiSectionFailure[] = [];
   const splices: { bodyStart: number; bodyEnd: number; replacement: string }[] = [];
@@ -2522,20 +2596,58 @@ export async function safePrepareMultiSectionBody(input: {
   const aggregatedRegenerated: RegeneratedTokenPair[] = [];
 
   for (const loc of located) {
-    let prepared;
+    let replacement: string;
+    let deletedTokens: DeletedToken[];
+    let regeneratedTokens: RegeneratedTokenPair[] = [];
+    let versionMessage: string;
+    let perPair: FindReplacePairOutcome[] | undefined;
     try {
-      prepared = await safePrepareBody({
-        body: loc.inputBody,
-        currentBody: loc.body,
-        scope: "section",
-        confirmDeletions: confirmDeletions ? true : undefined,
-        confirmShrinkage,
-        confirmStructureLoss,
-        // Measure each section's guards page-relative (see safePrepareBody).
-        fullPageBody: currentStorage,
-        ...(allowRawHtml !== undefined ? { allowRawHtml } : {}),
-        ...(confluenceBaseUrl !== undefined ? { confluenceBaseUrl } : {}),
-      });
+      if (loc.entry.find_replace !== undefined) {
+        const fr = safePrepareFindReplace({
+          sectionBody: loc.body,
+          pairs: loc.entry.find_replace,
+          confirmDeletions: ackFor(loc.section),
+        });
+        // Same page-relative guards as update_page_section's find_replace.
+        enforceFindReplacePageGuards({
+          oldStorage: currentStorage,
+          newStorage:
+            currentStorage.slice(0, loc.bodyStart) +
+            fr.newSectionBody +
+            currentStorage.slice(loc.bodyEnd),
+          confirmShrinkage,
+          confirmStructureLoss,
+          confirmDeletions: confirmDeletions !== undefined && confirmDeletions !== false,
+        });
+        replacement = fr.newSectionBody;
+        deletedTokens = fr.deletedTokens;
+        versionMessage = fr.versionMessage;
+        perPair = fr.perPair;
+      } else {
+        const prepared = await safePrepareBody({
+          body: loc.entry.body,
+          currentBody: loc.body,
+          scope: "section",
+          confirmDeletions: ackFor(loc.section),
+          confirmShrinkage,
+          confirmStructureLoss,
+          // Measure each section's guards page-relative (see safePrepareBody).
+          fullPageBody: currentStorage,
+          ...(allowRawHtml !== undefined ? { allowRawHtml } : {}),
+          ...(confluenceBaseUrl !== undefined ? { confluenceBaseUrl } : {}),
+        });
+        if (prepared.finalStorage === undefined) {
+          // safePrepareBody returned title-only — meaningless for a section
+          // splice. Treat as a prepare failure.
+          throw new Error(
+            "safePrepareBody returned undefined finalStorage; sections require a body",
+          );
+        }
+        replacement = prepared.finalStorage;
+        deletedTokens = prepared.deletedTokens;
+        regeneratedTokens = prepared.regeneratedTokens;
+        versionMessage = prepared.versionMessage;
+      }
     } catch (err) {
       prepareFailures.push({
         section: loc.section,
@@ -2544,33 +2656,25 @@ export async function safePrepareMultiSectionBody(input: {
       });
       continue;
     }
-    if (prepared.finalStorage === undefined) {
-      // safePrepareBody returned title-only — meaningless for a section
-      // splice. Treat as a prepare failure.
-      prepareFailures.push({
-        section: loc.section,
-        reason: "prepare",
-        message:
-          "safePrepareBody returned undefined finalStorage; sections require a body",
-      });
-      continue;
-    }
     perSectionResults.push({
       section: loc.section,
       matchedHeading: loc.matchedHeading,
-      deletedTokens: prepared.deletedTokens,
-      regeneratedTokens: prepared.regeneratedTokens,
+      deletedTokens,
+      regeneratedTokens,
+      ...(perPair !== undefined ? { perPair } : {}),
     });
     splices.push({
       bodyStart: loc.bodyStart,
       bodyEnd: loc.bodyEnd,
-      replacement: prepared.finalStorage,
+      replacement,
     });
-    if (prepared.versionMessage) {
-      versionMessageParts.push(`${loc.section}: ${prepared.versionMessage}`);
+    if (versionMessage) {
+      versionMessageParts.push(`${loc.section}: ${versionMessage}`);
     }
-    aggregatedDeleted.push(...prepared.deletedTokens);
-    aggregatedRegenerated.push(...prepared.regeneratedTokens);
+    aggregatedDeleted.push(
+      ...deletedTokens.map((d) => ({ ...d, id: qualifyTokenId(loc.section, d.id) })),
+    );
+    aggregatedRegenerated.push(...regeneratedTokens);
   }
   if (prepareFailures.length > 0) {
     throw new MultiSectionError(prepareFailures);
@@ -2585,6 +2689,27 @@ export async function safePrepareMultiSectionBody(input: {
   for (const sp of splices) {
     merged =
       merged.slice(0, sp.bodyStart) + sp.replacement + merged.slice(sp.bodyEnd);
+  }
+
+  // 6. Aggregate guard (M10) on the merged page. The marker non-growth part
+  //    is redundant for body entries (their input was already checked) and
+  //    harmless; it matters for find_replace entries.
+  try {
+    enforceFindReplacePageGuards({
+      oldStorage: currentStorage,
+      newStorage: merged,
+      confirmShrinkage,
+      confirmStructureLoss,
+      confirmDeletions: confirmDeletions !== undefined && confirmDeletions !== false,
+    });
+  } catch (err) {
+    if (err instanceof ConverterError) {
+      throw new ConverterError(
+        `Across all ${sections.length} sections combined: ${err.message}`,
+        err.code,
+      );
+    }
+    throw err;
   }
 
   return {

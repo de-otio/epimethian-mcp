@@ -86,6 +86,7 @@ import {
   tryBatchTokenForWrite,
   type DeletedToken,
   type FindReplacePair,
+  type MultiSectionInput,
 } from "./safe-write.js";
 import {
   BATCH_MINT_RATE_LIMITED,
@@ -2275,7 +2276,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           "if any section's heading is missing, ambiguous, or its body fails " +
           "to convert, the whole call is rejected and the page is left " +
           "unchanged. Use this when you need to update 4+ sections in one go " +
-          "without 4 separate version bumps.\n\n" +
+          "without 4 separate version bumps. Each entry takes a `body` or a " +
+          "`find_replace` list.\n\n" +
           "Sections are matched against the ORIGINAL page contents (not the " +
           "cumulative-edited state) and applied in input order; sections " +
           "cannot reference content introduced by an earlier section in the " +
@@ -2340,10 +2342,27 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
                 .describe("Heading text identifying the section to replace"),
               body: z
                 .string()
+                .optional()
                 .describe(
                   "New content for this section — GFM markdown or Confluence " +
                   "storage format (auto-detected). Same conversion rules as " +
-                  "update_page_section."
+                  "update_page_section. Exactly one of `body` or `find_replace`."
+                ),
+              find_replace: z
+                .array(
+                  z.object({
+                    find: z.string(),
+                    replace: z.string(),
+                    replace_all: z.boolean().optional(),
+                  })
+                )
+                .min(1)
+                .optional()
+                .describe(
+                  "Literal substitutions in this section's storage, with the same " +
+                  "rules as update_page_section's find_replace (exactly-once " +
+                  "matching unless replace_all, macros opaque). Placeholder ids " +
+                  "are per section; confirm_deletions covers every section."
                 ),
             })
           )
@@ -2365,6 +2384,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       let batchReservationId: string | undefined;
       let dispatched = false;
       try {
+        const entries = sections as MultiSectionInput[];
+        // Placeholder ids are positional: never apply them to an unpinned version.
+        for (const s of entries) {
+          if (s.find_replace !== undefined) {
+            assertFindReplaceVersionPinned(s.find_replace, version);
+          }
+        }
+
         // F3: space allowlist.
         await checkSpaceAllowed({ pageId: page_id });
         const cfg = await getConfig();
@@ -2384,13 +2411,26 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           );
         }
 
-        // E4/A2: gate when ANY destructive flag is set (confirm_deletions,
-        // confirm_shrinkage, confirm_structure_loss). When confirm_deletions
-        // is among them, an aggregated deletion forecast across all sections
-        // is computed independently against each section's current body
-        // (planUpdate is pure — no side effects), then summed into one
-        // DeletionSummary. The gate fires ONCE on the aggregate; a caller
-        // cannot bypass it by spreading changes across many sections.
+        // 1. Atomic multi-section prepare (pure) — throws MultiSectionError
+        // on any per-section failure (missing heading, ambiguous, duplicate
+        // name, bad entry shape, or sub-prepare error), and a ConverterError
+        // when the merged page fails the aggregate content-safety guard. No
+        // splice is committed unless every section succeeds. Runs before the
+        // gate so the confirmation token binds the exact merged storage.
+        const prepared = await safePrepareMultiSectionBody({
+          currentStorage: fullBody,
+          sections: entries,
+          confirmDeletions: confirm_deletions,
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          confluenceBaseUrl: cfg.url,
+        });
+
+        // 2. Gate. E4/A2: gate when ANY destructive flag is set
+        // (confirm_deletions, confirm_shrinkage, confirm_structure_loss). The
+        // deletion summary is the exact aggregate across all sections, and
+        // the gate fires ONCE on it; a caller cannot bypass it by spreading
+        // changes across many sections.
         const sectionsFlagsSet = listDestructiveFlagsSet({
           confirmShrinkage: confirm_shrinkage,
           confirmStructureLoss: confirm_structure_loss,
@@ -2406,50 +2446,25 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           batchReservationId = batchAttempt.batchReservationId;
 
           if (batchReservationId === undefined) {
-            const summed: DeletionSummary = {
-              tocs: 0,
-              links: 0,
-              structuredMacros: 0,
-              codeMacros: 0,
-              plainElements: 0,
-              other: 0,
-            };
-            let any = false;
-            if (confirm_deletions) {
-              for (const s of sections) {
-                // Use extractSectionBody against the original body. If the
-                // section is missing or ambiguous, the forecast is skipped —
-                // the real failure surfaces (with a structured error) inside
-                // safePrepareMultiSectionBody.
-                let currentSectionBody: string | null = null;
-                try {
-                  currentSectionBody = extractSectionBody(fullBody, s.section);
-                } catch {
-                  currentSectionBody = null;
-                }
-                if (currentSectionBody === null) continue;
-                const summary = tryForecastDeletions(
-                  currentSectionBody,
-                  s.body,
-                  cfg.url,
-                );
-                if (summary !== null) {
-                  summed.tocs += summary.tocs;
-                  summed.links += summary.links;
-                  summed.structuredMacros += summary.structuredMacros;
-                  summed.codeMacros += summary.codeMacros;
-                  summed.plainElements += summary.plainElements;
-                  summed.other += summary.other;
-                  any = true;
-                }
-              }
-            }
+            const deletionSummary = confirm_deletions
+              ? summariseDeletedTokens(prepared.aggregatedDeletedTokens)
+              : null;
 
-            // 2.C preamble — for update_page_sections, diffHash is bound to
-            // the aggregate of all sections' bodies joined (deterministic).
-            const aggregateBody = sections.map((s) => s.body).join("\n");
+            // 2.C preamble — H1: the hash covers every entry (section plus
+            // body or pairs), the flags and the merged storage.
             const diffHash = (cloudId && pageVersion > 0)
-              ? computeDiffHash(aggregateBody, pageVersion)
+              ? computeSectionWriteDiffHash({
+                  tool: "update_page_sections",
+                  pageId: page_id,
+                  pageVersion,
+                  entries,
+                  flags: {
+                    confirmDeletions: confirm_deletions === true,
+                    confirmShrinkage: confirm_shrinkage === true,
+                    confirmStructureLoss: confirm_structure_loss === true,
+                  },
+                  resultingStorage: prepared.finalStorage,
+                })
               : undefined;
 
             const tokenResult = await maybeConsumeConfirmToken({
@@ -2471,12 +2486,12 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             } else if (tokenResult === "no_token") {
               await gateOperation(server, {
                 tool: "update_page_sections",
-                summary: `Update ${sections.length} section${sections.length === 1 ? "" : "s"} in page ${page_id} with ${sectionsFlagsSet.join(", ")}?`,
+                summary: `Update ${entries.length} section${entries.length === 1 ? "" : "s"} in page ${page_id} with ${sectionsFlagsSet.join(", ")}?`,
                 details: {
                   page_id,
-                  section_count: sections.length,
+                  section_count: entries.length,
                   flags: sectionsFlagsSet.join(","),
-                  ...(any ? { deletionSummary: summed } : {}),
+                  ...(deletionSummary ? { deletionSummary } : {}),
                 },
                 cloudId,
                 pageId: page_id,
@@ -2488,27 +2503,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           }
         }
 
-        // Atomic multi-section prepare — throws MultiSectionError on any
-        // per-section failure (missing heading, ambiguous, duplicate name,
-        // or sub-prepare error). No splice is committed unless every section
-        // succeeds.
-        const prepared = await safePrepareMultiSectionBody({
-          currentStorage: fullBody,
-          sections,
-          confirmDeletions: confirm_deletions,
-          confirmShrinkage: confirm_shrinkage,
-          confirmStructureLoss: confirm_structure_loss,
-          confluenceBaseUrl: cfg.url,
-        });
-
         const mergedVersionMessage =
           prepared.versionMessage && version_message
             ? `${version_message}; ${prepared.versionMessage}`
             : prepared.versionMessage || version_message || "";
 
-        // ONE submit, ONE version bump. The deletion gate already fired (if
-        // applicable) on the aggregate; safeSubmitPage owns the rest of the
-        // safety pipeline.
+        // 3. ONE submit, ONE version bump. The deletion gate already fired
+        // (if applicable) on the aggregate; safeSubmitPage owns the rest of
+        // the safety pipeline.
         dispatched = true;
         const submitted = await safeSubmitPage({
           pageId: page_id,
@@ -2535,7 +2537,15 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
 
         const removalNote =
           submitted.deletedTokens.length > 0
-            ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`
+            ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => `${t.id} ${t.fingerprint}`).join(", ")}`
+            : "";
+        const normalisedPairs = prepared.perSectionResults.reduce(
+          (n, r) => n + (r.perPair ?? []).filter((p) => p.matched === "normalised").length,
+          0,
+        );
+        const normalisedNote =
+          normalisedPairs > 0
+            ? `; ${normalisedPairs} find/replace pair${normalisedPairs === 1 ? "" : "s"} matched after Unicode compatibility normalisation (unchanged text kept its stored bytes)`
             : "";
         const sectionList = prepared.perSectionResults
           .map((r) => `"${r.section}"`)
@@ -2545,7 +2555,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         }
         return toolResult(
           appendWarnings(
-            `Updated ${prepared.perSectionResults.length} section${prepared.perSectionResults.length === 1 ? "" : "s"} (${sectionList}) in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}${removalNote})`,
+            `Updated ${prepared.perSectionResults.length} section${prepared.perSectionResults.length === 1 ? "" : "s"} (${sectionList}) in: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}${removalNote}${normalisedNote})`,
             warnings,
           ) + echo,
         );
