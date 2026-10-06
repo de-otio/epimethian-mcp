@@ -73,6 +73,7 @@ import { tokeniseStorage } from "./converter/tokeniser.js";
 import { extractSectionBody } from "./confluence-client.js";
 import { getSessionCanary } from "./session-canary.js";
 import { pageCache } from "./page-cache.js";
+import { safePrepareBody, safePrepareFindReplace } from "./safe-write.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures (example.com / DOCS only)
@@ -365,6 +366,65 @@ describe("markdown section view numbers placeholders from the body (contract 1)"
       expect(tableRows).toHaveLength(bodyIds.length);
       expect(tableRows[0]).toContain('ac:name="info"');
       expect(content).toContain("preserved as tokens");
+    }
+  });
+
+  it("the ids the view shows are the ids find_replace and body mode resolve", async () => {
+    // Heading macro + two distinct body macros, so a base that included the
+    // heading (or numbered differently) would map an id to another macro.
+    currentBody =
+      `<h2>Setup<ac:emoticon ac:name="smile" /></h2>` +
+      `<p>see <ac:link><ri:page ri:content-title="Target" /></ac:link> here</p>` +
+      `<ac:structured-macro ac:name="info" ac:macro-id="m-1"><ac:rich-text-body><p>info-sentinel</p></ac:rich-text-body></ac:structured-macro>` +
+      `<h2>Usage</h2><p>${USAGE_TEXT}</p>`;
+    const { text } = await callTool("get_page", { section: "Setup", format: "markdown" });
+    const content = bodyFence(text);
+
+    // What the agent sees: the token table, and the body markdown.
+    const rows = new Map(
+      [...content.matchAll(/^- \[\[epi:(T\d+)\]\]: <([a-z:-]+)(?: ac:name="([^"]+)")?>$/gm)].map(
+        (m) => [m[1], { tag: m[2], name: m[3] }],
+      ),
+    );
+    expect([...rows.keys()]).toEqual(["T0001", "T0002"]);
+    const bodyStart = content.indexOf("-->\n\n", content.indexOf("preserved as tokens")) + 5;
+    const viewMarkdown = content
+      .slice(bodyStart, content.indexOf("\n\n---\nTokens:"))
+      .split("\n")
+      .filter((l) => !l.startsWith("## Setup"))
+      .join("\n")
+      .trim();
+    expect(viewMarkdown).toContain("see [[epi:T0001]] here");
+
+    // The write paths work on the section body, as update_page_section does.
+    const sectionBody = extractSectionBody(currentBody, "Setup")!;
+    for (const [id, row] of rows) {
+      const fr = safePrepareFindReplace({
+        sectionBody,
+        pairs: [{ find: `[[epi:${id}]]`, replace: "" }],
+        confirmDeletions: [id],
+      });
+      const bm = await safePrepareBody({
+        body: viewMarkdown.replace(`[[epi:${id}]]`, ""),
+        currentBody: sectionBody,
+        scope: "section",
+        confirmDeletions: [id],
+        // As the handler does; the fixture page is tiny, so shrinkage is
+        // acknowledged — this test is about ids, not the size guards.
+        fullPageBody: currentBody,
+        confirmShrinkage: true,
+      });
+      for (const deleted of [fr.deletedTokens, bm.deletedTokens]) {
+        expect(deleted.map((d) => d.id)).toEqual([id]);
+        expect(deleted[0].tag).toBe(row.tag);
+        if (row.name) expect(deleted[0].fingerprint).toContain(row.name);
+      }
+      // The other id is restored to the macro the view listed for it.
+      for (const out of [fr.newSectionBody, bm.finalStorage!]) {
+        expect(out).not.toContain("smile");
+        expect(out.includes("<ac:link>")).toBe(id !== "T0001");
+        expect(out.includes('ac:name="info"')).toBe(id !== "T0002");
+      }
     }
   });
 

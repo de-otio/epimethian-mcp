@@ -115,6 +115,13 @@ describe("exactly-once matching", () => {
     expect(messageOf(fn)).toContain(`more than ${MAX_FIND_OCCURRENCES}`);
   });
 
+  it("exactly MAX_FIND_OCCURRENCES occurrences are still replaced", () => {
+    const body = `<p>${"a ".repeat(MAX_FIND_OCCURRENCES)}</p>`;
+    const out = applyFindReplace(body, [{ find: "a", replace: "b", replace_all: true }]);
+    expect(out.perPair[0].count).toBe(MAX_FIND_OCCURRENCES);
+    expect(out.body).toBe(`<p>${"b ".repeat(MAX_FIND_OCCURRENCES)}</p>`);
+  });
+
   it("a match may not cut a placeholder in half", () => {
     // "]] tail" occurs only as the end of the placeholder plus following text.
     const body = `<p>x${EMOTICON} tail</p>`;
@@ -345,6 +352,30 @@ describe("property tests (fast-check, fixed seeds)", () => {
         expect(applyFindReplace(body, [{ find, replace: find }]).body).toBe(body);
       }),
       { seed: 7002, numRuns: 300 },
+    );
+  });
+
+  it("stripped and folded characters inside the match keep their stored bytes", () => {
+    // The match range itself is full of characters the fence strips (ZWSP,
+    // ZWJ) or folds (NBSP, ellipsis, superscript); there are no "§" anchors,
+    // so the common prefix/suffix runs through those characters.
+    const oddChar = fc.constantFrom("​", "‍", " ", "…", "²", "a", " ");
+    const middle = fc
+      .array(oddChar, { minLength: 1, maxLength: 10 })
+      .map((cs) => cs.join(""))
+      .filter((m) => sanitiseTenantText(m) !== m);
+    fc.assert(
+      fc.property(middle, (m) => {
+        const body = `<p>a${m}b</p>`;
+        const find = sanitiseTenantText(`a${m}b`); // as copied from a fenced read
+        // No-op replacement: nothing changes.
+        expect(applyFindReplace(body, [{ find, replace: find }]).body).toBe(body);
+        // Anchor-style insert: the stored match survives, only "X" is added.
+        expect(applyFindReplace(body, [{ find, replace: `${find}X` }]).body).toBe(`<p>a${m}bX</p>`);
+        // Prepend: the same, on the other side.
+        expect(applyFindReplace(body, [{ find, replace: `X${find}` }]).body).toBe(`<p>Xa${m}b</p>`);
+      }),
+      { seed: 7005, numRuns: 300 },
     );
   });
 

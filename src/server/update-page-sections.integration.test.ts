@@ -190,6 +190,32 @@ describe("update_page_sections with find_replace entries (R3)", () => {
     expect(mockGetPage).not.toHaveBeenCalled();
     expect(mockRawUpdatePage).not.toHaveBeenCalled();
   });
+
+  it('rejects version "current" when a BODY entry holds a placeholder', async () => {
+    const sections = [
+      { section: "Last", body: "<p>final words</p>" },
+      { section: "Intro", body: "Hello alpha world.\n\nkeep [[epi:T0001]] me" },
+    ];
+    const r = await call(sections, { version: "current" });
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain("PLACEHOLDER_NEEDS_PINNED_VERSION");
+    expect(mockGetPage).not.toHaveBeenCalled();
+    expect(mockRawUpdatePage).not.toHaveBeenCalled();
+
+    // Pinned, the same call resolves T0001 to Intro's emoticon and writes.
+    const ok = await call(sections);
+    expect(ok.isError).toBeUndefined();
+    const sent = mockRawUpdatePage.mock.calls[0][1].body as string;
+    expect(sent).toContain(`keep ${EMOTICON} me`);
+    expect(sent).toContain("<p>final words</p>");
+  });
+
+  it("refuses an empty body entry and writes nothing", async () => {
+    const r = await call([{ section: "Last", body: "" }]);
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain("Post-transform body is empty");
+    expect(mockRawUpdatePage).not.toHaveBeenCalled();
+  });
 });
 
 describe("update_page_sections confirmation binding (H1)", () => {

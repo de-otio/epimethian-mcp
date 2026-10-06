@@ -105,6 +105,7 @@ type Handler = (args: Record<string, unknown>) => Promise<{
 }>;
 
 let handler: Handler;
+let updatePageHandler: Handler;
 let writeOutputSchema: { safeParse: (v: unknown) => { success: boolean } };
 let confirmationRequiredArm: { safeParse: (v: unknown) => { success: boolean } };
 
@@ -113,6 +114,7 @@ beforeAll(async () => {
   await main();
   const call = mockRegisterTool.mock.calls.find((c) => c[0] === "update_page_section")!;
   handler = call[2] as Handler;
+  updatePageHandler = mockRegisterTool.mock.calls.find((c) => c[0] === "update_page")![2] as Handler;
   const schemas = await import("./output-schema.js");
   writeOutputSchema = schemas.writeOutputSchema;
   confirmationRequiredArm = schemas.confirmationRequiredArm;
@@ -341,5 +343,80 @@ describe("update_page_section — confirmation binding (H1)", () => {
     const r = await handler({ ...args, confirm_token: token });
     expect(r.isError).toBeUndefined();
     expect(sentBody()).toContain('ac:name="code"');
+  });
+});
+
+describe("body mode — placeholders need a pinned version", () => {
+  const SECTION_BODY = "Hello alpha world.\n\nkeep [[epi:T0001]] me\n\nWait… a b";
+  const PAGE_MARKDOWN =
+    "## Intro\n\nHello alpha world.\n\nkeep [[epi:T0001]] me\n\nWait… a b\n\n" +
+    "## Other\n\nother [[epi:T0002]] text\n\ntwin twin";
+
+  it('update_page_section rejects version "current" with a placeholder in the body, before fetching', async () => {
+    const r = await handler(base({ version: "current", body: SECTION_BODY, confirm_deletions: true }));
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain("PLACEHOLDER_NEEDS_PINNED_VERSION");
+    expect(mockGetPage).not.toHaveBeenCalled();
+    expect(mockRawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("update_page_section with the pinned version resolves the placeholder and writes", async () => {
+    const r = await handler(base({ body: SECTION_BODY }));
+    expect(r.isError).toBeUndefined();
+    const body = sentBody();
+    expect(body).toContain(`keep ${EMOTICON} me`);
+    expect(body.split(EMOTICON)).toHaveLength(3); // Intro's and Other's both kept
+  });
+
+  it('update_page_section without placeholders still accepts version "current"', async () => {
+    const r = await handler(
+      base({ version: "current", body: "Hello alpha world.", confirm_deletions: true }),
+    );
+    // The pinned-version rule does not fire for placeholder-free bodies; the
+    // call proceeds to the page read (and then the deletion gate).
+    expect(r.content[0].text).not.toContain("PLACEHOLDER_NEEDS_PINNED_VERSION");
+    expect(mockGetPage).toHaveBeenCalled();
+  });
+
+  it('update_page rejects version "current" with a placeholder in the body, before fetching', async () => {
+    const r = await updatePageHandler({
+      page_id: PAGE_ID,
+      title: "Runbook",
+      version: "current",
+      body: PAGE_MARKDOWN,
+    });
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain("PLACEHOLDER_NEEDS_PINNED_VERSION");
+    expect(mockGetPage).not.toHaveBeenCalled();
+    expect(mockRawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("update_page with the pinned version resolves the placeholders and writes", async () => {
+    const r = await updatePageHandler({
+      page_id: PAGE_ID,
+      title: "Runbook",
+      version: 7,
+      body: PAGE_MARKDOWN,
+    });
+    expect(r.isError).toBeUndefined();
+    expect(sentBody().split(EMOTICON)).toHaveLength(3);
+  });
+});
+
+describe("body mode — an empty body never blanks a section", () => {
+  it("update_page_section refuses an empty or whitespace-only body without writing", async () => {
+    // Existing guards refuse every variant: the deletion gate (the section
+    // holds a macro), the soft confirmation once deletions are acked, and the
+    // post-transform body guard behind them. Whichever fires, nothing is
+    // written.
+    for (const body of ["", "   \n"]) {
+      for (const flags of [{}, { confirm_deletions: true }]) {
+        const r = await handler(base({ body, ...flags }));
+        expect(r.isError).toBe(true);
+        // Never as far as a confirmation token: a token would let the retry write.
+        expect(r.structuredContent?.kind).not.toBe("confirmation_required");
+      }
+    }
+    expect(mockRawUpdatePage).not.toHaveBeenCalled();
   });
 });

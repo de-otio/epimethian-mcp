@@ -77,6 +77,7 @@ import { settleInChunks, DEFAULT_MAX_CONCURRENCY } from "./request-policy.js";
 import { markPageUnverified } from "./provenance.js";
 import {
   MultiSectionError,
+  assertBodyVersionPinned,
   assertFindReplaceVersionPinned,
   computeSectionWriteDiffHash,
   enforceFindReplacePageGuards,
@@ -1593,6 +1594,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       let batchReservationId: string | undefined;
       let dispatched = false;
       try {
+        // Placeholder ids are positional: never apply them to an unpinned version.
+        assertBodyVersionPinned(body ?? undefined, version);
         // F3: space allowlist — check before any other work; resolution
         // uses the cached page→space map.
         await checkSpaceAllowed({ pageId: page_id });
@@ -2116,6 +2119,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         // Placeholder ids are positional: never apply them to an unpinned version.
         if (hasFindReplace) {
           assertFindReplaceVersionPinned(find_replace as FindReplacePair[], version);
+        } else {
+          assertBodyVersionPinned(body, version);
         }
 
         // F3: space allowlist.
@@ -2490,6 +2495,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           if (s.find_replace !== undefined) {
             assertFindReplaceVersionPinned(s.find_replace, version);
           }
+          assertBodyVersionPinned(s.body, version);
         }
 
         // F3: space allowlist.

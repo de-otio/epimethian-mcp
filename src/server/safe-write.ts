@@ -1940,11 +1940,22 @@ export async function safeSubmitPage(
 
 /**
  * Thrown when `version: "current"` is combined with a placeholder in any
- * find or replace string. Placeholder ids are positional (T0001 is the
- * first macro of the section at read time); a write that skips the version
- * check could apply them to a page whose macros have shifted since.
+ * find or replace string, or in a body-mode body. Placeholder ids are
+ * positional (T0001 is the first macro of the section, or of the page for
+ * update_page, at read time); a write that skips the version check could
+ * apply them to a page whose macros have shifted since.
  */
 export const PLACEHOLDER_NEEDS_PINNED_VERSION = "PLACEHOLDER_NEEDS_PINNED_VERSION";
+
+function placeholderNeedsPinnedVersion(what: string): ConverterError {
+  return new ConverterError(
+    `${PLACEHOLDER_NEEDS_PINNED_VERSION}: ` +
+      `${what} with \`[[epi:\` placeholders requires a numeric version, not "current": ` +
+      "placeholder ids are positional and can point at a different macro " +
+      "if the page changed since your read. Pass the version from that read.",
+    PLACEHOLDER_NEEDS_PINNED_VERSION,
+  );
+}
 
 /** Reject `version: "current"` when any pair references a placeholder. */
 export function assertFindReplaceVersionPinned(
@@ -1957,15 +1968,22 @@ export function assertFindReplaceVersionPinned(
       p.find.includes(TOKEN_LITERAL_PREFIX) ||
       p.replace.includes(TOKEN_LITERAL_PREFIX),
   );
-  if (usesPlaceholder) {
-    throw new ConverterError(
-      `${PLACEHOLDER_NEEDS_PINNED_VERSION}: ` +
-        'find_replace with `[[epi:` placeholders requires a numeric version, not "current": ' +
-        "placeholder ids are positional and can point at a different macro " +
-        "if the page changed since your read. Pass the version from that read.",
-      PLACEHOLDER_NEEDS_PINNED_VERSION,
-    );
-  }
+  if (usesPlaceholder) throw placeholderNeedsPinnedVersion("find_replace");
+}
+
+/**
+ * Body-mode counterpart (update_page, update_page_section, body entries of
+ * update_page_sections): planUpdate resolves `[[epi:` placeholders in the
+ * body against the macros of the page as fetched at write time, so
+ * `version: "current"` would bind them to whatever macro now holds that
+ * position. Checked before the page is fetched.
+ */
+export function assertBodyVersionPinned(
+  body: string | undefined,
+  version: number | "current",
+): void {
+  if (version !== "current" || body === undefined) return;
+  if (body.includes(TOKEN_LITERAL_PREFIX)) throw placeholderNeedsPinnedVersion("a body");
 }
 
 export interface SafePrepareFindReplaceInput {
@@ -2062,11 +2080,30 @@ function countOccurrences(haystack: string, needle: string): number {
 }
 
 /**
+ * Occurrences of a fence marker that a reader would treat as live: not
+ * preceded by an extra "<". escapeFenceContent neutralises a marker by
+ * prefixing one "<", so `<<<<CONFLUENCE_UNTRUSTED` is inert even though it
+ * contains the marker as a substring. Markers start with "<<<", so the
+ * leftmost hit inside a run of "<" is preceded by "<" exactly when the run
+ * is longer than the marker's own.
+ */
+function countLiveFenceMarkers(haystack: string, marker: string): number {
+  let n = 0;
+  for (let i = haystack.indexOf(marker); i !== -1; i = haystack.indexOf(marker, i + marker.length)) {
+    if (i === 0 || haystack[i - 1] !== "<") n++;
+  }
+  return n;
+}
+
+/**
  * Page-level guards for a find_replace write, run on the spliced full page.
  *
  *   - The number of fence markers, canaries and read-only-markdown markers
  *     must not grow. Pages that merely contain such text stay editable; a
  *     replacement that completes a marker with neighbouring text does not.
+ *     Fence markers are counted twice: as substrings, and as live markers
+ *     (so turning an inert escaped `<<<<…` into a live `<<<…` is caught
+ *     even though the substring count stays equal).
  *   - enforceContentSafetyGuards, page-relative, with the same flags and
  *     meaning as body mode (confirmDeletions bypasses macro/table loss only).
  */
@@ -2078,13 +2115,16 @@ export function enforceFindReplacePageGuards(input: {
   confirmDeletions?: boolean;
 }): void {
   const { oldStorage, newStorage } = input;
+  const grows = (count: (s: string, m: string) => number, marker: string) =>
+    count(newStorage, marker) > count(oldStorage, marker);
   for (const marker of [
     OPEN_FENCE_PREFIX,
     CLOSE_FENCE,
     getSessionCanary(),
     READ_ONLY_MARKDOWN_MARKER_TEXT,
   ]) {
-    if (countOccurrences(newStorage, marker) > countOccurrences(oldStorage, marker)) {
+    const isFence = marker === OPEN_FENCE_PREFIX || marker === CLOSE_FENCE;
+    if (grows(countOccurrences, marker) || (isFence && grows(countLiveFenceMarkers, marker))) {
       throw new ConverterError(
         `find_replace would add "${marker}" to the page. Read-tool fence ` +
           `markers, the session canary and the read-only-markdown marker ` +
@@ -2198,6 +2238,21 @@ export interface MultiSectionInput {
  */
 export function qualifyTokenId(section: string, id: string): string {
   return `${section}#${id}`;
+}
+
+/**
+ * Inverse of qualifyTokenId, parsed from the right: heading text may itself
+ * contain "#" ("A#B"), token ids never do. Returns undefined when the part
+ * after the last "#" is not a token id (T followed by digits).
+ */
+function parseQualifiedTokenId(
+  ack: string,
+): { section: string; id: string } | undefined {
+  const at = ack.lastIndexOf("#");
+  if (at < 0) return undefined;
+  const id = ack.slice(at + 1);
+  if (!/^T\d+$/.test(id)) return undefined;
+  return { section: ack.slice(0, at), id };
 }
 
 /**
@@ -2494,11 +2549,14 @@ export async function safePrepareMultiSectionBody(input: {
     throw new MultiSectionError(dupFailures);
   }
 
-  // 1b. Itemised acks must each name a section of this call.
+  // 1b. Itemised acks must each name a section of this call. Routing is by
+  //     exact section name (parsed from the right), never by prefix: with
+  //     sections "A" and "A#B", "A#B#T0001" belongs to "A#B" only.
   if (Array.isArray(confirmDeletions)) {
-    const stray = confirmDeletions.filter(
-      (ack) => !sections.some((s) => ack.startsWith(`${s.section}#`)),
-    );
+    const stray = confirmDeletions.filter((ack) => {
+      const parsed = parseQualifiedTokenId(ack);
+      return parsed === undefined || !sections.some((s) => s.section === parsed.section);
+    });
     if (stray.length > 0) {
       throw new MultiSectionError([
         {
@@ -2513,10 +2571,10 @@ export async function safePrepareMultiSectionBody(input: {
   }
   const ackFor = (section: string): string[] | true | undefined => {
     if (!Array.isArray(confirmDeletions)) return confirmDeletions ? true : undefined;
-    const prefix = `${section}#`;
-    const ids = confirmDeletions
-      .filter((ack) => ack.startsWith(prefix))
-      .map((ack) => ack.slice(prefix.length));
+    const ids = confirmDeletions.flatMap((ack) => {
+      const parsed = parseQualifiedTokenId(ack);
+      return parsed !== undefined && parsed.section === section ? [parsed.id] : [];
+    });
     return ids.length > 0 ? ids : undefined;
   };
 
@@ -2562,14 +2620,17 @@ export async function safePrepareMultiSectionBody(input: {
   //    sections in the same page cannot legitimately occupy the same byte
   //    range — overlapping ranges would mean the splice plan is non-
   //    deterministic. This catches the pathological case where one section
-  //    is fully contained in another (e.g. an h3 nested under an h2 with
-  //    the same name); the dedup check above would already cover identical
-  //    names. We keep the guard belt-and-braces.
+  //    is fully contained in another (a parent section and its nested
+  //    child), or two different names (e.g. "A" and "1. A") that resolve to
+  //    the same heading; the dedup check above only covers identical names.
+  //    Equal starts count as overlap too: two names that resolve to the same
+  //    empty section (bodyStart === bodyEnd) would otherwise both splice at
+  //    one offset.
   const sortedByStart = [...located].sort((a, b) => a.bodyStart - b.bodyStart);
   for (let i = 1; i < sortedByStart.length; i++) {
     const prev = sortedByStart[i - 1];
     const cur = sortedByStart[i];
-    if (cur.bodyStart < prev.bodyEnd) {
+    if (cur.bodyStart < prev.bodyEnd || cur.bodyStart === prev.bodyStart) {
       throw new MultiSectionError([
         {
           section: cur.section,

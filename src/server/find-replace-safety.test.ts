@@ -30,6 +30,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
 });
 
 import {
+  assertBodyVersionPinned,
   assertFindReplaceVersionPinned,
   computeSectionWriteDiffHash,
   enforceFindReplacePageGuards,
@@ -46,7 +47,8 @@ import { getSessionCanary } from "./session-canary.js";
 import { extractSection, extractSectionBody } from "./confluence-client.js";
 import { tokeniseStorage } from "./converter/tokeniser.js";
 import { planUpdate } from "./converter/update-orchestrator.js";
-import { PLACEHOLDER_LITERAL_IN_PAGE } from "./converter/types.js";
+import { markdownToStorage } from "./converter/md-to-storage.js";
+import { PLACEHOLDER_LITERAL_IN_PAGE, SHRINKAGE_NOT_CONFIRMED } from "./converter/types.js";
 import { TABLE_LOSS_NOT_CONFIRMED } from "./converter/content-safety-guards.js";
 
 const EMOTICON = '<ac:emoticon ac:name="smile"/>';
@@ -138,6 +140,17 @@ describe("safePrepareFindReplace — fence, canary and read-only guards", () => 
       ),
     ).toBe(INPUT_BODY_TOO_LARGE);
   });
+
+  it("caps an oversized find string too, not only the replacement", () => {
+    expect(
+      codeOf(() =>
+        safePrepareFindReplace({
+          sectionBody: "<p>x</p>",
+          pairs: [{ find: "y".repeat(MAX_INPUT_BODY + 1), replace: "z" }],
+        }),
+      ),
+    ).toBe(INPUT_BODY_TOO_LARGE);
+  });
 });
 
 describe("safePrepareFindReplace — deletion gate", () => {
@@ -174,6 +187,18 @@ describe("safePrepareFindReplace — deletion gate", () => {
         .deletedTokens,
     ).toHaveLength(1);
   });
+
+  it("an itemised ack is refused when nothing is deleted (stale ack list)", () => {
+    expect(
+      codeOf(() =>
+        safePrepareFindReplace({
+          sectionBody: "<p>abc</p>",
+          pairs: [{ find: "abc", replace: "xyz" }],
+          confirmDeletions: ["T0001"],
+        }),
+      ),
+    ).toBe(DELETION_ACK_MISMATCH);
+  });
 });
 
 describe("enforceFindReplacePageGuards", () => {
@@ -198,6 +223,54 @@ describe("enforceFindReplacePageGuards", () => {
         }),
       ),
     ).toBe(WRITE_CONTAINS_UNTRUSTED_FENCE);
+  });
+
+  it("turning an inert escaped fence marker into a live one is refused", () => {
+    // escapeFenceContent neutralises a marker with one extra "<"; dropping it
+    // keeps the substring count equal but makes the marker live.
+    for (const [oldStorage, newStorage] of [
+      ["<p><<<<CONFLUENCE_UNTRUSTED field=body>>></p>", "<p><<<CONFLUENCE_UNTRUSTED field=body>>></p>"],
+      ["<p><<<<END_CONFLUENCE_UNTRUSTED>>></p>", "<p><<<END_CONFLUENCE_UNTRUSTED>>></p>"],
+      ["<p>x <<<<CONFLUENCE_UNTRUSTED</p>", "<p><<<CONFLUENCE_UNTRUSTED</p>"],
+    ]) {
+      expect(codeOf(() => enforceFindReplacePageGuards({ oldStorage, newStorage }))).toBe(
+        WRITE_CONTAINS_UNTRUSTED_FENCE,
+      );
+    }
+  });
+
+  it("an escaped fence marker that stays escaped keeps the page editable", () => {
+    const old = "<p><<<<CONFLUENCE_UNTRUSTED field=body>>> typo</p>";
+    expect(() =>
+      enforceFindReplacePageGuards({ oldStorage: old, newStorage: old.replace("typo", "fixed") }),
+    ).not.toThrow();
+    // A live marker that was already on the page is not "growth" either.
+    const live = "<p><<<CONFLUENCE_UNTRUSTED field=body>>> typo</p>";
+    expect(() =>
+      enforceFindReplacePageGuards({ oldStorage: live, newStorage: live.replace("typo", "fixed") }),
+    ).not.toThrow();
+  });
+
+  it("forwards confirm_shrinkage to the content-safety guards", () => {
+    const old = `<p>${"word ".repeat(60)}</p>`;
+    const shrunk = `<p>${"word ".repeat(20)}</p>`;
+    expect(codeOf(() => enforceFindReplacePageGuards({ oldStorage: old, newStorage: shrunk }))).toBe(
+      SHRINKAGE_NOT_CONFIRMED,
+    );
+    expect(() =>
+      enforceFindReplacePageGuards({ oldStorage: old, newStorage: shrunk, confirmShrinkage: true }),
+    ).not.toThrow();
+    // The other flags do not stand in for it.
+    expect(
+      codeOf(() =>
+        enforceFindReplacePageGuards({
+          oldStorage: old,
+          newStorage: shrunk,
+          confirmStructureLoss: true,
+          confirmDeletions: true,
+        }),
+      ),
+    ).toBe(SHRINKAGE_NOT_CONFIRMED);
   });
 
   it("runs the content-safety guards page-relative", () => {
@@ -240,6 +313,15 @@ describe("version pinning with placeholders", () => {
     ).not.toThrow();
     expect(() => assertFindReplaceVersionPinned([{ find: "a", replace: "b" }], "current")).not.toThrow();
   });
+
+  it('body mode: rejects version "current" when the body holds a placeholder', () => {
+    expect(codeOf(() => assertBodyVersionPinned("see [[epi:T0001]] now", "current"))).toBe(
+      PLACEHOLDER_NEEDS_PINNED_VERSION,
+    );
+    expect(() => assertBodyVersionPinned("see [[epi:T0001]] now", 7)).not.toThrow();
+    expect(() => assertBodyVersionPinned("plain text", "current")).not.toThrow();
+    expect(() => assertBodyVersionPinned(undefined, "current")).not.toThrow();
+  });
 });
 
 describe("computeSectionWriteDiffHash (H1 binding)", () => {
@@ -281,6 +363,16 @@ describe("computeSectionWriteDiffHash (H1 binding)", () => {
     const c = { ...base, resultingStorage: '<ac:structured-macro ac:name="info" ac:macro-id="1111"/>' };
     expect(computeSectionWriteDiffHash(a)).toBe(computeSectionWriteDiffHash(b));
     expect(computeSectionWriteDiffHash(a)).not.toBe(computeSectionWriteDiffHash(c));
+  });
+
+  it("the converter mints macro-ids only in the double-quoted form the hash blanks", () => {
+    // The only per-call randomness in a resulting storage is the macro-id
+    // markdownToStorage mints; page bytes and caller storage are identical
+    // on the retry. Pin the emitted shape the normalisation relies on.
+    const out = markdownToStorage("```\necho hi\n```\n\n:::expand More\nx\n:::\n");
+    expect(out.match(/ac:macro-id="[^"]+"/g)).toHaveLength(2); // code + expand
+    expect(out).not.toMatch(/ac:macro-id='/i);
+    expect(out).not.toMatch(/AC:MACRO-ID/);
   });
 });
 
