@@ -141,6 +141,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     formatPage: vi.fn().mockReturnValue("formatted page"),
     extractSection: actual.extractSection,
     extractSectionBody: actual.extractSectionBody,
+    settleOutcomeUnknown: actual.settleOutcomeUnknown,
     replaceSection: actual.replaceSection,
     truncateStorageFormat: actual.truncateStorageFormat,
     toMarkdownView: actual.toMarkdownView,
