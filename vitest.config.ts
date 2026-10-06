@@ -24,6 +24,19 @@ export default defineConfig({
         // 90% — coverage gaps here mean untested states where a wrong-page
         // or replayed token could validate. See plan §7 + §3.2 note 1.
         "src/server/confirmation-tokens.ts": { lines: 90, branches: 90, functions: 90, statements: 90 },
+        // 7.0.0 pure modules on the safety path: find_replace matching, CQL
+        // scoping, search redaction, read-scope validation, tool metadata,
+        // frontmatter parsing.
+        "src/server/converter/find-replace-engine.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/cql-scope.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/search-redact.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/read-scope.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/tool-meta.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        "src/server/converter/frontmatter.ts": { lines: 95, branches: 95, functions: 95, statements: 95 },
+        // HTTP retry/timeout/semaphore policy and diff normalisation; branch
+        // floors sit just under today's figures (93% / 86%).
+        "src/server/request-policy.ts": { lines: 95, branches: 90, functions: 95, statements: 95 },
+        "src/server/storage-normalise.ts": { lines: 95, branches: 85, functions: 90, statements: 95 },
         // Per-client config templates for the setup CLI (v6.5.0). Mechanical
         // templating; 85% threshold per plan §7.
         "src/cli/client-configs.ts": { lines: 85, branches: 85, functions: 85, statements: 85 },
