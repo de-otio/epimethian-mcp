@@ -5,6 +5,150 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.0.0] - 2026-10-06 - field-session safety and reliability
+
+Plan: `plans/field-session-findings-2026-10.md`.
+
+### Breaking
+
+- **`find_replace` matches exactly once.** In `update_page_section` and in
+  each `update_page_sections` entry, every `find` must occur exactly once in
+  the section. No match fails with `FIND_REPLACE_MATCH_FAILED`; several fail
+  with `FIND_REPLACE_AMBIGUOUS` and the count. A pair with
+  `replace_all: true` opts in to several occurrences. Overlapping
+  occurrences are rejected even with `replace_all`.
+- **`find_replace` placeholder rules.** A macro placeholder that would appear
+  twice is always rejected (`DUPLICATED_TOKEN`), and so is one the section
+  does not contain (`FORGED_TOKEN`). Dropped placeholders go through the
+  `confirm_deletions` gate (elicitation, soft-confirmation token or
+  `batch_token`), as in body mode.
+- **Literal `[[epi:` text is refused.** If a page's prose contains a literal
+  `[[epi:Tnnnn]]` string, `find_replace` and markdown body writes refuse the
+  edit (`PLACEHOLDER_LITERAL_IN_PAGE`). `[[epi:` in an `append_to_page` or
+  `prepend_to_page` body is refused (`INVENTED_TOKEN`).
+- **`version: "current"` with placeholders is refused.** A `find_replace`
+  whose find or replace string contains a placeholder must pass a numeric
+  version (`PLACEHOLDER_NEEDS_PINNED_VERSION`). This applies to
+  `find_replace` only in this release.
+- **Section-write confirmation tokens are bound to the call.** A token is
+  bound to the tool, page, section entries (body or pairs, with flags), the
+  resulting storage hash and the page version; a token for one call no
+  longer validates another.
+- **Every read path is fenced.** `get_page` and `get_page_by_title` return
+  section storage, section markdown, markdown and truncated bodies inside
+  the untrusted-content fence with its canary (fence fields `body`,
+  `section`, `markdown`). Reads are NFKC-folded and stripped of zero-width,
+  bidi and control characters, as full reads already were.
+- **Markdown section view numbers placeholders from the section body.** The
+  heading is rendered separately, so ids now match `find_replace` and body
+  mode.
+- `get_page_by_title` applies the same default `max_length` cap as
+  `get_page`.
+- **Search results are fenced per result** (ID, Space, Title, Excerpt), and
+  the v1 highlight markers are stripped.
+- **Tool annotations.** Every tool has a title and `readOnlyHint`,
+  `destructiveHint`, `idempotentHint` and `openWorldHint`. `update_page`,
+  `update_page_section(s)`, `add_drawio_diagram`, `revert_page`,
+  `download_attachment`, label and status removal, and `upgrade` are
+  `destructiveHint: true`. `delete_page`, `revert_page`, `delete_comment`,
+  `authorise_destructive_writes` and `upgrade` set
+  `_meta["anthropic/requiresUserInteraction"]`, so Claude Code prompts on
+  every call.
+- **`download_attachment` is no longer `readOnlyHint`.** It refuses any
+  destination with a dot-prefixed path segment below the working directory
+  (`.git`, `.claude`, `.env`, and so on) and never writes executable modes:
+  an overwrite clears execute, setuid and setgid bits.
+- **`authorise_destructive_writes` is a write tool**, so it is not
+  registered in the read-only posture. Profile `allowed_tools` /
+  `denied_tools` now accept `check_permissions`,
+  `authorise_destructive_writes` and `update_page_sections`.
+- Tool descriptions are at most 1,800 characters with the safety text first;
+  worked examples are in `install-agent.md`.
+- `@modelcontextprotocol/sdk` floor is `^1.32.1` and `zod` is `^3.25.76`.
+  The Node requirement is unchanged.
+
+### Added
+
+- **`update_page_sections` accepts `find_replace` entries.** Each entry is
+  `{section, body}` or `{section, find_replace}` (exactly one), applied in
+  one PUT and one version. An aggregate content-safety guard runs on the
+  merged page, and deletion ids are section-qualified (`Section#T0001`).
+- **`find_replace` matches text copied from a fenced read.** If the exact
+  bytes are not found, matching falls back to the fence's view (NFKD per
+  code point, minus the stripped characters), so NBSP, `²` and zero-width
+  characters copied from a read match. The result says when this was used,
+  and the common prefix and suffix of `find` and `replace` keep their stored
+  bytes.
+- **`search_pages` parameters and scope settings.** `all_spaces` and
+  `excerpts` (default true). Profile settings, edited in the profile
+  registry JSON (no CLI flag): `read_spaces` (default search scope),
+  `read_spaces_enforced` (makes `all_spaces` an error) and `redact_patterns`
+  (literal, case-insensitive, Unicode-normalised; applied to search titles
+  and excerpts only; patterns are never echoed). CQL that cannot be scoped
+  safely (unbalanced parentheses, unterminated literals, invalid
+  `ORDER BY`) is refused when scoping applies.
+- **`diff_page_versions` sees macro-only changes.** It compares normalised
+  storage too (`No text changes; N macro/attribute changes in: …`) and
+  accepts `format: "storage"` for a unified diff of normalised storage.
+  Panel, info, note, warning, tip and expand bodies are rendered as block
+  quotes in the markdown view, so `get_page_version` markdown output
+  changes as well.
+- **HTTP timeouts, retry and concurrency cap.** Timeouts are 30 s for reads,
+  60 s for writes and 120 s for transfers; `EPIMETHIAN_HTTP_TIMEOUT_MS`
+  scales them, clamped to 5 to 300 s. GET and HEAD retry on 429 and 503 with
+  `Retry-After` up to 60 s, at most 3 attempts. A process-wide cap of 6
+  concurrent requests applies, and comment-reply fan-out is chunked.
+- **Unknown write outcomes are reported.** A write that times out, hits a
+  network error, or gets a 502 or 504 after being sent raises
+  `WriteOutcomeUnknownError`, is logged with outcome `unknown`, evicts the
+  cached page and invalidates tokens. Writes to that page based on a newer
+  version, including `version: "current"`, are refused until the page is
+  re-read. These writes are never retried.
+- **409 triage.** A 409 where the page has not moved past the sent version
+  raises `ConfluenceApprovalRequiredError` for approval-required spaces and
+  `ConfluenceUnexpectedConflictError` otherwise. Neither is retried or
+  suggests retrying with a new version.
+- **Frontmatter handling.** The `...` terminator is supported, only mapping
+  or empty blocks are stripped, blocks over 64 KiB are not treated as
+  frontmatter, and `headingOffset` accepts integers only.
+
+### Changed
+
+- **Placeholder restore is single-pass.** XML restored from one macro is
+  never rescanned for further placeholders.
+- The setup tool list and `KNOWN_TOOLS` match the registered tools.
+
+### Fixed
+
+- **`spaces` allowlist checks by page id compared a numeric space id with
+  configured space keys.** Writes addressed by `page_id` failed closed
+  because the v2 API returns a numeric `spaceId` and the allowlist holds
+  keys. The id is now resolved to its key, cached per tenant.
+- **`update_page_sections` had no aggregate guard.** Several sections that
+  each stayed under the shrinkage threshold could together remove most of a
+  page; the guards now run on the merged page.
+- **A literal placeholder in a code macro could be expanded** by the old
+  multi-pass restore into another macro's XML. Restore is now single-pass.
+- `KNOWN_TOOLS` no longer omits `update_page_sections`,
+  `authorise_destructive_writes` and `check_permissions`.
+
+### Security
+
+- `gray-matter` is removed in favour of a small frontmatter splitter that
+  uses js-yaml 4 with `JSON_SCHEMA`. This clears the sprintf-js, argparse
+  and js-yaml 3 advisory chain and gray-matter's JavaScript-engine
+  frontmatter.
+- `npm audit fix` updates `proxy-addr` (critical), `source-map-js` (high),
+  `fast-uri` and `ip-address`, reached through the SDK and dev tooling.
+  `npm audit` reports 0 vulnerabilities.
+
+### Planned
+
+See `plans/field-session-findings-2026-10.md`. 7.1.0: `move_page`,
+`delete_attachment`, new attachment versions, `insert_section`,
+`rename_heading`, `grep`, a label memo and low-risk reads. 7.2.0: compact
+reads, entity-tolerant matching and, if its precondition is resolved, R4.
+
 ## [6.10.1] - 2026-09-23 - code scanning fixes
 
 ### Security
