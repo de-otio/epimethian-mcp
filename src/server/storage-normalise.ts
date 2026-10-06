@@ -19,16 +19,36 @@ interface Segment {
   opaque: boolean;
 }
 
-const OPAQUE_RE = /<!\[CDATA\[[\s\S]*?\]\]>|<!--[\s\S]*?-->/g;
+const OPAQUE_OPEN_RE = /<!\[CDATA\[|<!--/g;
 
+/**
+ * Split into markup and opaque (CDATA / comment) segments. An opener with no
+ * closer is plain text. Once one CDATA (or comment) opener has no closer, no
+ * later opener of that kind has one either, so the search stops: many
+ * unterminated openers cost one scan, not one scan each.
+ */
 function segmentStorage(storage: string): Segment[] {
   const out: Segment[] = [];
   let last = 0;
-  for (const m of storage.matchAll(OPAQUE_RE)) {
-    const at = m.index ?? 0;
+  let cdataClosable = true;
+  let commentClosable = true;
+  OPAQUE_OPEN_RE.lastIndex = 0;
+  for (let m = OPAQUE_OPEN_RE.exec(storage); m !== null; m = OPAQUE_OPEN_RE.exec(storage)) {
+    const at = m.index;
+    const isCdata = m[0] === "<![CDATA[";
+    if (isCdata ? !cdataClosable : !commentClosable) continue;
+    const closer = isCdata ? "]]>" : "-->";
+    const closeAt = storage.indexOf(closer, at + m[0].length);
+    if (closeAt < 0) {
+      if (isCdata) cdataClosable = false;
+      else commentClosable = false;
+      continue;
+    }
+    const end = closeAt + closer.length;
     if (at > last) out.push({ text: storage.slice(last, at), opaque: false });
-    out.push({ text: m[0], opaque: true });
-    last = at + m[0].length;
+    out.push({ text: storage.slice(at, end), opaque: true });
+    last = end;
+    OPAQUE_OPEN_RE.lastIndex = end;
   }
   if (last < storage.length) out.push({ text: storage.slice(last), opaque: false });
   return out;
@@ -103,8 +123,47 @@ export function splitStorageBlocks(storage: string): string {
 /** Macro names are reported to the agent; only this alphabet is ever shown. */
 const SAFE_MACRO_NAME_RE = /^[A-Za-z0-9_-]+$/;
 
-const MACRO_OPEN_RE = /<ac:structured-macro\b[^>]*?\sac:name="([^"]*)"[^>]*?(\/?)>/gi;
+/**
+ * A macro start tag. `[^<>]*` stops at the next `<`, so a failed attempt never
+ * rescans text that a later attempt covers: the scan is linear however many
+ * unterminated start tags the input holds. Confluence escapes `<` in attribute
+ * values; an unescaped `>` inside one would end the tag early, which only
+ * affects this comparison-only name report.
+ */
+const MACRO_OPEN_RE = /<ac:structured-macro(?=[\s/>])([^<>]*)>/gi;
+const MACRO_NAME_ATTR_RE = /(?:^|\s)ac:name="([^"]*)"/i;
 const MACRO_CLOSE_RE = /<\/ac:structured-macro\s*>/gi;
+
+interface MacroEvent {
+  readonly at: number;
+  readonly open: boolean;
+  readonly name?: string;
+  readonly selfClosing?: boolean;
+}
+
+/** Macro open and close tags in source order. CDATA payloads and comments are skipped. */
+function macroEvents(text: string): readonly MacroEvent[] {
+  const events: MacroEvent[] = [];
+  let base = 0;
+  for (const seg of segmentStorage(text)) {
+    if (!seg.opaque) {
+      for (const m of seg.text.matchAll(MACRO_OPEN_RE)) {
+        const attrs = m[1] ?? "";
+        events.push({
+          at: base + (m.index ?? 0),
+          open: true,
+          name: MACRO_NAME_ATTR_RE.exec(attrs)?.[1],
+          selfClosing: attrs.endsWith("/"),
+        });
+      }
+      for (const m of seg.text.matchAll(MACRO_CLOSE_RE)) {
+        events.push({ at: base + (m.index ?? 0), open: false });
+      }
+    }
+    base += seg.text.length;
+  }
+  return events.sort((a, b) => a.at - b.at);
+}
 
 /**
  * For each line of block-split storage, the names of the macros it belongs
@@ -112,26 +171,26 @@ const MACRO_CLOSE_RE = /<\/ac:structured-macro\s*>/gi;
  * A change to a macro's parameter, which sits on its own line, is therefore
  * attributed to that macro rather than to nothing.
  *
+ * Tags are found over the whole text, not line by line, so a CDATA payload or
+ * comment that spans lines is skipped as a unit: a macro inside one is not a
+ * macro.
+ *
  * Names outside `[A-Za-z0-9_-]` are reported as `undefined` slots and dropped
  * by the caller, so tenant-authored text never reaches the output.
  */
 export function macroNamesPerLine(lines: readonly string[]): readonly (readonly string[])[] {
+  const events = macroEvents(lines.join("\n"));
   // Mutated across lines on purpose: the open-macro stack is the scan's state.
   const open: (string | undefined)[] = [];
+  let next = 0;
+  let lineEnd = -1;
   return lines.map((line) => {
+    lineEnd += line.length + 1; // offset of this line's newline (or the end)
     const names: string[] = [];
     const top = open[open.length - 1];
     if (top !== undefined) names.push(top);
-    // Events in source order: opens push, closes pop.
-    const events: Array<{ at: number; open: boolean; name?: string; selfClosing?: boolean }> = [];
-    for (const m of line.matchAll(MACRO_OPEN_RE)) {
-      events.push({ at: m.index ?? 0, open: true, name: m[1], selfClosing: m[2] === "/" });
-    }
-    for (const m of line.matchAll(MACRO_CLOSE_RE)) {
-      events.push({ at: m.index ?? 0, open: false });
-    }
-    events.sort((a, b) => a.at - b.at);
-    for (const ev of events) {
+    for (; next < events.length && events[next]!.at <= lineEnd; next++) {
+      const ev = events[next]!;
       if (ev.open) {
         const safe = ev.name !== undefined && SAFE_MACRO_NAME_RE.test(ev.name) ? ev.name : undefined;
         if (safe !== undefined) names.push(safe);
