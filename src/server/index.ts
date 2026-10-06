@@ -88,6 +88,7 @@ import {
   maybeConsumeConfirmToken,
   formatSoftConfirmationResult,
   tryBatchTokenForWrite,
+  MAX_FIND_REPLACE_PAIRS,
   type DeletedToken,
   type FindReplacePair,
   type MultiSectionInput,
@@ -225,10 +226,16 @@ export function effectiveMaxReadLength(raw: number | undefined): number {
  * macros were tokenised, the token table. The result is tenant-derived (macro
  * names in the table come from the page), so callers MUST place it inside
  * `fenceUntrusted` (see `renderBodyResult`).
+ *
+ * `scope` says which write tools the ids fit (R2.2): a full-page view
+ * numbers placeholders across the page, which only update_page uses; a
+ * section view numbers them within the section body, as the section tools do
+ * (contract 1). Same numeric version, different macro, so the note matters.
  */
 function formatMarkdownBody(
   markdown: string,
   sidecar: Record<string, string>,
+  scope: "page" | "section",
 ): string {
   const tokenCount = Object.keys(sidecar).length;
   let body = markdown;
@@ -247,7 +254,12 @@ function formatMarkdownBody(
     body =
       `${READ_ONLY_MARKDOWN_MARKER}\n\n` +
       `<!-- ${tokenCount} Confluence macro${tokenCount === 1 ? "" : "s"} preserved as tokens; ` +
-      `remove a token to delete that macro on the next update_page -->\n\n` +
+      `removing a token deletes that macro. ` +
+      (scope === "page"
+        ? `these ids are page-wide and valid for update_page only (for ` +
+          `update_page_section(s), read the section with section:<name>) -->\n\n`
+        : `these ids are local to this section: use them only with ` +
+          `update_page_section(s) on this section, not with update_page -->\n\n`) +
       `${markdown}\n\n---\nTokens:\n${table}`;
   } else {
     body = `${READ_ONLY_MARKDOWN_MARKER}\n\n${markdown}`;
@@ -366,7 +378,8 @@ async function renderPageRead(
       const headingLine = renderSectionHeadingLine(headingHtml);
       const view = formatMarkdownBody(
         markdown.length > 0 ? `${headingLine}\n\n${markdown}` : headingLine,
-        sidecar
+        sidecar,
+        "section"
       );
       return toolResult(
         await renderBodyResult(page, view, { kind: "markdown", section, truncation })
@@ -393,7 +406,7 @@ async function renderPageRead(
   if (format === "markdown") {
     const { markdown, sidecar } = storageToMarkdown(capped);
     return toolResult(
-      await renderBodyResult(page, formatMarkdownBody(markdown, sidecar), {
+      await renderBodyResult(page, formatMarkdownBody(markdown, sidecar, "page"), {
         kind: "markdown",
         truncation,
       })
@@ -776,6 +789,15 @@ const MARKDOWN_BODY_NOTE =
   "`:status[...]{colour=...}`, `:mention[Name]{accountId=...}`, `:date[...]`, " +
   "`:jira[KEY-1]`, `:anchor[name]` (syntax and examples: install-agent.md, " +
   "\"Markdown bodies\").";
+
+/**
+ * R2.2: placeholder ids in a section write are numbered within the section
+ * body (contract 1), unlike a full-page markdown read. Shared by the body and
+ * find_replace parameters of update_page_section and update_page_sections.
+ */
+const SECTION_PLACEHOLDER_NOTE =
+  "Placeholder ids ([[epi:T0001]]) are section-local: take them from get_page with " +
+  "`section` and format: markdown, never from a full-page read.";
 
 /** Shared `version` parameter description for the page-writing tools. */
 const VERSION_PARAM_NOTE =
@@ -2015,7 +2037,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .describe(
             "New section content: GFM markdown or storage XHTML, never mixed; markdown " +
             "preserves existing macros in the section. The heading is kept; only the content " +
-            "under it is replaced. Exactly one of `body` or `find_replace`."
+            "under it is replaced. Exactly one of `body` or `find_replace`. " +
+            SECTION_PLACEHOLDER_NOTE
           ),
         find_replace: z
           .array(
@@ -2045,6 +2068,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             })
           )
           .min(1)
+          .max(MAX_FIND_REPLACE_PAIRS)
           .optional()
           .describe(
             "Alternative to `body`: literal substitutions in the section's storage XML. " +
@@ -2052,8 +2076,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             "must match exactly once unless `replace_all` is set; no match fails with " +
             "FIND_REPLACE_MATCH_FAILED. Text inside macros is never matched. If the exact " +
             "bytes are not found, text copied from a fenced read (NFKC-folded) still " +
-            "matches, and unchanged text keeps its stored bytes. Removing a macro " +
+            "matches, and unchanged text keeps its stored bytes; a find that matches once " +
+            "exactly but more often as reads show it is FIND_REPLACE_AMBIGUOUS. Removing a macro " +
             "placeholder needs confirm_deletions; duplicating one is rejected. " +
+            SECTION_PLACEHOLDER_NOTE + " " +
+            `At most ${MAX_FIND_REPLACE_PAIRS} pairs; no new XML comments or CDATA. ` +
             "Exactly one of `body` or `find_replace` must be provided."
           ),
         version: versionField
@@ -2451,7 +2478,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
                 .describe(
                   "New content for this section — GFM markdown or Confluence " +
                   "storage format (auto-detected). Same conversion rules as " +
-                  "update_page_section. Exactly one of `body` or `find_replace`."
+                  "update_page_section. Exactly one of `body` or `find_replace`. " +
+                  SECTION_PLACEHOLDER_NOTE
                 ),
               find_replace: z
                 .array(
@@ -2462,12 +2490,13 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
                   })
                 )
                 .min(1)
+                .max(MAX_FIND_REPLACE_PAIRS)
                 .optional()
                 .describe(
                   "Literal substitutions in this section's storage, with the same " +
                   "rules as update_page_section's find_replace (exactly-once " +
-                  "matching unless replace_all, macros opaque). Placeholder ids " +
-                  "are per section; confirm_deletions covers every section."
+                  `matching unless replace_all, macros opaque, at most ${MAX_FIND_REPLACE_PAIRS} pairs). ` +
+                  SECTION_PLACEHOLDER_NOTE + " confirm_deletions covers every section."
                 ),
             })
           )

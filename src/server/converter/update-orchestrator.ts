@@ -304,9 +304,19 @@ function describeSidecarEntry(xml: string | undefined): string {
   // the identity of the element, not its content.
   const nameMatch = xml.match(/\bac:name="([^"]+)"/);
   if (tag === "ac:structured-macro" && nameMatch) {
-    return `${tag} ac:name="${nameMatch[1]}"`;
+    return `${tag} ac:name="${safeMacroLabel(nameMatch[1]!)}"`;
   }
   return tag;
+}
+
+/**
+ * Reduce a tenant-supplied macro or diagram name to a label that is safe to
+ * show unfenced in errors, success notes and version messages (R1.5): only
+ * `[A-Za-z0-9 _.-]`, at most 64 characters, `?` when nothing is left.
+ */
+export function safeMacroLabel(raw: string): string {
+  const label = raw.replace(/[^A-Za-z0-9 _.-]/g, "").slice(0, 64);
+  return label.length > 0 ? label : "?";
 }
 
 /**
