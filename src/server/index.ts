@@ -29,6 +29,7 @@ import {
   setContentState,
   removeContentState,
   formatPage,
+  type PageData,
   extractSection,
   extractSectionBody,
   replaceSection,
@@ -66,7 +67,7 @@ import {
   MAX_DIFF_SIZE,
 } from "./diff.js";
 import { ConverterError } from "./converter/types.js";
-import { fenceUntrusted } from "./converter/untrusted-fence.js";
+import { fenceUntrusted, sanitiseTenantText } from "./converter/untrusted-fence.js";
 import { isValidAttachmentFilename } from "./converter/filename-validator.js";
 import { safeWriteFile } from "../shared/safe-fs.js";
 import { storageToMarkdown } from "./converter/storage-to-md.js";
@@ -207,10 +208,15 @@ export function effectiveMaxReadLength(raw: number | undefined): number {
   return raw;
 }
 
-function formatMarkdownWithTokens(
+/**
+ * Build the markdown read view: read-only marker, the markdown and, when
+ * macros were tokenised, the token table. The result is tenant-derived (macro
+ * names in the table come from the page), so callers MUST place it inside
+ * `fenceUntrusted` (see `renderBodyResult`).
+ */
+function formatMarkdownBody(
   markdown: string,
   sidecar: Record<string, string>,
-  header: string
 ): string {
   const tokenCount = Object.keys(sidecar).length;
   let body = markdown;
@@ -234,7 +240,161 @@ function formatMarkdownWithTokens(
   } else {
     body = `${READ_ONLY_MARKDOWN_MARKER}\n\n${markdown}`;
   }
-  return `${header}\n\n${body}`;
+  return body;
+}
+
+/**
+ * Render the heading line of a section for the markdown view.
+ *
+ * Contract 1 (plans/field-session-findings-2026-10.md): placeholders are
+ * numbered by tokenising the section BODY only (heading excluded), exactly as
+ * the write path does. The heading is therefore converted on its own and any
+ * macro inside it is shown as a plain `[macro in heading]` marker rather than
+ * a `[[epi:T####]]` token, so heading macros can never shift or collide with
+ * the body's ids. The heading is not editable through the section tools.
+ */
+function renderSectionHeadingLine(headingHtml: string): string {
+  const { markdown } = storageToMarkdown(headingHtml);
+  const line = markdown.replace(/\[\[epi:T\d+\]\]/g, "[macro in heading]").trim();
+  return line.length > 0 ? line : "(untitled heading)";
+}
+
+/**
+ * The single exit for every body-returning path of get_page and
+ * get_page_by_title. `content` is tenant-authored (a storage body, a section,
+ * or the markdown view built from either), so it ALWAYS goes inside
+ * `fenceUntrusted`. Only server-authored text (the header, the section label
+ * the caller supplied, the truncation note) stays outside the fence.
+ */
+async function renderBodyResult(
+  page: PageData,
+  content: string,
+  opts: {
+    kind: "storage" | "markdown";
+    section?: string;
+    truncation?: { origLen: number };
+  },
+): Promise<string> {
+  const header = await formatPage(page, { includeBody: false });
+  const field =
+    opts.kind === "markdown" ? "markdown" : opts.section ? "section" : "body";
+  const fenced = fenceUntrusted(content, { pageId: page.id, field });
+  const label = opts.section ? `Section: ${opts.section}` : "Content:";
+  const truncationNote = opts.truncation
+    ? `\n\n[truncated: full body is ${opts.truncation.origLen} chars; pass max_length=0 for no limit or a larger explicit value]`
+    : "";
+  // The fence folds Unicode (NFKC) and strips control/zero-width characters,
+  // so the fenced text can differ from the stored bytes (NBSP, ellipsis,
+  // superscripts, ...). Say so, so a whole-section write-back from this view
+  // is not mistaken for a byte-exact copy. Server-authored text only.
+  const normalisedNote =
+    sanitiseTenantText(content) !== content
+      ? "\n\n[note: this view was Unicode-normalised or had invisible characters removed, so it can differ from the stored page (for example NBSP, ellipsis, superscripts). Prefer update_page_section with find_replace for small edits; do not write this view back as a whole section without checking those characters.]"
+      : "";
+  return `${header}\n\n${label}\n${fenced}${truncationNote}${normalisedNote}`;
+}
+
+/**
+ * Shared read pipeline for get_page and get_page_by_title, so both tools apply
+ * the same section / format / max_length semantics and the same fencing.
+ * `page` was fetched by the caller (with a body when one is needed).
+ */
+async function renderPageRead(
+  page: PageData,
+  opts: {
+    include_body: boolean;
+    headings_only: boolean;
+    section?: string;
+    max_length?: number;
+    format: "storage" | "markdown";
+  },
+): Promise<ToolResult> {
+  const { include_body, headings_only, section, max_length, format } = opts;
+
+  if (headings_only) {
+    return toolResult(await formatPage(page, { headingsOnly: true }));
+  }
+
+  // D4: resolve effective max_length (default 50_000 when unset;
+  // 0 → no limit sentinel).
+  const effectiveMax = effectiveMaxReadLength(max_length);
+  const body = page.body?.storage?.value ?? page.body?.value ?? "";
+
+  if (section) {
+    const sectionContent = extractSection(body, section);
+    if (sectionContent === null) {
+      return toolResult(
+        `Section "${section}" not found. Use headings_only to see available sections.`
+      );
+    }
+    const origLen = sectionContent.length;
+    const truncation = origLen > effectiveMax ? { origLen } : undefined;
+
+    if (format === "markdown") {
+      const sectionBody = extractSectionBody(body, section);
+      if (sectionBody === null || !sectionContent.endsWith(sectionBody)) {
+        // Both come from one heading range, so this cannot happen; refuse
+        // rather than number placeholders from a different base (contract 1).
+        throw new Error(
+          "Internal error: section body is not a suffix of the section; refusing to render a markdown view with inconsistent placeholder ids."
+        );
+      }
+      const headingHtml = sectionContent.slice(
+        0,
+        sectionContent.length - sectionBody.length
+      );
+      const bodyForView = truncation
+        ? truncateStorageFormat(
+            sectionBody,
+            Math.max(effectiveMax - headingHtml.length, 0)
+          )
+        : sectionBody;
+      // Tokenise the body only; the heading is rendered separately.
+      const { markdown, sidecar } = storageToMarkdown(bodyForView);
+      const headingLine = renderSectionHeadingLine(headingHtml);
+      const view = formatMarkdownBody(
+        markdown.length > 0 ? `${headingLine}\n\n${markdown}` : headingLine,
+        sidecar
+      );
+      return toolResult(
+        await renderBodyResult(page, view, { kind: "markdown", section, truncation })
+      );
+    }
+
+    return toolResult(
+      await renderBodyResult(
+        page,
+        truncation ? truncateStorageFormat(sectionContent, effectiveMax) : sectionContent,
+        { kind: "storage", section, truncation }
+      )
+    );
+  }
+
+  if (!include_body) {
+    return toolResult(await formatPage(page, { includeBody: false }));
+  }
+
+  const origLen = body.length;
+  const truncation = origLen > effectiveMax ? { origLen } : undefined;
+  const capped = truncation ? truncateStorageFormat(body, effectiveMax) : body;
+
+  if (format === "markdown") {
+    const { markdown, sidecar } = storageToMarkdown(capped);
+    return toolResult(
+      await renderBodyResult(page, formatMarkdownBody(markdown, sidecar), {
+        kind: "markdown",
+        truncation,
+      })
+    );
+  }
+
+  if (body.length === 0) {
+    // Nothing to fence; formatPage omits the Content block for an empty body.
+    return toolResult(await formatPage(page, { includeBody: true }));
+  }
+  return toolResult(
+    await renderBodyResult(page, capped, { kind: "storage", truncation })
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -989,79 +1149,13 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       try {
         const needBody = include_body || headings_only || !!section;
         const page = await getPage(page_id, needBody);
-
-        if (headings_only) {
-          return toolResult(
-            await formatPage(page, { headingsOnly: true })
-          );
-        }
-
-        // D4: resolve effective max_length (default 50_000 when unset;
-        // 0 → no limit sentinel).
-        const effectiveMax = effectiveMaxReadLength(max_length);
-        const truncationNote = (origLen: number) =>
-          `\n\n[truncated: full body is ${origLen} chars; pass max_length=0 for no limit or a larger explicit value]`;
-
-        if (section) {
-          const body = page.body?.storage?.value ?? page.body?.value ?? "";
-          const sectionContent = extractSection(body, section);
-          if (sectionContent === null) {
-            return toolResult(
-              `Section "${section}" not found. Use headings_only to see available sections.`
-            );
-          }
-          const origLen = sectionContent.length;
-          let content = sectionContent;
-          let truncated = false;
-          if (content.length > effectiveMax) {
-            content = truncateStorageFormat(content, effectiveMax);
-            truncated = true;
-          }
-          if (format === "markdown") {
-            const { markdown, sidecar } = storageToMarkdown(content);
-            const header = await formatPage(page, { includeBody: false });
-            const note = truncated ? truncationNote(origLen) : "";
-            return toolResult(
-              `${header}\n\nSection: ${section}\n${formatMarkdownWithTokens(markdown, sidecar, "").slice(2)}${note}`
-            );
-          }
-          const header = await formatPage(page, { includeBody: false });
-          const note = truncated ? truncationNote(origLen) : "";
-          return toolResult(`${header}\n\nSection: ${section}\n${content}${note}`);
-        }
-
-        if (include_body && format === "markdown") {
-          const body = page.body?.storage?.value ?? page.body?.value ?? "";
-          const origLen = body.length;
-          let content = body;
-          let truncated = false;
-          if (content.length > effectiveMax) {
-            content = truncateStorageFormat(content, effectiveMax);
-            truncated = true;
-          }
-          const { markdown, sidecar } = storageToMarkdown(content);
-          const header = await formatPage(page, { includeBody: false });
-          const note = truncated ? truncationNote(origLen) : "";
-          return toolResult(formatMarkdownWithTokens(markdown, sidecar, header) + note);
-        }
-
-        if (include_body) {
-          const body = page.body?.storage?.value ?? page.body?.value ?? "";
-          const origLen = body.length;
-          if (body.length > effectiveMax) {
-            const header = await formatPage(page, { includeBody: false });
-            const truncated = truncateStorageFormat(body, effectiveMax);
-            return toolResult(
-              `${header}\n\nContent:\n${truncated}${truncationNote(origLen)}`
-            );
-          }
-          // At or under the cap — fall through to the full formatPage path
-          // (which fences the body and attaches tenant-echo downstream).
-        }
-
-        return toolResult(
-          await formatPage(page, { includeBody: include_body })
-        );
+        return await renderPageRead(page, {
+          include_body,
+          headings_only,
+          section,
+          max_length,
+          format,
+        });
       } catch (err) {
         return toolError(err);
       }
@@ -2915,56 +3009,13 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           );
         }
 
-        if (headings_only) {
-          return toolResult(
-            await formatPage(page, { headingsOnly: true })
-          );
-        }
-
-        if (section) {
-          const body = page.body?.storage?.value ?? page.body?.value ?? "";
-          const sectionContent = extractSection(body, section);
-          if (sectionContent === null) {
-            return toolResult(
-              `Section "${section}" not found. Use headings_only to see available sections.`
-            );
-          }
-          let content = sectionContent;
-          if (max_length && content.length > max_length) {
-            content = truncateStorageFormat(content, max_length);
-          }
-          if (format === "markdown") {
-            const { markdown, sidecar } = storageToMarkdown(content);
-            const header = await formatPage(page, { includeBody: false });
-            return toolResult(
-              `${header}\n\nSection: ${section}\n${formatMarkdownWithTokens(markdown, sidecar, "").slice(2)}`
-            );
-          }
-          const header = await formatPage(page, { includeBody: false });
-          return toolResult(`${header}\n\nSection: ${section}\n${content}`);
-        }
-
-        if (include_body && format === "markdown") {
-          const body = page.body?.storage?.value ?? page.body?.value ?? "";
-          let content = body;
-          if (max_length && content.length > max_length) {
-            content = truncateStorageFormat(content, max_length);
-          }
-          const { markdown, sidecar } = storageToMarkdown(content);
-          const header = await formatPage(page, { includeBody: false });
-          return toolResult(formatMarkdownWithTokens(markdown, sidecar, header));
-        }
-
-        if (include_body && max_length) {
-          const body = page.body?.storage?.value ?? page.body?.value ?? "";
-          const truncated = truncateStorageFormat(body, max_length);
-          const header = await formatPage(page, { includeBody: false });
-          return toolResult(`${header}\n\nContent:\n${truncated}`);
-        }
-
-        return toolResult(
-          await formatPage(page, { includeBody: include_body, headingsOnly: headings_only })
-        );
+        return await renderPageRead(page, {
+          include_body,
+          headings_only,
+          section,
+          max_length,
+          format,
+        });
       } catch (err) {
         return toolError(err);
       }

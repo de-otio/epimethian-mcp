@@ -8,7 +8,11 @@ import {
   fetchTenantInfo,
 } from "../shared/test-connection.js";
 import { escapeXmlText } from "./converter/escape.js";
-import { fenceUntrusted } from "./converter/untrusted-fence.js";
+import {
+  escapeFenceContent,
+  fenceUntrusted,
+  sanitiseTenantText,
+} from "./converter/untrusted-fence.js";
 
 declare const __PKG_VERSION__: string;
 import { pageCache } from "./page-cache.js";
@@ -2154,11 +2158,18 @@ function findHeadingInTree(
   // caller supplied bare "Notes" and two headings both strip to "notes"
   // but one was stored as "1.2. Notes" and the other as "2.1. Notes").
   // In that ambiguous case we cannot pick safely → throw.
+  // Heading text is tenant-authored and this message reaches the agent
+  // unfenced, so each heading is sanitised, fence-escaped, length-capped and
+  // JSON-quoted (control characters and newlines cannot forge extra lines).
+  const quoteTenant = (s: string): string =>
+    JSON.stringify(escapeFenceContent(sanitiseTenantText(s)).slice(0, 120));
   const strippedTexts = strippedMatches
-    .map(h => decodeHtmlEntities(h.text.trim()))
+    .map(h => quoteTenant(decodeHtmlEntities(h.text.trim())))
     .join(", ");
+  // The caller's `headingText` is often copied from a previous read, so it is
+  // treated the same way (single-quoted; JSON escaping applied inside).
   throw new Error(
-    `Section '${headingText}' is ambiguous; matched ${strippedMatches.length} headings: ${strippedTexts}`
+    `Section '${quoteTenant(headingText).slice(1, -1)}' is ambiguous; matched ${strippedMatches.length} headings: ${strippedTexts}`
   );
 }
 
