@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.1.0] - 2026-10-06 - recent-changes report
+
+Plan: `plans/recent-changes-report.md`.
+
+### Added
+- `get_recent_changes` (read-only): one call reports the pages and blog
+  posts changed in a window (`hours`, or `since` as ISO 8601 with offset;
+  at most 720 hours). `detail` is `list` (search only), `versions` (adds edit
+  count, editors and `new page`) or `summary` (adds a condensed section-level
+  diff for the first `max_diffs` pages). Pages are grouped by space, newest
+  first, with blog posts marked `[blog]`. The header says `complete` or
+  `showing N, more exist`, and a failed per-page version fetch gives a
+  `versions unavailable` line instead of dropping the page. The window uses a
+  relative CQL bound and an exact server-side filter, so the user's profile
+  timezone does not shift it.
+- `read_spaces`, `read_spaces_enforced` and `redact_patterns` now also scope
+  `get_recent_changes`, as they do `search_pages`. They still do not scope the
+  other read tools.
+
+### Changed
+- `search_pages` results show the last-modified time and version outside the
+  fence (`- ID: 123, Space: DOCS, Modified: …, v14`) and the last editor
+  inside it. Results are paged through until `limit` is reached, and the
+  output ends with `More results exist. Raise limit or narrow the query.`
+  when there are more. Only pages and blog posts are returned; paging stops
+  after a page that held none, and the empty result then says more exist.
+- Version history tolerates an author without a display name or account id
+  (`unknown user`) instead of failing the whole history.
+- `search_pages` `limit` is capped at 200 (default 25).
+
 ## [7.0.0] - 2026-10-06 - field-session safety and reliability
 
 Plan: `plans/field-session-findings-2026-10.md`.
@@ -41,7 +71,7 @@ Plan: `plans/field-session-findings-2026-10.md`.
   inside the untrusted-content fence with its canary (fence fields `body`,
   `section`, `markdown`). Reads are NFKC-folded and stripped of zero-width,
   bidi and control characters, as full reads already were. Page titles in
-  `list_pages` and child listings are not fenced yet (planned for 7.1.0).
+  `list_pages` and child listings are not fenced yet (planned for 7.2.0).
 - **Markdown section view numbers placeholders from the section body.** The
   heading is rendered separately, so ids now match `find_replace` and body
   mode.
@@ -194,12 +224,12 @@ Plan: `plans/field-session-findings-2026-10.md`.
 
 ### Planned
 
-See `plans/field-session-findings-2026-10.md`. 7.1.0: `move_page`,
+See `plans/field-session-findings-2026-10.md`. 7.2.0: `move_page`,
 `delete_attachment`, new attachment versions, `insert_section`,
 `rename_heading`, `grep`, a label memo, low-risk reads, fenced page titles
 in listings, `read_spaces_enforced` on reads, confirmation before
 `download_attachment` overwrites build or agent-instruction files, and
-duplicate-heading disambiguation. 7.2.0: compact reads, entity-tolerant
+duplicate-heading disambiguation. 7.3.0: compact reads, entity-tolerant
 matching and, if its precondition is resolved, R4.
 
 ## [6.10.1] - 2026-09-23 - code scanning fixes
