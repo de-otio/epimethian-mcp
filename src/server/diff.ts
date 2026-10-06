@@ -177,8 +177,10 @@ export function computeSummaryDiff(
     if (totalRemoved > 0) parts.push(`${totalRemoved} lines removed`);
     summary = parts.join(", ");
     if (changes.length > 0) {
-      const sectionNames = changes.map((c) => c.section).join(", ");
-      summary += `. Changes in sections: ${sectionNames}`;
+      // Section names are tenant-authored heading text. The summary is shown
+      // outside any fence, so it carries counts only; the caller lists the
+      // names inside a fence.
+      summary += `; ${changes.length} section(s) changed (listed below)`;
     }
   }
 

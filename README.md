@@ -179,13 +179,13 @@ Three profile settings limit what `search_pages` shows the agent. They live in t
 | Setting | Type | Purpose |
 |---|---|---|
 | `read_spaces` | string[] (max 100 keys) | Default search scope. CQL is combined with `space in (...)`, and the result says the search was restricted. An empty list means no space is searchable by default. |
-| `read_spaces_enforced` | boolean (default `false`) | Requires `read_spaces`. When `true`, `search_pages` with `all_spaces: true` returns an error. When `false`, the agent may widen a call with `all_spaces: true`. |
+| `read_spaces_enforced` | boolean (default `false`) | Requires `read_spaces`. When `true`, `search_pages` with `all_spaces: true` returns an error. When `false`, the agent may widen a call with `all_spaces: true`. Scopes `search_pages` only: it is not a read boundary for `get_page`, `list_pages`, `get_page_by_title` and the other read tools. |
 | `redact_patterns` | string[] (max 100, 1–200 chars each) | Literal strings replaced with `[redacted]` in search result titles and excerpts. Matching is case-insensitive after entity decoding and Unicode normalisation. Patterns are never treated as regular expressions and never appear in errors. |
 
 Notes:
 
-- A query that cannot be scoped safely (unbalanced parentheses, an unterminated string literal, an invalid `ORDER BY`) is refused when scoping applies, rather than sent unscoped.
-- Redaction applies to search titles and excerpts only, not to page bodies. It is hygiene, not a security boundary: it cannot hide that a result exists. `read_spaces_enforced` limits `search_pages` only; use `spaces` to restrict writes.
+- A query that cannot be scoped safely (unbalanced parentheses, an unterminated string literal, a backslash outside a quoted string, an invalid `ORDER BY`) is refused when scoping applies, rather than sent unscoped.
+- Redaction applies to search titles and excerpts only, not to page bodies. It is hygiene, not a security boundary: it cannot hide that a result exists. `read_spaces_enforced` limits `search_pages` only and does not restrict `get_page`, `list_pages`, `get_page_by_title` or any other read tool; to keep an agent out of a space, use a token without access to it. Use `spaces` to restrict writes.
 - Invalid values disable `search_pages` with an error naming the setting, while the other tools keep working.
 
 ## Provenance: AI-Edited Badge
@@ -317,7 +317,7 @@ Configuration via environment variables (all optional; sensible defaults provide
 | `CONFLUENCE_UNVERIFIED_STATUS` | `true` | Master toggle for AI-edited badge. Set to `false` to disable. |
 | `CONFLUENCE_UNVERIFIED_STATUS_LOCALE` | Confluence site default → `en` | Language for the badge label (10 locales: en/fr/de/es/pt/it/nl/ja/zh/ko). |
 
-Network behaviour: `GET` and `HEAD` requests are retried up to 3 attempts on 429 and 503, honouring `Retry-After` up to 60 s. Writes are never retried automatically. At most 6 requests run at once per process. If a write times out or fails after the request was sent (network error, 502, 504), the outcome is unknown: the mutation log records it as `unknown`, the page cache entry is dropped, pending confirmation tokens are invalidated, and `version: "current"` writes to that page are refused until you read the page again.
+Network behaviour: `GET` and `HEAD` requests are retried up to 3 attempts on 429 and 503, honouring `Retry-After` up to 60 s. Writes are never retried automatically. At most 6 requests run at once per process. If a write times out or fails after the request was sent (network error, 502, 504), the outcome is unknown: the mutation log records it as `unknown`, the page cache entry is dropped, pending confirmation tokens are invalidated, and `version: "current"` writes to that page are refused until you read the whole page again (a full body: not truncated, not a section, not `headings_only`; pass `max_length: 0` for a long page). That read carries a note stating the earlier write's base version and the page's current version.
 
 Tool annotations: every tool declares a title and `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`, and `delete_page`, `revert_page`, `delete_comment`, `authorise_destructive_writes` and `upgrade` also set `_meta["anthropic/requiresUserInteraction"]`, which makes Claude Code prompt on every call. The hints are advisory; the server-side guards do not depend on them. See [install-agent.md](install-agent.md#tool-descriptions-and-annotations-700) for details.
 

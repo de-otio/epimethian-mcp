@@ -164,6 +164,40 @@ describe("macroNamesPerLine", () => {
     expect(names[idx("tail")]).toEqual([]);
   });
 
+  it("does not report macros that sit inside CDATA or comments, even across lines", () => {
+    const lines = [
+      '<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[',
+      '<ac:structured-macro ac:name="fake">',
+      "]]></ac:plain-text-body></ac:structured-macro>",
+      '<!-- <ac:structured-macro ac:name="hidden"> -->',
+      '<ac:structured-macro ac:name="real" />',
+    ];
+    expect(macroNamesPerLine(lines)).toEqual([["code"], ["code"], ["code"], [], ["real"]]);
+  });
+
+  it("stays linear on unterminated macro start tags (no '>' anywhere)", () => {
+    const hostile = '<ac:structured-macro ac:name="x" a="b'.repeat(30_000);
+    const t0 = performance.now();
+    macroNamesPerLine([hostile]);
+    expect(performance.now() - t0).toBeLessThan(1500);
+  });
+
+  it("stays fast on many unterminated CDATA openers", () => {
+    const hostile = "<![CDATA[<ac:structured-macro ac:name=".repeat(14_000);
+    const t0 = performance.now();
+    macroNamesPerLine([hostile]);
+    splitStorageBlocks(hostile);
+    expect(performance.now() - t0).toBeLessThan(1500);
+  });
+
+  it("skips a hostile CDATA payload instead of scanning it", () => {
+    const payload = '<ac:structured-macro ac:name="x" a="b'.repeat(30_000);
+    const lines = [`<ac:structured-macro ac:name="code"><![CDATA[${payload}]]></ac:structured-macro>`];
+    const t0 = performance.now();
+    expect(macroNamesPerLine(lines)).toEqual([["code"]]);
+    expect(performance.now() - t0).toBeLessThan(1500);
+  });
+
   it("drops names outside [A-Za-z0-9_-] instead of reporting them", () => {
     const lines = ['<ac:structured-macro ac:name="bad name!&lt;x">', "<p>in</p>", "</ac:structured-macro>"];
     expect(macroNamesPerLine(lines).flat()).toEqual([]);

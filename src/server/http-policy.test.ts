@@ -36,6 +36,7 @@ import {
   formatPage,
   getLabels,
   getPage,
+  settleOutcomeUnknown,
   removeContentState,
   removeLabel,
   setContentState,
@@ -538,6 +539,32 @@ describe("R1 outcome-unknown writes", () => {
     });
   });
 
+  describe("a 2xx answer that does not parse is an unknown outcome, not a failed write", () => {
+    const writes: Array<[string, () => Promise<unknown>]> = [
+      ["createFooterComment", () => createFooterComment("30", "hi")],
+      ["createFooterComment (reply)", () => createFooterComment("30", "hi", "77")],
+      ["createInlineComment (reply)", () => createInlineComment("30", "hi", "text", 0, "77")],
+      ["createInlineComment (selection)", () => createInlineComment("30", "hi", "text", 0)],
+      ["uploadAttachment", () => uploadAttachment("30", Buffer.from("x"), "f.txt")],
+    ];
+    const routed = (init?: RequestInit) =>
+      init?.method === "POST"
+        ? json({ unexpected: "shape", results: "not-an-array" })
+        : json({ id: "30", title: "T", version: { number: 5 }, body: { storage: { value: "<p>text</p>" } } });
+
+    it.each(writes)("%s: rejects with WriteOutcomeUnknownError and evicts the parent page's cache", async (_name, write) => {
+      setFetch((_url, init) => routed(init));
+      pageCache.set("30", 5, "<p>text</p>");
+      pageCache.set("31", 2, "<p>other</p>");
+      const err = await write().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(WriteOutcomeUnknownError);
+      expect((err as Error).message).toContain("may have been applied");
+      expect(pageCache.has("30")).toBeUndefined();
+      expect(pageCache.getOutcomeUnknown("30")).toBeUndefined();
+      expect(pageCache.has("31")).toMatchObject({ version: 2 });
+    });
+  });
+
   it("the mutation log record carries outcome: unknown, and only for these errors", () => {
     const unknown = new WriteOutcomeUnknownError("PUT", `${API_V2}/pages/30`, new TypeError("x"), "request");
     expect(errorRecord("update_page", "30", unknown).outcome).toBe("unknown");
@@ -575,10 +602,23 @@ describe("R1 outcome-unknown writes", () => {
       expect(err).toBeInstanceOf(ConfluenceConflictError);
     });
 
-    it("is settled when getPage observes the version the lost write was based on", async () => {
+    it("stays marked when getPage observes the version the lost write was based on (it may still land late)", async () => {
       setFetch(() => json(pageJson(5)));
       await getPage("30", false);
-      expect(pageCache.getOutcomeUnknown("30")).toBeUndefined();
+      expect(pageCache.getOutcomeUnknown("30")).toEqual({ attemptedVersion: 5 });
+    });
+
+    it("a late-landing write after a read of the old version is still guarded", async () => {
+      setFetch(() => json(pageJson(5)));
+      await getPage("30", false);
+      // The slow write lands now; "current" resolves to 6, which is blocked.
+      const f = setFetch(() => json(pageJson(6)));
+      const err = await _rawUpdatePage("30", { title: "T", version: 6 }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(PageOutcomeUnknownError);
+      expect(f).not.toHaveBeenCalled();
+      // And a write based on the marked version is still allowed.
+      setFetch(() => json(pageJson(6)));
+      await _rawUpdatePage("30", { title: "T", version: 5 });
     });
 
     it("stays marked when getPage observes a newer version (the write may have landed)", async () => {
@@ -587,20 +627,35 @@ describe("R1 outcome-unknown writes", () => {
       expect(pageCache.getOutcomeUnknown("30")).toEqual({ attemptedVersion: 5 });
     });
 
-    it("is settled when the agent is shown the page with its body (get_page)", async () => {
+    it("neither getPage nor formatPage settles the mark, even with a body", async () => {
       const page = { id: "30", title: "T", version: { number: 6 }, body: { storage: { value: "<p>x</p>" } } };
       setFetch(() => json(page));
       const fetched = await getPage("30", true);
-      // getPage alone is an internal read and must not settle the mark...
       expect(pageCache.getOutcomeUnknown("30")).toBeDefined();
-      // ...rendering it for the agent does.
       await formatPage(fetched, { includeBody: true });
+      expect(pageCache.getOutcomeUnknown("30")).toBeDefined();
+    });
+
+    it("settleOutcomeUnknown clears the mark and returns a note naming both versions", () => {
+      const note = settleOutcomeUnknown({ id: "30", title: "T", version: { number: 6 } });
+      expect(note).toContain("based on version 5");
+      expect(note).toContain("unknown outcome");
+      expect(note).toContain("now at version 6");
+      expect(note).toContain("may have been applied");
+      expect(pageCache.getOutcomeUnknown("30")).toBeUndefined();
+      // Nothing to report once settled.
+      expect(settleOutcomeUnknown({ id: "30", title: "T", version: { number: 6 } })).toBeUndefined();
+    });
+
+    it("settleOutcomeUnknown says 'not applied so far' when the page is still at the marked version", () => {
+      const note = settleOutcomeUnknown({ id: "30", title: "T", version: { number: 5 } });
+      expect(note).toContain("now at version 5");
+      expect(note).toContain("not been applied so far");
       expect(pageCache.getOutcomeUnknown("30")).toBeUndefined();
     });
 
-    it("rendering a page without a body does not settle the mark", async () => {
-      await formatPage({ id: "30", title: "T", version: { number: 6 } }, { includeBody: false });
-      expect(pageCache.getOutcomeUnknown("30")).toBeDefined();
+    it("settleOutcomeUnknown returns nothing for a page that was never marked", () => {
+      expect(settleOutcomeUnknown({ id: "99", title: "T", version: { number: 1 } })).toBeUndefined();
     });
 
     it("only marks the page that failed", async () => {

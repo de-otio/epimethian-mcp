@@ -51,6 +51,18 @@ describe("cleanSearchText", () => {
   it("strips markers but does not decode or normalise when no redactor is set", () => {
     expect(cleanSearchText("@@@hl@@@a&amp;b@@@endhl@@@")).toBe("a&amp;b");
   });
+
+  it("collapses every whitespace run to one space so text stays on one line", () => {
+    expect(cleanSearchText("a\nID: 99999\r\n\tSpace: DOCS x  y")).toBe(
+      "a ID: 99999 Space: DOCS x y",
+    );
+    expect(cleanSearchText("  padded \n title  ")).toBe("padded title");
+  });
+
+  it("collapses whitespace after redaction too", () => {
+    const redactor = compileRedactor(["secret"]);
+    expect(cleanSearchText("see\nthe\n\nsecret\nplan", redactor)).toBe(`see the ${REDACTED} plan`);
+  });
 });
 
 describe("compileRedactor", () => {

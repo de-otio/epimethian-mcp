@@ -11,6 +11,8 @@
  * query is scanned first and rejected when:
  *
  *   - a quoted literal (`'` or `"`, backslash escapes) is not terminated;
+ *   - a backslash appears outside a quoted literal (CQL may read `\"` there as
+ *     an escaped quote, which would desynchronise this scanner);
  *   - parenthesis depth goes below zero at any point, or ends non-zero
  *     (outside literals);
  *   - `ORDER BY` appears inside parentheses, is glued to the text before or
@@ -59,7 +61,13 @@ export function scopeCql(cql: string, spaceKeys: readonly string[]): ScopeResult
       }
       continue;
     }
-    if (ch === '"' || ch === "'") {
+    if (ch === "\\") {
+      // CQL (a JQL-family grammar) may read `\"` outside a literal as an
+      // escaped quote, while this scanner would read it as a literal opener.
+      // The two then disagree about where literals and parentheses start and
+      // end, so the wrapper could be closed early. Fail closed.
+      return reject("backslash outside a string literal");
+    } else if (ch === '"' || ch === "'") {
       quote = ch;
     } else if (ch === "(") {
       depth++;

@@ -159,10 +159,28 @@ export function compileRedactor(patterns: readonly string[]): Redactor | undefin
 }
 
 /**
- * Clean one search title or excerpt: always strip highlight markers, then
- * redact when a redactor is configured.
+ * Clean one search title or excerpt: always strip highlight markers, redact
+ * when a redactor is configured, then reduce the text to a single line.
+ *
+ * Every whitespace run (newlines, tabs, line and paragraph separators, NBSP
+ * and the like) becomes one space, so the text can never start a new line
+ * that looks like a result field (`ID: ...`, `Title: ...`) to the reader.
+ * The tenant-text sanitiser runs first because its NFKC step can turn
+ * compatibility characters into whitespace.
  */
 export function cleanSearchText(text: string, redactor?: Redactor): string {
   const stripped = stripHighlightMarkers(text);
-  return redactor === undefined ? stripped : redactor(stripped);
+  const redacted = redactor === undefined ? stripped : redactor(stripped);
+  return sanitiseTenantText(redacted).replace(/\s+/gu, " ").trim();
+}
+
+const SAFE_IDENTIFIER_RE = /^[A-Za-z0-9_.~:/-]{1,64}$/; // `/` admits the literal `N/A`
+
+/**
+ * Render a server-assigned identifier (page id, space id or key) that is
+ * printed outside a fence. Real values are short and use a narrow alphabet;
+ * anything else is shown as `unknown` rather than passed through.
+ */
+export function safeIdentifier(value: string): string {
+  return SAFE_IDENTIFIER_RE.test(value) ? value : "unknown";
 }

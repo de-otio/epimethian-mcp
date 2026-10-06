@@ -908,8 +908,9 @@ export class PageOutcomeUnknownError extends Error {
   constructor(pageId: string) {
     super(
       `An earlier write to page ${pageId} ended without a response, so it may or may not have ` +
-        `been applied. Call get_page to see the page as it is now, then decide whether the ` +
-        `change is still needed. This write was not sent.`
+        `been applied. Call get_page for the whole page as it is now (a full body: no section, ` +
+        `no headings_only, and max_length: 0 if the page is long, because a partial read does not ` +
+        `clear this), then decide whether the change is still needed. This write was not sent.`
     );
     this.name = "PageOutcomeUnknownError";
     this.pageId = pageId;
@@ -944,6 +945,25 @@ async function guardPageSideWrite<T>(pageId: string, write: () => Promise<T>): P
       noteWriteOutcomeUnknown(pageId, (await getConfig()).sealedCloudId);
     }
     throw err;
+  }
+}
+
+/**
+ * Parse the body of a 2xx answer to a write. The write was sent and accepted,
+ * so an answer that does not match the schema must not read as "not written":
+ * it becomes WriteOutcomeUnknownError, which the caller's guard turns into
+ * cache and token invalidation and which the mutation log records as unknown.
+ */
+function parseWriteResponse<S extends z.ZodTypeAny>(
+  schema: S,
+  raw: unknown,
+  method: string,
+  url: string
+): z.infer<S> {
+  try {
+    return schema.parse(raw);
+  } catch (err) {
+    throw new WriteOutcomeUnknownError(method, url, err, "response");
   }
 }
 
@@ -1186,16 +1206,38 @@ export async function resolveSpaceId(spaceKey: string): Promise<string> {
 }
 
 /**
- * An unknown-outcome mark is moot once the server shows the version that
- * write was based on: the write was not applied, and the version check still
- * protects any later write. A higher version stays marked until the agent
- * re-reads the page (see `formatPage`).
+ * Settle an unknown-outcome mark because the agent has just been shown the
+ * COMPLETE page (the caller decides what counts: not a truncated body, a
+ * section or an outline). Returns a server-authored note for the read result
+ * when a mark was cleared, so the agent is told that an earlier write had an
+ * unknown outcome and where the page stands now; undefined when there was no
+ * mark.
+ *
+ * Reads that merely observe the version never clear the mark. A slow write
+ * that lands after a read still showed the old version would otherwise be
+ * followed by an unguarded `version: "current"` retry that applies it twice.
+ * While the page stays at the marked version, writes based on it remain
+ * allowed (the version check protects them), so the mark strands nothing.
  */
-function observeVersionForOutcome(page: PageData): void {
+export function settleOutcomeUnknown(page: PageData): string | undefined {
   const mark = pageCache.getOutcomeUnknown(page.id);
-  if (mark && page.version?.number === mark.attemptedVersion) {
-    pageCache.clearOutcomeUnknown(page.id);
-  }
+  if (mark === undefined) return undefined;
+  pageCache.clearOutcomeUnknown(page.id);
+  const now = page.version?.number;
+  const state =
+    now === undefined
+      ? "its current version could not be read"
+      : `the page is now at version ${now}`;
+  const consequence =
+    now === undefined
+      ? "check the content before repeating that change"
+      : now > mark.attemptedVersion
+        ? "so the write may have been applied; check the content below before repeating that change"
+        : "so it has not been applied so far, but it could still land late; re-read before relying on that";
+  return (
+    `[note: an earlier write to this page, based on version ${mark.attemptedVersion}, ended with an ` +
+    `unknown outcome; ${state}, ${consequence}.]`
+  );
 }
 
 // Space id -> key lookups, scoped by tenant URL so a process that is ever
@@ -1238,15 +1280,6 @@ export function _resetConfigForTests(): void {
 }
 
 export async function getPage(
-  pageId: string,
-  includeBody: boolean
-): Promise<PageData> {
-  const page = await getPageUnobserved(pageId, includeBody);
-  observeVersionForOutcome(page);
-  return page;
-}
-
-async function getPageUnobserved(
   pageId: string,
   includeBody: boolean
 ): Promise<PageData> {
@@ -1957,22 +1990,26 @@ export async function uploadAttachment(
   // POST: a transfer-length timeout, the shared permit, and no automatic
   // retry (a repeated upload would add a second copy or version). A failure
   // after the request was sent surfaces as WriteOutcomeUnknownError.
-  const raw = await guardPageSideWrite(pageId, () =>
-    sendGuarded(
-      attachUrl,
-      {
-        method: "POST",
-        headers: {
-          Authorization: cfg.authHeader,
-          "X-Atlassian-Token": "nocheck",
+  const data = await guardPageSideWrite(pageId, async () =>
+    parseWriteResponse(
+      UploadResultSchema,
+      await sendGuarded(
+        attachUrl,
+        {
+          method: "POST",
+          headers: {
+            Authorization: cfg.authHeader,
+            "X-Atlassian-Token": "nocheck",
+          },
+          body: form,
         },
-        body: form,
-      },
-      "transfer",
-      (res) => res.json() as Promise<unknown>
+        "transfer",
+        (res) => res.json() as Promise<unknown>
+      ),
+      "POST",
+      attachUrl
     )
   );
-  const data = UploadResultSchema.parse(raw);
   const att = data.results[0];
   if (!att) throw new Error("Attachment uploaded but no details returned.");
   return { title: att.title, id: att.id, fileSize: att.extensions?.fileSize };
@@ -2255,8 +2292,10 @@ export async function createFooterComment(
         body: { representation: "storage", value: attributed },
       };
 
-  const raw = await guardPageSideWrite(pageId, () => v2Post("/footer-comments", payload));
-  return CommentSchema.parse(raw);
+  const url = `${cfg.apiV2}/footer-comments`;
+  return guardPageSideWrite(pageId, async () =>
+    parseWriteResponse(CommentSchema, await v2Post("/footer-comments", payload), "POST", url)
+  );
 }
 
 export async function createInlineComment(
@@ -2273,14 +2312,20 @@ export async function createInlineComment(
     ? `<p><em>[AI-generated by ${escapeXmlText(label)} via Epimethian]</em></p>${sanitized}`
     : `<p><em>[AI-generated via Epimethian]</em></p>${sanitized}`;
 
+  const inlineUrl = `${cfg.apiV2}/inline-comments`;
+
   if (parentCommentId) {
-    const raw = await guardPageSideWrite(pageId, () =>
-      v2Post("/inline-comments", {
-        parentCommentId,
-        body: { representation: "storage", value: attributed },
-      })
+    return guardPageSideWrite(pageId, async () =>
+      parseWriteResponse(
+        CommentSchema,
+        await v2Post("/inline-comments", {
+          parentCommentId,
+          body: { representation: "storage", value: attributed },
+        }),
+        "POST",
+        inlineUrl
+      )
     );
-    return CommentSchema.parse(raw);
   }
 
   const page = await getPage(pageId, true);
@@ -2306,18 +2351,22 @@ export async function createInlineComment(
     );
   }
 
-  const raw = await guardPageSideWrite(pageId, () =>
-    v2Post("/inline-comments", {
-      pageId,
-      body: { representation: "storage", value: attributed },
-      inlineCommentProperties: {
-        textSelection,
-        textSelectionMatchCount: count,
-        textSelectionMatchIndex,
-      },
-    })
+  return guardPageSideWrite(pageId, async () =>
+    parseWriteResponse(
+      CommentSchema,
+      await v2Post("/inline-comments", {
+        pageId,
+        body: { representation: "storage", value: attributed },
+        inlineCommentProperties: {
+          textSelection,
+          textSelectionMatchCount: count,
+          textSelectionMatchIndex,
+        },
+      }),
+      "POST",
+      inlineUrl
+    )
   );
-  return CommentSchema.parse(raw);
 }
 
 export async function resolveComment(
@@ -2999,10 +3048,6 @@ export async function formatPage(
       : optionsOrIncludeBody;
 
   const { includeBody = false, headingsOnly = false } = options;
-
-  // R1: rendering a page that carries its body is the agent-visible re-read
-  // that settles an unknown-outcome write mark (see `_rawUpdatePage`).
-  if (page.body !== undefined) pageCache.clearOutcomeUnknown(page.id);
 
   const cfg = await getConfig();
   const spaceKey = page.spaceId ?? page.space?.key ?? "N/A";

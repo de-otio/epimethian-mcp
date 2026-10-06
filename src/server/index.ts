@@ -32,6 +32,7 @@ import {
   type PageData,
   extractSection,
   extractSectionBody,
+  settleOutcomeUnknown,
   replaceSection,
   truncateStorageFormat,
   toMarkdownView,
@@ -130,7 +131,7 @@ import { getProfileSettings } from "../shared/profiles.js";
 import { assertSpaceAllowed } from "./space-allowlist.js";
 import { resolveReadScope } from "./read-scope.js";
 import { scopeCql } from "./cql-scope.js";
-import { cleanSearchText } from "./search-redact.js";
+import { cleanSearchText, safeIdentifier } from "./search-redact.js";
 import { buildCheckPermissionsPayload } from "./check-permissions.js";
 import {
   checkForUpdates,
@@ -403,22 +404,32 @@ async function renderPageRead(
   const truncation = origLen > effectiveMax ? { origLen } : undefined;
   const capped = truncation ? truncateStorageFormat(body, effectiveMax) : body;
 
+  // Only a COMPLETE body read settles the mark left by a write whose outcome
+  // was unknown: a truncated body may hide exactly the part that write added.
+  // Headings-only and section reads (above) never settle it. When a mark is
+  // cleared the agent is told, in server-authored text outside the fence.
+  const settleNote = truncation === undefined ? settleOutcomeUnknown(page) : undefined;
+  const withNote = (text: string): string =>
+    settleNote === undefined ? text : `${text}\n\n${settleNote}`;
+
   if (format === "markdown") {
     const { markdown, sidecar } = storageToMarkdown(capped);
     return toolResult(
-      await renderBodyResult(page, formatMarkdownBody(markdown, sidecar, "page"), {
-        kind: "markdown",
-        truncation,
-      })
+      withNote(
+        await renderBodyResult(page, formatMarkdownBody(markdown, sidecar, "page"), {
+          kind: "markdown",
+          truncation,
+        })
+      )
     );
   }
 
   if (body.length === 0) {
     // Nothing to fence; formatPage omits the Content block for an empty body.
-    return toolResult(await formatPage(page, { includeBody: true }));
+    return toolResult(withNote(await formatPage(page, { includeBody: true })));
   }
   return toolResult(
-    await renderBodyResult(page, capped, { kind: "storage", truncation })
+    withNote(await renderBodyResult(page, capped, { kind: "storage", truncation }))
   );
 }
 
@@ -2864,7 +2875,9 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     "search_pages",
     {
       description: withUntrustedNote(
-        "Search Confluence pages using CQL (Confluence Query Language)"
+        "Search Confluence pages using CQL (Confluence Query Language). " +
+          "A profile's read_spaces (and read_spaces_enforced) scope this tool only; " +
+          "get_page, list_pages and the other read tools are not restricted by them."
       ),
       inputSchema: {
         cql: z
@@ -2935,14 +2948,15 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (scopeNote !== undefined) lines.push(scopeNote);
         lines.push("");
         for (const p of results) {
-          // T5: one fence per result (title, excerpt and metadata together),
-          // so the canary appears once per result, not once per field.
+          // T5: one fence per result (title and excerpt together), so the
+          // canary appears once per result, not once per field. The ID and
+          // Space are server-authored identifiers and stay OUTSIDE the fence,
+          // on their own line: inside it, tenant text could imitate them and
+          // make a fake hit that looks like a real one. Title and excerpt are
+          // collapsed to one line each for the same reason.
           const spaceKey = p.spaceId ?? p.space?.key ?? "N/A";
-          const block = [
-            `ID: ${p.id}`,
-            `Space: ${spaceKey}`,
-            `Title: ${cleanSearchText(p.title, readScope.redactor)}`,
-          ];
+          lines.push(`- ID: ${safeIdentifier(p.id)}, Space: ${safeIdentifier(spaceKey)}`);
+          const block = [`Title: ${cleanSearchText(p.title, readScope.redactor)}`];
           if (excerpts !== false && p.excerpt) {
             block.push(`Excerpt: ${cleanSearchText(p.excerpt, readScope.redactor)}`);
           }
