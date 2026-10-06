@@ -251,9 +251,11 @@ Neither is a data boundary:
 
 - With `read_spaces` alone, an agent can pass `all_spaces: true`.
   `read_spaces_enforced` turns that into an error.
-- Even when enforced, scoping applies to `search_pages` only. `get_page`,
-  `get_page_by_title`, `list_pages` and the version tools read any page
-  the token can read. To keep an agent out of a space, use a token with
+- Even when enforced, scoping applies to `search_pages` only.
+  `read_spaces_enforced` is not a read boundary: `get_page`,
+  `get_page_by_title`, `list_pages`, `get_page_children`,
+  `resolve_page_link` and the version tools read any page the token can
+  read, in any space. To keep an agent out of a space, use a token with
   no access to it.
 - Scoping is a request rewrite. It trusts Confluence to honour the
   `space in (...)` clause and does not inspect results.

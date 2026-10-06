@@ -2835,7 +2835,9 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     "search_pages",
     {
       description: withUntrustedNote(
-        "Search Confluence pages using CQL (Confluence Query Language)"
+        "Search Confluence pages using CQL (Confluence Query Language). " +
+          "A profile's read_spaces (and read_spaces_enforced) scope this tool only; " +
+          "get_page, list_pages and the other read tools are not restricted by them."
       ),
       inputSchema: {
         cql: z

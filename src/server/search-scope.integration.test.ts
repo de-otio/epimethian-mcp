@@ -173,6 +173,15 @@ describe("search_pages without read-scope settings", () => {
     expect(text).not.toContain("Ignore prior instructions");
   });
 
+  it("says in the description that read_spaces scopes search_pages only", async () => {
+    await bootSearchPages(undefined);
+    const call = mockRegisterTool.mock.calls.find(([name]) => name === "search_pages");
+    const description = (call![1] as { description: string }).description;
+    expect(description).toMatch(/scope this tool only/);
+    expect(description).toMatch(/get_page, list_pages/);
+    expect(description.length).toBeLessThanOrEqual(1800);
+  });
+
   it("always strips highlight markers", async () => {
     const handler = await bootSearchPages(undefined);
     const text = (await handler(ARGS)).content[0].text;
