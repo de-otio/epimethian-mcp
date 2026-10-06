@@ -908,6 +908,40 @@ export async function resolveSpaceId(spaceKey: string): Promise<string> {
   return space.id;
 }
 
+// Space id -> key lookups, scoped by tenant URL so a process that is ever
+// pointed at a second tenant cannot answer from the first one's cache. Space
+// keys are immutable in Confluence Cloud, so entries never expire. Only hits
+// are cached: a failed lookup is retried on the next call.
+const spaceKeyCache = new Map<string, string>();
+
+/**
+ * Resolve a v2 numeric space id to its space key (`GET /spaces/{id}`).
+ *
+ * v2 page objects carry `spaceId` (a numeric string), never the key, so
+ * callers that compare against key-based configuration (the `spaces`
+ * allowlist) must resolve through this. Returns undefined when the id is not
+ * numeric or the response has no key; API errors propagate so callers fail
+ * closed.
+ */
+export async function getSpaceKeyById(spaceId: string): Promise<string | undefined> {
+  // Ids are interpolated into the request path; accept only what the API issues.
+  if (!/^\d+$/.test(spaceId)) return undefined;
+  const cfg = await getConfig();
+  const cacheKey = `${cfg.url}\u0000${spaceId}`;
+  const cached = spaceKeyCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const raw = await v2Get(`/spaces/${spaceId}`);
+  const space = z.object({ key: z.string() }).parse(raw);
+  if (space.key === "") return undefined;
+  spaceKeyCache.set(cacheKey, space.key);
+  return space.key;
+}
+
+/** Testing only. */
+export function _resetSpaceKeyCacheForTests(): void {
+  spaceKeyCache.clear();
+}
+
 export async function getPage(
   pageId: string,
   includeBody: boolean

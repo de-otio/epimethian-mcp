@@ -23,7 +23,7 @@
  *   §8.2
  */
 
-import { getPage } from "./confluence-client.js";
+import { getPage, getSpaceKeyById } from "./confluence-client.js";
 import type { Config } from "./confluence-client.js";
 
 /** Error code thrown when a tool targets a space outside the allowlist. */
@@ -87,8 +87,9 @@ export const pageSpaceCache = new PageSpaceCache();
  * Resolve the space key for a given page ID, using the cache on a hit
  * and falling back to a metadata `getPage(..., false)` call otherwise.
  *
- * The returned space key is the canonical form Confluence stores — the
- * caller should not mutate it before comparing against the allowlist.
+ * The returned value is always a space KEY (never a v2 numeric space id) in
+ * the canonical form Confluence stores — the caller should not mutate it
+ * before comparing against the allowlist.
  *
  * Throws whatever `getPage` throws on network / auth errors; the caller
  * surfaces the error to the agent as-is (space check fails closed).
@@ -97,11 +98,14 @@ export async function resolvePageSpace(pageId: string): Promise<string | undefin
   const cached = pageSpaceCache.get(pageId);
   if (cached !== undefined) return cached;
   const page = await getPage(pageId, false);
-  // The v2 API returns `spaceId` on page objects; the v1 search API returns
-  // `space.key`. `getPage` uses v2, so consult `spaceId` first. We store
-  // whichever key the API actually returned — the allowlist comparison
-  // expects callers to use whichever form their tenant uses consistently.
-  const spaceKey = page.spaceId ?? page.space?.key;
+  // The v2 API returns `spaceId` on page objects: a NUMERIC id such as
+  // "98765", not the key. The allowlist holds keys ("DOCS"), so the id must
+  // be resolved to its key (cached per tenant) before comparing. The v1 shape
+  // carries `space.key` directly, so it is used as-is when present. An id
+  // that cannot be resolved yields undefined and the caller fails closed.
+  const spaceKey =
+    page.space?.key ??
+    (page.spaceId !== undefined ? await getSpaceKeyById(page.spaceId) : undefined);
   if (spaceKey !== undefined) {
     pageSpaceCache.set(pageId, spaceKey);
   }

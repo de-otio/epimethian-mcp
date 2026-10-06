@@ -2,6 +2,27 @@ import { z } from "zod";
 import type { ProfileSettings } from "../shared/profiles.js";
 
 /**
+ * Read-scope fields (search scoping and result redaction). Defined once so the
+ * profile validator and the runtime resolver in `read-scope.ts` cannot drift.
+ * Bounds: 100 keys / patterns at most; patterns are literal strings.
+ */
+export const readScopeShape = {
+  read_spaces: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(255)
+        // No control characters: keys are spliced into a CQL string literal.
+        .regex(/^[^\u0000-\u001F\u007F]+$/u, "contains control characters"),
+    )
+    .max(100)
+    .optional(),
+  read_spaces_enforced: z.boolean().optional(),
+  redact_patterns: z.array(z.string().min(1).max(200)).max(100).optional(),
+};
+
+/**
  * Zod validation schema for the new fields introduced by designs #13 and #14.
  * This is a runtime validator for user-supplied settings — the TypeScript
  * type source-of-truth is still `ProfileSettings` in `../shared/profiles.ts`.
@@ -20,6 +41,7 @@ export const ProfileSettingsValidator = z
     allowed_tools: z.array(z.string()).optional(),
     denied_tools: z.array(z.string()).optional(),
     spaces: z.array(z.string()).optional(),
+    ...readScopeShape,
   })
   .strict();
 

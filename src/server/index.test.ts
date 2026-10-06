@@ -97,6 +97,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
   }
   return {
     resolveSpaceId: vi.fn(),
+    getSpaceKeyById: vi.fn(),
     getPage: vi.fn(),
     _rawCreatePage: vi.fn(),
     _rawUpdatePage: vi.fn(),

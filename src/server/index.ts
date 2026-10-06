@@ -117,6 +117,9 @@ import { tokeniseStorage } from "./converter/tokeniser.js";
 import { resolveToolFilter } from "./tool-allowlist.js";
 import { getProfileSettings } from "../shared/profiles.js";
 import { assertSpaceAllowed } from "./space-allowlist.js";
+import { resolveReadScope } from "./read-scope.js";
+import { scopeCql } from "./cql-scope.js";
+import { cleanSearchText } from "./search-redact.js";
 import { buildCheckPermissionsPayload } from "./check-permissions.js";
 import {
   checkForUpdates,
@@ -645,6 +648,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
   const allowedSpaces = settings?.spaces;
   const checkSpaceAllowed = (opts: { spaceKey?: string; pageId?: string }) =>
     assertSpaceAllowed({ spaces: allowedSpaces, ...opts });
+
+  // S5: read scoping and result redaction for search_pages. Resolved once;
+  // an invalid combination is reported by search_pages itself rather than
+  // failing server startup.
+  const readScope = resolveReadScope(settings);
 
   // O2: resolve effective posture and emit the startup mode banner.
   // effectivePosture is populated by validateStartup() before registerTools() is called.
@@ -2708,27 +2716,77 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .number()
           .default(25)
           .describe("Maximum results to return (default: 25)"),
+        all_spaces: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Search every space instead of the profile's read_spaces. Rejected when the profile enforces read_spaces."
+          ),
+        excerpts: z
+          .boolean()
+          .default(true)
+          .describe("Include result excerpts (default: true). Set false for titles only."),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ cql, limit }) => {
+    async ({ cql, limit, all_spaces, excerpts }) => {
       try {
-        const results = await searchPages(cql, limit);
-        if (results.length === 0) {
-          return toolResult("No pages found matching the query.");
-        }
-        const lines = [`Found ${results.length} page(s):`, ""];
-        for (const p of results) {
-          const spaceKey = p.spaceId ?? p.space?.key ?? "N/A";
-          lines.push(`- (ID: ${p.id}, space: ${spaceKey})`);
-          lines.push(
-            fenceUntrusted(p.title, { pageId: p.id, field: "title" })
-          );
-          if (p.excerpt) {
-            lines.push(
-              fenceUntrusted(p.excerpt, { pageId: p.id, field: "excerpt" })
-            );
+        if (!readScope.ok) return toolError(new Error(readScope.error));
+
+        let effectiveCql = cql;
+        let scopeNote: string | undefined;
+        const readSpaces = readScope.readSpaces;
+        if (readSpaces !== undefined) {
+          if (all_spaces) {
+            if (readScope.enforced) {
+              return toolError(
+                new Error(
+                  `This profile restricts search to spaces [${readSpaces.join(", ")}] ` +
+                    "(read_spaces_enforced); all_spaces is not permitted."
+                )
+              );
+            }
+          } else {
+            const scoped = scopeCql(cql, readSpaces);
+            if (!scoped.ok) {
+              return toolError(
+                new Error(
+                  `Cannot restrict this query to the profile's read_spaces: ${scoped.reason}.` +
+                    (readScope.enforced ? "" : " Pass all_spaces: true to search every space.")
+                )
+              );
+            }
+            effectiveCql = scoped.cql;
+            scopeNote =
+              `Search is restricted to spaces: ${readSpaces.join(", ")}.` +
+              (readScope.enforced ? "" : " Pass all_spaces: true to search every space.");
           }
+        }
+
+        const results = await searchPages(effectiveCql, limit);
+        if (results.length === 0) {
+          return toolResult(
+            scopeNote === undefined
+              ? "No pages found matching the query."
+              : `No pages found matching the query.\n${scopeNote}`
+          );
+        }
+        const lines = [`Found ${results.length} page(s):`];
+        if (scopeNote !== undefined) lines.push(scopeNote);
+        lines.push("");
+        for (const p of results) {
+          // T5: one fence per result (title, excerpt and metadata together),
+          // so the canary appears once per result, not once per field.
+          const spaceKey = p.spaceId ?? p.space?.key ?? "N/A";
+          const block = [
+            `ID: ${p.id}`,
+            `Space: ${spaceKey}`,
+            `Title: ${cleanSearchText(p.title, readScope.redactor)}`,
+          ];
+          if (excerpts !== false && p.excerpt) {
+            block.push(`Excerpt: ${cleanSearchText(p.excerpt, readScope.redactor)}`);
+          }
+          lines.push(fenceUntrusted(block.join("\n"), { pageId: p.id, field: "title" }));
         }
         return toolResult(lines.join("\n"));
       } catch (err) {
