@@ -365,6 +365,24 @@ describe("C1–C4: success-path — write tools structuredContent conforms to wr
     expect(writeOutputSchema.safeParse(r.structuredContent).success).toBe(true);
   });
 
+  it("C2b: update_page_section find_replace success — structuredContent.kind === 'written' and writeOutputSchema passes", async () => {
+    const handler = registeredTools.get("update_page_section")!.handler;
+
+    process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES = "true";
+
+    const r = await handler({
+      page_id: DEFAULT_PAGE_ID,
+      version: 7,
+      section: DEFAULT_SECTION,
+      find_replace: [{ find: "Existing", replace: "Revised" }],
+    });
+
+    expect(r.isError).toBeUndefined();
+    expect(r.structuredContent).toBeDefined();
+    expect(r.structuredContent.kind).toBe("written");
+    expect(writeOutputSchema.safeParse(r.structuredContent).success).toBe(true);
+  });
+
   it("C3: append_to_page success — structuredContent.kind === 'written' and writeOutputSchema passes", async () => {
     const handler = registeredTools.get("append_to_page")!.handler;
 
@@ -510,13 +528,31 @@ describe("C6–C10: confirmation-required arm — all five write tools conform t
   it("C7: update_page_section — no confirm_token + confirm_deletions → structuredContent.kind === 'confirmation_required'", async () => {
     const handler = registeredTools.get("update_page_section")!.handler;
 
-    // confirm_deletions triggers the gate in update_page_section.
+    // confirm_deletions triggers the gate in update_page_section. The
+    // schema type is boolean; 7.0.0 prepares the body before the gate, so a
+    // stale itemised list (impossible through the zod schema) would now be
+    // rejected as a mismatch before any token is minted.
     const r = await handler({
       page_id: DEFAULT_PAGE_ID,
       version: 7,
       section: DEFAULT_SECTION,
       body: "<p>New section body</p>",
-      confirm_deletions: ["T0001"],
+      confirm_deletions: true,
+    });
+
+    assertConfirmationRequired(r, "update_page_section");
+  });
+
+  it("C7b: update_page_section find_replace + destructive flag → structuredContent.kind === 'confirmation_required'", async () => {
+    const handler = registeredTools.get("update_page_section")!.handler;
+
+    // 7.0.0: find_replace goes through the same gate as body mode.
+    const r = await handler({
+      page_id: DEFAULT_PAGE_ID,
+      version: 7,
+      section: DEFAULT_SECTION,
+      find_replace: [{ find: "Existing", replace: "Revised" }],
+      confirm_shrinkage: true,
     });
 
     assertConfirmationRequired(r, "update_page_section");

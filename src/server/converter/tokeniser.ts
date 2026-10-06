@@ -62,6 +62,24 @@ export function tokenLiteral(id: string): string {
   return `[[epi:${id}]]`;
 }
 
+/** The prefix every token literal starts with. */
+export const TOKEN_LITERAL_PREFIX = "[[epi:";
+
+/**
+ * Count the `[[epi:` occurrences in a tokenised canonical beyond the one
+ * per sidecar entry that the tokeniser emitted. A non-zero result means the
+ * page's own text (outside any macro) contains placeholder-like literals:
+ * restoring such a canonical would expand the literal into a copy of the
+ * macro and lose the text, so write paths refuse it.
+ */
+export function placeholderLiteralSurplus(
+  canonical: string,
+  sidecar: TokenSidecar
+): number {
+  const occurrences = canonical.split(TOKEN_LITERAL_PREFIX).length - 1;
+  return occurrences - Object.keys(sidecar).length;
+}
+
 /**
  * Decide whether an element should be replaced with a token.
  * Matches any element in the `ac:` or `ri:` namespace, and the

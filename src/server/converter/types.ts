@@ -76,3 +76,9 @@ export const EMPTY_BODY_REJECTED = "EMPTY_BODY_REJECTED";
  * `confirm_*` flag. Matches the security audit's Finding 3 fix (C1).
  */
 export const CONTENT_FLOOR_BREACHED = "CONTENT_FLOOR_BREACHED";
+/**
+ * The page's own text contains `[[epi:` literals, so placeholder restore
+ * would be ambiguous (a literal would expand into a copy of a macro). Token-
+ * aware writes to such a section are refused; storage-format writes work.
+ */
+export const PLACEHOLDER_LITERAL_IN_PAGE = "PLACEHOLDER_LITERAL_IN_PAGE";
