@@ -609,6 +609,48 @@ describe("update_drawio_diagram: refusals before any write", () => {
   });
 });
 
+describe("update_drawio_diagram: the page step is checked before the upload", () => {
+  it("a page body the pre-flight refuses (over 2 MB): nothing is uploaded", async () => {
+    mockGetPage.mockResolvedValue(pageWith(PAGE_BODY + `<p>${"x".repeat(2_000_001)}</p>`));
+    const r = await updateDrawio();
+    expect(r.isError).toBe(true);
+    expect(text(r)).toContain("nothing was uploaded");
+    expectNoWrite();
+  });
+
+  it("a page returned without a body: refused, nothing uploaded", async () => {
+    mockGetPage.mockResolvedValue({ ...pageWith(PAGE_BODY), body: undefined });
+    const r = await updateDrawio();
+    expect(r.isError).toBe(true);
+    expect(text(r)).toContain("without its body");
+    expectNoWrite();
+  });
+
+  it("a write budget with room for the upload but not the page update: nothing is uploaded", async () => {
+    const { writeBudget } = await import("./write-budget.js");
+    writeBudget._resetForTest();
+    process.env.EPIMETHIAN_WRITE_BUDGET_SESSION = "1";
+    try {
+      const r = await updateDrawio();
+      expect(r.isError).toBe(true);
+      expect(text(r)).toMatch(/write budget/i);
+      expectNoWrite();
+    } finally {
+      delete process.env.EPIMETHIAN_WRITE_BUDGET_SESSION;
+      writeBudget._resetForTest();
+    }
+  });
+
+  it("a new diagram whose compressed payload cannot be inflated: refused, nothing uploaded", async () => {
+    const truncated = `<mxfile host="test"><diagram id="d1" name="Page-1">7VxbU+M2FP41eYSxLdlJHgkEtlOYYWB2</diagram></mxfile>`;
+    const r = await updateDrawio({ diagram_xml: truncated });
+    expect(r.isError).toBe(true);
+    expect(text(r)).toContain("could not be read");
+    expect(mockElicitInput).not.toHaveBeenCalled();
+    expectNoWrite();
+  });
+});
+
 describe("update_drawio_diagram: shrinkage guard", () => {
   it("fewer than half the cells: refused without confirm_shrinkage, no upload", async () => {
     const r = await updateDrawio({ diagram_xml: mxfile(4) });
@@ -852,6 +894,27 @@ describe("update_drawio_diagram: page conflicts and partial state", () => {
     expect(r.isError).toBe(true);
     expect(text(r)).toContain("did not report its number");
     expect(mockRawUpdatePage).not.toHaveBeenCalled();
+  });
+
+  it("an upload answer without a version and a failing re-read: the upload is logged and reported, not lost", async () => {
+    mockUploadAttachmentVersion.mockImplementation(async (_p: string, id: string, _d: Buffer, title: string) => ({
+      id,
+      title,
+    }));
+    mockFindAttachmentByName.mockImplementation((pageId: string, filename: string) =>
+      filename === NAME && mockUploadAttachmentVersion.mock.calls.length > 0
+        ? Promise.reject(new Error("network down"))
+        : lookupDiagramOnly(pageId, filename),
+    );
+    const r = await updateDrawio();
+    expect(r.isError).toBe(true);
+    expect(text(r)).toContain("was uploaded");
+    expect(text(r)).toContain("did not report its number");
+    expect(mockUploadAttachmentVersion).toHaveBeenCalledTimes(1);
+    expect(mockRawUpdatePage).not.toHaveBeenCalled();
+    expect(mockLogMutation).toHaveBeenCalledWith(
+      expect.objectContaining({ operation: "update_attachment", attachmentId: ATT_ID, oldAttachmentVersion: 3 }),
+    );
   });
 });
 

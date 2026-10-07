@@ -24,6 +24,26 @@ describe("writeBudget (F4)", () => {
     expect(writeBudget.hourly).toBe(2);
   });
 
+  it("check(n) throws when n more writes would not fit, and consumes nothing", () => {
+    process.env.EPIMETHIAN_WRITE_BUDGET_SESSION = "3";
+    process.env.EPIMETHIAN_WRITE_BUDGET_ROLLING = "100";
+    writeBudget.consume();
+    expect(() => writeBudget.check(2)).not.toThrow();
+    expect(() => writeBudget.check(3)).toThrow(WriteBudgetExceededError);
+    expect(writeBudget.session).toBe(1);
+    writeBudget.consume();
+    writeBudget.consume();
+    expect(() => writeBudget.check(1)).toThrow(WriteBudgetExceededError);
+  });
+
+  it("check(n) applies to the rolling window too", () => {
+    process.env.EPIMETHIAN_WRITE_BUDGET_SESSION = "0";
+    process.env.EPIMETHIAN_WRITE_BUDGET_ROLLING = "2";
+    writeBudget.consume();
+    expect(() => writeBudget.check(1)).not.toThrow();
+    expect(() => writeBudget.check(2)).toThrow(/rolling write budget exhausted/i);
+  });
+
   it("F4: default session budget is 250", () => {
     // Disable rolling so session fires first and we can probe the default
     process.env.EPIMETHIAN_WRITE_BUDGET_ROLLING = "0";

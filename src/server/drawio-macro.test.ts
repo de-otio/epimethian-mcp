@@ -396,6 +396,19 @@ describe("countMxCells", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toMatch(/64 MB/);
   });
+
+  it("the inflate limit is for the whole file: pages under it one by one still add up", () => {
+    // Each page inflates to 3/8 of the limit; three of them exceed it together.
+    const page = deflateRawSync(Buffer.alloc((MAX_INFLATED_DIAGRAM_BYTES / 8) * 3, "a")).toString("base64");
+    const two = countMxCells(`<mxfile><diagram>${page}</diagram><diagram>${page}</diagram></mxfile>`);
+    // "a…" is not valid URI-encoded XML with cells, but it decodes; two fit.
+    expect(two).toEqual({ ok: true, count: 0 });
+    const three = countMxCells(
+      `<mxfile><diagram>${page}</diagram><diagram>${page}</diagram><diagram>${page}</diagram></mxfile>`
+    );
+    expect(three.ok).toBe(false);
+    if (!three.ok) expect(three.reason).toMatch(/64 MB in total/);
+  });
 });
 
 describe("looksLikeDrawioXml", () => {
