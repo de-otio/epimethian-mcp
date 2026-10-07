@@ -38,6 +38,22 @@ destructive intent:
 - `confirm_shrinkage: true` — acknowledge a >50% body-size reduction
 - `confirm_structure_loss: true` — acknowledge a >50% heading-count drop
 
+Two other tools have their own flags of this kind (7.2.0):
+
+- `add_attachment` with `overwrite: true` — replace an existing attachment
+  with a new version. The prompt names the attachment, its current and new
+  version, and the first 16 hex characters of the new file's SHA-256.
+- `update_drawio_diagram` with `confirm_shrinkage: true` — acknowledge that
+  the new diagram has under half the cells of the current one. The prompt
+  shows both cell counts. This tool also rejects
+  `source: chained_tool_output` even without the flag.
+
+Both go through the same `source` check and the same soft-confirmation token
+flow as `update_page`. For `add_attachment`, the token is bound to the
+attachment, its current version and the exact bytes; for
+`update_drawio_diagram`, to the page version, the attachment version and the
+exact XML.
+
 When destructive flags are set, the `source` parameter records where the flag
 originated: `user_request` (the user's direct instruction), `file_or_cli_input`
 (from local files), `elicitation_response` (from a confirmed interactive prompt),

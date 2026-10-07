@@ -791,7 +791,8 @@ depend on them. The exact table is pinned in `tool-surface.test.ts`. Points that
 surprise people:
 
 - Writes that can remove content (`update_page`, `update_page_section`,
-  `update_page_sections`, `add_drawio_diagram`, `set_page_status`,
+  `update_page_sections`, `add_drawio_diagram`, `update_drawio_diagram`,
+  `set_page_status`,
   `remove_page_status`, `remove_label`) declare `destructiveHint: true`, even
   though the flag-gated path asks for confirmation first.
 - `download_attachment` declares `readOnlyHint: false, destructiveHint: true`:
@@ -811,7 +812,38 @@ established whether MCP clients truncate long parameter descriptions in the
 tool schema, or at what length. Until that is measured, parameter descriptions
 are kept short and the rules that matter live in the tool description.
 
-## Available Tools (38)
+## Revise an existing draw.io diagram (7.2.0)
+
+`add_attachment` and `add_drawio_diagram` only create: if the page already has
+an attachment with that name, Confluence refuses. To change a diagram that is
+already on a page:
+
+1. `get_attachments` with the page ID. Note the diagram's exact name (for
+   example `example.drawio`) and its version (`v3`).
+2. `download_attachment` to save the current XML under the working directory,
+   then edit it.
+3. `update_drawio_diagram` with `page_id`, `diagram_name` (exact and
+   case-sensitive; `.drawio` is not appended), the new XML as `diagram_xml` or
+   `file_path`, and `expected_version` set to the version from step 1. The
+   tool uploads the XML as the next attachment version, then raises the
+   `revision` of every draw.io macro on that page that shows the diagram, in
+   one page version.
+
+The tool never creates a diagram: if no attachment has that name it refuses
+(use `add_drawio_diagram`). It also refuses diagrams saved in the draw.io
+editor (a `<name>.png` preview next to the attachment, or a macro bound to a
+draw.io content object); edit those in the editor. If the new XML has under
+half the cells of the current version, it refuses unless the user expects that
+and you pass `confirm_shrinkage: true`. A draw.io embed of the diagram on
+another page (`inc-drawio`) may keep showing the old version until the diagram
+is next saved in the editor.
+
+For a file that is not a diagram (a PDF, a spreadsheet), use `add_attachment`
+with `overwrite: true`. It uploads a new version of the attachment with that
+exact name and asks the user to confirm. Pass `expected_version` as above so a
+newer upload by someone else is not replaced unseen.
+
+## Available Tools (39)
 
 | Tool | Description |
 |------|-------------|
@@ -831,10 +863,11 @@ are kept short and the rules that matter live in the tool description.
 | `get_page_children` | Get child pages of a page |
 | `search_pages` | Search pages using CQL (Confluence Query Language); shows last-modified time, version and last editor |
 | `get_spaces` | List available Confluence spaces |
-| `add_attachment` | Upload a file attachment to a page |
-| `get_attachments` | List attachments on a page |
+| `add_attachment` | Upload a file attachment to a page (`overwrite: true` uploads a new version of an existing one) |
+| `get_attachments` | List attachments on a page, with each attachment's version |
 | `download_attachment` | Download an attachment to a local file under the working directory, outside dot-directories (does not modify Confluence, so it works in read-only profiles; the bytes are not returned inline) |
 | `add_drawio_diagram` | Add a draw.io diagram to a page |
+| `update_drawio_diagram` | Replace an existing draw.io diagram in place (new attachment version, macro revision raised) |
 | `get_labels` | Get all labels on a Confluence page |
 | `add_label` | Add one or more labels to a Confluence page |
 | `remove_label` | Remove a label from a Confluence page |

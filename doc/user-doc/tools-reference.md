@@ -1,10 +1,10 @@
 # Tools Reference
 
-The Epimethian MCP server provides **38 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
+The Epimethian MCP server provides **39 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
 
 _Last updated: 2026-10-06 — v7.1.0_
 
-Every tool declares a title and the annotation hints `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`. The hints are advisory; the server's own guards never depend on them. `update_page`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `revert_page`, `download_attachment`, `remove_label`, `set_page_status`, `remove_page_status` and `upgrade` declare `destructiveHint: true`. `delete_page`, `revert_page`, `delete_comment`, `authorise_destructive_writes` and `upgrade` also set `_meta["anthropic/requiresUserInteraction"]`, so Claude Code asks for approval on every call.
+Every tool declares a title and the annotation hints `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`. The hints are advisory; the server's own guards never depend on them. `update_page`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `update_drawio_diagram`, `revert_page`, `download_attachment`, `remove_label`, `set_page_status`, `remove_page_status` and `upgrade` declare `destructiveHint: true`. `delete_page`, `revert_page`, `delete_comment`, `authorise_destructive_writes` and `upgrade` also set `_meta["anthropic/requiresUserInteraction"]`, so Claude Code asks for approval on every call.
 
 **Untrusted-content fence.** Text read from Confluence (page bodies, titles, search results, comments) is wrapped in a fence the agent must not treat as instructions. Within the fence, text is Unicode-normalised (NFKC) and zero-width, bidirectional and control characters are removed.
 
@@ -376,14 +376,27 @@ Does **not** accept `version: "current"` — this tool relies on optimistic lock
 
 ### `add_attachment`
 
-Uploads a local file as an attachment to a Confluence page. For security, the file path must resolve to a location under the server's working directory.
+Uploads a local file as an attachment to a Confluence page. By default it only creates: if the page already has an attachment with that name, Confluence refuses, and the error suggests `overwrite: true` or, for a diagram shown on the page, `update_drawio_diagram`. With `overwrite: true` it uploads a new version of the existing attachment instead (the old version stays in Confluence's history, and watchers are notified).
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `page_id` | string | Yes | Numeric page ID |
 | `file_path` | string | Yes | Absolute path to the local file (must be under the working directory) |
-| `filename` | string | No | Name to use for the attachment (defaults to the file's basename) |
+| `filename` | string | No | Name to use for the attachment (defaults to the file's basename). Must not contain control characters. |
 | `comment` | string | No | Comment describing the attachment |
+| `overwrite` | boolean | No | If an attachment with this exact name (case-sensitive) exists, upload a new version of it instead of failing (default: false). Asks the user to confirm. If none exists, a new attachment is created and the result says so. A name that differs only in case is refused. |
+| `expected_version` | number | No | Only with `overwrite: true`. Refuse unless the existing attachment is at this version (from `get_attachments`), so a newer upload by someone else is not replaced unseen. |
+| `source` | string | No | Where the `overwrite` flag came from (`user_request`, `file_or_cli_input`, `elicitation_response`, `chained_tool_output`). `chained_tool_output` is blocked with `overwrite: true`. |
+| `confirm_token` | string | No | Soft-confirmation token from a prior `SOFT_CONFIRMATION_REQUIRED` response. Single-use; bound to this attachment, its current version and the exact bytes. |
+
+The result includes the attachment ID and its version. An overwrite reports `v3 → v4`, the size, and the first 16 hex characters of the file's SHA-256.
+
+**Safety.** The file is read under the same rules as `download_attachment` writes:
+
+- `page_id` must be numeric.
+- The real path (symlinks resolved) must be under the working directory.
+- Any path segment below the working directory that starts with a dot (`.git`, `.claude`, `.env`, ...) is refused, so a file such as `.env` cannot be uploaded.
+- The file is opened with `O_NOFOLLOW` and checked through the open handle: it must be a regular file of at most 10 MB.
 
 ---
 
@@ -396,7 +409,15 @@ Lists attachments on a page.
 | `page_id` | string | Yes | Numeric page ID |
 | `limit` | number | No | Maximum number of attachments to return (default: 25) |
 
-Returns filename, attachment ID, media type, and file size for each attachment.
+Returns filename, attachment ID, version (`v3`), media type, and file size for each attachment. Attachment titles are authored by anyone who can upload to the page, so the list is returned inside an untrusted-content fence.
+
+**Example result text:**
+
+```
+Attachments on page 12345 (1):
+
+- example.drawio (ID: att12345678, v3, application/octet-stream, 12KB)
+```
 
 ---
 
@@ -448,6 +469,8 @@ The result text includes both `attachment_id` and `macro_id` so a follow-up call
 | `after_section` | string | No | Heading text of a section to place the diagram in. The macro is inserted at the **end of that section** (before the next heading) instead of at the end of the page. Takes precedence over `append`. |
 | `return_macro_only` | boolean | No | If true, upload the attachment but **do not modify the page body**; the result returns the draw.io macro storage markup so you can position it yourself with `update_page` / `update_page_section` (default: false). Takes precedence over `after_section` and `append`. The attachment is created regardless; an un-embedded macro leaves it orphaned. |
 
+If the page already has an attachment with that name, Confluence refuses and the error points at `update_drawio_diagram`.
+
 **Placement.** By default the diagram is appended at the end of the page. Use
 `after_section` for one-call placement inside a section, or `return_macro_only`
 when you need exact positioning the other options can't express.
@@ -457,6 +480,55 @@ when you need exact positioning the other options can't express.
 ```
 Diagram "architecture.drawio" added to page My Page (ID: 12345, version: 4, attachment ID: att-abc123, macro ID: uuid-xxx)
 ```
+
+---
+
+### `update_drawio_diagram`
+
+Replaces an existing draw.io diagram on a page, in place. It uploads the new XML as the next version of the diagram's attachment, then raises the pinned `revision` of every `drawio` macro on that page that shows this diagram, so the page renders the new version. All of that happens in one page version, and the rest of the page body is left byte-for-byte unchanged. **Requires the draw.io app to be installed on your Confluence instance.**
+
+The tool never creates a diagram: if the page has no attachment with exactly that name, it refuses (use `add_drawio_diagram` for a new one). It is annotated `destructiveHint: true`, is not registered in read-only profiles, and always rejects `source: chained_tool_output`.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `page_id` | string | Yes | Numeric page ID that holds the diagram attachment |
+| `diagram_name` | string | Yes | Exact attachment name as `get_attachments` lists it (e.g., `example.drawio`). Case-sensitive. `.drawio` is **not** appended. |
+| `diagram_xml` | string | One of | The new diagram in mxGraph XML format. Must start with `<mxfile` or `<mxGraphModel`; `<!DOCTYPE` and `<!ENTITY` are rejected. Pass this or `file_path`, not both. |
+| `file_path` | string | One of | Absolute path to a `.drawio` file under the working directory (same rules as `add_attachment`: no dot-paths, regular file, at most 10 MB). Pass this or `diagram_xml`, not both. |
+| `expected_version` | number | No | Refuse unless the diagram attachment is at this version (from `get_attachments`), so a newer upload by someone else is not replaced unseen. |
+| `version_message` | string | No | Comment for the new attachment version and the page version (max 500 characters). Defaults to `Updated diagram: <name> (attachment v<n>)` for the page. |
+| `confirm_shrinkage` | boolean | No | Set to true only when the user expects the new diagram to have far fewer elements (default: false). Asks the user to confirm. |
+| `source` | string | No | Provenance of the request (`user_request`, `file_or_cli_input`, `elicitation_response`). `chained_tool_output` is always blocked for this tool. |
+| `confirm_token` | string | No | Soft-confirmation token from a prior `SOFT_CONFIRMATION_REQUIRED` response (only used with `confirm_shrinkage`). Single-use. |
+
+**Refused before any write:**
+
+- No attachment has that exact name (the error lists up to 10 diagram names on the page, and says when one differs only in case).
+- `expected_version` does not match the attachment's current version.
+- The diagram was saved in the draw.io editor: the page has a `<diagram_name>.png` preview attachment, or a matching macro carries a `custContentId` or `contentId`. Raising the revision would not refresh what such a diagram shows. Edit those in the draw.io editor.
+- The new XML has fewer than half as many cells as the current version, and `confirm_shrinkage` is not set. If the current version is over 10 MB or either file cannot be read, this check is skipped and the result says so.
+
+**Which macros change.** Only `drawio` macros whose `diagramName` equals `diagram_name` exactly. Macros whose `pageId` names another page are skipped. `inc-drawio` macros are never touched. `contentVer` is raised together with `revision` only when it equalled the old `revision`. If the page's macro already shows the new revision, the page is not modified. If no macro on the page shows the diagram, only the attachment is updated and the result says the page was not modified.
+
+If the page changed while the tool was working, it re-reads the page and recomputes the macro edit once. A second conflict fails with the partial-state message below.
+
+**Partial states.** These never read as "nothing happened":
+
+- Upload outcome unknown (timeout or lost response): the page was not touched. Run `get_attachments` and check whether the diagram is now at the next version before doing anything else.
+- Upload done but the page step failed: the attachment is at the new version and the page still pins the old revision, so it shows the old diagram. Re-run the tool with the same XML (it uploads one more identical version), or set the macro's `revision` with `update_page_section`.
+
+**Limitation.** An `inc-drawio` embed of this diagram on another page may keep showing the old version until the diagram is next saved in the draw.io editor.
+
+**Example result text:**
+
+```
+Diagram "example.drawio" (attachment att12345678) uploaded: v3 → v4, sha256 3f2a9c1b7d4e8a60….
+Cells: 42 → 45.
+Page My Page (ID: 12345) updated to version 7: 1 macro(s) now show revision 4.
+Embeds of this diagram on other pages (inc-drawio) may show the old version until it is next saved in the draw.io editor.
+```
+
+The page also gets the attribution label and the "AI-edited" badge, as with `add_drawio_diagram`.
 
 ---
 

@@ -17,7 +17,7 @@ Every tool carries a `title` and the four hints below (`openWorldHint` is `true`
 | `get_page`, `get_page_by_title`, `search_pages`, `list_pages`, `get_page_children`, `get_spaces`, `get_attachments`, `get_labels`, `get_comments`, `get_page_status`, `get_page_versions`, `get_page_version`, `diff_page_versions`, `get_recent_changes`, `get_version`, `check_permissions`, `lookup_user`, `resolve_page_link` | yes | no | yes |
 | `create_page`, `add_attachment`, `create_comment`, `prepend_to_page`, `append_to_page` | no | no | no |
 | `add_label`, `resolve_comment` | no | no | yes |
-| `update_page`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `revert_page`, `download_attachment`, `authorise_destructive_writes` | no | yes | no |
+| `update_page`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `update_drawio_diagram`, `revert_page`, `download_attachment`, `authorise_destructive_writes` | no | yes | no |
 | `delete_page`, `delete_comment`, `remove_label`, `set_page_status`, `remove_page_status`, `upgrade` | no | yes | yes |
 
 `destructiveHint` is true for any tool that can remove or overwrite content, including a local file (`download_attachment`) or the installed server (`upgrade`). `prepend_to_page` and `append_to_page` only ever add, so they stay non-destructive.
@@ -46,10 +46,11 @@ Every description, measured after the safety wrappers are applied, is at most 1,
 | `get_page_children` | page_id, limit? | Get child pages |
 | `get_spaces` | limit?, type? | List available spaces |
 | `get_page_by_title` | title, space_key, include_body?, headings_only?, section?, max_length?, format? | Look up a page by title within a space |
-| `add_attachment` | page_id, file_path, filename?, comment? | Upload a file attachment to a page. Requires add-attachment permission. |
-| `get_attachments` | page_id, limit? | List attachments on a page |
+| `add_attachment` | page_id, file_path, filename?, comment?, overwrite?, expected_version?, source?, confirm_token? | Upload a file attachment to a page. With `overwrite: true`, upload a new version of the attachment with that exact name (gated). Requires add-attachment permission. |
+| `get_attachments` | page_id, limit? | List attachments on a page, with each attachment's version |
 | `download_attachment` | attachment_id, output_path?, overwrite? | Download an attachment's bytes to a local file under the working directory and return the path. Read-only against Confluence; no write permission and no write budget consumed. Annotated as destructive because it writes a local file. |
 | `add_drawio_diagram` | page_id, diagram_xml, diagram_name, append? | Add a draw.io diagram to a page (all-in-one). Applies the "AI-edited" provenance badge. Requires write permission. |
+| `update_drawio_diagram` | page_id, diagram_name, diagram_xml?, file_path?, expected_version?, version_message?, confirm_shrinkage?, source?, confirm_token? | Replace an existing draw.io diagram in place: upload a new attachment version, then raise the macro `revision` on the page. Never creates. Requires write permission. |
 | `get_labels` | page_id | Get all labels on a page |
 | `add_label` | page_id, labels | Add one or more labels to a page. Requires edit permission. |
 | `remove_label` | page_id, label | Remove a label from a page. Requires edit permission. |
@@ -148,10 +149,14 @@ Lists available Confluence spaces. Supports filtering by type (`global`, `person
 Looks up a page by its exact title within a space. Returns the same formatted output as `get_page`. Useful when you know the page name but not its numeric ID. Supports the same `headings_only` drill-down pattern as `get_page`, and applies the same default `max_length` cap.
 
 ### add_attachment
-Uploads a local file as an attachment to a Confluence page. Reads the file from the local filesystem and uploads via the v1 attachment API with `X-Atlassian-Token: nocheck` header. **Security:** The file path is resolved and validated to be under `process.cwd()` to prevent exfiltration of files outside the working directory.
+Uploads a local file as an attachment to a Confluence page. Reads the file from the local filesystem and uploads via the v1 attachment API with `X-Atlassian-Token: nocheck` header. The result includes the attachment version. By default it only creates; Confluence's duplicate-name 400 is turned into an error that suggests `overwrite: true` or `update_drawio_diagram`.
+
+With `overwrite: true` the tool looks up the attachment by exact, case-sensitive title (`findAttachmentByName`: the v1 `?filename=` filter plus a local equality check, because the server match is case-insensitive). If it exists, the optional `expected_version` is checked, the user is asked to confirm (soft-confirmation token bound to the attachment id, its current version and the SHA-256 of the bytes), and the bytes are posted to `/child/attachment/{id}/data` with `minorEdit=false` so watchers are notified. If none exists, a new attachment is created. A name that differs only in case is refused. `overwrite` is a destructive flag: `source: chained_tool_output` is blocked. Each replacement is written to the mutation log as `update_attachment`.
+
+**Security:** the upload is an exfiltration channel, so `src/server/upload-file.ts` applies the rules of `download_attachment` in reverse. `page_id` must be numeric. The real path must be under `process.cwd()`, with no dot-directory or dot-file segment below it (`.env`, `.git/config`). The file is opened with `O_NOFOLLOW`, checked with `fstat` on the handle (regular file, at most 10 MB), and read from that handle. The filename must not contain control characters.
 
 ### get_attachments
-Lists attachments on a page with filename, ID, media type, and size.
+Lists attachments on a page with filename, ID, version, media type, and size. The list sits inside an untrusted-content fence, because titles are chosen by whoever uploaded the file.
 
 ### download_attachment
 Fetches an attachment's bytes by attachment ID and writes them to a local file, returning the path. The bytes are never returned inline — attachments are routinely megabytes of binary, and base64 in a tool result would consume the agent's context for no benefit; the agent reads the saved file with its own file tools. Registered in every posture: it is a read against Confluence, so it is not gated by the write guard and does not consume write budget. Its annotations nonetheless say `readOnlyHint: false, destructiveHint: true` (7.0.0), because it writes, and with `overwrite: true` replaces, a local file; annotations are untrusted hints and the server-side rules below are what enforce safety. The asymmetry is deliberate — the tool writes to the *local* filesystem while the read-only posture governs the *remote* side. **Security:** `output_path` is resolved and validated to be under `process.cwd()`; when it is omitted the attachment's own (Confluence-controlled) filename is validated — no separators, no control characters, no `..`, no leading dot — and rejected rather than sanitised; any destination containing a `.`-prefixed path segment below the working directory (`.git`, `.claude`, `.github`, `.vscode`, dot-files) is refused, and files are never created executable (an overwrite clears any execute bits the old file had); the write opens with `O_NOFOLLOW | O_EXCL` so a symlink at the destination is not followed and an existing file is not clobbered unless `overwrite: true`; attachments above a 10 MB ceiling are refused before the body is fetched, with an error naming the actual size.
@@ -164,6 +169,18 @@ All-in-one tool for adding draw.io diagrams. The LLM provides the diagram XML (m
 4. Cleans up the temp file
 
 By default appends the diagram to existing page content (`append: true`). Set `append: false` to replace the page body entirely. Requires the draw.io app to be installed on the Confluence instance. Creates or refreshes the "AI-edited" provenance badge on the page after the diagram is embedded. Configurable via the `unverifiedStatus` profile setting.
+
+### update_drawio_diagram
+Revises a diagram that is already on a page, in place. The LLM provides the new XML (`diagram_xml` or `file_path`, exactly one) and the exact attachment name; the tool:
+1. Checks the XML starts with `<mxfile` or `<mxGraphModel` and has no `<!DOCTYPE` or `<!ENTITY` (the XML is never parsed with an XML parser)
+2. Finds the attachment by exact name and checks `expected_version`; refuses if it does not exist (it never creates)
+3. Refuses editor-saved diagrams before any write: a `<name>.png` preview sibling, or a matching macro with `custContentId` or `contentId`
+4. Runs the shrinkage guard: counts `<mxCell` elements in the current and new XML (inflating a compressed `<diagram>` payload, capped at 64 MB) and refuses when the new count is under half, unless `confirm_shrinkage` is set. That flag is gated like the other destructive flags. An unreadable or over-10 MB current file skips the check with a note
+5. Uploads the XML as the next attachment version (`minorEdit=false`) and takes the returned version as the truth
+6. Calls `bumpDrawioRevision` (`src/server/drawio-macro.ts`) on the page body: for every `drawio` macro whose `diagramName` matches and whose `pageId` is absent or this page, only the text of `revision` (and of `contentVer` when it equalled the old `revision`) is replaced. CDATA sections and comments are masked while scanning. `inc-drawio` is never touched and every other byte of the body is unchanged
+7. Submits the page in one version. On a `ConfluenceConflictError` it re-reads and recomputes once; a second conflict stops with a partial-state message
+
+The tool is always checked with `validateSource`, so `source: chained_tool_output` is blocked regardless of flags (an overwrite needs no flag to be destructive). Partial states are named in the result: an unknown upload outcome leaves the page untouched and points at `get_attachments`; an upload that succeeded followed by a failed page step says the attachment is at vN and the page still pins the old revision. The mutation log records the upload as `update_attachment` (attachment id, old to new version, first 16 hex of the SHA-256, source, outcome) and the page step as `update_drawio_diagram`. Applies the attribution label and the "AI-edited" badge. Limitation: `inc-drawio` embeds on other pages may show the old version until the diagram is next saved in the editor.
 
 ### get_labels
 Returns all labels on a page. Labels are returned as an array of strings. This is a read-only operation and does not require edit permissions.

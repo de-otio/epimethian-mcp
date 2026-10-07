@@ -5,6 +5,81 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.2.0] - 2026-10-07 - update attachments and draw.io diagrams in place
+
+Plan: `plans/update-attachment-and-drawio-in-place.md`.
+
+### Added
+- `update_drawio_diagram` (destructive, write tool, not registered in
+  read-only profiles; GitHub issue #3): replaces an existing draw.io diagram
+  in place. It uploads the XML as the next version of the attachment named
+  `diagram_name` (exact, case-sensitive; `.drawio` is not appended), then
+  raises `revision` (and `contentVer` when it equalled the old revision) in
+  every `drawio` macro on that page that shows the diagram, in one page
+  version. The rest of the body stays byte-identical. Macros pointing at
+  another page are skipped and `inc-drawio` is never touched.
+  Parameters: `page_id`, `diagram_name`, `diagram_xml` or `file_path` (exactly
+  one), `expected_version`, `version_message`, `confirm_shrinkage`, `source`,
+  `confirm_token`.
+- It never creates: no attachment with that exact name means a refusal. It
+  also refuses, before any write, diagrams saved in the draw.io editor (a
+  `<name>.png` preview sibling, or a macro with `custContentId`/`contentId`).
+- Shrinkage guard: new XML with under half the cells of the current version is
+  refused unless `confirm_shrinkage: true`, which asks the user to confirm.
+  The XML must start with `<mxfile` or `<mxGraphModel`; `<!DOCTYPE` and
+  `<!ENTITY` are rejected. On a page version conflict it re-reads and
+  recomputes once.
+- Partial states are spelled out: an unknown upload outcome leaves the page
+  untouched (check `get_attachments`); an upload that succeeded followed by a
+  failed page step says the attachment is at vN and the page still shows the
+  old version (re-run, or use `update_page_section`). `source:
+  chained_tool_output` is always blocked. Embeds of the diagram on other pages
+  (`inc-drawio`) may show the old version until it is next saved in the editor.
+- `add_attachment` gains `overwrite` (default `false`): upload a new version
+  of the existing attachment with that exact name. It asks the user to confirm
+  (soft-confirmation token flow, as the other gated tools) and is blocked with
+  `source: chained_tool_output`. `expected_version` (only with `overwrite`)
+  refuses if someone uploaded since. New `source` and `confirm_token`
+  parameters. The result includes the attachment version.
+- The mutation log records attachment replacements as `update_attachment`
+  (attachment id, old to new version, first 16 hex of the SHA-256, source,
+  outcome) and the page step as `update_drawio_diagram`.
+
+### Changed
+- `get_attachments` shows each attachment's version (`v3`), and the list is
+  now inside an untrusted-content fence, because titles are tenant-authored.
+- The duplicate-name error of `add_attachment` now suggests `overwrite: true`
+  or `update_drawio_diagram`; that of `add_drawio_diagram` points at
+  `update_drawio_diagram`.
+- `add_attachment` is stricter about what it reads: `page_id` must be numeric;
+  `file_path` may not be in a dot-directory or be a dot-file (`.env`,
+  `.git/...`), must be a regular file of at most 10 MB, and is read through
+  `O_NOFOLLOW` with `fstat` on the open handle; `filename` rejects control
+  characters.
+- The server now has 39 tools.
+
+### Fixed
+- `get_version` and the startup banner showed a pending-update record left in
+  the shared state file by another installed version (for example
+  "v6.10.0 → v6.10.1" while running 7.1.0), and the `upgrade` tool would have
+  installed that older release, a downgrade. A record now applies only if it
+  was written by the running version and names a strictly newer semver
+  release; others are cleared, and a stale record no longer suppresses the
+  daily update check.
+
+### Security
+- `add_attachment` could upload any file under the working directory,
+  including `.env` and `.git/config`, read it whole with no size cap, and
+  re-open it by path after the symlink check. Uploads now refuse dot paths,
+  cap at 10 MB, and read from a no-follow handle (see Changed).
+- Replacing an attachment is a destructive flag (`overwrite`) and, for
+  `update_drawio_diagram`, always blocked for `source: chained_tool_output`.
+  New versions are uploaded with `minorEdit=false`, so watchers are notified,
+  and every replacement is mutation-logged.
+- Macro edits mask CDATA sections and comments while scanning, splice only
+  numeric `revision`/`contentVer` values, and never run an XML parser over
+  diagram input. Decompression for the cell count is capped at 64 MB.
+
 ## [7.1.0] - 2026-10-06 - recent-changes report
 
 Plan: `plans/recent-changes-report.md`.
