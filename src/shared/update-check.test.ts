@@ -40,6 +40,7 @@ import {
   checkForUpdates,
   getPendingUpdate,
   clearPendingUpdate,
+  pendingAppliesTo,
   performUpgrade,
 } from "./update-check.js";
 
@@ -134,6 +135,32 @@ describe("classifyUpdate", () => {
 // --- Integration-style tests ---
 
 describe("checkForUpdates", () => {
+  it("does not let a record from another install suppress a fresh check", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({
+        lastCheck: new Date().toISOString(),
+        pendingUpdate: { current: "6.10.0", latest: "6.10.1", type: "patch" },
+      })
+    );
+    mockFetch.mockResolvedValue({ ok: true, json: async () => ({ version: "7.2.0" }) });
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const result = await checkForUpdates("7.1.0");
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ current: "7.1.0", latest: "7.2.0", type: "minor" });
+    stderrSpy.mockRestore();
+  });
+
+  it("does not return a record from another install when the registry is unreachable", async () => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({
+        lastCheck: new Date().toISOString(),
+        pendingUpdate: { current: "6.10.0", latest: "6.10.1", type: "patch" },
+      })
+    );
+    mockFetch.mockResolvedValue({ ok: false });
+    expect(await checkForUpdates("7.1.0")).toBeNull();
+  });
+
   it("skips check when EPIMETHIAN_NO_UPDATE_CHECK is set", async () => {
     process.env.EPIMETHIAN_NO_UPDATE_CHECK = "true";
     const result = await checkForUpdates("5.2.1");
@@ -447,7 +474,7 @@ describe("getPendingUpdate", () => {
     enoent.code = "ENOENT";
     mockReadFile.mockRejectedValue(enoent);
 
-    const result = await getPendingUpdate();
+    const result = await getPendingUpdate("5.2.1");
     expect(result).toBeNull();
   });
 
@@ -455,7 +482,7 @@ describe("getPendingUpdate", () => {
     mockReadFile.mockResolvedValue(
       JSON.stringify({ lastCheck: new Date().toISOString() })
     );
-    const result = await getPendingUpdate();
+    const result = await getPendingUpdate("5.2.1");
     expect(result).toBeNull();
   });
 
@@ -464,8 +491,41 @@ describe("getPendingUpdate", () => {
     mockReadFile.mockResolvedValue(
       JSON.stringify({ lastCheck: new Date().toISOString(), pendingUpdate: pending })
     );
-    const result = await getPendingUpdate();
+    const result = await getPendingUpdate("5.2.1");
     expect(result).toEqual(pending);
+    expect(mockWriteFile).not.toHaveBeenCalled();
+  });
+
+  // Regression: v7.1.0 reported "v6.10.0 → v6.10.1" from a record written by
+  // an older install, and `upgrade` would have installed that older release.
+  it.each([
+    ["written by an older install", { current: "6.10.0", latest: "6.10.1", type: "patch" }],
+    ["written by a newer install", { current: "8.0.0", latest: "8.0.1", type: "patch" }],
+    ["naming an older latest", { current: "5.2.1", latest: "5.2.0", type: "patch" }],
+    ["naming the running version as latest", { current: "5.2.1", latest: "5.2.1", type: "patch" }],
+    ["with a non-semver latest", { current: "5.2.1", latest: "6.0.0 --registry=x", type: "major" }],
+    ["with a missing latest", { current: "5.2.1", type: "major" }],
+  ])("drops and clears a record %s", async (_label, pending) => {
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ lastCheck: "2026-10-01T00:00:00.000Z", pendingUpdate: pending })
+    );
+    const result = await getPendingUpdate("5.2.1");
+    expect(result).toBeNull();
+    const written = JSON.parse(mockWriteFile.mock.calls[0]?.[1] as string);
+    expect(written.pendingUpdate).toBeUndefined();
+    expect(written.lastCheck).toBe("2026-10-01T00:00:00.000Z");
+  });
+});
+
+describe("pendingAppliesTo", () => {
+  it("accepts a record for the running version that names a newer release", () => {
+    expect(pendingAppliesTo({ current: "7.1.0", latest: "7.2.0", type: "minor" }, "7.1.0")).toBe(true);
+  });
+  it("rejects a record for another version", () => {
+    expect(pendingAppliesTo({ current: "6.10.0", latest: "6.10.1", type: "patch" }, "7.1.0")).toBe(false);
+  });
+  it("rejects undefined", () => {
+    expect(pendingAppliesTo(undefined, "7.1.0")).toBe(false);
   });
 });
 

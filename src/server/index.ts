@@ -4846,7 +4846,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     async () => {
       let text = `epimethian-mcp v${__PKG_VERSION__}`;
       try {
-        const pending = await getPendingUpdate();
+        const pending = await getPendingUpdate(__PKG_VERSION__);
         if (pending) {
           if (pending.autoInstalled) {
             text +=
@@ -4887,7 +4887,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     },
     async () => {
       try {
-        const pending = await getPendingUpdate();
+        const pending = await getPendingUpdate(__PKG_VERSION__);
         if (!pending) {
           return toolResult(
             `epimethian-mcp v${__PKG_VERSION__} is already up to date.`
@@ -5019,8 +5019,8 @@ export async function main() {
   // user sees it every startup (not only the first time the daily check
   // runs). Keeps the nag visible under the check-and-notify trust model.
   try {
-    const pending = await getPendingUpdate();
-    if (pending && pending.current === __PKG_VERSION__) {
+    const pending = await getPendingUpdate(__PKG_VERSION__);
+    if (pending) {
       console.error(
         `epimethian-mcp: update available: v${pending.current} → v${pending.latest} (${pending.type}). ` +
           `Run \`epimethian-mcp upgrade\` to install.`

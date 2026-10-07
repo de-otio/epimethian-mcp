@@ -39,7 +39,7 @@ export async function runUpgrade(): Promise<UpgradeResult> {
 
   // Consult cache first — recent check may already have recorded a pending
   // update. If there is one, use it. Otherwise force a fresh check.
-  let pending = await getPendingUpdate();
+  let pending = await getPendingUpdate(currentVersion);
   if (!pending) {
     console.log("Checking npm registry for a newer version…");
     const info = await checkForUpdates(currentVersion);

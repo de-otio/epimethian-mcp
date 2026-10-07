@@ -151,10 +151,46 @@ async function fetchLatestVersion(): Promise<string | null> {
   }
 }
 
-/** Return any cached pending update without performing a new check. */
-export async function getPendingUpdate(): Promise<UpdateInfo | null> {
+/**
+ * True when a stored pending-update record applies to the running version:
+ * it was written by this version, and it names a strictly newer release.
+ *
+ * The state file is shared by every installed copy, so a record written by
+ * an older install survives an upgrade. Without this check, v7.1.0 reported
+ * "v6.10.0 → v6.10.1", and `upgrade` would have installed that older release.
+ */
+export function pendingAppliesTo(
+  pending: UpdateInfo | undefined,
+  runningVersion: string
+): pending is UpdateInfo {
+  if (!pending || typeof pending !== "object") return false;
+  if (pending.current !== runningVersion) return false;
+  const running = parseSemVer(runningVersion);
+  const latest = typeof pending.latest === "string" ? parseSemVer(pending.latest) : null;
+  if (!running || !latest) return false;
+  return classifyUpdate(running, latest) !== null;
+}
+
+/**
+ * Return the cached pending update for the running version, without
+ * performing a new check. A record that does not apply to `runningVersion`
+ * (see `pendingAppliesTo`) is not returned, and is cleared from the file.
+ */
+export async function getPendingUpdate(
+  runningVersion: string
+): Promise<UpdateInfo | null> {
   const state = await readCheckState();
-  return state?.pendingUpdate ?? null;
+  if (!state?.pendingUpdate) return null;
+  if (pendingAppliesTo(state.pendingUpdate, runningVersion)) {
+    return state.pendingUpdate;
+  }
+  try {
+    delete state.pendingUpdate;
+    await writeCheckState(state);
+  } catch {
+    // Best effort: the stale record is ignored either way.
+  }
+  return null;
 }
 
 /** Clear the pending update record (e.g. after a successful upgrade). */
@@ -290,17 +326,23 @@ export async function checkForUpdates(
   try {
     // Throttle: skip if last check was less than 24 h ago
     const state = await readCheckState();
-    if (state?.lastCheck) {
+    const cached = pendingAppliesTo(state?.pendingUpdate, currentVersion)
+      ? state!.pendingUpdate!
+      : null;
+    // A record left by another installed version says nothing about this
+    // one, so it does not count as a recent check.
+    const staleRecord = state?.pendingUpdate !== undefined && cached === null;
+    if (state?.lastCheck && !staleRecord) {
       const elapsed = Date.now() - new Date(state.lastCheck).getTime();
       if (elapsed < ONE_DAY_MS) {
-        return state.pendingUpdate ?? null;
+        return cached;
       }
     }
 
     const latestStr = await fetchLatestVersion();
     if (!latestStr) {
-      // Network error — return whatever we had cached
-      return state?.pendingUpdate ?? null;
+      // Network error — return whatever we had cached for this version
+      return cached;
     }
 
     const current = parseSemVer(currentVersion);
