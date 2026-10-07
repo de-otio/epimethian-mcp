@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `epimethian-mcp upgrade` (and the `upgrade` tool) installed with whichever
+  `npm` was first on PATH. With two npm installations side by side (for
+  example Homebrew's and nvm's), it updated the other one, reported success,
+  and left the copy the MCP client starts on the old version. It now installs
+  into the npm global prefix that holds the running copy (`--prefix`), then
+  reads the installed `package.json` and fails if the version did not change.
+  A copy that is not an npm global install (a source checkout, an npx cache)
+  is refused instead of installing somewhere else.
+
 ## [7.2.0] - 2026-10-07 - update attachments and draw.io diagrams in place
 
 Plan: `plans/update-attachment-and-drawio-in-place.md`.

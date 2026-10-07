@@ -46,13 +46,14 @@
  * See `plans/security-audit-fixes.md` Track A for the full plan.
  */
 
-import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
+import { readFile, writeFile, rename, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { safeOpenRead } from "./safe-fs.js";
+import { globalInstallPrefix, packageDirUnder } from "./install-location.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -257,20 +258,56 @@ export async function verifyNpmProvenance(
  * Verifies npm provenance first (fail closed). On integrity-check failure we
  * throw; callers are responsible for preserving any pending-update record so
  * `get_version` keeps surfacing the pending upgrade to the user.
+ *
+ * The install targets the npm global prefix that holds the running copy
+ * (`--prefix`), not the prefix of whichever `npm` is first on PATH, and is
+ * then checked by reading the installed package.json: with two npm
+ * installations side by side, a bare `npm install -g` reports success while
+ * the copy the MCP client starts stays on the old version.
  */
-export async function performUpgrade(version: string): Promise<string> {
+export async function performUpgrade(
+  version: string,
+  scriptPath: string | undefined = process.argv[1]
+): Promise<string> {
   const integrity = await verifyNpmProvenance(version);
   if (!integrity.ok) {
     throw new Error(
       `Integrity check failed for ${PACKAGE_NAME}@${version}: ${integrity.message}`
     );
   }
+  let script: string | undefined;
+  try {
+    script = scriptPath ? await realpath(scriptPath) : undefined;
+  } catch {
+    script = undefined;
+  }
+  const prefix = script ? globalInstallPrefix(script) : null;
+  if (prefix === null) {
+    throw new Error(
+      `The running copy of epimethian-mcp (${script ?? "unknown location"}) is not an npm global ` +
+        `install, so \`npm install -g\` would not replace it. Nothing was installed. Upgrade it the way ` +
+        `it was installed (for a source checkout: git pull and npm run build).`
+    );
+  }
   const { stdout, stderr } = await execFileAsync(
     "npm",
-    ["install", "-g", `${PACKAGE_NAME}@${version}`],
+    ["install", "-g", "--prefix", prefix, `${PACKAGE_NAME}@${version}`],
     { timeout: 120_000 }
   );
-  return (stdout + stderr).trim();
+  const pkgJson = join(packageDirUnder(prefix), "package.json");
+  let installed: string | undefined;
+  try {
+    installed = (JSON.parse(await readFile(pkgJson, "utf-8")) as { version?: string }).version;
+  } catch {
+    installed = undefined;
+  }
+  if (installed !== version) {
+    throw new Error(
+      `npm reported success, but ${pkgJson} is at ${installed ? `v${installed}` : "an unreadable version"}, ` +
+        `not v${version}. The running copy was not replaced.`
+    );
+  }
+  return [(stdout + stderr).trim(), `Installed into ${packageDirUnder(prefix)}.`].filter(Boolean).join("\n");
 }
 
 /** True if the user has explicitly opted in to patch auto-upgrade. */

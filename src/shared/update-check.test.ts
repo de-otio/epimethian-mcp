@@ -5,6 +5,7 @@ vi.mock("node:fs/promises", () => ({
   writeFile: vi.fn().mockResolvedValue(undefined),
   rename: vi.fn().mockResolvedValue(undefined),
   mkdir: vi.fn().mockResolvedValue(undefined),
+  realpath: vi.fn(async (p: string) => p),
 }));
 
 // E2: readCheckState now goes through safeOpenRead. Bridge to the existing
