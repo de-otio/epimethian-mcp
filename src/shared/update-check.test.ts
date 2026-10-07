@@ -43,6 +43,7 @@ import {
   clearPendingUpdate,
   pendingAppliesTo,
   performUpgrade,
+  checkLatestNow,
 } from "./update-check.js";
 
 const mockReadFile = vi.mocked(readFile);
@@ -554,5 +555,38 @@ describe("clearPendingUpdate", () => {
 
     await clearPendingUpdate();
     expect(mockWriteFile).not.toHaveBeenCalled();
+  });
+});
+
+describe("checkLatestNow (manual upgrade)", () => {
+  it("asks the registry even when the last check was minutes ago", async () => {
+    mockReadFile.mockResolvedValue(JSON.stringify({ lastCheck: new Date().toISOString() }));
+    mockFetch.mockResolvedValue({ ok: true, json: async () => ({ version: "7.3.0" }) });
+    const r = await checkLatestNow("7.2.0");
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(r).toEqual({ status: "available", info: { current: "7.2.0", latest: "7.3.0", type: "minor" } });
+    expect(mockWriteFile).toHaveBeenCalled();
+  });
+
+  it("the same or an older version on npm is up-to-date", async () => {
+    mockFetch.mockResolvedValue({ ok: true, json: async () => ({ version: "7.2.0" }) });
+    expect(await checkLatestNow("7.2.0")).toEqual({ status: "up-to-date", latest: "7.2.0" });
+  });
+
+  it("a network error is unreachable, never up-to-date", async () => {
+    mockFetch.mockRejectedValue(Object.assign(new TypeError("fetch failed"), { cause: { code: "ENOTFOUND" } }));
+    const r = await checkLatestNow("7.2.0");
+    expect(r.status).toBe("unreachable");
+    if (r.status === "unreachable") expect(r.reason).toContain("ENOTFOUND");
+    expect(mockWriteFile).not.toHaveBeenCalled();
+  });
+
+  it("an HTTP error or an answer without a version is unreachable", async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 503 });
+    const a = await checkLatestNow("7.2.0");
+    expect(a.status).toBe("unreachable");
+    if (a.status === "unreachable") expect(a.reason).toContain("503");
+    mockFetch.mockResolvedValue({ ok: true, json: async () => ({}) });
+    expect((await checkLatestNow("7.2.0")).status).toBe("unreachable");
   });
 });

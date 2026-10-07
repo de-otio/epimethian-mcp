@@ -181,6 +181,7 @@ vi.mock("./diff.js", () => ({
 vi.mock("../shared/update-check.js", () => ({
   checkForUpdates: vi.fn().mockResolvedValue(null),
   getPendingUpdate: vi.fn().mockResolvedValue(null),
+  checkLatestNow: vi.fn().mockResolvedValue({ status: "up-to-date", latest: "0.0.0" }),
   clearPendingUpdate: vi.fn().mockResolvedValue(undefined),
   performUpgrade: vi.fn().mockResolvedValue("installed"),
 }));
@@ -3633,21 +3634,20 @@ describe("upgrade tool", () => {
     expect(registeredTools.has("upgrade")).toBe(true);
   });
 
-  it("reports up-to-date when no pending update", async () => {
-    const { getPendingUpdate } = await import("../shared/update-check.js");
-    (getPendingUpdate as any).mockResolvedValueOnce(null);
+  it("reports up-to-date when the registry has nothing newer", async () => {
+    const { checkLatestNow } = await import("../shared/update-check.js");
+    (checkLatestNow as any).mockResolvedValueOnce({ status: "up-to-date", latest: "5.2.1" });
     const handler = registeredTools.get("upgrade")!.handler;
     const result = await handler({});
     expect(result.content[0].text).toContain("already up to date");
   });
 
   it("performs upgrade and reports restart needed", async () => {
-    const { getPendingUpdate, performUpgrade, clearPendingUpdate } =
+    const { checkLatestNow, performUpgrade, clearPendingUpdate } =
       await import("../shared/update-check.js");
-    (getPendingUpdate as any).mockResolvedValueOnce({
-      current: "5.2.1",
-      latest: "6.0.0",
-      type: "major",
+    (checkLatestNow as any).mockResolvedValueOnce({
+      status: "available",
+      info: { current: "5.2.1", latest: "6.0.0", type: "major" },
     });
     (performUpgrade as any).mockResolvedValueOnce("added 1 package");
     const handler = registeredTools.get("upgrade")!.handler;
@@ -3659,12 +3659,11 @@ describe("upgrade tool", () => {
   });
 
   it("returns error on install failure", async () => {
-    const { getPendingUpdate, performUpgrade } =
+    const { checkLatestNow, performUpgrade } =
       await import("../shared/update-check.js");
-    (getPendingUpdate as any).mockResolvedValueOnce({
-      current: "5.2.1",
-      latest: "6.0.0",
-      type: "major",
+    (checkLatestNow as any).mockResolvedValueOnce({
+      status: "available",
+      info: { current: "5.2.1", latest: "6.0.0", type: "major" },
     });
     (performUpgrade as any).mockRejectedValueOnce(new Error("EACCES: permission denied"));
     const handler = registeredTools.get("upgrade")!.handler;

@@ -32,7 +32,8 @@ async function run(): Promise<void> {
     // Non-zero exit on failure so scripts and CI can detect.
     if (
       result.status === "integrity-failed" ||
-      result.status === "install-failed"
+      result.status === "install-failed" ||
+      result.status === "check-failed"
     ) {
       process.exit(1);
     }

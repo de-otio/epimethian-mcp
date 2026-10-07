@@ -9,7 +9,7 @@
  */
 
 import {
-  checkForUpdates,
+  checkLatestNow,
   clearPendingUpdate,
   getPendingUpdate,
   performUpgrade,
@@ -24,6 +24,7 @@ export interface UpgradeResult {
     | "installed"
     | "integrity-failed"
     | "install-failed"
+    | "check-failed"
     | "no-target";
   installed?: string;
   message: string;
@@ -37,33 +38,33 @@ export async function runUpgrade(): Promise<UpgradeResult> {
   const currentVersion = __PKG_VERSION__;
   console.log(`epimethian-mcp upgrade: current version v${currentVersion}`);
 
-  // Consult cache first — recent check may already have recorded a pending
-  // update. If there is one, use it. Otherwise force a fresh check.
-  let pending = await getPendingUpdate(currentVersion);
-  if (!pending) {
-    console.log("Checking npm registry for a newer version…");
-    const info = await checkForUpdates(currentVersion);
-    if (!info) {
-      console.log("Already on the latest version.");
-      return {
-        status: "up-to-date",
-        message: `Already on v${currentVersion}.`,
-      };
-    }
-    pending = info;
-  }
-
-  if (pending.current !== currentVersion) {
-    // Cached pending record is stale (we've since upgraded manually). Clear
-    // and no-op.
-    await clearPendingUpdate();
-    console.log(
-      `Pending record points at v${pending.current}; running version is v${currentVersion}. Cleared stale record.`
-    );
+  // A manual upgrade always asks the registry: the throttle that keeps the
+  // server's startup check quiet must not hide a release published today.
+  console.log("Checking npm registry for a newer version…");
+  const check = await checkLatestNow(currentVersion);
+  let pending;
+  if (check.status === "available") {
+    pending = check.info;
+  } else if (check.status === "up-to-date") {
+    console.log(`Already on the latest version (v${check.latest} on npm).`);
     return {
       status: "up-to-date",
       message: `Already on v${currentVersion}.`,
     };
+  } else {
+    // Unreachable: never report that as "up to date". A pending record from
+    // an earlier check for this version is still a usable target.
+    pending = await getPendingUpdate(currentVersion);
+    if (!pending) {
+      console.error(
+        `Could not check for updates: ${check.reason}. Whether a newer version exists is unknown; try again later.`
+      );
+      return {
+        status: "check-failed",
+        message: check.reason,
+      };
+    }
+    console.log(`Could not reach the registry (${check.reason}); using the update recorded by an earlier check.`);
   }
 
   console.log(

@@ -163,6 +163,7 @@ import {
   getPendingUpdate,
   clearPendingUpdate,
   performUpgrade,
+  checkLatestNow,
   type UpdateInfo,
 } from "../shared/update-check.js";
 
@@ -5535,11 +5536,25 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     },
     async () => {
       try {
-        const pending = await getPendingUpdate(__PKG_VERSION__);
-        if (!pending) {
+        // Ask the registry now: the cached record alone cannot tell "up to
+        // date" from "not checked yet", and a failed check is not "up to date".
+        const check = await checkLatestNow(__PKG_VERSION__);
+        let pending;
+        if (check.status === "available") {
+          pending = check.info;
+        } else if (check.status === "up-to-date") {
           return toolResult(
-            `epimethian-mcp v${__PKG_VERSION__} is already up to date.`
+            `epimethian-mcp v${__PKG_VERSION__} is already up to date (v${check.latest} is the latest on npm).`
           );
+        } else {
+          pending = await getPendingUpdate(__PKG_VERSION__);
+          if (!pending) {
+            return toolError(
+              new Error(
+                `Could not check for updates: ${check.reason}. Whether a newer version exists is unknown; nothing was installed.`
+              )
+            );
+          }
         }
 
         const output = await performUpgrade(pending.latest);

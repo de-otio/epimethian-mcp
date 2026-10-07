@@ -138,18 +138,62 @@ async function writeCheckState(state: UpdateCheckState): Promise<void> {
   await rename(tmpFile, UPDATE_CHECK_FILE);
 }
 
-async function fetchLatestVersion(): Promise<string | null> {
+type LatestLookup = { ok: true; version: string } | { ok: false; reason: string };
+
+async function lookupLatestVersion(): Promise<LatestLookup> {
   try {
     const response = await fetch(NPM_REGISTRY_URL, {
       headers: { Accept: "application/json" },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!response.ok) return null;
+    if (!response.ok) return { ok: false, reason: `the npm registry answered HTTP ${response.status}` };
     const data = (await response.json()) as { version?: string };
-    return typeof data.version === "string" ? data.version : null;
-  } catch {
-    return null; // Network error — silently skip
+    return typeof data.version === "string"
+      ? { ok: true, version: data.version }
+      : { ok: false, reason: "the npm registry's answer had no version" };
+  } catch (err) {
+    const cause = (err as { cause?: { code?: string } })?.cause?.code;
+    return {
+      ok: false,
+      reason: `the npm registry could not be reached (${cause ?? (err instanceof Error ? err.message : String(err))})`,
+    };
   }
+}
+
+async function fetchLatestVersion(): Promise<string | null> {
+  const r = await lookupLatestVersion();
+  return r.ok ? r.version : null; // Network error — silently skip
+}
+
+export type LatestCheck =
+  | { status: "up-to-date"; latest: string }
+  | { status: "available"; info: UpdateInfo }
+  | { status: "unreachable"; reason: string };
+
+/**
+ * Ask the registry now, ignoring the 24-hour throttle, for a manual upgrade.
+ * Unlike checkForUpdates, a registry that cannot be reached is reported as
+ * such, never as "up to date". Records the result in the state file as the
+ * throttled check does; never installs.
+ */
+export async function checkLatestNow(currentVersion: string): Promise<LatestCheck> {
+  const looked = await lookupLatestVersion();
+  if (!looked.ok) return { status: "unreachable", reason: looked.reason };
+  const current = parseSemVer(currentVersion);
+  const latest = parseSemVer(looked.version);
+  if (!current || !latest) {
+    return { status: "unreachable", reason: `the npm registry reported an unparseable version "${looked.version.slice(0, 40)}"` };
+  }
+  const type = classifyUpdate(current, latest);
+  const state: UpdateCheckState = { lastCheck: new Date().toISOString() };
+  if (!type) {
+    await writeCheckState(state).catch(() => undefined);
+    return { status: "up-to-date", latest: looked.version };
+  }
+  const info: UpdateInfo = { current: currentVersion, latest: looked.version, type };
+  state.pendingUpdate = info;
+  await writeCheckState(state).catch(() => undefined);
+  return { status: "available", info };
 }
 
 /**
