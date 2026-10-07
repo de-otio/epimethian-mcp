@@ -3324,6 +3324,9 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         // Security (H2): cwd-confined, no dot paths, O_NOFOLLOW, size cap.
         const file = await readUploadFile(file_path);
         const name = filename ?? basename(file.path);
+        if (CONTROL_CHAR_RE.test(name)) {
+          return toolError(new Error("The file name contains control characters; pass a clean name in filename."));
+        }
 
         if (!overwrite) {
           try {
@@ -3783,7 +3786,13 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         // what the page shows, so refuse before any write.
         const png = await findAttachmentByName(page_id, `${diagram_name}.png`);
         const page = await getPage(page_id, true);
-        const body = page.body?.storage?.value ?? page.body?.value ?? "";
+        const pageBody = page.body?.storage?.value ?? page.body?.value;
+        if (pageBody === undefined) {
+          return toolError(
+            new Error(`Confluence returned page ${page_id} without its body, so its macros cannot be checked. Nothing was uploaded. Try again.`)
+          );
+        }
+        const body = pageBody;
         const pageVersion = page.version?.number ?? 0;
         const shown = findDrawioMacros(body).filter(
           (m) => m.diagramName === diagram_name && (m.pageIdParam === undefined || m.pageIdParam === page_id)
@@ -3814,14 +3823,22 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           );
         }
         const newCount = countMxCells(newXml);
+        if (!newCount.ok) {
+          // The caller controls this input; a truncated compressed <diagram>
+          // is exactly the accident the shrinkage check exists for.
+          return toolError(
+            new Error(
+              `The new diagram could not be read (${newCount.reason}); a compressed <diagram> payload is ` +
+                `probably truncated or corrupt. Nothing was uploaded. Export the diagram again and retry.`
+            )
+          );
+        }
         if (meta.fileSize !== undefined && meta.fileSize > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
           guardNotes.push("shrinkage check skipped: the current diagram is above the 10 MB download limit");
         } else {
           const oldCount = countMxCells((await downloadAttachmentBytes(meta)).toString("utf-8"));
           if (!oldCount.ok) {
             guardNotes.push(`shrinkage check skipped: the current diagram could not be read (${oldCount.reason})`);
-          } else if (!newCount.ok) {
-            guardNotes.push(`shrinkage check skipped: the new diagram could not be read (${newCount.reason})`);
           } else {
             oldCells = oldCount.count;
             newCells = newCount.count;
@@ -3833,6 +3850,26 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
                 SHRINKAGE_NOT_CONFIRMED,
               );
             }
+          }
+        }
+
+        // Dry run of the page step, before the upload: a refusal there
+        // (budget, body pre-flight) would otherwise leave a new attachment
+        // version that the page does not show, and a re-run would only add
+        // another one.
+        const dryRun = bumpDrawioRevision(body, { diagramName: diagram_name, pageId: page_id, newRevision: oldVersion + 1 });
+        writeBudget.check(dryRun.updated > 0 ? 2 : 1);
+        if (dryRun.updated > 0) {
+          try {
+            await safePrepareBody({ body: dryRun.body, currentBody: body, scope: "full" });
+          } catch (err) {
+            if (err instanceof SoftConfirmationRequiredError) throw err;
+            return toolError(
+              new Error(
+                `The page update that would follow the upload would be refused, so nothing was uploaded: ` +
+                  `${err instanceof Error ? err.message : String(err)}`
+              )
+            );
           }
         }
 
@@ -3902,17 +3939,21 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           }
           throw err; // A definite refusal: nothing was uploaded.
         }
-        let newVersion = uploaded.version;
-        if (newVersion === undefined) {
-          newVersion = (await findAttachmentByName(page_id, diagram_name)).exact?.version;
-        }
         logMutation({
           timestamp: new Date().toISOString(),
           operation: "update_attachment",
           pageId: page_id,
           ...logBase,
-          newAttachmentVersion: newVersion,
+          newAttachmentVersion: uploaded.version,
         });
+        let newVersion = uploaded.version;
+        if (newVersion === undefined) {
+          try {
+            newVersion = (await findAttachmentByName(page_id, diagram_name)).exact?.version;
+          } catch {
+            // Fall through to the "uploaded, version unknown" answer below.
+          }
+        }
         if (newVersion === undefined) {
           return toolError(
             new Error(

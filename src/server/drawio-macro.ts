@@ -279,23 +279,26 @@ function countCells(s: string): number {
 const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 
 /** Inflate one compressed `<diagram>` payload: base64, raw deflate, URI-encoded XML. */
-function inflateDiagram(payload: string): { ok: true; xml: string } | { ok: false; reason: string } {
+function inflateDiagram(
+  payload: string,
+  budget: number
+): { ok: true; xml: string; bytes: number } | { ok: false; reason: string } {
   const compact = payload.replace(/\s+/g, "");
   if (compact === "" || compact.length % 4 === 1 || !BASE64_RE.test(compact)) {
     return { ok: false, reason: "compressed diagram could not be decoded" };
   }
   try {
     const inflated = inflateRawSync(Buffer.from(compact, "base64"), {
-      maxOutputLength: MAX_INFLATED_DIAGRAM_BYTES,
+      maxOutputLength: Math.max(1, budget),
     });
-    return { ok: true, xml: decodeURIComponent(inflated.toString("utf8")) };
+    return { ok: true, xml: decodeURIComponent(inflated.toString("utf8")), bytes: inflated.length };
   } catch (err) {
     const code = (err as { code?: string }).code;
     return {
       ok: false,
       reason:
         code === "ERR_BUFFER_TOO_LARGE"
-          ? "compressed diagram exceeds 64 MB when inflated"
+          ? "compressed diagrams exceed 64 MB in total when inflated"
           : "compressed diagram could not be decoded",
     };
   }
@@ -303,10 +306,13 @@ function inflateDiagram(payload: string): { ok: true; xml: string } | { ok: fals
 
 /**
  * Count `<mxCell` elements across the whole file, inflating compressed
- * `<diagram>` pages. Any decode failure is reported, never thrown.
+ * `<diagram>` pages. Any decode failure is reported, never thrown. The
+ * inflate limit is for the whole file, not each page: a tenant-authored file
+ * of many small bombs must not add up to gigabytes.
  */
 export function countMxCells(xml: string): CellCount {
   let total = 0;
+  let inflateBudget = MAX_INFLATED_DIAGRAM_BYTES;
   let pos = 0;
   for (;;) {
     const open = xml.indexOf("<diagram", pos);
@@ -331,8 +337,9 @@ export function countMxCells(xml: string): CellCount {
     if (content.trimStart().startsWith("<")) {
       total += countCells(content);
     } else if (content.trim() !== "") {
-      const res = inflateDiagram(content);
+      const res = inflateDiagram(content, inflateBudget);
       if (!res.ok) return res;
+      inflateBudget -= res.bytes;
       total += countCells(res.xml);
     }
     pos = close + "</diagram>".length;

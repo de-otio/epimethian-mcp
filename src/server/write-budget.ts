@@ -149,6 +149,17 @@ class WriteBudget {
    * any one-shot deprecation warnings to surface in the tool result.
    */
   consume(): void {
+    this.check(1);
+    this.sessionCount += 1;
+    this.rollingTimestamps.push(Date.now());
+  }
+
+  /**
+   * Throw as consume() would if `n` more writes would exceed either budget,
+   * without consuming anything. For a tool that makes several writes, so it
+   * can refuse before the first instead of failing between them.
+   */
+  check(n: number): void {
     const now = Date.now();
     const cutoff = now - WINDOW_MS;
     this.rollingTimestamps = this.rollingTimestamps.filter((ts) => ts >= cutoff);
@@ -157,7 +168,7 @@ class WriteBudget {
     this.refreshDeprecationFlag();
 
     const sessionLimit = this.sessionLimit;
-    if (sessionLimit > 0 && this.sessionCount >= sessionLimit) {
+    if (sessionLimit > 0 && this.sessionCount + n > sessionLimit) {
       throw new WriteBudgetExceededError(
         buildSessionExceededMessage(this.sessionCount, sessionLimit),
         "session",
@@ -167,7 +178,7 @@ class WriteBudget {
     }
 
     const rollingLimit = this.rollingLimit;
-    if (rollingLimit > 0 && this.rollingTimestamps.length >= rollingLimit) {
+    if (rollingLimit > 0 && this.rollingTimestamps.length + n > rollingLimit) {
       const oldest = this.rollingTimestamps[0];
       const waitMs = Math.max(0, oldest + WINDOW_MS - now);
       const waitMin = Math.ceil(waitMs / 60_000);
@@ -187,9 +198,6 @@ class WriteBudget {
         rollingLimit,
       );
     }
-
-    this.sessionCount += 1;
-    this.rollingTimestamps.push(now);
   }
 
   /** Current session counter (for observability). */

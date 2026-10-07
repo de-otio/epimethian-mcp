@@ -16,6 +16,7 @@ import {
 
 declare const __PKG_VERSION__: string;
 import { pageCache } from "./page-cache.js";
+import { writeBudget } from "./write-budget.js";
 import { invalidateForPage } from "./confirmation-tokens.js";
 import {
   Semaphore,
@@ -1949,7 +1950,12 @@ export async function findAttachmentByName(
       `Confluence returned ${exact.length} attachments with the same name on page ${pageId}; refusing to choose one.`
     );
   }
-  return { exact: exact[0] ?? null, near: all.filter((a) => a.title !== filename) };
+  // The server's match is looser than case alone; keep only true case-variants.
+  const folded = filename.toLowerCase();
+  return {
+    exact: exact[0] ?? null,
+    near: all.filter((a) => a.title !== filename && a.title.toLowerCase() === folded),
+  };
 }
 
 const UploadedAttachmentSchema = z.object({
@@ -2007,6 +2013,8 @@ export async function uploadAttachmentVersion(
   if (comment) form.append("comment", comment);
 
   const dataUrl = `${cfg.apiV1}/content/${pageId}/child/attachment/${attachmentId}/data`;
+  // An upload is a write like a page update: it counts against the budget.
+  writeBudget.consume();
   return guardPageSideWrite(pageId, async () => {
     const parsed = parseWriteResponse(
       UploadVersionResultSchema,
@@ -2341,6 +2349,7 @@ export async function uploadAttachment(
   // POST: a transfer-length timeout, the shared permit, and no automatic
   // retry (a repeated upload would add a second copy or version). A failure
   // after the request was sent surfaces as WriteOutcomeUnknownError.
+  writeBudget.consume();
   const data = await guardPageSideWrite(pageId, async () =>
     parseWriteResponse(
       UploadResultSchema,
