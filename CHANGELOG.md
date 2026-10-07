@@ -78,7 +78,17 @@ Plan: `plans/update-attachment-and-drawio-in-place.md`.
   and every replacement is mutation-logged.
 - Macro edits mask CDATA sections and comments while scanning, splice only
   numeric `revision`/`contentVer` values, and never run an XML parser over
-  diagram input. Decompression for the cell count is capped at 64 MB.
+  diagram input. Decompression for the cell count is capped at 64 MB per
+  file (not per page), so a tenant-authored file of many small compressed
+  pages cannot add up to gigabytes.
+- `update_drawio_diagram` checks the page step before it uploads: the page
+  body must be present and pass the usual pre-flight, and the write budget
+  must have room for both writes. A refusal there no longer leaves an
+  uploaded version that the page does not show. New XML whose compressed
+  pages cannot be inflated (for example a truncated payload) is refused
+  rather than skipping the shrinkage check.
+- Attachment uploads (`add_attachment`, `add_drawio_diagram`,
+  `update_drawio_diagram`) now count against the write budget.
 
 ## [7.1.0] - 2026-10-06 - recent-changes report
 

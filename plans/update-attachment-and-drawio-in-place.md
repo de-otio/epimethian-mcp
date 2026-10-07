@@ -4,22 +4,23 @@
 Revised 2026-10-07 after a security review and the read-only part of the
 P0 probe; see "Security review" and "P0 answers".
 
-**Progress (2026-10-07):** implemented and committed locally on `master`
-(45e3535 fix, 231d70b feat, cb2b1ec docs); full suite green (2895 tests),
-build clean, no new type errors. Not yet pushed or released.
+**Progress (2026-10-07):** implemented, reviewed and committed locally on
+`master`; version bumped to 7.2.0. The W6 reviews found no blockers; their
+should-fix items (page step checked before the upload, an unreadable new
+diagram refused, the upload logged before the version re-read, a per-file
+inflate limit, uploads counted against the write budget) are fixed and
+tested. Full suite green (2906 tests), build clean, no new type errors.
+Not yet pushed or released.
 
 Remaining, in order:
-1. Read the final W6 reviews (data-loss/security and test critique); fix any
-   blockers and commit.
-2. `npm version 7.2.0 --no-git-tag-version`, commit `chore(release): 7.2.0`.
-3. With the maintainer's per-invocation OK (public repo):
+1. With the maintainer's per-invocation OK (public repo):
    `git push origin master`, `git push origin v7.2.0` (after `git tag v7.2.0`),
    then `gh release create v7.2.0 --repo de-otio/epimethian-mcp --title
    "7.2.0 - update attachments and draw.io diagrams in place"` with the
    CHANGELOG section as notes. The `publish.yml` workflow publishes to npm.
-4. When npm shows 7.2.0: `epimethian-mcp upgrade`, restart the MCP server,
+2. When npm shows 7.2.0: `epimethian-mcp upgrade`, restart the MCP server,
    and check `get_version`.
-5. Optional, with the maintainer's OK for that run: the E2E checks below
+3. Optional, with the maintainer's OK for that run: the E2E checks below
    (the write questions P0 #3, #4 and #6 are still open).
 
 **Catalyst:** an agent revised an existing draw.io diagram, checked the new
