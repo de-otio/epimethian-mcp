@@ -3788,11 +3788,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         const shown = findDrawioMacros(body).filter(
           (m) => m.diagramName === diagram_name && (m.pageIdParam === undefined || m.pageIdParam === page_id)
         );
-        if (png.exact || shown.some((m) => m.hasCustomContent)) {
+        // Any name the server matched counts: it ignores case, and a preview
+        // saved as ".PNG" is still a preview.
+        const hasPreview = png.exact !== null || png.near.length > 0;
+        if (hasPreview || shown.some((m) => m.hasCustomContent)) {
           return toolError(
             new Error(
               `Diagram "${diagram_name}" on page ${page_id} was saved in the draw.io editor ` +
-                `(${png.exact ? `it has a "${diagram_name}.png" preview` : "its macro is bound to a draw.io content object"}). ` +
+                `(${hasPreview ? `it has a "${diagram_name}.png" preview` : "its macro is bound to a draw.io content object"}). ` +
                 `This tool cannot refresh what such a diagram shows, so nothing was changed. ` +
                 `Open it in the draw.io editor and import the new XML there.`
             )

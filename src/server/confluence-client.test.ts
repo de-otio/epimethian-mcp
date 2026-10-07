@@ -2114,6 +2114,13 @@ describe("findAttachmentByName", () => {
     expect((await findAttachmentByName("123", "a.drawio")).exact).toBeNull();
   });
 
+  it("refuses to call the name absent when a full page of case-variants came back", async () => {
+    global.fetch = mockFetchResponse({
+      results: Array.from({ length: 25 }, (_, i) => ({ id: `att${i}`, title: `A.DRAWIO${"".padEnd(i % 2)}` })),
+    });
+    await expect(findAttachmentByName("123", "a.drawio")).rejects.toThrow(/refusing to decide/);
+  });
+
   it("refuses two exact matches", async () => {
     global.fetch = mockFetchResponse({
       results: [

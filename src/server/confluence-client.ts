@@ -1934,6 +1934,14 @@ export async function findAttachmentByName(
   const raw = await confluenceJson(url.toString());
   const all = AttachmentsResultSchema.parse(raw).results.map(toAttachmentInfo);
   const exact = all.filter((a) => a.title === filename);
+  if (exact.length === 0 && all.length >= 25) {
+    // A full page of case-variants without the exact name: the exact match
+    // could be on a later page, so "absent" cannot be trusted.
+    throw new Error(
+      `Confluence returned ${all.length} attachments whose names match "${filename}" ignoring case; ` +
+        `refusing to decide that the exact name is absent.`
+    );
+  }
   if (exact.length > 1) {
     // Confluence keeps attachment titles unique per page; two exact matches
     // mean the answer cannot be trusted to pick one.

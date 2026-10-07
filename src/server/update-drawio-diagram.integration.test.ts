@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 /**
  * update_drawio_diagram and add_attachment (overwrite) end to end through the
  * real handlers, gates and safe-write pipeline. Only the Confluence client
@@ -375,6 +376,7 @@ describe("update_drawio_diagram: happy path", () => {
       attachmentId: ATT_ID,
       oldAttachmentVersion: 3,
       newAttachmentVersion: 4,
+      attachmentHash: createHash("sha256").update(NEW_XML).digest("hex").slice(0, 16),
     });
   });
 
@@ -530,6 +532,18 @@ describe("update_drawio_diagram: refusals before any write", () => {
     expect(r.isError).toBe(true);
     expect(text(r)).toContain("draw.io editor");
     expect(text(r)).toContain(".png");
+    expectNoWrite();
+  });
+
+  it("a preview whose extension differs in case (.PNG): still refused, nothing written", async () => {
+    mockFindAttachmentByName.mockImplementation((pageId: string, filename: string) =>
+      filename === `${NAME}.png`
+        ? Promise.resolve({ exact: null, near: [{ id: "att5", title: `${NAME}.PNG`, version: 3 }] })
+        : lookupDiagramOnly(pageId, filename),
+    );
+    const r = await updateDrawio();
+    expect(r.isError).toBe(true);
+    expect(text(r)).toContain("draw.io editor");
     expectNoWrite();
   });
 

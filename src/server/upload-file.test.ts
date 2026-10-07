@@ -39,6 +39,17 @@ describe("readUploadFile", () => {
     await expect(readUploadFile(join(outside, "secret.txt"))).rejects.toThrow(/under the working directory/);
   });
 
+  it("refuses a sibling directory whose name merely starts with the working directory's", async () => {
+    const sibling = `${root}-sibling`;
+    await mkdir(sibling);
+    try {
+      await writeFile(join(sibling, "x.txt"), "s");
+      await expect(readUploadFile(join(sibling, "x.txt"))).rejects.toThrow(/under the working directory/);
+    } finally {
+      await rm(sibling, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a symlink that points outside the working directory", async () => {
     await writeFile(join(outside, "secret.txt"), "s");
     await symlink(join(outside, "secret.txt"), join(root, "link.txt"));
