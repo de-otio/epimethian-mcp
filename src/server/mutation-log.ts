@@ -44,7 +44,9 @@ export interface MutationRecord {
     | "prepend_to_page"
     | "append_to_page"
     | "revert_page"
-    | "add_drawio_diagram";
+    | "add_drawio_diagram"
+    | "update_drawio_diagram"
+    | "update_attachment";
   pageId: string;
   oldVersion?: number;
   newVersion?: number;
@@ -93,6 +95,15 @@ export interface MutationRecord {
    */
   outcome?: "unknown";
   error?: string;
+  /**
+   * Attachment uploads that replace an existing file (`update_attachment`,
+   * and the upload step of `update_drawio_diagram`). The hash is the first
+   * 16 hex chars of the SHA-256 of the uploaded bytes; no content is logged.
+   */
+  attachmentId?: string;
+  oldAttachmentVersion?: number;
+  newAttachmentVersion?: number;
+  attachmentHash?: string;
 }
 
 const MAX_LOG_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days

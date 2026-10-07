@@ -13,6 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
+import { tmpdir as osTmpdir } from "node:os";
 import {
   mintToken,
   computeDiffHash,
@@ -111,6 +112,10 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     getPageByTitle: vi.fn(),
     getAttachments: vi.fn(),
     uploadAttachment: vi.fn(),
+    findAttachmentByName: vi.fn(),
+    uploadAttachmentVersion: vi.fn(),
+    WriteOutcomeUnknownError: actual.WriteOutcomeUnknownError,
+    PageOutcomeUnknownError: actual.PageOutcomeUnknownError,
     getAttachmentMetadata: vi.fn(),
     downloadAttachmentBytes: vi.fn(),
     // Real constant, not a magic number: the handler's ceiling check and the
@@ -419,16 +424,42 @@ describe("add_attachment path security", () => {
       fileSize: 100,
     });
 
-    mockReadFile.mockResolvedValueOnce(Buffer.from("data"));
+    // readUploadFile opens the real file (O_NOFOLLOW + fstat), so give it one.
+    const cwd = mkdtempSync(join(osTmpdir(), "add-att-"));
+    writeFileSync(join(cwd, "test.txt"), "data");
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
+    try {
+      const handler = registeredTools.get("add_attachment")!.handler;
+      const result = await handler({
+        page_id: "1",
+        file_path: `${cwd}/test.txt`,
+      });
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain("Attached: test.txt");
+      expect((uploadAttachment as any).mock.lastCall[1].toString()).toBe("data");
+    } finally {
+      cwdSpy.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 
-    const handler = registeredTools.get("add_attachment")!.handler;
-    const cwd = process.cwd();
-    const result = await handler({
-      page_id: "1",
-      file_path: `${cwd}/test.txt`,
-    });
-    expect(result.isError).toBeUndefined();
-    expect(result.content[0].text).toContain("Attached: test.txt");
+  it("refuses a dot-file inside cwd before reading it", async () => {
+    const { uploadAttachment } = await import("./confluence-client.js");
+    (uploadAttachment as any).mockClear();
+    const cwd = mkdtempSync(join(osTmpdir(), "add-att-"));
+    writeFileSync(join(cwd, ".env"), "TOKEN=hunter2-value");
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
+    try {
+      const handler = registeredTools.get("add_attachment")!.handler;
+      const result = await handler({ page_id: "1", file_path: `${cwd}/.env` });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("dot-directory or a dot-file");
+      expect(result.content[0].text).not.toContain("hunter2");
+      expect(uploadAttachment).not.toHaveBeenCalled();
+    } finally {
+      cwdSpy.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -5169,7 +5200,7 @@ describe("Track O2 — Conditional tool registration", () => {
     }
   });
 
-  it("O2-7: WRITE_TOOLS set contains exactly the 18 expected write tools", async () => {
+  it("O2-7: WRITE_TOOLS set contains exactly the 19 expected write tools", async () => {
     const { WRITE_TOOLS } = await import("./index.js");
     const expected = new Set([
       // 7.0.0: always failed in a read-only profile (writeGuard), so it is no
@@ -5177,7 +5208,7 @@ describe("Track O2 — Conditional tool registration", () => {
       "authorise_destructive_writes",
       "create_page", "update_page", "append_to_page", "prepend_to_page",
       "update_page_section", "update_page_sections",
-      "delete_page", "add_drawio_diagram", "revert_page",
+      "delete_page", "add_drawio_diagram", "update_drawio_diagram", "revert_page",
       "add_attachment", "add_label", "remove_label", "create_comment",
       "delete_comment", "resolve_comment", "set_page_status", "remove_page_status",
     ]);
@@ -6657,8 +6688,9 @@ describe("download_attachment in a read-only profile", () => {
     const { WRITE_TOOLS } = await import("./index.js");
     expect(WRITE_TOOLS.has("download_attachment")).toBe(false);
     // Guard the count too: adding it to WRITE_TOOLS would silently unregister
-    // the tool in read-only profiles. (18 = the 17 body/label/comment/status
-    // writers plus authorise_destructive_writes, added in 7.0.0.)
-    expect(WRITE_TOOLS.size).toBe(18);
+    // the tool in read-only profiles. (19 = the 17 body/label/comment/status
+    // writers, authorise_destructive_writes (7.0.0) and update_drawio_diagram
+    // (7.2.0).)
+    expect(WRITE_TOOLS.size).toBe(19);
   });
 });

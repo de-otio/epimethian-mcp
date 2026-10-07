@@ -44,6 +44,7 @@ export const KNOWN_TOOLS = [
   "get_page_by_title",
   "add_attachment",
   "add_drawio_diagram",
+  "update_drawio_diagram",
   "get_attachments",
   "download_attachment",
   "get_labels",

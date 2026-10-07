@@ -615,6 +615,8 @@ export type SpaceData = z.infer<typeof SpaceSchema>;
 const AttachmentSchema = z.object({
   id: z.string(),
   title: z.string(),
+  // Present when the request asks for `expand=version`.
+  version: z.object({ number: z.number().int().positive() }).optional(),
   extensions: z
     .object({
       fileSize: z.number().optional(),
@@ -679,6 +681,7 @@ const UploadResultSchema = z.object({
       z.object({
         title: z.string(),
         id: z.string(),
+        version: z.object({ number: z.number().int().positive() }).optional(),
         extensions: z.object({ fileSize: z.number().optional() }).optional(),
       })
     )
@@ -1865,8 +1868,173 @@ export async function getAttachments(
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/child/attachment`);
   url.searchParams.set("limit", String(limit));
+  url.searchParams.set("expand", "version");
   const raw = await confluenceJson(url.toString());
   return AttachmentsResultSchema.parse(raw).results;
+}
+
+// --- Attachment lookup and new versions ---
+
+/** Confluence page ids are numeric; anything else must not reach a URL path. */
+const PAGE_ID_RE = /^\d{1,20}$/;
+/** Attachment ids are numeric, with an `att` prefix in v1 answers. */
+const ATTACHMENT_ID_RE = /^(att)?\d{1,20}$/;
+
+function assertPageId(pageId: string): void {
+  if (!PAGE_ID_RE.test(pageId)) {
+    throw new Error(`Invalid page id: expected digits only.`);
+  }
+}
+
+export interface AttachmentInfo {
+  id: string;
+  title: string;
+  /** Undefined only when Confluence omitted it despite `expand=version`. */
+  version?: number;
+  fileSize?: number;
+  mediaType?: string;
+}
+
+function toAttachmentInfo(a: AttachmentData): AttachmentInfo {
+  return {
+    id: a.id,
+    title: a.title,
+    version: a.version?.number,
+    fileSize: a.extensions?.fileSize,
+    mediaType: a.extensions?.mediaType,
+  };
+}
+
+export interface AttachmentLookup {
+  /** The attachment whose title equals `filename` exactly, or null. */
+  exact: AttachmentInfo | null;
+  /** Other attachments the server matched (its `filename` filter ignores case). */
+  near: AttachmentInfo[];
+}
+
+/**
+ * Find a page's attachment by its exact title.
+ *
+ * The v1 `filename` filter narrows the search on the server, but it ignores
+ * case (probed live: `Example.drawio` returns `example.drawio`). The title is
+ * therefore compared again here, exactly: an update must never pick a file
+ * the caller did not name. Server matches that differ only in case come back
+ * in `near`, so the caller can say "did you mean".
+ */
+export async function findAttachmentByName(
+  pageId: string,
+  filename: string
+): Promise<AttachmentLookup> {
+  assertPageId(pageId);
+  const cfg = await getConfig();
+  const url = new URL(`${cfg.apiV1}/content/${pageId}/child/attachment`);
+  url.searchParams.set("filename", filename);
+  url.searchParams.set("expand", "version");
+  url.searchParams.set("limit", "25");
+  const raw = await confluenceJson(url.toString());
+  const all = AttachmentsResultSchema.parse(raw).results.map(toAttachmentInfo);
+  const exact = all.filter((a) => a.title === filename);
+  if (exact.length > 1) {
+    // Confluence keeps attachment titles unique per page; two exact matches
+    // mean the answer cannot be trusted to pick one.
+    throw new Error(
+      `Confluence returned ${exact.length} attachments with the same name on page ${pageId}; refusing to choose one.`
+    );
+  }
+  return { exact: exact[0] ?? null, near: all.filter((a) => a.title !== filename) };
+}
+
+const UploadedAttachmentSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  version: z.object({ number: z.number().int().positive() }).optional(),
+  extensions: z.object({ fileSize: z.number().optional() }).optional(),
+});
+
+/**
+ * The `/data` endpoint is documented to answer with the attachment itself;
+ * some deployments wrap it in `{ results: [...] }` like the create endpoint.
+ * Accept either, and require exactly one attachment.
+ */
+const UploadVersionResultSchema = z.union([
+  z.object({ results: z.array(UploadedAttachmentSchema).length(1) }),
+  UploadedAttachmentSchema,
+]);
+
+export interface UploadedVersion {
+  id: string;
+  title: string;
+  /** The version Confluence assigned; undefined when its answer omitted it. */
+  version?: number;
+  fileSize?: number;
+}
+
+/**
+ * Upload new bytes as the next version of an existing attachment.
+ *
+ * Uses `POST /content/{pageId}/child/attachment/{attachmentId}/data`, which is
+ * keyed by attachment id: it can only add a version to that attachment and
+ * can never create a new file, unlike `PUT /child/attachment` (create or
+ * update). `minorEdit=false` keeps the change visible: watchers are notified.
+ *
+ * Never retried. A failure after the request was sent, an unreadable answer,
+ * or an answer about a different attachment is WriteOutcomeUnknownError: the
+ * new version may exist.
+ */
+export async function uploadAttachmentVersion(
+  pageId: string,
+  attachmentId: string,
+  fileData: Buffer | Uint8Array,
+  filename: string,
+  comment?: string
+): Promise<UploadedVersion> {
+  assertPageId(pageId);
+  if (!ATTACHMENT_ID_RE.test(attachmentId)) {
+    throw new Error(`Invalid attachment id: expected digits, optionally prefixed with "att".`);
+  }
+  const cfg = await getConfig();
+  const form = new FormData();
+  form.append("file", new Blob([new Uint8Array(fileData)]), filename);
+  form.append("minorEdit", "false");
+  if (comment) form.append("comment", comment);
+
+  const dataUrl = `${cfg.apiV1}/content/${pageId}/child/attachment/${attachmentId}/data`;
+  return guardPageSideWrite(pageId, async () => {
+    const parsed = parseWriteResponse(
+      UploadVersionResultSchema,
+      await sendGuarded(
+        dataUrl,
+        {
+          method: "POST",
+          headers: {
+            Authorization: cfg.authHeader,
+            "X-Atlassian-Token": "nocheck",
+          },
+          body: form,
+        },
+        "transfer",
+        (res) => res.json() as Promise<unknown>
+      ),
+      "POST",
+      dataUrl
+    );
+    const att = "results" in parsed ? parsed.results[0]! : parsed;
+    const bare = (id: string) => id.replace(/^att/, "");
+    if (bare(att.id) !== bare(attachmentId)) {
+      throw new WriteOutcomeUnknownError(
+        "POST",
+        dataUrl,
+        new Error(`the answer names attachment ${att.id}, not ${attachmentId}`),
+        "response"
+      );
+    }
+    return {
+      id: att.id,
+      title: att.title,
+      version: att.version?.number,
+      fileSize: att.extensions?.fileSize,
+    };
+  });
 }
 
 // --- Attachment download ---
@@ -2154,7 +2322,7 @@ export async function uploadAttachment(
   fileData: Buffer | Uint8Array,
   filename: string,
   comment?: string
-): Promise<{ title: string; id: string; fileSize?: number }> {
+): Promise<{ title: string; id: string; fileSize?: number; version?: number }> {
   // Attachments only available via v1 REST API
   const cfg = await getConfig();
   const form = new FormData();
@@ -2187,7 +2355,12 @@ export async function uploadAttachment(
   );
   const att = data.results[0];
   if (!att) throw new Error("Attachment uploaded but no details returned.");
-  return { title: att.title, id: att.id, fileSize: att.extensions?.fileSize };
+  return {
+    title: att.title,
+    id: att.id,
+    fileSize: att.extensions?.fileSize,
+    version: att.version?.number,
+  };
 }
 
 // --- Attribution ---

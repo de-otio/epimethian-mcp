@@ -40,6 +40,9 @@ import {
   getPageByTitle,
   getAttachments,
   uploadAttachment,
+  findAttachmentByName,
+  uploadAttachmentVersion,
+  WriteOutcomeUnknownError as WOUE_ForAttachments,
   getAttachmentMetadata,
   resolveDownloadUrl,
   downloadAttachmentBytes,
@@ -2058,6 +2061,141 @@ describe("uploadAttachment", () => {
     await expect(
       uploadAttachment("page-1", Buffer.from("data"), "file.txt")
     ).rejects.toThrow("Attachment uploaded but no details returned.");
+  });
+});
+
+describe("getAttachments version", () => {
+  it("asks for the version and returns it", async () => {
+    global.fetch = mockFetchResponse({
+      results: [{ id: "att1", title: "a.drawio", version: { number: 3 } }],
+    });
+    const atts = await getAttachments("123", 10);
+    expect(atts[0].version?.number).toBe(3);
+    const url = new URL((global.fetch as any).mock.calls[0][0] as string);
+    expect(url.searchParams.get("expand")).toBe("version");
+  });
+});
+
+describe("findAttachmentByName", () => {
+  it("encodes the filename and asks for the version", async () => {
+    global.fetch = mockFetchResponse({ results: [] });
+    await findAttachmentByName("123", "my diagram ä&b.drawio");
+    const url = new URL((global.fetch as any).mock.calls[0][0] as string);
+    expect(url.pathname).toBe("/wiki/rest/api/content/123/child/attachment");
+    expect(url.searchParams.get("filename")).toBe("my diagram ä&b.drawio");
+    expect(url.searchParams.get("expand")).toBe("version");
+  });
+
+  it("returns the exact title match with its version", async () => {
+    global.fetch = mockFetchResponse({
+      results: [
+        { id: "att9", title: "a.drawio", version: { number: 4 }, extensions: { fileSize: 10, mediaType: "application/vnd.jgraph.mxfile" } },
+      ],
+    });
+    const r = await findAttachmentByName("123", "a.drawio");
+    expect(r.exact).toEqual({ id: "att9", title: "a.drawio", version: 4, fileSize: 10, mediaType: "application/vnd.jgraph.mxfile" });
+    expect(r.near).toEqual([]);
+  });
+
+  it("never treats a case-only server match as the file", async () => {
+    // The live filter ignores case.
+    global.fetch = mockFetchResponse({
+      results: [{ id: "att9", title: "Example.drawio", version: { number: 2 } }],
+    });
+    const r = await findAttachmentByName("123", "example.drawio");
+    expect(r.exact).toBeNull();
+    expect(r.near.map((a) => a.title)).toEqual(["Example.drawio"]);
+  });
+
+  it("never treats a prefix match as the file", async () => {
+    global.fetch = mockFetchResponse({
+      results: [{ id: "att9", title: "a.drawio.bak", version: { number: 1 } }],
+    });
+    expect((await findAttachmentByName("123", "a.drawio")).exact).toBeNull();
+  });
+
+  it("refuses two exact matches", async () => {
+    global.fetch = mockFetchResponse({
+      results: [
+        { id: "att1", title: "a.drawio" },
+        { id: "att2", title: "a.drawio" },
+      ],
+    });
+    await expect(findAttachmentByName("123", "a.drawio")).rejects.toThrow(/refusing to choose/);
+  });
+
+  it("rejects a page id that is not numeric before any request", async () => {
+    global.fetch = vi.fn();
+    await expect(findAttachmentByName("123/../../x", "a")).rejects.toThrow(/Invalid page id/);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("uploadAttachmentVersion", () => {
+  it("POSTs to the id-keyed data endpoint with minorEdit=false and the comment", async () => {
+    global.fetch = mockFetchResponse({ id: "att9", title: "a.drawio", version: { number: 5 }, extensions: { fileSize: 7 } });
+    const r = await uploadAttachmentVersion("123", "att9", Buffer.from("<mxfile/>"), "a.drawio", "why");
+    expect(r).toEqual({ id: "att9", title: "a.drawio", version: 5, fileSize: 7 });
+    const [url, init] = (global.fetch as any).mock.calls[0];
+    expect(url).toBe(`${API_V1}/content/123/child/attachment/att9/data`);
+    expect(init.method).toBe("POST");
+    expect(init.headers["X-Atlassian-Token"]).toBe("nocheck");
+    const form = init.body as FormData;
+    expect(form.get("minorEdit")).toBe("false");
+    expect(form.get("comment")).toBe("why");
+    expect((form.get("file") as File).name).toBe("a.drawio");
+    expect(await (form.get("file") as Blob).text()).toBe("<mxfile/>");
+  });
+
+  it("accepts the results-wrapped answer", async () => {
+    global.fetch = mockFetchResponse({ results: [{ id: "att9", title: "a.drawio", version: { number: 2 } }] });
+    const r = await uploadAttachmentVersion("123", "att9", Buffer.from("x"), "a.drawio");
+    expect(r.version).toBe(2);
+    const form = (global.fetch as any).mock.calls[0][1].body as FormData;
+    expect(form.get("comment")).toBeNull();
+  });
+
+  it("matches the id with or without the att prefix", async () => {
+    global.fetch = mockFetchResponse({ id: "9", title: "a.drawio", version: { number: 2 } });
+    const r = await uploadAttachmentVersion("123", "att9", Buffer.from("x"), "a.drawio");
+    expect(r.version).toBe(2);
+  });
+
+  it("reports an unknown outcome when the answer names another attachment", async () => {
+    global.fetch = mockFetchResponse({ id: "att10", title: "b.drawio", version: { number: 2 } });
+    await expect(
+      uploadAttachmentVersion("123", "att9", Buffer.from("x"), "a.drawio")
+    ).rejects.toBeInstanceOf(WOUE_ForAttachments);
+  });
+
+  it("reports an unknown outcome when a 2xx answer cannot be parsed", async () => {
+    global.fetch = mockFetchResponse({ unexpected: true });
+    await expect(
+      uploadAttachmentVersion("123", "att9", Buffer.from("x"), "a.drawio")
+    ).rejects.toBeInstanceOf(WOUE_ForAttachments);
+  });
+
+  it("reports an unknown outcome on a transport failure and never retries", async () => {
+    global.fetch = vi.fn().mockRejectedValue(new Error("socket hang up"));
+    await expect(
+      uploadAttachmentVersion("123", "att9", Buffer.from("x"), "a.drawio")
+    ).rejects.toBeInstanceOf(WOUE_ForAttachments);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a 503 on the POST", async () => {
+    global.fetch = mockFetchResponse({ message: "busy" }, 503);
+    await expect(
+      uploadAttachmentVersion("123", "att9", Buffer.from("x"), "a.drawio")
+    ).rejects.toThrow();
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects malformed ids before any request", async () => {
+    global.fetch = vi.fn();
+    await expect(uploadAttachmentVersion("12a", "att9", Buffer.from("x"), "a")).rejects.toThrow(/Invalid page id/);
+    await expect(uploadAttachmentVersion("123", "att9/../1", Buffer.from("x"), "a")).rejects.toThrow(/Invalid attachment id/);
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });
 
