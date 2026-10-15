@@ -68,7 +68,7 @@ Returns title, ID, space, version, URL, and optionally the page content. Page bo
 
 The tools that rewrite a page body accept pages only: `update_page`, `update_page_section`, `update_page_sections`, `prepend_to_page`, `append_to_page`, `revert_page`, `add_drawio_diagram`, `update_drawio_diagram` and `delete_page`. Given a blog post ID, they refuse with an error that names it as a blog post, and nothing is written. To write a blog post, use `create_blog_post` and `update_blog_post` (see [Blog posts](#blog-posts)). `get_page_by_title`, `get_page_version` and `diff_page_versions` do not support blog posts.
 
-`get_labels`, `get_page_status`, `get_attachments` and `get_page_versions` also work with a blog post ID. The label, status and attachment tools and `create_comment` change a blog post as they change a page, with or without a `spaces` allowlist: the allowlist judges a blog post by the space it is in, exactly as it judges a page.
+`get_labels`, `get_page_status`, `get_attachments` and `get_page_versions` also work with a blog post ID. The label, status and attachment tools and `create_comment` change a blog post as they change a page, with or without a `spaces` allowlist: the allowlist judges a blog post by the space it is in, exactly as it judges a page. The label, status and attachment tools also work on a draft; Confluence takes no comments on a draft.
 
 ---
 
@@ -390,6 +390,20 @@ Blog posts have their own two write tools; the page tools do not write them. Cre
 
 Set `publish` only when the user asked for the post to be published. Turning a published post back into a draft is not supported, nor are deleting or reverting a blog post, or section, prepend and append edits to one.
 
+**Preparing a post as a draft.** A post with images can be prepared in full before anyone is notified:
+
+1. `create_blog_post` without `publish` creates the draft (version 1).
+2. `add_attachment` uploads the images to the draft; `get_attachments` lists them.
+3. `update_blog_post` sets the body that references them.
+4. `get_page` reads it back, and the author checks the rendered draft in Confluence.
+5. `update_blog_post` with `publish: true` publishes it, once the user confirms.
+
+**A draft stays at version 1.** Confluence keeps no version history for a draft: every edit of a draft, and its first publish, is written as version 1, and the post is at version 1 once published. Pass `version: 1` (or `"current"`) for a draft. The first edit after publishing makes version 2.
+
+**No concurrency check on a draft.** Because a draft is always at version 1, the `version` check cannot tell that someone else changed the draft since you read it: an update overwrites the current draft body. Read the draft just before updating it. A confirmed publish is still safe: the confirmation covers the exact title and body that will be published, so if the draft changes after the user confirmed, the publish is refused and has to be confirmed again.
+
+**Comments on a draft** are not supported by Confluence. `create_comment` on a draft says so, and nothing is posted. Labels, the page status and attachments work on a draft.
+
 ### `create_blog_post`
 
 Creates a blog post in a space's blog. A blog post has no parent and no position; for a page in the page tree, use `create_page`. Body formats are as for `create_page`.
@@ -417,7 +431,7 @@ Updates a blog post through the same pipeline as `update_page`: the content-safe
 |------|------|----------|-------------|
 | `blog_post_id` | string | Yes | Numeric blog post ID |
 | `title` | string | Yes | Post title (use the title from `get_page` if unchanged) |
-| `version` | number \| `"current"` | Yes | Version from your most recent `get_page` call (as for `update_page`) |
+| `version` | number \| `"current"` | Yes | Version from your most recent `get_page` call (as for `update_page`). A draft is always at version 1. |
 | `body` | string | No | New body — GFM markdown or Confluence storage format. Omit to change only the title; the current body is sent unchanged. |
 | `version_message` | string | No | Version comment |
 | `publish` | boolean | No | Publish a draft (default: false). Always asks the user to confirm. No effect on a post that is already published. |
@@ -425,9 +439,9 @@ Updates a blog post through the same pipeline as `update_page`: the content-safe
 | `allow_raw_html` | boolean | No | Allow raw HTML passthrough inside markdown bodies (default: false). |
 | `confluence_base_url` | string (URL) | No | Override the Confluence base URL used by the link rewriter. |
 | `source` | string | No | As for `update_page`. `chained_tool_output` is refused with `publish: true` or a destructive flag. |
-| `confirm_token` | string | No | Soft-confirmation token from a prior `SOFT_CONFIRMATION_REQUIRED` response. |
+| `confirm_token` | string | No | Soft-confirmation token from a prior `SOFT_CONFIRMATION_REQUIRED` response. Bound to the post, its version, the title, the body and whether the call publishes. |
 
-A draft stays a draft unless `publish: true` is passed. There is no `batch_token` parameter.
+A draft stays a draft unless `publish: true` is passed, and stays at version 1 (see [Blog posts](#blog-posts)). The result reports the version Confluence returned. There is no `batch_token` parameter.
 
 ---
 
