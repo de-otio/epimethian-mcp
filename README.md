@@ -68,7 +68,7 @@ Add to your `.mcp.json` (or equivalent MCP client config):
 
 All credentials (URL, email, token) are read from the OS keychain at startup. **Only the profile name goes in config files.**
 
-For IDE-hosted agents, use the absolute path from `which epimethian-mcp` as the `command` value.
+Prefer the absolute path from `which epimethian-mcp` as the `command` value: your MCP client and your terminal may see different PATHs, and so start different installed copies. See [installation.md](doc/user-doc/installation.md#step-3-configure-your-ai-client).
 
 ## Multi-Tenant Support
 
@@ -353,7 +353,7 @@ Write operations are protected by layered safety guards to prevent accidental co
 - Startup validation verifies credentials, tenant identity (email), and tenant seal (cloudId) before accepting tool calls. Sealed profiles fail closed if the tenant-id endpoint is unreachable.
 - Write operations include a tenant echo so the target is always visible
 - For CI/headless environments, set all three env vars (`CONFLUENCE_URL`, `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN`) — partial combinations are rejected
-- Updates are **check-and-notify** by default. Run `epimethian-mcp upgrade` to install — the CLI verifies the npm provenance attestation first and refuses to install without it. Set `EPIMETHIAN_AUTO_UPGRADE=patches` to opt in to automatic patch installs (same integrity check).
+- Updates are **check-and-notify** by default. Run `epimethian-mcp upgrade` to install — the CLI verifies the npm provenance attestation first and refuses to install without it. An upgrade replaces only the installed copy it runs from; with a second copy installed, `upgrade`, `get_version` and `epimethian-mcp status` list it and print the command that removes it. Set `EPIMETHIAN_AUTO_UPGRADE=patches` to opt in to automatic patch installs (same integrity check).
 
 For a full security & safety evaluation — threat model, defence-in-depth mechanisms, known limitations — see [doc/design/security/](doc/design/security/README.md).
 

@@ -28,6 +28,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version failed with a version conflict.
 - The `update_blog_post` confirmation now covers the title, so a confirmed
   publish cannot go out under a different title.
+- A second installed copy of epimethian-mcp is now visible. With two global
+  copies (one under Homebrew's npm and one under nvm's, say), an upgrade
+  replaced the copy it ran from while the MCP client kept starting the other,
+  and `get_version` went on showing the old version with no clue why. Now:
+  - the server prints the installed copies to stderr at startup, and
+    `get_version` lists them, marking the one the server runs and giving the
+    `npm uninstall -g --prefix <prefix> @de-otio/epimethian-mcp` command for
+    each of the others. Copies are found on PATH and under the usual npm
+    prefixes (Homebrew, `/usr/local`, `/usr`, `~/.npm-global`, every nvm Node
+    version), so a copy missing from the IDE's PATH is still found;
+  - the update notice names the running copy's command by absolute path
+    when there are two or more copies, since a bare `epimethian-mcp upgrade`
+    may upgrade a different one;
+  - `epimethian-mcp upgrade` says which copy it is about to upgrade, and the
+    CLI and the `upgrade` tool list every copy they did not upgrade;
+  - `epimethian-mcp status` starts with the installed copy, or all of them,
+    even when no credentials are configured.
+
+  The installation guide now recommends the absolute path from
+  `which epimethian-mcp` as the MCP config's `command`, and its
+  troubleshooting section covers this case.
 
 ## [7.4.0] - 2026-10-15 - write blog posts
 
