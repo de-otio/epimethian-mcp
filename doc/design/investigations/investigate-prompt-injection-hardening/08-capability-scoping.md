@@ -101,6 +101,17 @@ allowlist set the side writes (labels, status, attachments, comments)
 refused a blog post id, while without one they reached it. They now
 behave the same either way (A3).
 
+Tools that act on a comment by id (`resolve_comment`, `delete_comment`,
+and `create_comment` with `parent_comment_id`) resolve the space
+through the comment: one `GET /{footer,inline}-comments/{id}` for its
+`pageId` or `blogPostId`, following `parentCommentId` for a reply that
+carries neither, then the page-ID resolution above. A comment with no
+page or blog post container is refused. Up to 7.3.0 these tools were
+not gated: with an allowlist set, an agent could resolve, delete or
+reply to a comment in any space it could read, since reads are not
+limited by the allowlist. The lookup only runs when an allowlist is
+set.
+
 ### 8.3 Parent-subtree allowlist
 
 Narrower than per-space: "this profile can only operate on pages

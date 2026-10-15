@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - write blog posts
 
+### Security
+- `resolve_comment`, `delete_comment`, and `create_comment` replies now obey
+  the profile's `spaces` allowlist. Before, with an allowlist set, an agent
+  could resolve or delete a comment in any space it could read, by comment ID,
+  and could reply to one by pairing its ID with an allowed `page_id`. The
+  space is now taken from the page or blog post the comment belongs to, read
+  from the comment and, for a reply, from its parents. A comment whose page
+  cannot be found is refused. Without an allowlist, nothing changes and no
+  extra request is made.
+
 ### Added
 - `create_blog_post` creates a blog post in a space's blog. It makes a
   **draft** by default: nobody is notified, and the result says how to

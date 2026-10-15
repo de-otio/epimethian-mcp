@@ -26,6 +26,7 @@
 
 import {
   ConfluenceNotFoundError,
+  getCommentContainerId,
   getContent,
   getDraftBlogPost,
   getSpaceKeyById,
@@ -195,6 +196,12 @@ export async function assertSpaceAllowed(opts: {
   spaces: readonly string[] | undefined;
   spaceKey?: string;
   pageId?: string;
+  /**
+   * A comment the write acts on (resolve, delete, or reply to). Its space is
+   * the space of the page or blog post it belongs to, found by fetching the
+   * comment. Only fetched when an allowlist is active.
+   */
+  comment?: { id: string; type: "footer" | "inline" };
 }): Promise<void> {
   const filter = resolveSpaceFilter(opts.spaces);
   if (!filter.active) return;
@@ -204,6 +211,9 @@ export async function assertSpaceAllowed(opts: {
     key = opts.spaceKey;
   } else if (opts.pageId !== undefined) {
     key = await resolvePageSpace(opts.pageId);
+  } else if (opts.comment !== undefined) {
+    const containerId = await getCommentContainerId(opts.comment.id, opts.comment.type);
+    key = containerId === undefined ? undefined : await resolvePageSpace(containerId);
   }
 
   if (key === undefined) {
