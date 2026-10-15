@@ -5206,17 +5206,17 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           // A reply is keyed by its parent comment. A new top-level comment
           // names its container, so resolve whether the id is a page or a
           // blog post (A3: side writes on blog posts are allowed).
-          const contentType: ContentType = parent_comment_id
-            ? "page"
-            : await resolveContentType(page_id);
           try {
+            const contentType: ContentType = parent_comment_id
+              ? "page"
+              : await resolveContentType(page_id);
             comment = await createFooterComment(page_id, body, parent_comment_id, contentType);
           } catch (err) {
             // Confluence does not take comments on a blog post draft (probed
             // live: the v2 endpoint looks for a current container only).
             if (
               err instanceof ConfluenceNotFoundError &&
-              contentType === "blogpost" &&
+              !parent_comment_id &&
               (await resolveContainerStatus(page_id).catch(() => "current")) === "draft"
             ) {
               throw new Error(

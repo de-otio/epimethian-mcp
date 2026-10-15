@@ -9,6 +9,10 @@
  *   - A4: add_drawio_diagram reads the page before uploading.
  *   - B: create_blog_post (draft by default, publishing always confirmed) and
  *     update_blog_post (the update_page pipeline against /blogposts).
+ *   - Drafts (7.4.1): the mock answers as Confluence did when probed live.
+ *     v1 attachment and content-state calls on a draft need status=draft
+ *     (and refuse it on published content), a draft PUT must keep version
+ *     1 (also when it publishes), and a draft takes no footer comments.
  *
  * The real confluence-client, safe-write, confirmation-token and elicitation
  * modules run against a stubbed `fetch`. Assertions are on the requests on
@@ -145,6 +149,10 @@ interface Item {
 
 let pages: Map<string, Item>;
 let posts: Map<string, Item>;
+type Att = { id: string; title: string; version: number };
+let attachments: Map<string, Att[]>;
+let states: Map<string, { name: string; color: string }>;
+const isDraft = (id: string) => posts.get(id)?.status === "draft";
 /** Next PUT to /blogposts/{id} answers 409 and bumps the stored version. */
 let conflictOnNextBlogPut = false;
 
@@ -158,6 +166,8 @@ function resetFixtures(): void {
     [DRAFT_ID, { id: DRAFT_ID, title: "Coming soon", spaceId: DOCS_ID, status: "draft", version: 1, body: BODY }],
   ]);
   conflictOnNextBlogPut = false;
+  attachments = new Map();
+  states = new Map();
 }
 
 type Req = { method: string; path: string; query: URLSearchParams; body: unknown };
@@ -193,6 +203,7 @@ const fetchMock = vi.fn(async (input: unknown, init?: { method?: string; body?: 
   } else if (init?.body !== undefined) {
     body = "(form-data)";
   }
+  const upload = init?.body instanceof FormData ? (init.body.get("file") as File | null) : null;
   requests.push({ method, path: url.pathname, query: url.searchParams, body });
   const p = url.pathname.replace(/^\/wiki\/api\/v2/, "v2:").replace(/^\/wiki\/rest\/api/, "v1:");
   const withBody = url.searchParams.has("body-format");
@@ -239,6 +250,15 @@ const fetchMock = vi.fn(async (input: unknown, init?: { method?: string; body?: 
         return json({ message: "Version must be incremented" }, 409);
       }
       const sent = body as { version: { number: number }; title: string; status: string; body?: { value: string } };
+      // A draft has no version history: Confluence wants 1, whether the
+      // PUT keeps it a draft or publishes it (texts as seen live).
+      if (item.status === "draft" && sent.version.number !== 1) {
+        const title =
+          sent.status === "draft"
+            ? `DRAFT blogposts do not support multiple versions. Expected version: [1]. Provided version: [${sent.version.number}]`
+            : `Version number must be 1 when publishing a blogpost for the first time. Provided version: [${sent.version.number}]`;
+        return json({ errors: [{ status: 400, code: "BAD_REQUEST", title, detail: null }] }, 400);
+      }
       item.version = sent.version.number;
       item.title = sent.title;
       item.status = sent.status;
@@ -260,6 +280,10 @@ const fetchMock = vi.fn(async (input: unknown, init?: { method?: string; body?: 
     return json(view(item, false));
   }
   if (p === "v2:/footer-comments" && method === "POST") {
+    const target = (body as { blogPostId?: string }).blogPostId;
+    if (target !== undefined && isDraft(target)) {
+      return json({ errors: [{ status: 404, code: "NOT_FOUND", title: `Could not find container with id [${target}], type [blogpost], and status [current]` }] }, 404);
+    }
     return json({ id: "9100", version: { number: 1 } });
   }
   // Footer comments on blog posts: 9001 on a post in DOCS, 9002 on one in OPS.
@@ -272,14 +296,46 @@ const fetchMock = vi.fn(async (input: unknown, init?: { method?: string; body?: 
     return json({ results: [] });
   }
   if ((m = p.match(/^v1:\/content\/(\d+)\/state$/))) {
-    if (method === "GET") return json({ contentState: null });
+    const id = m[1];
+    const asked = url.searchParams.get("status") ?? "current";
+    if (asked !== (isDraft(id) ? "draft" : "current")) {
+      return json({ statusCode: 404, message: `No content found with id : ${id} and status [${asked}]` }, 404);
+    }
+    if (method === "GET") return json({ contentState: states.get(id) ?? null });
+    if (method === "PUT") states.set(id, body as { name: string; color: string });
+    if (method === "DELETE") states.delete(id);
     return json({});
   }
-  if ((m = p.match(/^v1:\/content\/(\d+)\/child\/attachment$/)) && method === "POST") {
-    return json({ results: [{ id: "att-1", title: "file.txt", version: { number: 1 } }] });
-  }
-  if ((m = p.match(/^v1:\/content\/(\d+)\/child\/attachment$/)) && method === "GET") {
-    return json({ results: [] });
+  if ((m = p.match(/^v1:\/content\/(\d+)\/child\/attachment(?:\/(att\d+)\/data)?$/))) {
+    const id = m[1];
+    const asked = url.searchParams.get("status");
+    const actual = isDraft(id) ? "draft" : "current";
+    const list = attachments.get(id) ?? [];
+    const shape = (a: Att) => ({ id: a.id, title: a.title, version: { number: a.version } });
+    if (method === "GET") {
+      // Asked with the wrong status, the listing answers 200 with nothing.
+      const shown = (asked ?? "current") === actual ? list : [];
+      const name = url.searchParams.get("filename")?.toLowerCase();
+      const hits = name ? shown.filter((a) => a.title.toLowerCase() === name) : shown;
+      return json({ results: hits.map(shape), size: hits.length });
+    }
+    if (method === "POST") {
+      const notFound = () =>
+        json({ statusCode: 404, message: `No content found with id : ContentId{id=${id}} and status [${asked ?? "current"}]` }, 404);
+      if (asked === "draft" && actual === "current") return notFound();
+      if (m[2]) {
+        // New version of an existing attachment (live, this also works on a
+        // draft without status; the client sends it anyway).
+        const att = list.find((a) => a.id === m![2]);
+        if (!att) return notFound();
+        att.version += 1;
+        return json(shape(att));
+      }
+      if ((asked ?? "current") !== actual) return notFound();
+      const att = { id: `att${9000 + list.length}`, title: upload?.name ?? "file.txt", version: 1 };
+      attachments.set(id, [...list, att]);
+      return json({ results: [shape(att)] });
+    }
   }
   if (p === "v1:/settings/lookandfeel" || p.startsWith("v1:/settings")) {
     return json({});
@@ -823,9 +879,25 @@ describe("update_blog_post: drafts and publishing", () => {
     expect(r.text).toContain("still a draft");
     expect(mockElicitInput).not.toHaveBeenCalled();
     expect(requests.some((x) => x.path === v2(`/blogposts/${DRAFT_ID}`) && x.query.get("status") === "draft" && x.query.get("body-format") === "storage")).toBe(true);
-    const put = writes().find((w) => w.method === "PUT");
+    const put = writes().find((w) => w.method === "PUT" && w.path.startsWith(v2("/blogposts")));
     expect(put?.path).toBe(v2(`/blogposts/${DRAFT_ID}`));
-    expect(put?.body).toMatchObject({ status: "draft", version: { number: 2 } });
+    // A draft keeps version 1 (Confluence refuses 2 with a 400).
+    expect(put?.body).toMatchObject({ status: "draft", version: { number: 1 } });
+    expect(r.structured?.new_version).toBe(1);
+    expect(r.text).toContain("version: 1,");
+    // The status badge on a draft is set with status=draft.
+    const badge = writes().find((w) => w.path === v1(`/content/${DRAFT_ID}/state`));
+    if (badge) expect(badge.query.get("status")).toBe("draft");
+  });
+
+  it("a second edit of the same draft also sends version 1", async () => {
+    const one = await updateDraft({ body: BODY.replace("Details", "Draft one") });
+    expect(one.isError, one.text).toBe(false);
+    const two = await updateDraft({ body: BODY.replace("Details", "Draft two") });
+    expect(two.isError, two.text).toBe(false);
+    const puts = writes().filter((w) => w.method === "PUT" && w.path === v2(`/blogposts/${DRAFT_ID}`));
+    expect(puts.map((w) => (w.body as { version: { number: number } }).version.number)).toEqual([1, 1]);
+    expect(posts.get(DRAFT_ID)?.body).toContain("Draft two");
   });
 
   it("publish: true on a draft with no confirmation: SOFT_CONFIRMATION_REQUIRED and no PUT", async () => {
@@ -862,7 +934,23 @@ describe("update_blog_post: drafts and publishing", () => {
     expect(second.text).toContain(`Published blog post: Coming soon (ID: ${DRAFT_ID}`);
     const puts = writes().filter((w) => w.method === "PUT" && w.path === v2(`/blogposts/${DRAFT_ID}`));
     expect(puts).toHaveLength(1);
-    expect(puts[0].body).toMatchObject({ status: "current", version: { number: 2 }, body: { value: BODY } });
+    // The first publish of a draft must also send version 1.
+    expect(puts[0].body).toMatchObject({ status: "current", version: { number: 1 }, body: { value: BODY } });
+    expect(second.structured?.new_version).toBe(1);
+    expect(posts.get(DRAFT_ID)?.status).toBe("current");
+  });
+
+  it("a publish token is refused after the draft body changed (a draft stays at version 1)", async () => {
+    const first = await updateDraft({ publish: true });
+    const token = first.structured?.confirm_token as string;
+    expect(token).toBeTruthy();
+    // Someone edits the draft: the version number cannot tell.
+    posts.get(DRAFT_ID)!.body = BODY.replace("Details", "Changed by someone else");
+    const second = await updateDraft({ publish: true, confirm_token: token });
+    expect(second.isError).toBe(true);
+    expect(second.text).toContain("no longer valid");
+    expect(writes()).toEqual([]);
+    expect(posts.get(DRAFT_ID)?.status).toBe("draft");
   });
 
   it("a publish token does not cover a plain update (and vice versa it is bound to publishing)", async () => {
@@ -881,6 +969,103 @@ describe("update_blog_post: drafts and publishing", () => {
     expect(r.text).toContain("Updated blog post");
     const put = writes().find((w) => w.method === "PUT");
     expect(put?.body).toMatchObject({ status: "current" });
+  });
+});
+
+describe("drafts: attachments, status and comments", () => {
+  beforeAll(async () => {
+    await boot(undefined);
+  });
+
+  const attachmentRequests = () => requests.filter((r) => r.path.includes("/child/attachment"));
+
+  it("add_attachment on a draft uploads with status=draft, and get_attachments lists the file", async () => {
+    const r = await call("add_attachment", { page_id: DRAFT_ID, file_path: "/work/diagram.png", overwrite: false });
+    expect(r.isError, r.text).toBe(false);
+    const post = writes().find((w) => w.path === v1(`/content/${DRAFT_ID}/child/attachment`));
+    expect(post?.method).toBe("POST");
+    expect(post?.query.get("status")).toBe("draft");
+
+    const list = await call("get_attachments", { page_id: DRAFT_ID, limit: 25 });
+    expect(list.isError, list.text).toBe(false);
+    expect(list.text).toContain("diagram.png");
+    const get = requests.filter((x) => x.method === "GET" && x.path === v1(`/content/${DRAFT_ID}/child/attachment`));
+    expect(get.at(-1)?.query.get("status")).toBe("draft");
+  });
+
+  it("add_attachment with overwrite on a draft: the lookup and the new version both carry status=draft", async () => {
+    attachments.set(DRAFT_ID, [{ id: "att501", title: "diagram.png", version: 1 }]);
+    const args = { page_id: DRAFT_ID, file_path: "/work/diagram.png", overwrite: true };
+    const first = await call("add_attachment", args);
+    const token = first.structured?.confirm_token as string | undefined;
+    const r = token ? await call("add_attachment", { ...args, confirm_token: token }) : first;
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("v1 → v2");
+    const lookups = requests.filter((x) => x.method === "GET" && x.path === v1(`/content/${DRAFT_ID}/child/attachment`));
+    expect(lookups.length).toBeGreaterThan(0);
+    for (const l of lookups) expect(l.query.get("status")).toBe("draft");
+    const data = writes().find((w) => w.path === v1(`/content/${DRAFT_ID}/child/attachment/att501/data`));
+    expect(data?.query.get("status")).toBe("draft");
+    expect(attachments.get(DRAFT_ID)?.[0].version).toBe(2);
+  });
+
+  it.each([
+    ["a page", PAGE_ID],
+    ["a published post", BLOG_ID],
+  ])("add_attachment and get_attachments on %s send no status (unchanged URLs)", async (_l, id) => {
+    const r = await call("add_attachment", { page_id: id, file_path: "/work/file.txt", overwrite: false });
+    expect(r.isError, r.text).toBe(false);
+    const list = await call("get_attachments", { page_id: id, limit: 25 });
+    expect(list.isError, list.text).toBe(false);
+    expect(list.text).toContain("file.txt");
+    expect(attachmentRequests().length).toBeGreaterThan(1);
+    for (const x of attachmentRequests()) expect(x.query.has("status")).toBe(false);
+  });
+
+  it("a failed status lookup uploads nothing", async () => {
+    const r = await call("add_attachment", { page_id: BLOG_500, file_path: "/work/file.txt", overwrite: false });
+    expect(r.isError).toBe(true);
+    expect(writes()).toEqual([]);
+  });
+
+  it("set_page_status, get_page_status and remove_page_status work on a draft", async () => {
+    const set = await call("set_page_status", { page_id: DRAFT_ID, name: "Ready", color: "#57D9A3" });
+    expect(set.isError, set.text).toBe(false);
+    const put = writes().find((w) => w.method === "PUT" && w.path === v1(`/content/${DRAFT_ID}/state`));
+    expect(put?.query.get("status")).toBe("draft");
+    expect(states.get(DRAFT_ID)).toEqual({ name: "Ready", color: "#57D9A3" });
+
+    const get = await call("get_page_status", { page_id: DRAFT_ID });
+    expect(get.text).toContain("Ready");
+
+    const del = await call("remove_page_status", { page_id: DRAFT_ID });
+    expect(del.isError, del.text).toBe(false);
+    expect(del.text).not.toContain("no-op");
+    expect(states.has(DRAFT_ID)).toBe(false);
+  });
+
+  it("set_page_status on a published post still sends status=current", async () => {
+    const r = await call("set_page_status", { page_id: BLOG_ID, name: "Ready", color: "#57D9A3" });
+    expect(r.isError, r.text).toBe(false);
+    const put = writes().find((w) => w.method === "PUT" && w.path === v1(`/content/${BLOG_ID}/state`));
+    expect(put?.query.get("status")).toBe("current");
+  });
+
+  it("create_comment on a draft says drafts take no comments", async () => {
+    const r = await call("create_comment", { page_id: DRAFT_ID, body: "early", type: "footer", text_selection_match_index: 0 });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("is a draft");
+    expect(r.text).toContain("Nothing was posted");
+  });
+
+  it("create_blog_post as a draft sets the status badge with status=draft", async () => {
+    posts.delete(NEW_POST_ID);
+    const r = await createBlog({});
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).not.toContain("Could not apply");
+    for (const w of writes().filter((x) => x.path === v1(`/content/${NEW_POST_ID}/state`))) {
+      expect(w.query.get("status")).toBe("draft");
+    }
   });
 });
 
