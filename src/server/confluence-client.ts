@@ -664,6 +664,7 @@ export const CommentSchema = z.object({
   id: z.string().regex(/^\d+$/),
   status: z.string().optional(),
   pageId: z.string().optional(),
+  blogPostId: z.string().optional(),
   parentCommentId: z.string().nullable().optional(),
   version: z.object({
     number: z.number(),
@@ -3035,6 +3036,31 @@ export async function resolveComment(
   }
 
   return CommentSchema.parse(result);
+}
+
+/** Parent hops followed when a reply carries no container id of its own. */
+const MAX_COMMENT_PARENT_HOPS = 10;
+
+/**
+ * The id of the page or blog post a comment belongs to, for the space
+ * allowlist. A reply that carries no container id is resolved through its
+ * parent comments. Returns undefined when no container is found (a comment on
+ * an attachment or custom content, or a chain longer than the hop limit); the
+ * caller then fails closed.
+ */
+export async function getCommentContainerId(
+  commentId: string,
+  type: "footer" | "inline"
+): Promise<string | undefined> {
+  let id = commentId;
+  for (let hop = 0; hop <= MAX_COMMENT_PARENT_HOPS; hop++) {
+    const comment = CommentSchema.parse(await v2Get(`/${type}-comments/${id}`));
+    const container = comment.pageId ?? comment.blogPostId;
+    if (container) return container;
+    if (!comment.parentCommentId) return undefined;
+    id = comment.parentCommentId;
+  }
+  return undefined;
 }
 
 export async function deleteFooterComment(commentId: string): Promise<void> {

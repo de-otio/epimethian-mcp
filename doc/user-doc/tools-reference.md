@@ -699,6 +699,8 @@ Adds a new comment to a page or blog post.
 
 Footer comments appear at the bottom of the page. Inline comments are anchored to specific text on the page. On a blog post you can start a footer comment or reply to any comment; a new top-level inline comment works on pages only. All comments are prefixed with `[AI-generated via Epimethian]`.
 
+With a `spaces` allowlist on the profile, `page_id` must be in an allowed space. A reply is posted under its parent comment's page, so the parent's page must be in an allowed space too, whatever `page_id` says.
+
 ---
 
 ### `resolve_comment`
@@ -710,6 +712,8 @@ Resolves or reopens an inline comment. Only inline comments can be resolved — 
 | `comment_id` | string | Yes | Inline comment ID |
 | `resolved` | boolean | No | `true` to resolve, `false` to reopen (default: true) |
 
+With a `spaces` allowlist on the profile, the comment's page must be in an allowed space. A comment whose page cannot be found is refused.
+
 ---
 
 ### `delete_comment`
@@ -720,6 +724,8 @@ Permanently deletes a comment. Deleting a parent comment also deletes all its re
 |------|------|----------|-------------|
 | `comment_id` | string | Yes | Comment ID to delete |
 | `type` | string | Yes | Comment type: `footer` or `inline` (required — cannot be auto-detected) |
+
+With a `spaces` allowlist on the profile, the comment's page must be in an allowed space. The page is found by reading the comment, and through its parent comments for a reply. A comment whose page cannot be found, such as a comment on an attachment, is refused.
 
 ---
 

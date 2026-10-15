@@ -262,6 +262,12 @@ const fetchMock = vi.fn(async (input: unknown, init?: { method?: string; body?: 
   if (p === "v2:/footer-comments" && method === "POST") {
     return json({ id: "9100", version: { number: 1 } });
   }
+  // Footer comments on blog posts: 9001 on a post in DOCS, 9002 on one in OPS.
+  if ((m = p.match(/^v2:\/footer-comments\/(\d+)$/)) && method === "GET") {
+    if (m[1] === "9001") return json({ id: "9001", blogPostId: BLOG_ID, version: { number: 1 } });
+    if (m[1] === "9002") return json({ id: "9002", blogPostId: BLOG_OPS, version: { number: 1 } });
+    return json({ message: "nf" }, 404);
+  }
   if ((m = p.match(/^v1:\/content\/(\d+)\/label$/))) {
     return json({ results: [] });
   }
@@ -420,6 +426,22 @@ describe("A2: the space allowlist resolves blog posts", () => {
     expect(isError).toBe(false);
     expect(requests.some((r) => r.path === v2(`/blogposts/${DRAFT_ID}`) && r.query.get("status") === "draft")).toBe(true);
     expect(writes().map((w) => w.path)).toEqual([v1(`/content/${DRAFT_ID}/label`)]);
+  });
+
+  it("create_comment: a reply to a comment on a blog post outside the allowlist is refused", async () => {
+    // The parent's space comes from its blogPostId, resolved through /blogposts.
+    const r = await call("create_comment", { page_id: BLOG_ID, body: "thanks", type: "footer", parent_comment_id: "9002", text_selection_match_index: 0 });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain('"OPS"');
+    expect(requests.map((x) => x.path)).toContain(v2(`/blogposts/${BLOG_OPS}`));
+    expect(writes()).toEqual([]);
+  });
+
+  it("delete_comment: a comment on a blog post outside the allowlist is refused", async () => {
+    const r = await call("delete_comment", { comment_id: "9002", type: "footer" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain('"OPS"');
+    expect(writes()).toEqual([]);
   });
 
   it("a page keeps its page-only checks: update_page on an allowed blog post id still writes nothing", async () => {

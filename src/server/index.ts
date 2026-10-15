@@ -1044,7 +1044,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
   // F3: closure that each write handler calls before dispatching. When
   // the profile has no `spaces` allowlist, this is effectively a no-op.
   const allowedSpaces = settings?.spaces;
-  const checkSpaceAllowed = (opts: { spaceKey?: string; pageId?: string }) =>
+  const checkSpaceAllowed = (opts: {
+    spaceKey?: string;
+    pageId?: string;
+    comment?: { id: string; type: "footer" | "inline" };
+  }) =>
     assertSpaceAllowed({ spaces: allowedSpaces, ...opts });
 
   // S5: read scoping and result redaction for search_pages. Resolved once;
@@ -5141,6 +5145,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       try {
         // F3: space allowlist.
         await checkSpaceAllowed({ pageId: page_id });
+        // A reply is posted under its parent's container, whatever page_id
+        // says, so the parent's space must pass the check too.
+        if (parent_comment_id) {
+          await checkSpaceAllowed({ comment: { id: parent_comment_id, type } });
+        }
         let comment: CommentData;
         if (type === "inline") {
           if (!parent_comment_id && !text_selection) {
@@ -5200,6 +5209,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       const blocked = writeGuard("resolve_comment", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist, by the space of the comment's page or blog post.
+        await checkSpaceAllowed({ comment: { id: comment_id, type: "inline" } });
         const comment = await resolveComment(comment_id, resolved);
         const state = resolved ? "resolved" : "reopened";
         return toolResult(
@@ -5237,6 +5248,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       const blocked = writeGuard("delete_comment", config);
       if (blocked) return blocked;
       try {
+        // F3: space allowlist, by the space of the comment's page or blog post.
+        await checkSpaceAllowed({ comment: { id: comment_id, type } });
         if (type === "footer") {
           await deleteFooterComment(comment_id);
         } else {
