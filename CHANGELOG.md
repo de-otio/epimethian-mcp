@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     badge failed with a warning.
   - `create_comment` on a draft says that Confluence takes no comments on
     drafts, instead of "Resource not found".
+- `create_blog_post` and `update_blog_post` on a published post report the
+  version the post is at after the "unverified" status badge, which Confluence
+  counts as a version of its own. Before, the next update with the reported
+  version failed with a version conflict.
 - The `update_blog_post` confirmation now covers the title, so a confirmed
   publish cannot go out under a different title.
 
