@@ -11,6 +11,10 @@ declare const __PKG_VERSION__: string;
 import {
   resolveSpaceId,
   getPage,
+  getContent,
+  resolveContentType,
+  ContentIsBlogPostError,
+  type ContentType,
   deletePage,
   searchContent,
   getVersionStorage,
@@ -636,6 +640,14 @@ export function toolErrorWithContext(err: unknown, ctx: ErrCtx): ToolResult {
       isError: true,
     };
   }
+  // Must precede the ConfluenceNotFoundError branch (it is a subclass): the
+  // agent needs "this is a blog post", not the generic not-found text.
+  if (err instanceof ContentIsBlogPostError) {
+    return {
+      content: [{ type: "text", text: `Error: ${err.message}` }],
+      isError: true,
+    };
+  }
   if (err instanceof ConfluenceNotFoundError) {
     return {
       content: [{
@@ -873,12 +885,17 @@ function formatCommentLine(c: CommentData, indent = ""): string {
   return `${indent}- [${c.id}] ${author} (${date})${resolution}:${fencedBody}`;
 }
 
+function commentsHeader(id: string, contentType: ContentType): string {
+  return `Comments on ${contentType === "blogpost" ? "blog post" : "page"} ${id}:`;
+}
+
 function formatComments(
   footer: CommentData[],
   inline: CommentData[],
-  pageId: string
+  pageId: string,
+  contentType: ContentType = "page"
 ): string {
-  const lines: string[] = [`Comments on page ${pageId}:`, ""];
+  const lines: string[] = [commentsHeader(pageId, contentType), ""];
   if (footer.length > 0) {
     lines.push(`Footer comments (${footer.length}):`);
     footer.forEach((c) => lines.push(formatCommentLine(c)));
@@ -900,9 +917,10 @@ function formatCommentThreads(
   inline: Array<{ comment: CommentData; replies?: CommentData[]; error?: string }>,
   pageId: string,
   failedFetches: number = 0,
-  totalFetches: number = 0
+  totalFetches: number = 0,
+  contentType: ContentType = "page"
 ): string {
-  const lines: string[] = [`Comments on page ${pageId}:`, ""];
+  const lines: string[] = [commentsHeader(pageId, contentType), ""];
   if (footer.length > 0) {
     lines.push(`Footer comments (${footer.length}):`);
     footer.forEach(({ comment, replies, error }) => {
@@ -1300,11 +1318,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     "get_page",
     {
       description: withUntrustedNote(
-        "Read a Confluence page by ID. For large pages, use headings_only to get the page outline first, then use section to read a specific section, or max_length to limit the response size. " +
+        "Read a Confluence page or blog post by ID. For a blog URL (/wiki/spaces/<KEY>/blog/<yyyy>/<mm>/<dd>/<id>/<slug>), pass <id>. Blog posts are read-only here: the tools that rewrite the body (update_page, the section, prepend and append tools, revert_page, the draw.io tools, delete_page) accept pages only. For large pages, use headings_only to get the page outline first, then use section to read a specific section, or max_length to limit the response size. " +
         "Note: in Confluence spaces with heading auto-numbering enabled, stored heading text contains the prefix (e.g. `1.2. Section`); the matcher accepts either the prefixed or plain form."
       ),
       inputSchema: {
-        page_id: z.string().describe("The Confluence page ID"),
+        page_id: pageIdSchema.describe("The Confluence page or blog post ID"),
         include_body: z
           .boolean()
           .default(true)
@@ -1339,7 +1357,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     async ({ page_id, include_body, headings_only, section, max_length, format }) => {
       try {
         const needBody = include_body || headings_only || !!section;
-        const page = await getPage(page_id, needBody);
+        const page = await getContent(page_id, needBody);
         return await renderPageRead(page, {
           include_body,
           headings_only,
@@ -4515,7 +4533,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     "get_comments",
     {
       description: withUntrustedNote(
-        "Get comments on a Confluence page. Returns footer comments, inline comments, or both. " +
+        "Get comments on a Confluence page or blog post. Returns footer comments, inline comments, or both. " +
         "Inline comments can be filtered by resolution status. " +
         "Use include_replies to fetch reply threads (makes one extra API call per top-level comment)."
       ),
@@ -4538,9 +4556,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     },
     async ({ page_id, type, resolution_status, include_replies }) => {
       try {
+        const contentType = await resolveContentType(page_id);
         const [footerComments, inlineComments] = await Promise.all([
-          type !== "inline" ? getFooterComments(page_id) : Promise.resolve([]),
-          type !== "footer" ? getInlineComments(page_id, resolution_status) : Promise.resolve([]),
+          type !== "inline" ? getFooterComments(page_id, undefined, contentType) : Promise.resolve([]),
+          type !== "footer" ? getInlineComments(page_id, resolution_status, undefined, contentType) : Promise.resolve([]),
         ]);
 
         if (include_replies) {
@@ -4587,11 +4606,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           ].filter((r) => r.status === "rejected").length;
 
           return toolResult(
-            formatCommentThreads(fr, ir, page_id, failedFetches, totalFetches)
+            formatCommentThreads(fr, ir, page_id, failedFetches, totalFetches, contentType)
           );
         }
 
-        return toolResult(formatComments(footerComments, inlineComments, page_id));
+        return toolResult(formatComments(footerComments, inlineComments, page_id, contentType));
       } catch (err) {
         return toolError(err);
       }

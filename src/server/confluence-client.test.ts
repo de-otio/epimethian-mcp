@@ -85,6 +85,10 @@ import {
   validateStartup,
   ensureAttributionLabel,
   type Config,
+  getContent,
+  resolveContentType,
+  ContentIsBlogPostError,
+  _resetHttpStateForTests,
 } from "./confluence-client.js";
 import { pageCache } from "./page-cache.js";
 
@@ -3646,5 +3650,358 @@ describe("ensureAttributionLabel (Track G)", () => {
   it("re-throws on ConfluenceNotFoundError (404 — a missing page is a real error)", async () => {
     global.fetch = mockFetchResponse("Not Found", 404);
     await expect(ensureAttributionLabel("page-missing")).rejects.toThrow(ConfluenceNotFoundError);
+  });
+});
+
+// =============================================================================
+// Blog posts: getContent, resolveContentType, getPage refusal, comment paths
+// =============================================================================
+
+describe("blog post reads", () => {
+  type Route = { status: number; body: unknown } | "network-error";
+
+  /** Fetch stub that answers by path segment and records every URL it saw. */
+  function routeFetch(routes: { pages: Route; blogposts?: Route }) {
+    const fn = vi.fn().mockImplementation((url: string) => {
+      const path = new URL(url).pathname;
+      const route = path.includes("/blogposts/")
+        ? routes.blogposts
+        : path.includes("/pages/")
+          ? routes.pages
+          : undefined;
+      if (route === undefined) {
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }
+      if (route === "network-error") {
+        return Promise.reject(new TypeError("fetch failed"));
+      }
+      const { status, body } = route;
+      return Promise.resolve({
+        ok: status >= 200 && status < 300,
+        status,
+        json: () => Promise.resolve(body),
+        text: () => Promise.resolve(JSON.stringify(body)),
+      });
+    });
+    global.fetch = fn as any;
+    return fn;
+  }
+
+  const urls = (fn: ReturnType<typeof vi.fn>) =>
+    fn.mock.calls.map((c) => c[0] as string);
+  const blogUrls = (fn: ReturnType<typeof vi.fn>) =>
+    urls(fn).filter((u) => u.includes("/blogposts/"));
+
+  const notFound: Route = { status: 404, body: { message: "Not Found" } };
+  const page = {
+    id: "10",
+    title: "A page",
+    spaceId: "1",
+    version: { number: 2 },
+    body: { storage: { value: "<p>page body</p>" } },
+  };
+  const blog = {
+    id: "77",
+    title: "A blog post",
+    spaceId: "1",
+    version: { number: 4 },
+    body: { storage: { value: "<p>blog body</p>" } },
+  };
+
+  beforeEach(() => {
+    // Reads retry 429/5xx; make the backoff instant.
+    _resetHttpStateForTests({ sleep: async () => {} });
+  });
+
+  afterEach(() => {
+    _resetHttpStateForTests();
+  });
+
+  describe("getContent", () => {
+    it("a page id makes exactly one request and nothing to /blogposts", async () => {
+      const fn = routeFetch({ pages: { status: 200, body: page } });
+      const result = await getContent("10", true);
+      expect(fn).toHaveBeenCalledOnce();
+      expect(urls(fn)[0]).toBe(`${API_V2}/pages/10?body-format=storage`);
+      expect(result.contentType).toBe("page");
+      expect(result.body?.storage?.value).toBe("<p>page body</p>");
+    });
+
+    it("a page read still populates and uses the page cache", async () => {
+      routeFetch({ pages: { status: 200, body: page } });
+      await getContent("10", true);
+      expect(pageCache.has("10")).toEqual({ version: 2 });
+    });
+
+    it("a blog id: /pages 404, then /blogposts/{id}?body-format=storage", async () => {
+      const fn = routeFetch({ pages: notFound, blogposts: { status: 200, body: blog } });
+      const result = await getContent("77", true);
+      expect(urls(fn)).toEqual([
+        `${API_V2}/pages/77?body-format=storage`,
+        `${API_V2}/blogposts/77?body-format=storage`,
+      ]);
+      expect(result.contentType).toBe("blogpost");
+      expect(result.title).toBe("A blog post");
+      expect(result.body?.storage?.value).toBe("<p>blog body</p>");
+    });
+
+    it("a blog id without body: metadata-only requests to both endpoints", async () => {
+      const fn = routeFetch({ pages: notFound, blogposts: { status: 200, body: blog } });
+      const result = await getContent("77", false);
+      expect(urls(fn)).toEqual([`${API_V2}/pages/77`, `${API_V2}/blogposts/77`]);
+      expect(result.contentType).toBe("blogpost");
+    });
+
+    it("reading the same blog id twice repeats both requests and never caches the body", async () => {
+      const fn = routeFetch({ pages: notFound, blogposts: { status: 200, body: blog } });
+      await getContent("77", true);
+      await getContent("77", true);
+      expect(urls(fn)).toEqual([
+        `${API_V2}/pages/77?body-format=storage`,
+        `${API_V2}/blogposts/77?body-format=storage`,
+        `${API_V2}/pages/77?body-format=storage`,
+        `${API_V2}/blogposts/77?body-format=storage`,
+      ]);
+      expect(pageCache.has("77")).toBeUndefined();
+    });
+
+    it.each([
+      [401, ConfluenceAuthError],
+      [403, ConfluencePermissionError],
+      [429, ConfluenceApiError],
+      [500, ConfluenceApiError],
+    ] as const)("/pages %i is rethrown with no /blogposts request", async (status, cls) => {
+      const fn = routeFetch({
+        pages: { status, body: { message: "nope" } },
+        blogposts: { status: 200, body: blog },
+      });
+      const err = await getContent("77", true).catch((e) => e);
+      expect(err).toBeInstanceOf(cls);
+      expect((err as ConfluenceApiError).status).toBe(status);
+      expect(err).not.toBeInstanceOf(ConfluenceNotFoundError);
+      expect(blogUrls(fn)).toEqual([]);
+    });
+
+    it("a /pages network error is rethrown with no /blogposts request", async () => {
+      const fn = routeFetch({ pages: "network-error", blogposts: { status: 200, body: blog } });
+      await expect(getContent("77", true)).rejects.toThrow("fetch failed");
+      expect(blogUrls(fn)).toEqual([]);
+    });
+
+    it("both 404 → combined not-found message", async () => {
+      routeFetch({ pages: notFound, blogposts: notFound });
+      const err = await getContent("77", true).catch((e) => e);
+      expect(err).toBeInstanceOf(ConfluenceNotFoundError);
+      expect(err).not.toBeInstanceOf(ContentIsBlogPostError);
+      expect(err.message).toBe(
+        "No page or blog post with id 77 exists, or this account cannot view it."
+      );
+    });
+
+    it.each([403, 500])("a non-404 /blogposts error (%i) after a pages 404 propagates", async (status) => {
+      routeFetch({ pages: notFound, blogposts: { status, body: { message: "x" } } });
+      const err = await getContent("77", true).catch((e) => e);
+      expect(err).toBeInstanceOf(ConfluenceApiError);
+      expect(err.status).toBe(status);
+      expect(err).not.toBeInstanceOf(ConfluenceNotFoundError);
+    });
+
+    it.each(["abc", "12/../34", "", "77?x=1", " 77"])(
+      "rejects non-numeric id %j with no request",
+      async (id) => {
+        const fn = routeFetch({ pages: { status: 200, body: page } });
+        await expect(getContent(id, true)).rejects.toThrow(/numeric/);
+        expect(fn).not.toHaveBeenCalled();
+      }
+    );
+  });
+
+  describe("resolveContentType", () => {
+    it("returns page after one metadata request", async () => {
+      const fn = routeFetch({ pages: { status: 200, body: page } });
+      await expect(resolveContentType("10")).resolves.toBe("page");
+      expect(urls(fn)).toEqual([`${API_V2}/pages/10`]);
+    });
+
+    it("returns blogpost after a pages 404, with metadata-only requests", async () => {
+      const fn = routeFetch({ pages: notFound, blogposts: { status: 200, body: blog } });
+      await expect(resolveContentType("77")).resolves.toBe("blogpost");
+      expect(urls(fn)).toEqual([`${API_V2}/pages/77`, `${API_V2}/blogposts/77`]);
+    });
+
+    it("does not memoise: a second call repeats both requests", async () => {
+      const fn = routeFetch({ pages: notFound, blogposts: { status: 200, body: blog } });
+      await resolveContentType("77");
+      await resolveContentType("77");
+      expect(fn).toHaveBeenCalledTimes(4);
+    });
+
+    it.each([401, 403, 429, 500])("/pages %i is rethrown with no /blogposts request", async (status) => {
+      const fn = routeFetch({
+        pages: { status, body: { message: "nope" } },
+        blogposts: { status: 200, body: blog },
+      });
+      const err = await resolveContentType("77").catch((e) => e);
+      expect(err.status).toBe(status);
+      expect(blogUrls(fn)).toEqual([]);
+    });
+
+    it("both 404 → combined not-found message", async () => {
+      routeFetch({ pages: notFound, blogposts: notFound });
+      await expect(resolveContentType("77")).rejects.toThrow(
+        "No page or blog post with id 77 exists, or this account cannot view it."
+      );
+    });
+
+    it("rejects a non-numeric id with no request", async () => {
+      const fn = routeFetch({ pages: { status: 200, body: page } });
+      await expect(resolveContentType("../spaces")).rejects.toThrow(/numeric/);
+      expect(fn).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("getPage stays page-only", () => {
+    it.each([true, false])("a blog id throws ContentIsBlogPostError (includeBody=%s)", async (includeBody) => {
+      const fn = routeFetch({ pages: notFound, blogposts: { status: 200, body: blog } });
+      const err = await getPage("77", includeBody).catch((e) => e);
+      expect(err).toBeInstanceOf(ContentIsBlogPostError);
+      expect(err).toBeInstanceOf(ConfluenceNotFoundError);
+      expect(err.status).toBe(404);
+      expect(err.message).toBe(
+        "id 77 is a blog post. This tool works on pages only; blog posts can be read with get_page and get_comments."
+      );
+      // The probe is metadata-only: no blog body is ever fetched.
+      expect(blogUrls(fn)).toEqual([`${API_V2}/blogposts/77`]);
+      expect(pageCache.has("77")).toBeUndefined();
+    });
+
+    it("a blog id on the cached path (metadata /pages 404) also throws ContentIsBlogPostError", async () => {
+      pageCache.set("77", 1, "<p>stale</p>");
+      const fn = routeFetch({ pages: notFound, blogposts: { status: 200, body: blog } });
+      await expect(getPage("77", true)).rejects.toBeInstanceOf(ContentIsBlogPostError);
+      expect(urls(fn)).toEqual([`${API_V2}/pages/77`, `${API_V2}/blogposts/77`]);
+    });
+
+    const probeFailures: Array<[string, Route]> = [
+      ["404", notFound],
+      ["403", { status: 403, body: { message: "Forbidden" } }],
+      ["429", { status: 429, body: { message: "Too Many" } }],
+      ["500", { status: 500, body: { message: "boom" } }],
+      ["network error", "network-error"],
+      ["unparseable 200", { status: 200, body: { unexpected: true } }],
+    ];
+
+    for (const includeBody of [true, false]) {
+      it.each(probeFailures)(
+        `/blogposts %s rethrows the ORIGINAL pages 404 (includeBody=${includeBody})`,
+        async (_label, blogRoute) => {
+          routeFetch({
+            pages: { status: 404, body: { message: "original pages 404" } },
+            blogposts: blogRoute,
+          });
+          const err = await getPage("77", includeBody).then(
+            () => {
+              throw new Error("getPage resolved");
+            },
+            (e) => e
+          );
+          expect(err).toBeInstanceOf(ConfluenceNotFoundError);
+          expect(err).not.toBeInstanceOf(ContentIsBlogPostError);
+          expect(err.rawBody).toContain("original pages 404");
+        }
+      );
+    }
+
+    it("a non-404 /pages error is rethrown without probing /blogposts", async () => {
+      const fn = routeFetch({
+        pages: { status: 403, body: { message: "Forbidden" } },
+        blogposts: { status: 200, body: blog },
+      });
+      await expect(getPage("77", true)).rejects.toBeInstanceOf(ConfluencePermissionError);
+      expect(blogUrls(fn)).toEqual([]);
+    });
+
+    it("a non-numeric id is not probed against /blogposts", async () => {
+      const fn = routeFetch({ pages: notFound, blogposts: { status: 200, body: blog } });
+      const err = await getPage("abc", false).catch((e) => e);
+      expect(err).toBeInstanceOf(ConfluenceNotFoundError);
+      expect(err).not.toBeInstanceOf(ContentIsBlogPostError);
+      expect(blogUrls(fn)).toEqual([]);
+    });
+
+    it("a page id makes one request and returns no contentType", async () => {
+      const fn = routeFetch({ pages: { status: 200, body: page } });
+      const result = await getPage("10", true);
+      expect(fn).toHaveBeenCalledOnce();
+      expect(result.contentType).toBeUndefined();
+    });
+  });
+
+  describe("comment fetchers", () => {
+    it("getFooterComments with type blogpost hits /blogposts/{id}/footer-comments", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      await getFooterComments("77", 250, "blogpost");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V2}/blogposts/77/footer-comments`);
+      expect(url).toContain("body-format=storage");
+      expect(url).toContain("limit=250");
+    });
+
+    it("getFooterComments default stays on /pages", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      await getFooterComments("42");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V2}/pages/42/footer-comments`);
+    });
+
+    it.each(["open", "resolved"] as const)(
+      "getInlineComments with type blogpost keeps resolution-status=%s",
+      async (status) => {
+        global.fetch = mockFetchResponse({ results: [] });
+        await getInlineComments("77", status, 250, "blogpost");
+        const url = (global.fetch as any).mock.calls[0][0] as string;
+        expect(url).toContain(`${API_V2}/blogposts/77/inline-comments`);
+        expect(url).toContain(`resolution-status=${status}`);
+      }
+    );
+
+    it("getInlineComments with type blogpost and 'all' omits resolution-status", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      await getInlineComments("77", "all", 250, "blogpost");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V2}/blogposts/77/inline-comments`);
+      expect(url).not.toContain("resolution-status");
+    });
+
+    it("getInlineComments default stays on /pages", async () => {
+      global.fetch = mockFetchResponse({ results: [] });
+      await getInlineComments("42", "open");
+      const url = (global.fetch as any).mock.calls[0][0] as string;
+      expect(url).toContain(`${API_V2}/pages/42/inline-comments`);
+      expect(url).toContain("resolution-status=open");
+    });
+  });
+
+  describe("formatPage Type line", () => {
+    const base = {
+      id: "77",
+      title: "T",
+      spaceId: "1",
+      version: { number: 4 },
+      _links: { base: "https://x.atlassian.net/wiki", webui: "/x" },
+    };
+
+    it("a blog post gets 'Type: blog post' right after the ID line", async () => {
+      const out = await formatPage({ ...base, contentType: "blogpost" }, false);
+      expect(out).toContain("ID: 77\nType: blog post\nSpace: 1");
+    });
+
+    it("a page (explicit or unset contentType) has no Type line and identical output", async () => {
+      const unset = await formatPage(base, false);
+      const asPage = await formatPage({ ...base, contentType: "page" }, false);
+      expect(unset).not.toContain("Type:");
+      expect(asPage).toBe(unset);
+      expect(unset).toContain("ID: 77\nSpace: 1");
+    });
   });
 });

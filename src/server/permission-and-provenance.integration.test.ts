@@ -155,6 +155,9 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     // Stubbed HTTP-layer functions — tests override per scenario
     resolveSpaceId: vi.fn().mockResolvedValue("~SPACEID"),
     getPage: mockGetPage,
+    // get_page reads through getContent; delegate so getPage stubs still drive it.
+    getContent: (...args: unknown[]) => mockGetPage(...args),
+    resolveContentType: vi.fn().mockResolvedValue("page"),
     getFooterComments: mockGetFooterComments,
     getInlineComments: mockGetInlineComments,
     getCommentReplies: mockGetCommentReplies,

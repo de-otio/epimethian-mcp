@@ -47,13 +47,13 @@ In spaces with auto-numbering, the page version may advance silently after creat
 
 ### `get_page`
 
-Reads a page by its numeric ID. For large pages, use `headings_only` to get the page outline first, then use `section` to read a specific section, or `max_length` to limit the response size.
+Reads a page or a blog post by its numeric ID. For large pages, use `headings_only` to get the page outline first, then use `section` to read a specific section, or `max_length` to limit the response size.
 
 In Confluence spaces with heading auto-numbering enabled, stored heading text contains the prefix (e.g., `1.2. Section`); the section matcher accepts either the prefixed or plain form. `headings_only` output decodes HTML entities (`&uuml;` → `ü`, etc.).
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `page_id` | string | Yes | Numeric page ID |
+| `page_id` | string | Yes | Numeric ID of a page or blog post. A non-numeric value is rejected. |
 | `include_body` | boolean | No | Whether to include page content (default: true) |
 | `headings_only` | boolean | No | Return only the heading outline (default: false). Takes precedence over all other body options. HTML entities in headings are decoded. |
 | `section` | string | No | Return only the content under this heading (case-insensitive). Use `headings_only` first to see available sections. Accepts both prefixed and plain forms in auto-numbered spaces. |
@@ -63,6 +63,10 @@ In Confluence spaces with heading auto-numbering enabled, stored heading text co
 Every body path (full storage, `section`, markdown, truncated) is returned inside the untrusted-content fence, with the field named `body`, `section` or `markdown`. With `format: "markdown"` and `section`, placeholder ids (`[[epi:T0001]]`) are numbered from the section body, with the heading rendered separately, so they match the ids `update_page_section` and `find_replace` use.
 
 Returns title, ID, space, version, URL, and optionally the page content. Page bodies are cached in memory — repeated reads of the same page version avoid redundant API calls.
+
+**Blog posts.** You do not say which type the ID is. The tool tries it as a page first and, only if Confluence answers 404, as a blog post. A page read costs the same as before; a blog post read costs one extra request, and blog posts are not cached. Blog post output has a `Type: blog post` line after `ID:`; page output is unchanged. `headings_only`, `section` and `format: "markdown"` work on blog posts. For a blog URL such as `/wiki/spaces/<KEY>/blog/<yyyy>/<mm>/<dd>/<id>/<slug>`, pass `<id>`.
+
+The tools that rewrite a page body accept pages only: `update_page`, `update_page_section`, `update_page_sections`, `prepend_to_page`, `append_to_page`, `revert_page`, `add_drawio_diagram`, `update_drawio_diagram` and `delete_page`. Given a blog post ID, they refuse with an error that names it as a blog post, and nothing is written. `get_page_by_title`, `get_page_version` and `diff_page_versions` do not support blog posts.
 
 ---
 
@@ -610,11 +614,11 @@ Removes the content status badge from a page. Idempotent — removing a status t
 
 ### `get_comments`
 
-Retrieves comments on a page. Works in read-only mode.
+Retrieves comments on a page or a blog post. Works in read-only mode. For a blog post the header says "Comments on blog post X".
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `page_id` | string | Yes | Confluence page ID |
+| `page_id` | string | Yes | Confluence page or blog post ID |
 | `type` | string | No | Comment type: `footer`, `inline`, or `all` (default: `all`) |
 | `resolution_status` | string | No | Filter inline comments by status: `open`, `resolved`, or `all` (default: `all`). Ignored for footer comments. |
 | `include_replies` | boolean | No | If true, fetches replies for each top-level comment (one extra API call per comment; default: false) |

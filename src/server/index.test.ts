@@ -96,10 +96,15 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
       this.attemptedVersion = attemptedVersion;
     }
   }
+  const getPage = vi.fn();
   return {
     resolveSpaceId: vi.fn(),
     getSpaceKeyById: vi.fn(),
-    getPage: vi.fn(),
+    getPage,
+    // get_page reads through getContent; delegate so getPage stubs still drive it.
+    getContent: (...args: unknown[]) => (getPage as (...a: unknown[]) => unknown)(...args),
+    resolveContentType: vi.fn().mockResolvedValue("page"),
+    ContentIsBlogPostError: actual.ContentIsBlogPostError,
     _rawCreatePage: vi.fn(),
     _rawUpdatePage: vi.fn(),
     deletePage: vi.fn(),
@@ -2891,8 +2896,8 @@ describe("get_comments tool", () => {
     const handler = registeredTools.get("get_comments")!.handler;
     await handler({ page_id: "42", type: "all", resolution_status: "all", include_replies: false });
 
-    expect(getFooterComments).toHaveBeenCalledWith("42");
-    expect(getInlineComments).toHaveBeenCalledWith("42", "all");
+    expect(getFooterComments).toHaveBeenCalledWith("42", undefined, "page");
+    expect(getInlineComments).toHaveBeenCalledWith("42", "all", undefined, "page");
   });
 
   it("only calls getFooterComments for type: footer", async () => {
@@ -2903,7 +2908,7 @@ describe("get_comments tool", () => {
     const handler = registeredTools.get("get_comments")!.handler;
     await handler({ page_id: "42", type: "footer", resolution_status: "all", include_replies: false });
 
-    expect(getFooterComments).toHaveBeenCalledWith("42");
+    expect(getFooterComments).toHaveBeenCalledWith("42", undefined, "page");
     expect(getInlineComments).not.toHaveBeenCalled();
   });
 
@@ -2915,7 +2920,7 @@ describe("get_comments tool", () => {
     const handler = registeredTools.get("get_comments")!.handler;
     await handler({ page_id: "42", type: "inline", resolution_status: "open", include_replies: false });
 
-    expect(getInlineComments).toHaveBeenCalledWith("42", "open");
+    expect(getInlineComments).toHaveBeenCalledWith("42", "open", undefined, "page");
     expect(getFooterComments).not.toHaveBeenCalled();
   });
 
@@ -2927,7 +2932,7 @@ describe("get_comments tool", () => {
     const handler = registeredTools.get("get_comments")!.handler;
     await handler({ page_id: "42", type: "all", resolution_status: "resolved", include_replies: false });
 
-    expect(getInlineComments).toHaveBeenCalledWith("42", "resolved");
+    expect(getInlineComments).toHaveBeenCalledWith("42", "resolved", undefined, "page");
   });
 
   it("fetches replies when include_replies is true", async () => {
