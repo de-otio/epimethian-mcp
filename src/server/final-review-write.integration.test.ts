@@ -69,6 +69,9 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     ...actual,
     resolveSpaceId: vi.fn().mockResolvedValue("1001"),
     getPage: mockGetPage,
+    // get_page reads through getContent; delegate so getPage stubs still drive it.
+    getContent: (...args: unknown[]) => mockGetPage(...args),
+    resolveContentType: vi.fn().mockResolvedValue("page"),
     _rawUpdatePage: mockRawUpdatePage,
     _rawCreatePage: vi.fn(),
     getPageByTitle: vi.fn().mockResolvedValue(null),

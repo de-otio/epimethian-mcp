@@ -594,7 +594,14 @@ export const PageSchema = z.object({
     .optional(),
 });
 
-export type PageData = z.infer<typeof PageSchema>;
+/** The two v2 content kinds the read tools understand. */
+export type ContentType = "page" | "blogpost";
+
+/**
+ * `contentType` is set by `getContent` only; it is never read from the API
+ * response (it is not part of PageSchema), so a tenant cannot spoof it.
+ */
+export type PageData = z.infer<typeof PageSchema> & { contentType?: ContentType };
 
 const PagesResultSchema = z.object({
   results: z.array(PageSchema).default([]),
@@ -761,6 +768,23 @@ export class ConfluenceAuthError extends ConfluenceApiError {}        // 401
 export class ConfluencePermissionError extends ConfluenceApiError {}  // 403
 
 export class ConfluenceNotFoundError extends ConfluenceApiError {}    // 404
+
+/**
+ * A page-only operation was given the id of a blog post. Subclasses
+ * not-found on purpose: every existing `instanceof ConfluenceNotFoundError`
+ * catch site keeps failing closed, and callers that want the friendlier
+ * message test for this class first.
+ */
+export class ContentIsBlogPostError extends ConfluenceNotFoundError {
+  constructor(id: string) {
+    const message =
+      `id ${id} is a blog post. This tool works on pages only; ` +
+      `blog posts can be read with get_page and get_comments.`;
+    super(404, message);
+    this.name = "ContentIsBlogPostError";
+    this.message = message;
+  }
+}
 
 /**
  * Best-effort extraction of the current page version from a Confluence
@@ -1285,15 +1309,121 @@ export function _resetConfigForTests(): void {
   _config = null;
 }
 
+type ContentSegment = "pages" | "blogposts";
+
+/** Ids are interpolated into request paths; accept only what the API issues. */
+function assertNumericContentId(id: string): void {
+  if (!/^\d+$/.test(id)) {
+    throw new Error(`Invalid content id: expected a numeric id.`);
+  }
+}
+
+function notFoundAsPageOrBlogPost(id: string): ConfluenceNotFoundError {
+  const message = `No page or blog post with id ${id} exists, or this account cannot view it.`;
+  const err = new ConfluenceNotFoundError(404, message);
+  err.message = message;
+  return err;
+}
+
+/**
+ * Fetch one piece of content from `/{segment}/{id}`.
+ *
+ * Pages go through the page cache exactly as before. Blog posts never touch
+ * pageCache, for reads or writes: the cache is keyed by id alone and its
+ * entries feed page writes, so a blog body must never be able to sit there.
+ */
+async function fetchContent(
+  segment: ContentSegment,
+  id: string,
+  includeBody: boolean
+): Promise<PageData> {
+  if (!includeBody) {
+    const raw = await v2Get(`/${segment}/${id}`, {});
+    return PageSchema.parse(raw);
+  }
+  if (segment === "blogposts") {
+    const raw = await v2Get(`/blogposts/${id}`, { "body-format": "storage" });
+    return PageSchema.parse(raw);
+  }
+  return fetchPageWithCache(id);
+}
+
+/**
+ * Page-only read. Never returns blog post data: when `/pages/{id}` is a 404,
+ * one metadata probe of `/blogposts/{id}` decides between
+ * ContentIsBlogPostError (the probe succeeded) and the ORIGINAL pages 404
+ * (every other outcome of the probe). The space allowlist relies on this to
+ * refuse writes, so the probe can only ever turn a not-found into a more
+ * specific not-found.
+ */
 export async function getPage(
   pageId: string,
   includeBody: boolean
 ): Promise<PageData> {
-  if (!includeBody) {
-    const raw = await v2Get(`/pages/${pageId}`, {});
-    return PageSchema.parse(raw);
+  try {
+    return await fetchContent("pages", pageId, includeBody);
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+    if (await isReadableBlogPost(pageId)) throw new ContentIsBlogPostError(pageId);
+    throw err;
   }
+}
 
+/** True only when a metadata GET of `/blogposts/{id}` succeeds and parses. */
+async function isReadableBlogPost(id: string): Promise<boolean> {
+  if (!/^\d+$/.test(id)) return false;
+  try {
+    PageSchema.parse(await v2Get(`/blogposts/${id}`, {}));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read a page or, failing that, a blog post with the same id. Only a pages
+ * 404 falls through to `/blogposts`; any other pages error is rethrown
+ * unchanged. Both 404 → one combined not-found.
+ */
+export async function getContent(
+  id: string,
+  includeBody: boolean
+): Promise<PageData & { contentType: ContentType }> {
+  assertNumericContentId(id);
+  try {
+    const page = await fetchContent("pages", id, includeBody);
+    return { ...page, contentType: "page" };
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+  }
+  try {
+    const post = await fetchContent("blogposts", id, includeBody);
+    return { ...post, contentType: "blogpost" };
+  } catch (err) {
+    if (err instanceof ConfluenceNotFoundError) throw notFoundAsPageOrBlogPost(id);
+    throw err;
+  }
+}
+
+/** Metadata-only variant of getContent's type decision. No memo. */
+export async function resolveContentType(id: string): Promise<ContentType> {
+  assertNumericContentId(id);
+  try {
+    PageSchema.parse(await v2Get(`/pages/${id}`, {}));
+    return "page";
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+  }
+  try {
+    PageSchema.parse(await v2Get(`/blogposts/${id}`, {}));
+    return "blogpost";
+  } catch (err) {
+    if (err instanceof ConfluenceNotFoundError) throw notFoundAsPageOrBlogPost(id);
+    throw err;
+  }
+}
+
+async function fetchPageWithCache(pageId: string): Promise<PageData> {
   // Check if this page is in the cache
   const cached = pageCache.has(pageId);
   if (cached) {
@@ -2596,11 +2726,16 @@ export async function removeContentState(pageId: string): Promise<void> {
   }
 }
 
+function segmentFor(type: ContentType): ContentSegment {
+  return type === "blogpost" ? "blogposts" : "pages";
+}
+
 export async function getFooterComments(
   pageId: string,
-  limit = 250
+  limit = 250,
+  type: ContentType = "page"
 ): Promise<CommentData[]> {
-  const raw = await v2Get(`/pages/${pageId}/footer-comments`, {
+  const raw = await v2Get(`/${segmentFor(type)}/${pageId}/footer-comments`, {
     "body-format": "storage",
     limit,
   });
@@ -2610,7 +2745,8 @@ export async function getFooterComments(
 export async function getInlineComments(
   pageId: string,
   resolutionStatus: "open" | "resolved" | "all",
-  limit = 250
+  limit = 250,
+  type: ContentType = "page"
 ): Promise<CommentData[]> {
   const params: Record<string, string | number> = {
     "body-format": "storage",
@@ -2619,7 +2755,7 @@ export async function getInlineComments(
   if (resolutionStatus !== "all") {
     params["resolution-status"] = resolutionStatus;
   }
-  const raw = await v2Get(`/pages/${pageId}/inline-comments`, params);
+  const raw = await v2Get(`/${segmentFor(type)}/${pageId}/inline-comments`, params);
   return CommentsResultSchema.parse(raw).results;
 }
 
@@ -3434,6 +3570,7 @@ export async function formatPage(
     "Title:",
     titleFenced,
     `ID: ${page.id}`,
+    ...(page.contentType === "blogpost" ? ["Type: blog post"] : []),
     `Space: ${spaceKey}`,
     `Version: ${version}`,
     `URL: ${url}`,

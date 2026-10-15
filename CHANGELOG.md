@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.3.0] - 2026-10-15 - read blog posts
+
+### Added
+- `get_page` reads a blog post by ID as well as a page (GitHub issue #5). It
+  tries `/pages/{id}` and falls back to `/blogposts/{id}` only on a 404, so
+  page reads cost the same as before; a blog post read costs one extra request
+  and is not cached. Blog post output has a `Type: blog post` line after `ID:`.
+  `headings_only`, `section` and `format: "markdown"` work on blog posts. For a
+  blog URL, pass the `<id>` from `/wiki/spaces/<KEY>/blog/<yyyy>/<mm>/<dd>/<id>/<slug>`.
+- `get_comments` works on blog posts: footer, inline, `resolution_status` and
+  `include_replies`. The header says "Comments on blog post X".
+
+### Changed
+- The tools that rewrite a page body (`update_page`, `update_page_section`,
+  `update_page_sections`, `prepend_to_page`, `append_to_page`, `revert_page`,
+  `add_drawio_diagram`, `update_drawio_diagram`, `delete_page`) still accept
+  pages only. Given a blog post ID, they now refuse with an error that names it
+  as a blog post, and nothing is written.
+- `get_page` rejects a `page_id` that is not numeric; it was an unvalidated string.
+
+Not included: blog post writes, `get_page_version` and `diff_page_versions` on
+blog posts, and `get_page_by_title` for blog posts.
+
 ## [7.2.1] - 2026-10-07 - upgrade fixes
 
 ### Fixed
