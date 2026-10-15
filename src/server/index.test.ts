@@ -2833,7 +2833,8 @@ describe("set_page_status tool", () => {
 
 describe("remove_page_status tool", () => {
   it("returns success + tenant echo", async () => {
-    const { removeContentState } = await import("./confluence-client.js");
+    const { getContentState, removeContentState } = await import("./confluence-client.js");
+    (getContentState as any).mockResolvedValueOnce({ name: "Draft", color: "#FFC400" });
     (removeContentState as any).mockResolvedValueOnce(undefined);
 
     const handler = registeredTools.get("remove_page_status")!.handler;
@@ -2863,7 +2864,8 @@ describe("remove_page_status tool", () => {
   });
 
   it("returns isError on API failure", async () => {
-    const { removeContentState } = await import("./confluence-client.js");
+    const { getContentState, removeContentState } = await import("./confluence-client.js");
+    (getContentState as any).mockResolvedValueOnce({ name: "Draft", color: "#FFC400" });
     (removeContentState as any).mockRejectedValueOnce(new Error("Server error"));
 
     const handler = registeredTools.get("remove_page_status")!.handler;

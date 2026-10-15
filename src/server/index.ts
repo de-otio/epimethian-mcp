@@ -4505,7 +4505,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     {
       description: describeWithLock(
         withDestructiveWarning(
-          "Remove the content status badge from a Confluence page. Idempotent — succeeds even if no status is set."
+          "Remove the content status badge from a Confluence page. Idempotent — succeeds even if no status is set, and then writes nothing."
         ),
         config
       ),
@@ -4520,6 +4520,12 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
       try {
         // F3: space allowlist.
         await checkSpaceAllowed({ pageId: page_id });
+        // Dedup, as set_page_status: Confluence creates a version on every
+        // DELETE, even when no status is set (GitHub issue #6).
+        const current = await getContentState(page_id);
+        if (!current) {
+          return toolResult(`Removed status from page ${page_id} (no-op: no status set)` + echo);
+        }
         await removeContentState(page_id);
         return toolResult(`Removed status from page ${page_id}` + echo);
       } catch (err) {

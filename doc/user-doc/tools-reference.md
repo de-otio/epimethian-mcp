@@ -604,7 +604,7 @@ Sets the content status badge on a page.
 
 ### `remove_page_status`
 
-Removes the content status badge from a page. Idempotent — removing a status that does not exist succeeds silently.
+Removes the content status badge from a page. Idempotent — removing a status that does not exist succeeds without writing anything, so no new version is created.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
