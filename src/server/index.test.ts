@@ -3098,7 +3098,7 @@ describe("create_comment tool", () => {
       text_selection_match_index: 0,
     });
 
-    expect(createFooterComment).toHaveBeenCalledWith("42", "Hello footer", undefined);
+    expect(createFooterComment).toHaveBeenCalledWith("42", "Hello footer", undefined, "page");
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Created footer comment");
     expect(result.content[0].text).toContain("456");

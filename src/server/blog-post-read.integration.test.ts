@@ -369,11 +369,10 @@ describe("body-rewriting tools refuse a blog post and write nothing", () => {
   }
 });
 
-describe("add_label on a blog id (pinned current behaviour)", () => {
-  // PINNED pending a follow-up decision on label/status/comment tools for blog
-  // posts. This documents what happens today with no spaces allowlist; it is
-  // not a statement that the behaviour is desired.
-  it("pins the current outcome", async () => {
+describe("add_label on a blog id (allowed: plans/blog-post-writes.md A3)", () => {
+  // Side writes on blog posts are allowed. The full matrix, with and without
+  // an allowlist, is in blog-post-write.integration.test.ts.
+  it("labels the post through v1 /content/{id}", async () => {
     const { text, isError } = await call("add_label", { page_id: BLOG_ID, labels: ["x"] });
     expect({ text, isError, writes: writes() }).toMatchInlineSnapshot(`
       {

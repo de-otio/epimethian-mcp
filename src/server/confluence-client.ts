@@ -787,6 +787,21 @@ export class ContentIsBlogPostError extends ConfluenceNotFoundError {
 }
 
 /**
+ * The mirror of ContentIsBlogPostError: a blog-post-only operation was given
+ * the id of a page. Also a not-found, so every catch site fails closed.
+ */
+export class ContentIsPageError extends ConfluenceNotFoundError {
+  constructor(id: string) {
+    const message =
+      `id ${id} is a page, not a blog post. This tool works on blog posts only; ` +
+      `use update_page to edit a page.`;
+    super(404, message);
+    this.name = "ContentIsPageError";
+    this.message = message;
+  }
+}
+
+/**
  * Best-effort extraction of the current page version from a Confluence
  * 409 response body. The Cloud API does not document a stable shape for
  * the current version in the conflict body; we look for common patterns.
@@ -1421,6 +1436,64 @@ export async function resolveContentType(id: string): Promise<ContentType> {
     if (err instanceof ConfluenceNotFoundError) throw notFoundAsPageOrBlogPost(id);
     throw err;
   }
+}
+
+/**
+ * A blog post as the blog write path reads it: PageSchema plus `status`,
+ * which decides whether an update keeps a draft a draft or publishes it.
+ * Separate from PageSchema so page parsing stays exactly as it was.
+ */
+export const BlogPostSchema = PageSchema.extend({ status: z.string().optional() });
+export type BlogPostData = z.infer<typeof BlogPostSchema> & { contentType?: ContentType };
+
+/**
+ * Metadata (or body) read of a blog post DRAFT. A post that has never been
+ * published may only be returned when `status=draft` is asked for, so the
+ * blog write path tries this after a plain `/blogposts/{id}` 404. Never
+ * called on the page read path. Errors propagate; callers fail closed.
+ */
+export async function getDraftBlogPost(id: string, includeBody: boolean): Promise<BlogPostData> {
+  assertNumericContentId(id);
+  const params: Record<string, string> = { status: "draft" };
+  if (includeBody) params["body-format"] = "storage";
+  return BlogPostSchema.parse(await v2Get(`/blogposts/${id}`, params));
+}
+
+/**
+ * Read a blog post for update_blog_post. Never touches pageCache (D6).
+ *
+ * `/blogposts/{id}` first, then the draft read on a 404. When both are 404
+ * and `/pages/{id}` answers, the id is a page: ContentIsPageError, so the
+ * agent is pointed at update_page rather than told "not found". Any other
+ * outcome of that probe rethrows the original 404.
+ */
+export async function getBlogPost(
+  id: string,
+  includeBody: boolean
+): Promise<BlogPostData & { contentType: "blogpost" }> {
+  assertNumericContentId(id);
+  let notFound: ConfluenceNotFoundError;
+  try {
+    const raw = await v2Get(`/blogposts/${id}`, includeBody ? { "body-format": "storage" } : {});
+    return { ...BlogPostSchema.parse(raw), contentType: "blogpost" };
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+    notFound = err;
+  }
+  try {
+    return { ...(await getDraftBlogPost(id, includeBody)), contentType: "blogpost" };
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+  }
+  let isPage = false;
+  try {
+    PageSchema.parse(await v2Get(`/pages/${id}`, {}));
+    isPage = true;
+  } catch {
+    // Probe failed: keep the original not-found.
+  }
+  if (isPage) throw new ContentIsPageError(id);
+  throw notFound;
 }
 
 async function fetchPageWithCache(pageId: string): Promise<PageData> {
@@ -2771,10 +2844,16 @@ export async function getCommentReplies(
   return CommentsResultSchema.parse(raw).results;
 }
 
+/**
+ * A reply is keyed by its parent comment, whatever the container. A new
+ * top-level comment names its container: `pageId` for a page, `blogPostId`
+ * for a blog post (`type`, resolved by the caller).
+ */
 export async function createFooterComment(
   pageId: string,
   body: string,
-  parentCommentId?: string
+  parentCommentId?: string,
+  type: ContentType = "page"
 ): Promise<CommentData> {
   const cfg = await getConfig();
   const sanitized = sanitizeCommentBody(toStorageFormat(body));
@@ -2789,7 +2868,7 @@ export async function createFooterComment(
         body: { representation: "storage", value: attributed },
       }
     : {
-        pageId,
+        [type === "blogpost" ? "blogPostId" : "pageId"]: pageId,
         body: { representation: "storage", value: attributed },
       };
 
