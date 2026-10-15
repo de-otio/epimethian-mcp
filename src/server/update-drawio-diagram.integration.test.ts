@@ -98,6 +98,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     downloadAttachmentBytes: (...a: unknown[]) => mockDownloadBytes(...a),
     ensureAttributionLabel: (...a: unknown[]) => mockEnsureAttributionLabel(...a),
     getContentState: vi.fn().mockResolvedValue(null),
+    resolveContainerStatus: vi.fn().mockResolvedValue("current"),
     setContentState: (...a: unknown[]) => mockSetContentState(...a),
     removeContentState: vi.fn().mockResolvedValue(undefined),
     getSiteDefaultLocale: vi.fn().mockResolvedValue("en"),

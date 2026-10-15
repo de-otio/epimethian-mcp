@@ -74,6 +74,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     _rawUpdatePage: vi.fn(),
     deletePage: vi.fn(),
     getContentState: vi.fn(),
+    resolveContainerStatus: vi.fn().mockResolvedValue("current"),
     setContentState: vi.fn(),
     getSiteDefaultLocale: vi.fn().mockResolvedValue(undefined),
     removeContentState: vi.fn(),
