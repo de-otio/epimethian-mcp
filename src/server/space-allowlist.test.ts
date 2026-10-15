@@ -15,12 +15,12 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./confluence-client.js")>();
   return {
     ...actual,
-    getPage: vi.fn(),
+    getContent: vi.fn(),
     getSpaceKeyById: vi.fn(),
   };
 });
 
-import { getPage, getSpaceKeyById } from "./confluence-client.js";
+import { getContent, getSpaceKeyById } from "./confluence-client.js";
 import {
   SPACE_NOT_ALLOWED,
   SpaceNotAllowedError,
@@ -60,7 +60,7 @@ describe("resolveSpaceFilter (F3)", () => {
 describe("assertSpaceAllowed (F3)", () => {
   beforeEach(() => {
     pageSpaceCache._resetForTest();
-    (getPage as any).mockReset();
+    (getContent as any).mockReset();
     (getSpaceKeyById as any).mockReset();
   });
 
@@ -73,7 +73,7 @@ describe("assertSpaceAllowed (F3)", () => {
       assertSpaceAllowed({ spaces: undefined, spaceKey: "OPS" }),
     ).resolves.toBeUndefined();
     // No metadata fetch needed when the filter is inactive.
-    expect(getPage).not.toHaveBeenCalled();
+    expect(getContent).not.toHaveBeenCalled();
   });
 
   it("F3: accepts spaceKey on the allowlist", async () => {
@@ -93,8 +93,8 @@ describe("assertSpaceAllowed (F3)", () => {
     }
   });
 
-  it("F3: resolves pageId to space via getPage and accepts when allowed", async () => {
-    (getPage as any).mockResolvedValueOnce({
+  it("F3: resolves pageId to space via getContent and accepts when allowed", async () => {
+    (getContent as any).mockResolvedValueOnce({
       id: "42",
       title: "P",
       spaceId: "1001",
@@ -103,12 +103,12 @@ describe("assertSpaceAllowed (F3)", () => {
     await expect(
       assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" }),
     ).resolves.toBeUndefined();
-    expect(getPage).toHaveBeenCalledOnce();
+    expect(getContent).toHaveBeenCalledOnce();
     expect(getSpaceKeyById).toHaveBeenCalledWith("1001");
   });
 
   it("F3: rejects pageId whose space is outside the allowlist", async () => {
-    (getPage as any).mockResolvedValueOnce({
+    (getContent as any).mockResolvedValueOnce({
       id: "42",
       title: "P",
       spaceId: "1002",
@@ -120,7 +120,7 @@ describe("assertSpaceAllowed (F3)", () => {
   });
 
   it("F3: fails closed when the page's space cannot be determined", async () => {
-    (getPage as any).mockResolvedValueOnce({
+    (getContent as any).mockResolvedValueOnce({
       id: "42",
       title: "P",
       // spaceId and space.key both missing.
@@ -135,7 +135,7 @@ describe("assertSpaceAllowed (F3)", () => {
   });
 
   it("F3: caches the page→space mapping across consecutive resolves", async () => {
-    (getPage as any).mockResolvedValueOnce({
+    (getContent as any).mockResolvedValueOnce({
       id: "42",
       title: "P",
       spaceId: "1001",
@@ -145,12 +145,12 @@ describe("assertSpaceAllowed (F3)", () => {
     await assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" });
     await assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" });
     // Only the first resolve hits the network; subsequent hit the cache.
-    expect(getPage).toHaveBeenCalledOnce();
+    expect(getContent).toHaveBeenCalledOnce();
     expect(getSpaceKeyById).toHaveBeenCalledOnce();
   });
 
   it("F3: the page→space cache is keyed per page id (no cross-page leakage)", async () => {
-    (getPage as any).mockImplementation(async (id: string) => ({
+    (getContent as any).mockImplementation(async (id: string) => ({
       id,
       title: "P",
       spaceId: id === "42" ? "1001" : "1002",
@@ -163,7 +163,7 @@ describe("assertSpaceAllowed (F3)", () => {
     // Second visits come from the cache and still round-trip independently.
     expect(await resolvePageSpace("42")).toBe("DOCS");
     expect(await resolvePageSpace("43")).toBe("OPS");
-    expect(getPage).toHaveBeenCalledTimes(2);
+    expect(getContent).toHaveBeenCalledTimes(2);
     await expect(assertSpaceAllowed({ spaces: ["DOCS"], pageId: "43" })).rejects.toBeInstanceOf(
       SpaceNotAllowedError,
     );
@@ -184,7 +184,7 @@ describe("assertSpaceAllowed (F3)", () => {
     });
 
     it("F3: still serves the cache at exactly the TTL, then re-resolves a moved page and rejects it", async () => {
-      (getPage as any).mockResolvedValueOnce({ id: "42", title: "P", spaceId: "1001" });
+      (getContent as any).mockResolvedValueOnce({ id: "42", title: "P", spaceId: "1001" });
       (getSpaceKeyById as any).mockResolvedValueOnce("DOCS");
       expect(await resolvePageSpace("42")).toBe("DOCS");
 
@@ -193,22 +193,22 @@ describe("assertSpaceAllowed (F3)", () => {
       await expect(
         assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" }),
       ).resolves.toBeUndefined();
-      expect(getPage).toHaveBeenCalledOnce();
+      expect(getContent).toHaveBeenCalledOnce();
 
       // One millisecond past the TTL the entry is expired; the page has moved.
       vi.setSystemTime(Date.now() + 1);
-      (getPage as any).mockResolvedValueOnce({ id: "42", title: "P", spaceId: "1002" });
+      (getContent as any).mockResolvedValueOnce({ id: "42", title: "P", spaceId: "1002" });
       (getSpaceKeyById as any).mockResolvedValueOnce("OPS");
       await expect(assertSpaceAllowed({ spaces: ["DOCS"], pageId: "42" })).rejects.toBeInstanceOf(
         SpaceNotAllowedError,
       );
-      expect(getPage).toHaveBeenCalledTimes(2);
+      expect(getContent).toHaveBeenCalledTimes(2);
       expect(getSpaceKeyById).toHaveBeenCalledTimes(2);
     });
   });
 
   it("F3: empty spaces array rejects all pageIds (paranoid no-write profile)", async () => {
-    (getPage as any).mockResolvedValueOnce({
+    (getContent as any).mockResolvedValueOnce({
       id: "42",
       title: "P",
       spaceId: "1001",
@@ -223,12 +223,12 @@ describe("assertSpaceAllowed (F3)", () => {
 describe("resolvePageSpace (F3)", () => {
   beforeEach(() => {
     pageSpaceCache._resetForTest();
-    (getPage as any).mockReset();
+    (getContent as any).mockReset();
     (getSpaceKeyById as any).mockReset();
   });
 
   it("F3: resolves the v2 numeric spaceId to its space key", async () => {
-    (getPage as any).mockResolvedValueOnce({
+    (getContent as any).mockResolvedValueOnce({
       id: "1",
       title: "T",
       spaceId: "1001",
@@ -238,7 +238,7 @@ describe("resolvePageSpace (F3)", () => {
   });
 
   it("F3: falls back to space.key when spaceId is absent (v1 shape)", async () => {
-    (getPage as any).mockResolvedValueOnce({
+    (getContent as any).mockResolvedValueOnce({
       id: "1",
       title: "T",
       space: { key: "LEGACY" },
@@ -247,7 +247,7 @@ describe("resolvePageSpace (F3)", () => {
   });
 
   it("F3: returns undefined when page has no space attribute", async () => {
-    (getPage as any).mockResolvedValueOnce({ id: "1", title: "T" });
+    (getContent as any).mockResolvedValueOnce({ id: "1", title: "T" });
     expect(await resolvePageSpace("1")).toBeUndefined();
   });
 });

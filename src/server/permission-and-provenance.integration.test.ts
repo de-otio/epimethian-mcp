@@ -788,11 +788,13 @@ describe("appendWarnings helper", () => {
 // Scenario bonus: WRITE_TOOLS exported set has expected members
 // ---------------------------------------------------------------------------
 describe("WRITE_TOOLS set completeness", () => {
-  it("contains the 7 body-modifying tools that get provenance badge", async () => {
+  it("contains the 9 body-modifying tools that get provenance badge", async () => {
     const { WRITE_TOOLS } = await import("./index.js");
     const bodyModifying = [
       "create_page",
       "update_page",
+      "create_blog_post",
+      "update_blog_post",
       "append_to_page",
       "prepend_to_page",
       "update_page_section",

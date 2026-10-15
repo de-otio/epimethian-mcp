@@ -121,6 +121,7 @@ const activeConfig = {
 };
 
 const mockGetPage = vi.fn();
+const mockGetBlogPost = vi.fn();
 const mockRawUpdatePage = vi.fn();
 const mockDeletePage = vi.fn();
 
@@ -149,6 +150,18 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
       _links: { webui: "/pages/new-99" },
     }),
     _rawUpdatePage: mockRawUpdatePage,
+    getBlogPost: mockGetBlogPost,
+    getSpaceKeyById: vi.fn().mockResolvedValue("TEST"),
+    _rawCreateContent: vi.fn().mockResolvedValue({
+      id: "new-blog-77",
+      title: "New Post",
+      version: { number: 1 },
+      _links: { webui: "/blog/new-blog-77" },
+    }),
+    _rawUpdateContent: vi.fn().mockResolvedValue({
+      page: { id: "blog-55", title: "Post", version: { number: 4 } },
+      newVersion: 4,
+    }),
     deletePage: mockDeletePage,
     getContentState: vi.fn().mockResolvedValue(null),
     setContentState: vi.fn().mockResolvedValue(undefined),
@@ -653,5 +666,80 @@ describe("C11: negative — discriminator integrity: confirmation_required does 
 
     // Sanity-check: the written payload satisfies writeSuccessArm.
     expect(writeSuccessArm.safeParse(writtenPayload).success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C12–C15: the blog post write tools declare writeOutputSchema too
+// ---------------------------------------------------------------------------
+
+describe("C12–C15: create_blog_post / update_blog_post conform to writeOutputSchema", () => {
+  const BLOG_ID = "blog-55";
+  const blogStub = (status: string) => ({
+    id: BLOG_ID,
+    title: "Post",
+    spaceId: "1001",
+    status,
+    version: { number: 3 },
+    body: { storage: { value: "<p>Hello post</p>" } },
+    contentType: "blogpost",
+  });
+
+  beforeEach(() => {
+    mockGetBlogPost.mockReset();
+  });
+
+  it("C12: create_blog_post (draft) success — kind 'written', writeSuccessArm passes", async () => {
+    const r = await registeredTools.get("create_blog_post")!.handler({
+      space_key: "TEST",
+      title: "New Post",
+      body: "<p>Hi</p>",
+      publish: false,
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent.kind).toBe("written");
+    expect(writeOutputSchema.safeParse(r.structuredContent).success).toBe(true);
+    expect(writeSuccessArm.safeParse(r.structuredContent).success).toBe(true);
+  });
+
+  it("C13: update_blog_post success — kind 'written', writeSuccessArm passes", async () => {
+    mockGetBlogPost.mockResolvedValue(blogStub("current"));
+    const r = await registeredTools.get("update_blog_post")!.handler({
+      blog_post_id: BLOG_ID,
+      title: "Post",
+      version: 3,
+      body: "<p>Hello post, edited</p>",
+      publish: false,
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent.kind).toBe("written");
+    expect(writeSuccessArm.safeParse(r.structuredContent).success).toBe(true);
+  });
+
+  it("C14: create_blog_post publish without a token — confirmationRequiredArm passes", async () => {
+    const r = await registeredTools.get("create_blog_post")!.handler({
+      space_key: "TEST",
+      title: "New Post",
+      body: "<p>Hi</p>",
+      publish: true,
+    });
+    expect(r.isError).toBe(true);
+    expect(r.structuredContent.kind).toBe("confirmation_required");
+    expect(confirmationRequiredArm.safeParse(r.structuredContent).success).toBe(true);
+    expect(writeOutputSchema.safeParse(r.structuredContent).success).toBe(true);
+  });
+
+  it("C15: update_blog_post publishing a draft without a token — confirmationRequiredArm passes", async () => {
+    mockGetBlogPost.mockResolvedValue(blogStub("draft"));
+    const r = await registeredTools.get("update_blog_post")!.handler({
+      blog_post_id: BLOG_ID,
+      title: "Post",
+      version: 3,
+      publish: true,
+    });
+    expect(r.isError).toBe(true);
+    expect(r.structuredContent.kind).toBe("confirmation_required");
+    expect(r.structuredContent.page_id).toBe(BLOG_ID);
+    expect(confirmationRequiredArm.safeParse(r.structuredContent).success).toBe(true);
   });
 });

@@ -843,7 +843,7 @@ with `overwrite: true`. It uploads a new version of the attachment with that
 exact name and asks the user to confirm. Pass `expected_version` as above so a
 newer upload by someone else is not replaced unseen.
 
-## Available Tools (39)
+## Available Tools (41)
 
 | Tool | Description |
 |------|-------------|
@@ -852,6 +852,8 @@ newer upload by someone else is not replaced unseen.
 | `get_page` | Read a page or blog post by ID (use `headings_only` to preview structure first) |
 | `get_page_by_title` | Look up a page by title (use `headings_only` to preview structure first) |
 | `update_page` | Update an existing page |
+| `create_blog_post` | Create a blog post; a draft by default, `publish: true` publishes it (notifies readers, always asks the user to confirm) |
+| `update_blog_post` | Update a blog post with the same safety checks as `update_page`; `publish: true` publishes a draft (always asks the user to confirm) |
 | `update_page_section` | Update a single section by heading name (supports `body` replacement OR `find_replace` literal substitutions) |
 | `update_page_sections` | Atomically update multiple sections in one version bump (all-or-nothing) |
 | `prepend_to_page` | Insert content at the beginning of an existing page (additive, safe) |
@@ -863,19 +865,19 @@ newer upload by someone else is not replaced unseen.
 | `get_page_children` | Get child pages of a page |
 | `search_pages` | Search pages using CQL (Confluence Query Language); shows last-modified time, version and last editor |
 | `get_spaces` | List available Confluence spaces |
-| `add_attachment` | Upload a file attachment to a page (`overwrite: true` uploads a new version of an existing one) |
+| `add_attachment` | Upload a file attachment to a page or blog post (`overwrite: true` uploads a new version of an existing one) |
 | `get_attachments` | List attachments on a page, with each attachment's version |
 | `download_attachment` | Download an attachment to a local file under the working directory, outside dot-directories (does not modify Confluence, so it works in read-only profiles; the bytes are not returned inline) |
 | `add_drawio_diagram` | Add a draw.io diagram to a page |
 | `update_drawio_diagram` | Replace an existing draw.io diagram in place (new attachment version, macro revision raised) |
 | `get_labels` | Get all labels on a Confluence page |
-| `add_label` | Add one or more labels to a Confluence page |
-| `remove_label` | Remove a label from a Confluence page |
+| `add_label` | Add one or more labels to a Confluence page or blog post |
+| `remove_label` | Remove a label from a Confluence page or blog post |
 | `get_page_status` | Get the content status badge on a page |
-| `set_page_status` | Set the content status badge on a page |
+| `set_page_status` | Set the content status badge on a page or blog post |
 | `remove_page_status` | Remove the content status badge from a page |
 | `get_comments` | Get footer and/or inline comments on a page or blog post |
-| `create_comment` | Create a footer or inline comment on a page |
+| `create_comment` | Create a footer or inline comment on a page, or a footer comment or reply on a blog post |
 | `resolve_comment` | Resolve or reopen an inline comment |
 | `delete_comment` | Permanently delete a comment |
 | `get_page_versions` | List version history for a page |

@@ -69,6 +69,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     resolveSpaceId: vi.fn(),
     getSpaceKeyById: vi.fn(),
     getPage: vi.fn(),
+    getContent: vi.fn(),
     _rawCreatePage: vi.fn(),
     _rawUpdatePage: vi.fn(),
     deletePage: vi.fn(),
@@ -288,12 +289,13 @@ describe("mass-damage integration (G3)", () => {
   // ---------------------------------------------------------------------------
   describe("F3: per-space allowlist rejection", () => {
     it("G3/F3: assertSpaceAllowed rejects a pageId whose space is outside the list", async () => {
-      const { getPage, getSpaceKeyById } = await import("./confluence-client.js");
+      const { getContent, getSpaceKeyById } = await import("./confluence-client.js");
       const { pageSpaceCache, assertSpaceAllowed, SpaceNotAllowedError } =
         await import("./space-allowlist.js");
       pageSpaceCache._resetForTest();
       // v2 pages carry a numeric spaceId; the allowlist holds keys.
-      (getPage as any).mockResolvedValueOnce({
+      (getContent as any).mockResolvedValueOnce({
+        contentType: "page",
         id: "999",
         title: "Restricted",
         spaceId: "5002",

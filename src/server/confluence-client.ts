@@ -787,6 +787,21 @@ export class ContentIsBlogPostError extends ConfluenceNotFoundError {
 }
 
 /**
+ * The mirror of ContentIsBlogPostError: a blog-post-only operation was given
+ * the id of a page. Also a not-found, so every catch site fails closed.
+ */
+export class ContentIsPageError extends ConfluenceNotFoundError {
+  constructor(id: string) {
+    const message =
+      `id ${id} is a page, not a blog post. This tool works on blog posts only; ` +
+      `use update_page to edit a page.`;
+    super(404, message);
+    this.name = "ContentIsPageError";
+    this.message = message;
+  }
+}
+
+/**
  * Best-effort extraction of the current page version from a Confluence
  * 409 response body. The Cloud API does not document a stable shape for
  * the current version in the conflict body; we look for common patterns.
@@ -1423,6 +1438,64 @@ export async function resolveContentType(id: string): Promise<ContentType> {
   }
 }
 
+/**
+ * A blog post as the blog write path reads it: PageSchema plus `status`,
+ * which decides whether an update keeps a draft a draft or publishes it.
+ * Separate from PageSchema so page parsing stays exactly as it was.
+ */
+export const BlogPostSchema = PageSchema.extend({ status: z.string().optional() });
+export type BlogPostData = z.infer<typeof BlogPostSchema> & { contentType?: ContentType };
+
+/**
+ * Metadata (or body) read of a blog post DRAFT. A post that has never been
+ * published may only be returned when `status=draft` is asked for, so the
+ * blog write path tries this after a plain `/blogposts/{id}` 404. Never
+ * called on the page read path. Errors propagate; callers fail closed.
+ */
+export async function getDraftBlogPost(id: string, includeBody: boolean): Promise<BlogPostData> {
+  assertNumericContentId(id);
+  const params: Record<string, string> = { status: "draft" };
+  if (includeBody) params["body-format"] = "storage";
+  return BlogPostSchema.parse(await v2Get(`/blogposts/${id}`, params));
+}
+
+/**
+ * Read a blog post for update_blog_post. Never touches pageCache (D6).
+ *
+ * `/blogposts/{id}` first, then the draft read on a 404. When both are 404
+ * and `/pages/{id}` answers, the id is a page: ContentIsPageError, so the
+ * agent is pointed at update_page rather than told "not found". Any other
+ * outcome of that probe rethrows the original 404.
+ */
+export async function getBlogPost(
+  id: string,
+  includeBody: boolean
+): Promise<BlogPostData & { contentType: "blogpost" }> {
+  assertNumericContentId(id);
+  let notFound: ConfluenceNotFoundError;
+  try {
+    const raw = await v2Get(`/blogposts/${id}`, includeBody ? { "body-format": "storage" } : {});
+    return { ...BlogPostSchema.parse(raw), contentType: "blogpost" };
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+    notFound = err;
+  }
+  try {
+    return { ...(await getDraftBlogPost(id, includeBody)), contentType: "blogpost" };
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+  }
+  let isPage = false;
+  try {
+    PageSchema.parse(await v2Get(`/pages/${id}`, {}));
+    isPage = true;
+  } catch {
+    // Probe failed: keep the original not-found.
+  }
+  if (isPage) throw new ContentIsPageError(id);
+  throw notFound;
+}
+
 async function fetchPageWithCache(pageId: string): Promise<PageData> {
   // Check if this page is in the cache
   const cached = pageCache.has(pageId);
@@ -1455,35 +1528,54 @@ export async function _rawCreatePage(
   parentId?: string,
   clientLabel?: string
 ): Promise<PageData> {
+  return _rawCreateContent("page", spaceId, title, body, { parentId, clientLabel });
+}
+
+/**
+ * `POST /pages` or `POST /blogposts`. `_rawCreatePage` above is the page
+ * wrapper, so create_page's call chain does not change.
+ *
+ * Blog posts: no parent (the API has none), `status` is `draft` or
+ * `current` (published), and the body is never cached: pageCache holds page
+ * bodies only (D6 of plans/read-blog-posts.md).
+ */
+export async function _rawCreateContent(
+  type: ContentType,
+  spaceId: string,
+  title: string,
+  body: string,
+  opts: { parentId?: string; clientLabel?: string; status?: "current" | "draft" } = {}
+): Promise<PageData> {
   const cfg = await getConfig();
   const pageBody = normalizeBodyForSubmit(body);
+  const segment = segmentFor(type);
 
   const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
-  const versionMsg = cfg.attribution && clientLabel
-    ? `Created by ${clientLabel} (via ${epimethianTag})`
+  const versionMsg = cfg.attribution && opts.clientLabel
+    ? `Created by ${opts.clientLabel} (via ${epimethianTag})`
     : `Created by ${epimethianTag}`;
   const payload: Record<string, unknown> = {
     title,
     spaceId,
-    status: "current",
+    status: type === "blogpost" ? (opts.status ?? "current") : "current",
     body: {
       representation: "storage",
       value: pageBody,
     },
     version: { message: versionMsg },
   };
-  if (parentId) payload.parentId = parentId;
-  const raw = await v2Post("/pages", payload);
+  if (type === "page" && opts.parentId) payload.parentId = opts.parentId;
+  const raw = await v2Post(`/${segment}`, payload);
   let page: PageData;
   try {
     page = PageSchema.parse(raw);
   } catch (err) {
     // The POST succeeded; an unreadable answer must not read as "not created".
-    throw new WriteOutcomeUnknownError("POST", `${cfg.apiV2}/pages`, err, "response");
+    throw new WriteOutcomeUnknownError("POST", `${cfg.apiV2}/${segment}`, err, "response");
   }
 
-  // Cache the body we just sent (new pages start at version 1)
-  pageCache.set(page.id, page.version?.number ?? 1, pageBody);
+  // Cache the body we just sent (new pages start at version 1). Pages only.
+  if (type === "page") pageCache.set(page.id, page.version?.number ?? 1, pageBody);
 
   // ensureAttributionLabel is now called by the handler via safeSubmitPage's
   // caller chain so warnings can be surfaced. No call here.
@@ -1491,25 +1583,52 @@ export async function _rawCreatePage(
   return page;
 }
 
+export interface RawUpdateOptions {
+  title: string;
+  body?: string;
+  version: number;
+  versionMessage?: string;
+  previousBody?: string;
+  clientLabel?: string;
+  /**
+   * Track C3: when non-empty, a `[destructive: ...]` suffix is appended
+   * to the Confluence version message so the Confluence UI's own history
+   * view shows which destructive flags were in effect — no dependency on
+   * the local mutation log.
+   */
+  destructiveFlags?: string[];
+  /**
+   * Blog posts only: the status to write. `draft` keeps a draft a draft,
+   * `current` publishes it (or keeps a published post published). Pages
+   * always send `current`.
+   */
+  status?: "current" | "draft";
+}
+
 export async function _rawUpdatePage(
   pageId: string,
-  opts: {
-    title: string;
-    body?: string;
-    version: number;
-    versionMessage?: string;
-    previousBody?: string;
-    clientLabel?: string;
-    /**
-     * Track C3: when non-empty, a `[destructive: ...]` suffix is appended
-     * to the Confluence version message so the Confluence UI's own history
-     * view shows which destructive flags were in effect — no dependency on
-     * the local mutation log.
-     */
-    destructiveFlags?: string[];
-  }
+  opts: RawUpdateOptions
+): Promise<{ page: PageData; newVersion: number }> {
+  return _rawUpdateContent("page", pageId, opts);
+}
+
+/**
+ * `PUT /pages/{id}` or `PUT /blogposts/{id}`, with the same version message,
+ * outcome-unknown and 409 handling for both. `_rawUpdatePage` above is the
+ * page wrapper, so update_page's call chain does not change.
+ *
+ * Blog posts: the 409 re-read goes to `/blogposts/{id}`; nothing is written
+ * to pageCache (no body, no snapshot); and `PUT /blogposts/{id}` requires a
+ * body, so a title-only update re-sends `previousBody` unchanged.
+ */
+export async function _rawUpdateContent(
+  type: ContentType,
+  pageId: string,
+  opts: RawUpdateOptions
 ): Promise<{ page: PageData; newVersion: number }> {
   const cfg = await getConfig();
+  const segment = segmentFor(type);
+  const isPage = type === "page";
   const newVersion = opts.version + 1;
 
   const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
@@ -1536,13 +1655,16 @@ export async function _rawUpdatePage(
 
   // Compute the cleaned body ONCE — avoids double-execution of
   // stripAttributionFooter which could diverge if regex state drifts.
-  const pageBody = opts.body
-    ? normalizeBodyForSubmit(opts.body)
+  // A blog post PUT requires a body: a title-only update re-sends the
+  // current one unchanged.
+  const bodyToSend = opts.body || (isPage ? undefined : opts.previousBody);
+  const pageBody = bodyToSend
+    ? normalizeBodyForSubmit(bodyToSend)
     : undefined;
 
   const payload: Record<string, unknown> = {
     id: pageId,
-    status: "current",
+    status: isPage ? "current" : (opts.status ?? "current"),
     title: opts.title,
     version: { number: newVersion, message: versionMessage },
   };
@@ -1562,14 +1684,14 @@ export async function _rawUpdatePage(
     throw new PageOutcomeUnknownError(pageId);
   }
 
-  // Pre-write snapshot for recovery
-  if (opts.previousBody !== undefined) {
+  // Pre-write snapshot for recovery (pages only: no blog bodies in pageCache)
+  if (isPage && opts.previousBody !== undefined) {
     pageCache.setSnapshot(pageId, opts.version, opts.previousBody);
   }
 
   let raw: unknown;
   try {
-    raw = await v2Put(`/pages/${pageId}`, payload);
+    raw = await v2Put(`/${segment}/${pageId}`, payload);
   } catch (err) {
     if (err instanceof WriteOutcomeUnknownError) {
       noteWriteOutcomeUnknown(pageId, cfg.sealedCloudId, opts.version);
@@ -1584,7 +1706,7 @@ export async function _rawUpdatePage(
       // with a fresh read. Also the fallback when the body has no version.
       if (currentVersion === undefined || currentVersion === opts.version) {
         try {
-          const refresh = await v2Get(`/pages/${pageId}`, {});
+          const refresh = await v2Get(`/${segment}/${pageId}`, {});
           const parsed = PageSchema.parse(refresh);
           currentVersion = parsed.version?.number ?? currentVersion;
         } catch {
@@ -1612,14 +1734,14 @@ export async function _rawUpdatePage(
   } catch (err) {
     // The PUT returned 2xx; an unreadable answer must not read as "not written".
     noteWriteOutcomeUnknown(pageId, cfg.sealedCloudId, opts.version);
-    throw new WriteOutcomeUnknownError("PUT", `${cfg.apiV2}/pages/${pageId}`, err, "response");
+    throw new WriteOutcomeUnknownError("PUT", `${cfg.apiV2}/${segment}/${pageId}`, err, "response");
   }
 
   // The write is confirmed, so any earlier unknown outcome is settled.
   pageCache.clearOutcomeUnknown(pageId);
 
-  // Cache the body we just sent (reuse pre-computed pageBody)
-  if (pageBody !== undefined) {
+  // Cache the body we just sent (reuse pre-computed pageBody). Pages only.
+  if (isPage && pageBody !== undefined) {
     pageCache.set(pageId, newVersion, pageBody);
   }
 
@@ -2771,10 +2893,16 @@ export async function getCommentReplies(
   return CommentsResultSchema.parse(raw).results;
 }
 
+/**
+ * A reply is keyed by its parent comment, whatever the container. A new
+ * top-level comment names its container: `pageId` for a page, `blogPostId`
+ * for a blog post (`type`, resolved by the caller).
+ */
 export async function createFooterComment(
   pageId: string,
   body: string,
-  parentCommentId?: string
+  parentCommentId?: string,
+  type: ContentType = "page"
 ): Promise<CommentData> {
   const cfg = await getConfig();
   const sanitized = sanitizeCommentBody(toStorageFormat(body));
@@ -2789,7 +2917,7 @@ export async function createFooterComment(
         body: { representation: "storage", value: attributed },
       }
     : {
-        pageId,
+        [type === "blogpost" ? "blogPostId" : "pageId"]: pageId,
         body: { representation: "storage", value: attributed },
       };
 

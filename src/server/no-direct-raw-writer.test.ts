@@ -3,8 +3,10 @@
  *
  * This test greps every non-test production TypeScript file under src/
  * (server, cli, shared — whatever exists) and asserts that none of them
- * import `_rawUpdatePage` or `_rawCreatePage`. Write paths outside safe-write
- * must go through safePrepareBody + safeSubmitPage — this includes CLI
+ * import `_rawUpdatePage` or `_rawCreatePage`, or their generalised forms
+ * `_rawUpdateContent` / `_rawCreateContent` (pages and blog posts). Write
+ * paths outside safe-write must go through safePrepareBody + safeSubmitPage —
+ * this includes CLI
  * migrations like fix-legacy-links and any future shared helper.
  *
  * If this test fails, a future developer added a direct import of the raw
@@ -51,7 +53,7 @@ const productionFiles = walkTsFiles(SRC_DIR).filter(
 );
 
 describe("raw-writer import restriction", () => {
-  it("only safe-write.ts imports _rawUpdatePage or _rawCreatePage in production code", () => {
+  it("only safe-write.ts imports the raw writers (page and generalised content) in production code", () => {
     // This test iterates explicitly over sorted files so that a failure names
     // the offending file clearly in the Vitest output.
     for (const file of productionFiles) {
@@ -67,14 +69,26 @@ describe("raw-writer import restriction", () => {
         content,
         `${relativePath} must not import _rawCreatePage (use safePrepareBody + safeSubmitPage instead)`,
       ).not.toMatch(/\b_rawCreatePage\b/);
+
+      expect(
+        content,
+        `${relativePath} must not import _rawUpdateContent (use safePrepareBody + safeSubmitPage instead)`,
+      ).not.toMatch(/\b_rawUpdateContent\b/);
+
+      expect(
+        content,
+        `${relativePath} must not import _rawCreateContent (use safePrepareBody + safeSubmitPage instead)`,
+      ).not.toMatch(/\b_rawCreateContent\b/);
     }
   });
 
-  it("safe-write.ts DOES import _rawUpdatePage and _rawCreatePage (sanity check)", () => {
+  it("safe-write.ts DOES import all four raw writers (sanity check)", () => {
     const safeWritePath = join(SRC_DIR, "server", "safe-write.ts");
     const content = readFileSync(safeWritePath, "utf8");
 
     expect(content).toMatch(/\b_rawUpdatePage\b/);
     expect(content).toMatch(/\b_rawCreatePage\b/);
+    expect(content).toMatch(/\b_rawUpdateContent\b/);
+    expect(content).toMatch(/\b_rawCreateContent\b/);
   });
 });
