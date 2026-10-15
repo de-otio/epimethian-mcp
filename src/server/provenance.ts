@@ -129,7 +129,7 @@ export async function markPageUnverified(
   pageId: string,
   cfg: Config,
   container?: ContainerOptions
-): Promise<{ warning?: string }> {
+): Promise<{ warning?: string; applied?: true }> {
   // Feature disabled — bail out immediately without any API calls.
   if (cfg.unverifiedStatus === false) {
     return {};
@@ -170,7 +170,9 @@ export async function markPageUnverified(
   try {
     if (container) await setContentState(pageId, target.name, target.color, 0, container);
     else await setContentState(pageId, target.name, target.color);
-    return {};
+    // Setting a status creates a Confluence version on a published page or
+    // post; callers that report a version re-read it when this is set.
+    return { applied: true };
   } catch (err) {
     if (err instanceof ConfluencePermissionError) {
       return {

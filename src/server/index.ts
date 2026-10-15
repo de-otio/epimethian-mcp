@@ -2164,19 +2164,32 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           : await markPageUnverified(submitted.page.id, cfg, { draft: true });
         if (badgeResult.warning) warnings.push(badgeResult.warning);
 
+        // On a published post the status badge is a Confluence version of its
+        // own. When it was just set, report the version the post is at now,
+        // so the next update does not conflict. Not re-read otherwise: that
+        // could report someone else's newer edit as ours.
+        let reportedVersion = submitted.newVersion;
+        if (badgeResult.applied && publish) {
+          try {
+            reportedVersion = (await getBlogPost(submitted.page.id, false)).version?.number ?? reportedVersion;
+          } catch {
+            // Keep the write's version; a stale one shows up as a conflict.
+          }
+        }
+
         const id = submitted.page.id;
         const note = publish
           ? `Published blog post ${id} in space ${space_key}.`
           : `Created DRAFT blog post ${id} in space ${space_key}. It is not on the blog and nobody ` +
             `was notified. To publish it, call update_blog_post with blog_post_id ${id}, ` +
-            `version ${submitted.newVersion}, the same title, and publish: true (the user is asked to confirm).`;
+            `version ${reportedVersion}, the same title, and publish: true (the user is asked to confirm).`;
         const page = await formatPage({ ...submitted.page, contentType: "blogpost" }, false);
         return {
           ...toolResult(appendWarnings(`${note}\n\n${page}`, warnings) + echo),
           structuredContent: {
             kind: "written" as const,
             page_id: id,
-            new_version: submitted.newVersion,
+            new_version: reportedVersion,
             title: submitted.page.title,
           },
         };
@@ -2405,6 +2418,19 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             : await markPageUnverified(submitted.page.id, cfg);
         if (badgeResult.warning) warnings.push(badgeResult.warning);
 
+        // On a published post the status badge is a Confluence version of its
+        // own. When it was just set, report the version the post is at now,
+        // so the next update does not conflict. Not re-read otherwise: that
+        // could report someone else's newer edit as ours.
+        let reportedVersion = submitted.newVersion;
+        if (badgeResult.applied && !(currentStatus === "draft" && !publishing)) {
+          try {
+            reportedVersion = (await getBlogPost(blog_post_id, false)).version?.number ?? reportedVersion;
+          } catch {
+            // Keep the write's version; a stale one shows up as a conflict.
+          }
+        }
+
         const isTitleOnly = prepared.finalStorage === undefined;
         const verb = publishing ? "Published" : "Updated";
         const bodyNote = isTitleOnly
@@ -2419,13 +2445,13 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             ? " It is still a draft: nobody was notified. Pass publish: true to publish it."
             : "";
         const text =
-          `${verb} blog post: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, ${bodyNote}${removalNote}).${draftNote}`;
+          `${verb} blog post: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${reportedVersion}, ${bodyNote}${removalNote}).${draftNote}`;
         return {
           ...toolResult(appendWarnings(text, warnings) + echo),
           structuredContent: {
             kind: "written" as const,
             page_id: blog_post_id,
-            new_version: submitted.newVersion,
+            new_version: reportedVersion,
             ...(isTitleOnly
               ? {}
               : { body_bytes_before: submitted.oldLen, body_bytes_after: submitted.newLen }),

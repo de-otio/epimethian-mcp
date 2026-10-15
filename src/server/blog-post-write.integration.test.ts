@@ -302,7 +302,12 @@ const fetchMock = vi.fn(async (input: unknown, init?: { method?: string; body?: 
       return json({ statusCode: 404, message: `No content found with id : ${id} and status [${asked}]` }, 404);
     }
     if (method === "GET") return json({ contentState: states.get(id) ?? null });
-    if (method === "PUT") states.set(id, body as { name: string; color: string });
+    if (method === "PUT") {
+      states.set(id, body as { name: string; color: string });
+      // Setting a status adds a version to published content (seen live).
+      const item = pages.get(id) ?? posts.get(id);
+      if (item && item.status === "current") item.version += 1;
+    }
     if (method === "DELETE") states.delete(id);
     return json({});
   }
@@ -781,8 +786,10 @@ describe("update_blog_post", () => {
     const newBody = BODY.replace("Details", "Details (updated)");
     const r = await updateBlog({ body: newBody });
     expect(r.isError, r.text).toBe(false);
-    expect(r.text).toContain(`Updated blog post: Release notes (ID: ${BLOG_ID}, version: 5`);
-    expect(r.structured).toMatchObject({ kind: "written", page_id: BLOG_ID, new_version: 5 });
+    // The PUT writes version 5; the status badge set after it is version 6,
+    // and the reported version is the one the post is at.
+    expect(r.text).toContain(`Updated blog post: Release notes (ID: ${BLOG_ID}, version: 6`);
+    expect(r.structured).toMatchObject({ kind: "written", page_id: BLOG_ID, new_version: 6 });
     expect(mockElicitInput).not.toHaveBeenCalled();
     const read = requests.find((x) => x.method === "GET" && x.path === v2(`/blogposts/${BLOG_ID}`));
     expect(read?.query.get("body-format")).toBe("storage");
@@ -936,8 +943,23 @@ describe("update_blog_post: drafts and publishing", () => {
     expect(puts).toHaveLength(1);
     // The first publish of a draft must also send version 1.
     expect(puts[0].body).toMatchObject({ status: "current", version: { number: 1 }, body: { value: BODY } });
-    expect(second.structured?.new_version).toBe(1);
+    // Version 1 is the publish, version 2 the status badge.
+    expect(second.structured?.new_version).toBe(2);
     expect(posts.get(DRAFT_ID)?.status).toBe("current");
+  });
+
+  it("the reported version is the one the post is at after the status badge", async () => {
+    const first = await updateDraft({ publish: true });
+    const token = first.structured?.confirm_token as string;
+    const second = await updateDraft({ publish: true, confirm_token: token });
+    expect(second.isError, second.text).toBe(false);
+    const badge = writes().filter((w) => w.method === "PUT" && w.path === v1(`/content/${DRAFT_ID}/state`));
+    expect(badge).toHaveLength(1);
+    // Published at 1, then the badge made version 2: the next update needs 2.
+    expect(posts.get(DRAFT_ID)?.version).toBe(2);
+    expect(second.structured?.new_version).toBe(2);
+    const next = await updateBlog({ blog_post_id: DRAFT_ID, title: "Coming soon", version: 2, body: BODY.replace("Details", "After") });
+    expect(next.isError, next.text).toBe(false);
   });
 
   it("a publish token is bound to the title", async () => {
