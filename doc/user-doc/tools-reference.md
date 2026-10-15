@@ -2,7 +2,7 @@
 
 The Epimethian MCP server provides **41 tools** for managing Confluence pages, blog posts, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
 
-_Last updated: 2026-10-06 — v7.1.0_
+_Last updated: 2026-10-15 — v7.4.1_
 
 Every tool declares a title and the annotation hints `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`. The hints are advisory; the server's own guards never depend on them. `update_page`, `update_blog_post`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `update_drawio_diagram`, `revert_page`, `download_attachment`, `remove_label`, `set_page_status`, `remove_page_status` and `upgrade` declare `destructiveHint: true`. `delete_page`, `revert_page`, `delete_comment`, `authorise_destructive_writes` and `upgrade` also set `_meta["anthropic/requiresUserInteraction"]`, so Claude Code asks for approval on every call.
 
@@ -845,6 +845,8 @@ Takes no parameters.
 
 Returns the epimethian-mcp server version. Also reports available updates, if any, including whether a patch was auto-installed via `EPIMETHIAN_AUTO_UPGRADE=patches`.
 
+When two or more copies of epimethian-mcp are installed (for example one under Homebrew's npm and one under nvm's), it lists each copy's version and directory, marks the one the server runs, and prints the `npm uninstall -g --prefix <prefix> @de-otio/epimethian-mcp` command for each of the others. The update notice then names the running copy's command by absolute path, since a bare `epimethian-mcp upgrade` in a terminal may upgrade a different copy.
+
 Takes no parameters.
 
 ---
@@ -852,6 +854,8 @@ Takes no parameters.
 ### `upgrade`
 
 Upgrades epimethian-mcp to the latest available version. After a successful upgrade the user must restart the MCP server (reload the VS Code window or restart Claude) for the new version to take effect.
+
+The upgrade replaces only the copy the server runs from. If other copies are installed, the result lists each one it did not upgrade ("Not upgraded: v7.2.0 at …"), with the command that removes it.
 
 Takes no parameters.
 

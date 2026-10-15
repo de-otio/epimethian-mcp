@@ -49,13 +49,19 @@ No admin access is required. Any Confluence user can generate their own token.
 
 ### Step 3: Configure Your AI Client
 
-Add to your MCP client configuration (`.mcp.json` or equivalent):
+Find the absolute path of the command you just installed:
+
+```bash
+which epimethian-mcp
+```
+
+Add it to your MCP client configuration (`.mcp.json` or equivalent) as the `command`:
 
 ```json
 {
   "mcpServers": {
     "confluence": {
-      "command": "epimethian-mcp",
+      "command": "/opt/homebrew/bin/epimethian-mcp",
       "env": {
         "CONFLUENCE_PROFILE": "<profile name from Step 2>"
       }
@@ -64,13 +70,7 @@ Add to your MCP client configuration (`.mcp.json` or equivalent):
 }
 ```
 
-For IDE-hosted agents that may not resolve PATH correctly, use the absolute path:
-
-```bash
-which epimethian-mcp
-```
-
-Then use the output as the `command` value.
+Use the absolute path rather than a bare `epimethian-mcp`. Your MCP client and your terminal may see different PATHs: on macOS an IDE started from the Dock does not get your login shell's PATH. With a bare name, the client can start a different installed copy from the one your terminal runs and upgrades. `epimethian-mcp setup` already writes the absolute path into the configs it generates.
 
 **Important:** Only `CONFLUENCE_PROFILE` goes in the config file. URL, email, and API token are read from the OS keychain at startup.
 
@@ -135,3 +135,15 @@ CONFLUENCE_PROFILE=<name> epimethian-mcp status
 **Pages or spaces not found (404)**
 - Double-check the space key, page ID, or page title.
 - Use the `get_spaces` tool to discover valid space keys.
+
+**Upgraded, but `get_version` still shows the old version**
+- You probably have two installed copies, for example one under Homebrew's npm and one under nvm's. An upgrade (the `upgrade` tool, `epimethian-mcp upgrade`, or `npm install -g`) replaces only one copy, and your MCP client keeps starting the other.
+- Run `epimethian-mcp status` to list every installed copy. `get_version` lists them too, and the server prints them to stderr at startup.
+- Keep the copy your MCP config's `command` starts, and remove the other with the command the listing prints:
+
+  ```bash
+  npm uninstall -g --prefix <prefix> @de-otio/epimethian-mcp
+  ```
+
+  `--prefix` makes the command remove that copy whichever `npm` runs it.
+- Then set `command` to the absolute path of the copy you kept (see Step 3) and restart your MCP client.

@@ -28,6 +28,12 @@ vi.mock("../shared/update-check.js", () => ({
   performUpgrade: (...a: unknown[]) => mockPerformUpgrade(...a),
 }));
 
+// Never probe the real machine's global prefixes from a test.
+vi.mock("../shared/installed-copies.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../shared/installed-copies.js")>();
+  return { ...actual, findInstalledCopies: vi.fn().mockResolvedValue([]) };
+});
+
 const mockRegisterTool = vi.fn();
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
   McpServer: vi.fn().mockImplementation(function () {

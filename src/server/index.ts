@@ -202,6 +202,39 @@ import {
   checkLatestNow,
   type UpdateInfo,
 } from "../shared/update-check.js";
+import {
+  describeCopies,
+  describeNotUpgraded,
+  findInstalledCopies,
+  upgradeInstruction,
+  type InstalledCopy,
+} from "../shared/installed-copies.js";
+
+/**
+ * The installed copies of the package, found once per server (it is a
+ * read-only probe of a few tens of directory entries) and cached. Forgotten
+ * after an upgrade, which changes the versions on disk.
+ */
+let installedCopiesFound: Promise<InstalledCopy[]> | null = null;
+
+function installedCopies(): Promise<InstalledCopy[]> {
+  installedCopiesFound ??= findInstalledCopies();
+  return installedCopiesFound;
+}
+
+/** Drop the cached list, so the next caller looks again. */
+export function forgetInstalledCopies(): void {
+  installedCopiesFound = null;
+}
+
+/** The installed copies, or [] if the finder fails: never breaks the caller. */
+async function installedCopiesOrNone(): Promise<InstalledCopy[]> {
+  try {
+    return await installedCopies();
+  } catch {
+    return [];
+  }
+}
 
 // --- Utilities ---
 
@@ -6089,12 +6122,16 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     {
       description:
         "Return the epimethian-mcp server version. " +
-        "Also reports available updates, if any.",
+        "Also reports available updates, if any, and lists every installed copy " +
+        "when more than one is installed.",
       ...readOnlyTool("Get server version"),
       inputSchema: {},
     },
     async () => {
       let text = `epimethian-mcp v${__PKG_VERSION__}`;
+      const copies = await installedCopiesOrNone();
+      const block = describeCopies(copies, __PKG_VERSION__);
+      if (block) text += `\n\n${block}`;
       try {
         const pending = await getPendingUpdate(__PKG_VERSION__);
         if (pending) {
@@ -6110,11 +6147,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
                 : pending.type === "minor"
                   ? "Minor"
                   : "Patch";
+            const instruction = upgradeInstruction(copies);
             text +=
               `\n\n${label} update available: ` +
               `v${pending.current} → v${pending.latest}. ` +
-              `Run \`epimethian-mcp upgrade\` in your terminal to install ` +
-              `(the install runs an npm provenance check before fetching the tarball).`;
+              (instruction
+                ? `${instruction} The install runs an npm provenance check before fetching the tarball.`
+                : `Run \`epimethian-mcp upgrade\` in your terminal to install ` +
+                  `(the install runs an npm provenance check before fetching the tarball).`);
           }
         }
       } catch {
@@ -6160,11 +6200,15 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
 
         const output = await performUpgrade(pending.latest);
         await clearPendingUpdate();
+        // The versions on disk changed: look again rather than reuse the list.
+        forgetInstalledCopies();
+        const notUpgraded = describeNotUpgraded(await installedCopiesOrNone());
         return toolResult(
           `Upgraded epimethian-mcp from v${pending.current} to v${pending.latest}.\n\n` +
             `⚠ Restart required: reload the VS Code window (or restart Claude) ` +
             `so the new version takes effect.\n\n` +
-            output
+            output +
+            (notUpgraded ? `\n\n${notUpgraded}` : "")
         );
       } catch (err) {
         return toolError(err);
@@ -6279,6 +6323,13 @@ export async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  // A second installed copy is how an upgrade "doesn't take": the upgrade
+  // replaces one copy and the MCP client keeps starting the other. Say so
+  // once per start. The probe only reads the filesystem and never throws.
+  const copies = await installedCopiesOrNone();
+  const copiesBlock = describeCopies(copies, __PKG_VERSION__);
+  if (copiesBlock) console.error(`epimethian-mcp: ${copiesBlock}`);
+
   // Surface any cached pending-update record on the stderr banner so the
   // user sees it every startup (not only the first time the daily check
   // runs). Keeps the nag visible under the check-and-notify trust model.
@@ -6287,7 +6338,7 @@ export async function main() {
     if (pending) {
       console.error(
         `epimethian-mcp: update available: v${pending.current} → v${pending.latest} (${pending.type}). ` +
-          `Run \`epimethian-mcp upgrade\` to install.`
+          (upgradeInstruction(copies) ?? `Run \`epimethian-mcp upgrade\` to install.`)
       );
     }
   } catch {
