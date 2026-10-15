@@ -2210,8 +2210,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         withDestructiveWarning(
           "Update a Confluence blog post (for a page, use update_page), with update_page's safety checks. " +
           MARKDOWN_BODY_NOTE + " " +
-          "Pass the `version` from your latest get_page; omit body for a title-only change. " +
-          "A draft is always at version 1: pass 1 (or \"current\") for every edit of a draft and for its publish.\n\n" +
+          "Pass the `version` from your latest get_page; omit body for a title-only change.\n\n" +
           "publish: true on a DRAFT publishes it. " + BLOG_PUBLISH_NOTE + " " +
           "Set publish only when the user asked for it. A published post cannot become a draft again.\n\n" +
           "Flags (default false), as on update_page: confirm_deletions, confirm_shrinkage, " +
@@ -2227,7 +2226,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .min(1)
           .describe("Post title (use the title from get_page if unchanged)"),
         version: versionField
-          .describe(VERSION_PARAM_NOTE),
+          .describe(`${VERSION_PARAM_NOTE} A draft is always at version 1: pass 1 for every edit of a draft and for its publish.`),
         body: z
           .string()
           .optional()
