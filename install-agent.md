@@ -849,7 +849,7 @@ newer upload by someone else is not replaced unseen.
 |------|-------------|
 | `check_permissions` | Report the current profile's MCP access mode and the token's capabilities |
 | `create_page` | Create a new Confluence page |
-| `get_page` | Read a page by ID (use `headings_only` to preview structure first) |
+| `get_page` | Read a page or blog post by ID (use `headings_only` to preview structure first) |
 | `get_page_by_title` | Look up a page by title (use `headings_only` to preview structure first) |
 | `update_page` | Update an existing page |
 | `update_page_section` | Update a single section by heading name (supports `body` replacement OR `find_replace` literal substitutions) |
@@ -874,7 +874,7 @@ newer upload by someone else is not replaced unseen.
 | `get_page_status` | Get the content status badge on a page |
 | `set_page_status` | Set the content status badge on a page |
 | `remove_page_status` | Remove the content status badge from a page |
-| `get_comments` | Get footer and/or inline comments on a page |
+| `get_comments` | Get footer and/or inline comments on a page or blog post |
 | `create_comment` | Create a footer or inline comment on a page |
 | `resolve_comment` | Resolve or reopen an inline comment |
 | `delete_comment` | Permanently delete a comment |

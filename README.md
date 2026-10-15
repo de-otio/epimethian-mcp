@@ -6,6 +6,8 @@
 
 A security-focused [MCP](https://modelcontextprotocol.io/) server that gives AI agents safe, multi-tenant access to Confluence Cloud. It provides some features not available in the official MCP server, like support for draw.io diagrams, macros, etc.
 
+**What's new (v7.3.0):** `get_page` and `get_comments` read blog posts as well as pages. Pass the blog post's numeric ID; the type is detected for you. The tools that rewrite a page body still accept pages only and refuse a blog post ID. See [CHANGELOG.md](CHANGELOG.md).
+
 **What's new (v7.1.0):** `get_recent_changes` reports the pages and blog posts changed in the last N hours in one call, grouped by space, with edit counts, editors and a condensed diff on request, and says whether the list is complete. `search_pages` results now show the last-modified time, version and last editor, page through to `limit` (max 200) and say when more results exist. See [CHANGELOG.md](CHANGELOG.md).
 
 **What's new (v7.0.0):** `find_replace` now requires each `find` to match exactly once (opt in to several with `replace_all: true`), and `update_page_sections` accepts `find_replace` per section. Every body returned by `get_page` and `get_page_by_title` sits inside the untrusted-content fence. `search_pages` can be scoped to a profile's `read_spaces` and redact `redact_patterns` from titles and excerpts. HTTP requests have timeouts and bounded retries, and a write whose outcome is unknown blocks `version: "current"` writes to that page until a fresh read. Every tool declares annotations. Breaking changes are listed in [CHANGELOG.md](CHANGELOG.md).

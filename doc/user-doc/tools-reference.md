@@ -68,6 +68,8 @@ Returns title, ID, space, version, URL, and optionally the page content. Page bo
 
 The tools that rewrite a page body accept pages only: `update_page`, `update_page_section`, `update_page_sections`, `prepend_to_page`, `append_to_page`, `revert_page`, `add_drawio_diagram`, `update_drawio_diagram` and `delete_page`. Given a blog post ID, they refuse with an error that names it as a blog post, and nothing is written. `get_page_by_title`, `get_page_version` and `diff_page_versions` do not support blog posts.
 
+`get_labels`, `get_page_status`, `get_attachments` and `get_page_versions` also work with a blog post ID. `add_label`, `remove_label`, `set_page_status` and `remove_page_status` change a blog post when the profile has no `spaces` allowlist. With an allowlist, they refuse a blog post ID, because the space check looks the ID up as a page.
+
 ---
 
 ### `get_page_by_title`

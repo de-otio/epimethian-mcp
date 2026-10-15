@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Not included: blog post writes, `get_page_version` and `diff_page_versions` on
 blog posts, and `get_page_by_title` for blog posts.
 
+Unchanged: the label and status tools already accepted a blog post ID, and still
+do. `add_label`, `remove_label`, `set_page_status` and `remove_page_status`
+refuse one when the profile has a `spaces` allowlist.
+
+The compact reads and entity-tolerant matching planned as 7.3.0 in
+`plans/field-session-findings-2026-10.md` are now planned as 7.4.0.
+
 ## [7.2.1] - 2026-10-07 - upgrade fixes
 
 ### Fixed
