@@ -76,7 +76,7 @@ resolution requires one extra `get_page` call (metadata only). Cache
 the mapping in `pageCache` to avoid the double-fetch on repeat
 access.
 
-**Blog posts (implemented, `plans/blog-post-writes.md` A2).** The
+**Blog posts (implemented).** The
 `page_id` of a write tool can be a blog post id: pages and blog posts
 share one id space. `resolveContentSpace(id) → { type, spaceKey }`
 (`src/server/space-allowlist.ts`) resolves either, using the read

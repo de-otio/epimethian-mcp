@@ -1,5 +1,5 @@
 /**
- * Blog-post writes (plans/blog-post-writes.md, stages A2-A4 and B).
+ * Blog-post writes (stages A2-A4 and B).
  *
  *   - A2: the space allowlist resolves a blog post's space, and fails closed
  *     when it cannot (including a pages 404 followed by a blogposts 500).

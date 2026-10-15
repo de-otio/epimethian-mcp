@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - write blog posts
 
-Plan: `plans/blog-post-writes.md`.
-
 ### Added
 - `create_blog_post` creates a blog post in a space's blog. It makes a
   **draft** by default: nobody is notified, and the result says how to

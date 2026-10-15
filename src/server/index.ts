@@ -864,8 +864,8 @@ const VERSION_PARAM_NOTE =
   "impossible (e.g. right after create_page).";
 
 /**
- * Publishing a blog post is a broadcast (plans/blog-post-writes.md, "What the
- * Confluence v2 API says"): no API parameter suppresses the notifications.
+ * Publishing a blog post is a broadcast: the Confluence v2 API has no parameter
+ * that suppresses the notifications.
  * Shared by the create_blog_post / update_blog_post descriptions.
  */
 const BLOG_PUBLISH_NOTE =
