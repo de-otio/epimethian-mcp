@@ -152,9 +152,11 @@ machine that installs it. Specific exposure points:
   the install runs whatever `prepare`, `install`, or `postinstall`
   scripts the tarball declares. There is nothing Epimethian's code can
   do at this point — you are trusting the publisher end-to-end.
-- **`epimethian-mcp upgrade` (manual)**: before fetching the new
-  version, the CLI runs `npm audit signatures` and refuses to install
-  if the package does not carry a verified npm provenance attestation.
+- **`epimethian-mcp upgrade` (manual)**: before the global install,
+  the CLI installs the exact version into a temporary directory with
+  `--ignore-scripts`, runs `npm audit signatures` there, and refuses to
+  install if the registry lists no provenance attestation for the
+  package or the audit does not verify it.
   This defends against both publisher-credential compromise (the
   attestation ties the tarball to a specific GitHub Actions workflow
   run) and registry tampering (sigstore's transparency log is

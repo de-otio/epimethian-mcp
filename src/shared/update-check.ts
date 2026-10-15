@@ -23,8 +23,10 @@
  *    - Minor / major upgrades remain manual even with the opt-in flag.
  *
  * 3. INTEGRITY CHECK: runs before every install, manual or opt-in.
- *    - Primary mechanism: `npm audit signatures` on the resolved
- *      `@de-otio/epimethian-mcp@<version>` tuple. This validates npm
+ *    - Primary mechanism: `npm audit signatures` over the exact
+ *      `@de-otio/epimethian-mcp@<version>`, installed with
+ *      `--ignore-scripts` into a temp directory (the command audits a
+ *      directory's tree, not a package spec). This validates npm
  *      provenance attestations against Sigstore's transparency log, which
  *      proves the tarball was produced by the declared GitHub Actions
  *      workflow — defending against both publisher-credential compromise
@@ -46,9 +48,9 @@
  * See `plans/security-audit-fixes.md` Track A for the full plan.
  */
 
-import { readFile, writeFile, rename, mkdir, realpath } from "node:fs/promises";
+import { readFile, writeFile, rename, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -247,32 +249,69 @@ export async function clearPendingUpdate(): Promise<void> {
   }
 }
 
+const SLSA_PROVENANCE = "https://slsa.dev/provenance/v1";
+
 /**
  * Verify npm provenance attestation for the given version.
  *
- * Shells out to `npm audit signatures @de-otio/epimethian-mcp@<version>` via
- * `execFile` (never `exec`, never a shell) and scans stdout for a success
- * signal. Any failure — non-zero exit, missing provenance, parse error,
- * timeout — returns `{ ok: false }`. Fail closed.
+ * `npm audit signatures` takes no package argument: it audits the installed
+ * tree of its working directory, and with no tree it fails with "found no
+ * installed dependencies to audit". So the exact version is installed into a
+ * fresh temp directory with `--ignore-scripts` (nothing from the package
+ * runs), and audited there. Every command goes through `execFile` (never
+ * `exec`, never a shell).
  *
- * `npm audit signatures` exits non-zero when verification fails; we also
- * require an explicit success line so a silent/empty pass does not let an
- * unverified package through.
+ * Two conditions must both hold:
+ * - `npm audit signatures` exits zero and reports verified attestations. It
+ *   verifies every attestation the registry advertises for the tree.
+ * - The registry advertises an SLSA provenance attestation for this package
+ *   itself. The audit's "N packages have verified attestations" line counts
+ *   dependencies too, so on its own it does not show that this package has
+ *   one.
+ *
+ * Any failure — non-zero exit, missing provenance, timeout — returns
+ * `{ ok: false }`. Fail closed. The temp directory is always removed.
  */
 export async function verifyNpmProvenance(
   version: string
 ): Promise<{ ok: true } | { ok: false; message: string }> {
   const spec = `${PACKAGE_NAME}@${version}`;
+  let dir: string | undefined;
   try {
+    const { stdout: viewOut } = await execFileAsync(
+      "npm",
+      ["view", spec, "dist.attestations.provenance.predicateType"],
+      { timeout: 30_000 }
+    );
+    if (String(viewOut).trim() !== SLSA_PROVENANCE) {
+      return {
+        ok: false,
+        message:
+          `the npm registry lists no provenance attestation for ${spec}. ` +
+          "The package may have been published without `--provenance`. Refusing to install.",
+      };
+    }
+
+    dir = await mkdtemp(join(tmpdir(), "epimethian-verify-"));
+    await writeFile(
+      join(dir, "package.json"),
+      JSON.stringify({ private: true, dependencies: { [PACKAGE_NAME]: version } }),
+      { mode: 0o600 }
+    );
+    await execFileAsync(
+      "npm",
+      ["install", "--ignore-scripts", "--no-audit", "--no-fund"],
+      { cwd: dir, timeout: 120_000 }
+    );
     const { stdout, stderr } = await execFileAsync(
       "npm",
-      ["audit", "signatures", spec],
-      { timeout: 30_000 }
+      ["audit", "signatures"],
+      { cwd: dir, timeout: 60_000 }
     );
     const output = `${stdout}\n${stderr}`;
     // `npm audit signatures` prints lines like:
-    //   "audited 1 package ... verified registry signatures"
-    //   "audited 1 package ... verified attestations"
+    //   "120 packages have verified registry signatures"
+    //   "12 packages have verified attestations"
     // We require the attestation line — a plain signature does not prove
     // provenance, it only proves the registry served the tarball.
     const attested = /verified\s+(?:registry\s+)?attestations?/i.test(output);
@@ -281,8 +320,7 @@ export async function verifyNpmProvenance(
         ok: false,
         message:
           "npm audit signatures did not report a verified provenance attestation. " +
-          "The package may have been published without `--provenance`, or the " +
-          "attestation failed to verify. Refusing to install.",
+          "The attestation may have failed to verify. Refusing to install.",
       };
     }
     return { ok: true };
@@ -291,8 +329,10 @@ export async function verifyNpmProvenance(
       err instanceof Error ? err.message : String(err);
     return {
       ok: false,
-      message: `npm audit signatures failed: ${message}`,
+      message: `provenance verification failed: ${message}`,
     };
+  } finally {
+    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
