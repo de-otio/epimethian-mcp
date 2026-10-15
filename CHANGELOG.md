@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - write blog posts
+## [7.4.0] - 2026-10-15 - write blog posts
 
 ### Security
 - `resolve_comment`, `delete_comment`, and `create_comment` replies now obey
@@ -63,10 +63,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check now installs the exact version into a temporary directory with
   `--ignore-scripts`, runs `npm audit signatures` there, and also requires the
   registry to list a provenance attestation for the package itself.
+  An older install still runs the old check, so its `upgrade` cannot reach
+  7.4.0: install it with `npm install -g @de-otio/epimethian-mcp@7.4.0`.
 - `remove_page_status` no longer creates a new version of a page or blog post
   that has no status (GitHub issue #6). It reads the status first, as
   `set_page_status` does, and sends no DELETE when none is set; the result then
   ends with "(no-op: no status set)".
+
+The compact reads and entity-tolerant matching planned as 7.4.0 in
+`plans/field-session-findings-2026-10.md` are now planned as 7.5.0.
 
 ## [7.3.0] - 2026-10-15 - read blog posts
 

@@ -6,6 +6,8 @@
 
 A security-focused [MCP](https://modelcontextprotocol.io/) server that gives AI agents safe, multi-tenant access to Confluence Cloud. It provides some features not available in the official MCP server, like support for draw.io diagrams, macros, etc.
 
+**What's new (v7.4.0):** `create_blog_post` and `update_blog_post` write blog posts. A new post is a draft unless you pass `publish: true`, and publishing, which emails the space's watchers, always asks you to confirm. The label, status, attachment and comment tools accept blog post IDs, and the comment tools now obey the profile's `spaces` allowlist. `upgrade` works again: its integrity check failed on every run, so to get 7.4.0 itself, run `npm install -g @de-otio/epimethian-mcp@7.4.0`. See [CHANGELOG.md](CHANGELOG.md).
+
 **What's new (v7.3.0):** `get_page` and `get_comments` read blog posts as well as pages. Pass the blog post's numeric ID; the type is detected for you. The tools that rewrite a page body still accept pages only and refuse a blog post ID. See [CHANGELOG.md](CHANGELOG.md).
 
 **What's new (v7.1.0):** `get_recent_changes` reports the pages and blog posts changed in the last N hours in one call, grouped by space, with edit counts, editors and a condensed diff on request, and says whether the list is complete. `search_pages` results now show the last-modified time, version and last editor, page through to `limit` (max 200) and say when more results exist. See [CHANGELOG.md](CHANGELOG.md).
