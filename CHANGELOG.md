@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check now installs the exact version into a temporary directory with
   `--ignore-scripts`, runs `npm audit signatures` there, and also requires the
   registry to list a provenance attestation for the package itself.
+- `remove_page_status` no longer creates a new version of a page or blog post
+  that has no status (GitHub issue #6). It reads the status first, as
+  `set_page_status` does, and sends no DELETE when none is set; the result then
+  ends with "(no-op: no status set)".
 
 ## [7.3.0] - 2026-10-15 - read blog posts
 

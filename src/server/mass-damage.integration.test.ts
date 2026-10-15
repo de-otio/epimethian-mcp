@@ -179,6 +179,39 @@ describe("mass-damage integration (G3)", () => {
       }
       expect(setContentState).not.toHaveBeenCalled();
     });
+
+    it("remove_page_status sends no DELETE when no status is set (#6)", async () => {
+      const { getContentState, removeContentState } = await import(
+        "./confluence-client.js"
+      );
+      (removeContentState as any).mockClear();
+      (getContentState as any).mockResolvedValue(null);
+
+      const handler = registeredTools.get("remove_page_status")!.handler;
+      for (let i = 0; i < 3; i++) {
+        const r = await handler({ page_id: "123" });
+        expect(r.isError).toBeUndefined();
+        expect(r.content[0].text).toContain("no-op: no status set");
+      }
+      expect(removeContentState).not.toHaveBeenCalled();
+    });
+
+    it("remove_page_status sends exactly one DELETE when a status is set (#6)", async () => {
+      const { getContentState, removeContentState } = await import(
+        "./confluence-client.js"
+      );
+      (removeContentState as any).mockClear();
+      (getContentState as any).mockResolvedValue({
+        name: "Ready for review",
+        color: "#57D9A3",
+      });
+
+      const r = await registeredTools.get("remove_page_status")!.handler({ page_id: "123" });
+      expect(r.isError).toBeUndefined();
+      expect(r.content[0].text).not.toContain("no-op");
+      expect(removeContentState).toHaveBeenCalledTimes(1);
+      expect(removeContentState).toHaveBeenCalledWith("123");
+    });
   });
 
   // ---------------------------------------------------------------------------
