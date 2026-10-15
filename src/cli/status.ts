@@ -1,7 +1,28 @@
 import { testConnection } from "../shared/test-connection.js";
 import { readFromKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
+import { describeCopies, findInstalledCopies } from "../shared/installed-copies.js";
+
+declare const __PKG_VERSION__: string;
+
+/**
+ * Which installed copy this is, or every copy when there are two or more.
+ * Printed first, so it shows even when no credentials are configured.
+ */
+async function printInstalledCopies(): Promise<void> {
+  const copies = await findInstalledCopies();
+  const block = describeCopies(copies, __PKG_VERSION__, { runningLabel: "this command" });
+  if (block) {
+    console.log(block);
+  } else if (copies.length === 1) {
+    console.log(`Installed: ${copies[0].version ? `v${copies[0].version}` : "unknown version"} at ${copies[0].packageDir}`);
+  } else {
+    console.log(`Installed: no npm global install found (running v${__PKG_VERSION__} from ${process.argv[1] ?? "an unknown location"})`);
+  }
+}
 
 export async function runStatus(): Promise<void> {
+  await printInstalledCopies();
+
   const profile = process.env.CONFLUENCE_PROFILE || "";
   const urlEnv = process.env.CONFLUENCE_URL || "";
   const emailEnv = process.env.CONFLUENCE_EMAIL || "";
