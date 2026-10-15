@@ -132,6 +132,7 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     addLabels: vi.fn(),
     removeLabel: vi.fn(),
     getContentState: vi.fn(),
+    resolveContainerStatus: vi.fn().mockResolvedValue("current"),
     setContentState: vi.fn(),
     removeContentState: vi.fn(),
     getFooterComments: vi.fn(),

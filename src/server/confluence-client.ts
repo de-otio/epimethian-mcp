@@ -1461,6 +1461,53 @@ export async function getDraftBlogPost(id: string, includeBody: boolean): Promis
 }
 
 /**
+ * Whether a page or blog post id is a never-published blog post draft.
+ *
+ * The v1 attachment and content-state endpoints look the container up as
+ * `current` unless `status=draft` is given, and refuse `status=draft` on
+ * published content (probed live), so the status must be known exactly.
+ * Not cached: publishing turns a draft into a current post. Same read order
+ * as resolveContentSpace: pages, blog posts, then the draft read. Errors
+ * propagate, so a failed lookup stops the caller before it writes.
+ */
+export async function resolveContainerStatus(id: string): Promise<"current" | "draft"> {
+  assertNumericContentId(id);
+  try {
+    PageSchema.parse(await v2Get(`/pages/${id}`, {}));
+    return "current";
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+  }
+  try {
+    const post = BlogPostSchema.parse(await v2Get(`/blogposts/${id}`, {}));
+    return post.status === "draft" ? "draft" : "current";
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+  }
+  try {
+    const draft = await getDraftBlogPost(id, false);
+    if (draft.status === "draft") return "draft";
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+  }
+  throw notFoundAsPageOrBlogPost(id);
+}
+
+/** Options for the v1 calls that name a page or blog post as their container. */
+export interface ContainerOptions {
+  /** The container is a blog post draft: send `status=draft`. */
+  draft?: boolean;
+}
+
+/** Add `status=draft` to a v1 container URL when the container is a draft. */
+function withContainerStatus(url: string, opts: ContainerOptions | undefined): string {
+  if (!opts?.draft) return url;
+  const u = new URL(url);
+  u.searchParams.set("status", "draft");
+  return u.toString();
+}
+
+/**
  * Read a blog post for update_blog_post. Never touches pageCache (D6).
  *
  * `/blogposts/{id}` first, then the draft read on a 404. When both are 404
@@ -1604,6 +1651,11 @@ export interface RawUpdateOptions {
    * always send `current`.
    */
   status?: "current" | "draft";
+  /**
+   * Blog posts only: the status the post had when it was read. A draft
+   * keeps its version number on every write, including the publish.
+   */
+  fromStatus?: "current" | "draft";
 }
 
 export async function _rawUpdatePage(
@@ -1630,7 +1682,12 @@ export async function _rawUpdateContent(
   const cfg = await getConfig();
   const segment = segmentFor(type);
   const isPage = type === "page";
-  const newVersion = opts.version + 1;
+  // A blog post draft has no version history: Confluence refuses any number
+  // but the one it has (1), both for a draft edit and for the first publish
+  // ("Version number must be 1 when publishing a blogpost for the first
+  // time"). Everything else is the usual version + 1.
+  const keepsVersion = !isPage && opts.fromStatus === "draft";
+  const newVersion = keepsVersion ? opts.version : opts.version + 1;
 
   const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
   const effectiveClient = cfg.attribution ? opts.clientLabel : undefined;
@@ -1749,7 +1806,8 @@ export async function _rawUpdateContent(
   // ensureAttributionLabel is now called by the handler via safeSubmitPage's
   // caller chain so warnings can be surfaced. No call here.
 
-  return { page, newVersion };
+  // Blog posts report the version Confluence assigned, not a computed one.
+  return { page, newVersion: isPage ? newVersion : (page.version?.number ?? newVersion) };
 }
 
 /**
@@ -2116,13 +2174,15 @@ export async function searchPagesByTitle(
 
 export async function getAttachments(
   pageId: string,
-  limit: number
+  limit: number,
+  container?: ContainerOptions
 ): Promise<AttachmentData[]> {
   // Attachments only available via v1 REST API
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/child/attachment`);
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("expand", "version");
+  if (container?.draft) url.searchParams.set("status", "draft");
   const raw = await confluenceJson(url.toString());
   return AttachmentsResultSchema.parse(raw).results;
 }
@@ -2177,7 +2237,8 @@ export interface AttachmentLookup {
  */
 export async function findAttachmentByName(
   pageId: string,
-  filename: string
+  filename: string,
+  container?: ContainerOptions
 ): Promise<AttachmentLookup> {
   assertPageId(pageId);
   const cfg = await getConfig();
@@ -2185,6 +2246,7 @@ export async function findAttachmentByName(
   url.searchParams.set("filename", filename);
   url.searchParams.set("expand", "version");
   url.searchParams.set("limit", "25");
+  if (container?.draft) url.searchParams.set("status", "draft");
   const raw = await confluenceJson(url.toString());
   const all = AttachmentsResultSchema.parse(raw).results.map(toAttachmentInfo);
   const exact = all.filter((a) => a.title === filename);
@@ -2253,7 +2315,8 @@ export async function uploadAttachmentVersion(
   attachmentId: string,
   fileData: Buffer | Uint8Array,
   filename: string,
-  comment?: string
+  comment?: string,
+  container?: ContainerOptions
 ): Promise<UploadedVersion> {
   assertPageId(pageId);
   if (!ATTACHMENT_ID_RE.test(attachmentId)) {
@@ -2265,7 +2328,10 @@ export async function uploadAttachmentVersion(
   form.append("minorEdit", "false");
   if (comment) form.append("comment", comment);
 
-  const dataUrl = `${cfg.apiV1}/content/${pageId}/child/attachment/${attachmentId}/data`;
+  const dataUrl = withContainerStatus(
+    `${cfg.apiV1}/content/${pageId}/child/attachment/${attachmentId}/data`,
+    container
+  );
   // An upload is a write like a page update: it counts against the budget.
   writeBudget.consume();
   return guardPageSideWrite(pageId, async () => {
@@ -2590,7 +2656,8 @@ export async function uploadAttachment(
   pageId: string,
   fileData: Buffer | Uint8Array,
   filename: string,
-  comment?: string
+  comment?: string,
+  container?: ContainerOptions
 ): Promise<{ title: string; id: string; fileSize?: number; version?: number }> {
   // Attachments only available via v1 REST API
   const cfg = await getConfig();
@@ -2598,7 +2665,7 @@ export async function uploadAttachment(
   form.append("file", new Blob([new Uint8Array(fileData)]), filename);
   if (comment) form.append("comment", comment);
 
-  const attachUrl = `${cfg.apiV1}/content/${pageId}/child/attachment`;
+  const attachUrl = withContainerStatus(`${cfg.apiV1}/content/${pageId}/child/attachment`, container);
   // POST: a transfer-length timeout, the shared permit, and no automatic
   // retry (a repeated upload would add a second copy or version). A failure
   // after the request was sent surfaces as WriteOutcomeUnknownError.
@@ -2784,11 +2851,12 @@ export async function getSiteDefaultLocale(cfg: Config): Promise<string | undefi
 // --- Content State (page status badge) ---
 
 export async function getContentState(
-  pageId: string
+  pageId: string,
+  container?: ContainerOptions
 ): Promise<ContentStateData | null> {
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
-  url.searchParams.set("status", "current");
+  url.searchParams.set("status", container?.draft ? "draft" : "current");
   try {
     const data = await confluenceJson(url.toString());
     // Confluence Cloud returns the state wrapped:
@@ -2813,11 +2881,12 @@ export async function setContentState(
   pageId: string,
   name: string,
   color: string,
-  attempt = 0
+  attempt = 0,
+  container?: ContainerOptions
 ): Promise<void> {
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
-  url.searchParams.set("status", "current");
+  url.searchParams.set("status", container?.draft ? "draft" : "current");
   try {
     await guardPageSideWrite(pageId, () =>
       confluenceSend(url.toString(), {
@@ -2830,16 +2899,19 @@ export async function setContentState(
     // idempotent (same name and colour), so a repeat cannot double-apply.
     if (err instanceof ConfluenceApiError && err.status === 409 && attempt < 2) {
       await new Promise((resolve) => setTimeout(resolve, 200));
-      return setContentState(pageId, name, color, attempt + 1);
+      return setContentState(pageId, name, color, attempt + 1, container);
     }
     throw err;
   }
 }
 
-export async function removeContentState(pageId: string): Promise<void> {
+export async function removeContentState(
+  pageId: string,
+  container?: ContainerOptions
+): Promise<void> {
   const cfg = await getConfig();
   const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
-  url.searchParams.set("status", "current");
+  url.searchParams.set("status", container?.draft ? "draft" : "current");
   try {
     await guardPageSideWrite(pageId, () => confluenceSend(url.toString(), { method: "DELETE" }));
   } catch (err) {

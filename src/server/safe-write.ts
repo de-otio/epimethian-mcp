@@ -1904,7 +1904,7 @@ export async function safeSubmitPage(
         destructiveFlags,
       };
       const res = isBlogPost
-        ? await _rawUpdateContent("blogpost", pageId!, { ...updateOpts, status })
+        ? await _rawUpdateContent("blogpost", pageId!, { ...updateOpts, status, fromStatus: previousStatus })
         : await _rawUpdatePage(pageId!, updateOpts);
       page = res.page;
       newVersion = res.newVersion;

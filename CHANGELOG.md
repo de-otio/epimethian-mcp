@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.4.1] - 2026-10-15
+
+### Fixed
+- A blog post draft can now be prepared in full before it is published:
+  - `add_attachment` and `get_attachments` work on a draft. Before, an upload
+    to a draft failed with "Resource not found", which blamed the token's
+    permissions.
+  - `update_blog_post` on a draft no longer fails with "400 DRAFT blogposts do
+    not support multiple versions". A draft stays at version 1 on every edit,
+    as Confluence requires, and publishing a draft sends version 1 too, so it
+    no longer fails after the user confirmed it. The result reports the
+    version Confluence returned.
+  - `set_page_status`, `get_page_status` and `remove_page_status` work on a
+    draft, and the "unverified" status badge is set on drafts. Before, the
+    badge failed with a warning.
+  - `create_comment` on a draft says that Confluence takes no comments on
+    drafts, instead of "Resource not found".
+- `create_blog_post` and `update_blog_post` on a published post report the
+  version the post is at after the "unverified" status badge, which Confluence
+  counts as a version of its own. Before, the next update with the reported
+  version failed with a version conflict.
+- The `update_blog_post` confirmation now covers the title, so a confirmed
+  publish cannot go out under a different title.
+
 ## [7.4.0] - 2026-10-15 - write blog posts
 
 ### Security

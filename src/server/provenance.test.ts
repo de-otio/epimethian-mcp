@@ -314,7 +314,7 @@ describe("markPageUnverified", () => {
     (getContentState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
     const result = await markPageUnverified("456", cfg);
-    expect(result).toEqual({});
+    expect(result).toEqual({ applied: true });
     expect(setContentState).toHaveBeenCalledOnce();
     expect(setContentState).toHaveBeenCalledWith("456", "AI-edited", UNVERIFIED_COLOR);
   });
@@ -327,7 +327,7 @@ describe("markPageUnverified", () => {
     });
 
     const result = await markPageUnverified("789", cfg);
-    expect(result).toEqual({});
+    expect(result).toEqual({ applied: true });
     expect(setContentState).toHaveBeenCalledOnce();
     expect(setContentState).toHaveBeenCalledWith("789", "AI-edited", UNVERIFIED_COLOR);
   });
@@ -355,7 +355,7 @@ describe("markPageUnverified", () => {
     // Must attempt setContentState despite the GET failure
     expect(setContentState).toHaveBeenCalledOnce();
     // And since setContentState succeeded, no warning
-    expect(result).toEqual({});
+    expect(result).toEqual({ applied: true });
   });
 
   it("20. when setContentState throws a generic error, returns warning and does NOT throw", async () => {

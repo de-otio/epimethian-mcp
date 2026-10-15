@@ -42,6 +42,8 @@ import {
   getContentState,
   setContentState,
   removeContentState,
+  resolveContainerStatus,
+  type ContainerOptions,
   formatPage,
   type PageData,
   extractSection,
@@ -90,6 +92,33 @@ import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
 import { settleInChunks, DEFAULT_MAX_CONCURRENCY } from "./request-policy.js";
 import { markPageUnverified } from "./provenance.js";
+
+/**
+ * The trailing container argument for the v1 attachment and content-state
+ * calls: `[{ draft: true }]` for a blog post draft, `[]` otherwise, so calls
+ * on pages and published posts stay exactly as they were. The v1 API looks a
+ * container up as `current` unless told otherwise, and refuses `status=draft`
+ * on published content, so the status is looked up, not guessed.
+ */
+async function draftContainerArgs(id: string): Promise<[ContainerOptions] | []> {
+  return (await resolveContainerStatus(id)) === "draft" ? [{ draft: true }] : [];
+}
+
+/**
+ * Read a content state whatever the container's status. A page or a
+ * published post answers the plain read; only when that finds nothing is
+ * the id checked for being a blog post draft, whose state needs
+ * `status=draft`. Returns the container args for a follow-up set or remove.
+ */
+async function getContentStateAnyStatus(
+  id: string
+): Promise<{ state: Awaited<ReturnType<typeof getContentState>>; container: [ContainerOptions] | [] }> {
+  const state = await getContentState(id);
+  if (state) return { state, container: [] };
+  const container = await draftContainerArgs(id);
+  if (container.length === 0) return { state, container };
+  return { state: await getContentState(id, ...container), container };
+}
 import { readUploadFile, UploadPathError, MAX_UPLOAD_BYTES } from "./upload-file.js";
 import { findDrawioMacros, bumpDrawioRevision, countMxCells, looksLikeDrawioXml } from "./drawio-macro.js";
 import {
@@ -2130,22 +2159,37 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         const warnings: WarningAccumulator = [];
         const labelResult = await ensureAttributionLabel(submitted.page.id);
         if (labelResult.warning) warnings.push(labelResult.warning);
-        const badgeResult = await markPageUnverified(submitted.page.id, cfg);
+        const badgeResult = publish
+          ? await markPageUnverified(submitted.page.id, cfg)
+          : await markPageUnverified(submitted.page.id, cfg, { draft: true });
         if (badgeResult.warning) warnings.push(badgeResult.warning);
+
+        // On a published post the status badge is a Confluence version of its
+        // own. When it was just set, report the version the post is at now,
+        // so the next update does not conflict. Not re-read otherwise: that
+        // could report someone else's newer edit as ours.
+        let reportedVersion = submitted.newVersion;
+        if (badgeResult.applied && publish) {
+          try {
+            reportedVersion = (await getBlogPost(submitted.page.id, false)).version?.number ?? reportedVersion;
+          } catch {
+            // Keep the write's version; a stale one shows up as a conflict.
+          }
+        }
 
         const id = submitted.page.id;
         const note = publish
           ? `Published blog post ${id} in space ${space_key}.`
           : `Created DRAFT blog post ${id} in space ${space_key}. It is not on the blog and nobody ` +
             `was notified. To publish it, call update_blog_post with blog_post_id ${id}, ` +
-            `version ${submitted.newVersion}, the same title, and publish: true (the user is asked to confirm).`;
+            `version ${reportedVersion}, the same title, and publish: true (the user is asked to confirm).`;
         const page = await formatPage({ ...submitted.page, contentType: "blogpost" }, false);
         return {
           ...toolResult(appendWarnings(`${note}\n\n${page}`, warnings) + echo),
           structuredContent: {
             kind: "written" as const,
             page_id: id,
-            new_version: submitted.newVersion,
+            new_version: reportedVersion,
             title: submitted.page.title,
           },
         };
@@ -2182,7 +2226,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .min(1)
           .describe("Post title (use the title from get_page if unchanged)"),
         version: versionField
-          .describe(VERSION_PARAM_NOTE),
+          .describe(`${VERSION_PARAM_NOTE} A draft is always at version 1: pass 1 for every edit of a draft and for its publish.`),
         body: z
           .string()
           .optional()
@@ -2282,8 +2326,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             !publishing && confirm_deletions && body
               ? tryForecastDeletions(currentStorage, body, confluence_base_url ?? cfg.url)
               : null;
+          // The token covers what readers will see: the publish step, the
+          // title and the body. A draft stays at version 1 on every edit, so
+          // the version alone cannot tell that the draft changed.
           const diffHash = (cloudId && pageVersion > 0)
-            ? computeDiffHash(`${publishing ? "publish\n" : ""}${body ?? currentStorage}`, pageVersion)
+            ? computeDiffHash(
+                `${publishing ? "publish\n" : ""}title:${title}\n${body ?? currentStorage}`,
+                pageVersion
+              )
             : undefined;
           const where = spaceKey !== undefined ? ` in space ${spaceKey}` : "";
           const summary = publishing
@@ -2361,8 +2411,24 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         const warnings: WarningAccumulator = [];
         const labelResult = await ensureAttributionLabel(submitted.page.id);
         if (labelResult.warning) warnings.push(labelResult.warning);
-        const badgeResult = await markPageUnverified(submitted.page.id, cfg);
+        const badgeResult =
+          currentStatus === "draft" && !publishing
+            ? await markPageUnverified(submitted.page.id, cfg, { draft: true })
+            : await markPageUnverified(submitted.page.id, cfg);
         if (badgeResult.warning) warnings.push(badgeResult.warning);
+
+        // On a published post the status badge is a Confluence version of its
+        // own. When it was just set, report the version the post is at now,
+        // so the next update does not conflict. Not re-read otherwise: that
+        // could report someone else's newer edit as ours.
+        let reportedVersion = submitted.newVersion;
+        if (badgeResult.applied && !(currentStatus === "draft" && !publishing)) {
+          try {
+            reportedVersion = (await getBlogPost(blog_post_id, false)).version?.number ?? reportedVersion;
+          } catch {
+            // Keep the write's version; a stale one shows up as a conflict.
+          }
+        }
 
         const isTitleOnly = prepared.finalStorage === undefined;
         const verb = publishing ? "Published" : "Updated";
@@ -2378,13 +2444,13 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             ? " It is still a draft: nobody was notified. Pass publish: true to publish it."
             : "";
         const text =
-          `${verb} blog post: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, ${bodyNote}${removalNote}).${draftNote}`;
+          `${verb} blog post: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${reportedVersion}, ${bodyNote}${removalNote}).${draftNote}`;
         return {
           ...toolResult(appendWarnings(text, warnings) + echo),
           structuredContent: {
             kind: "written" as const,
             page_id: blog_post_id,
-            new_version: submitted.newVersion,
+            new_version: reportedVersion,
             ...(isTitleOnly
               ? {}
               : { body_bytes_before: submitted.oldLen, body_bytes_after: submitted.newLen }),
@@ -3818,10 +3884,13 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         if (CONTROL_CHAR_RE.test(name)) {
           return toolError(new Error("The file name contains control characters; pass a clean name in filename."));
         }
+        // A blog post draft is only found with status=draft. Looked up before
+        // anything is uploaded: a failed lookup uploads nothing.
+        const container = await draftContainerArgs(page_id);
 
         if (!overwrite) {
           try {
-            const att = await uploadAttachment(page_id, file.data, name, comment);
+            const att = await uploadAttachment(page_id, file.data, name, comment, ...container);
             return toolResult(
               `Attached: ${att.title} (ID: ${att.id}, version: ${att.version ?? 1}, size: ${att.fileSize ?? "unknown"} bytes) to page ${page_id}` + echo
             );
@@ -3838,7 +3907,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           }
         }
 
-        const lookup = await findAttachmentByName(page_id, name);
+        const lookup = await findAttachmentByName(page_id, name, ...container);
         if (!lookup.exact) {
           if (expected_version !== undefined) {
             return toolError(
@@ -3856,7 +3925,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
               )
             );
           }
-          const att = await uploadAttachment(page_id, file.data, name, comment);
+          const att = await uploadAttachment(page_id, file.data, name, comment, ...container);
           return toolResult(
             `No attachment named "${name}" existed, so a new one was created: ID ${att.id}, version ${att.version ?? 1}, ` +
               `size ${att.fileSize ?? "unknown"} bytes, on page ${page_id}` + echo
@@ -3927,7 +3996,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         };
         let uploaded;
         try {
-          uploaded = await uploadAttachmentVersion(page_id, existing.id, file.data, name, comment);
+          uploaded = await uploadAttachmentVersion(page_id, existing.id, file.data, name, comment, ...container);
         } catch (err) {
           logMutation(errorRecord("update_attachment", page_id, err, logBase));
           if (err instanceof WriteOutcomeUnknownError) {
@@ -4586,7 +4655,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     },
     async ({ page_id, limit }) => {
       try {
-        const attachments = await getAttachments(page_id, limit);
+        const attachments = await getAttachments(page_id, limit, ...(await draftContainerArgs(page_id)));
         if (attachments.length === 0) {
           return toolResult(`No attachments found on page ${page_id}.`);
         }
@@ -4910,7 +4979,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     },
     async ({ page_id }) => {
       try {
-        const state = await getContentState(page_id);
+        const { state } = await getContentStateAnyStatus(page_id);
         if (!state) {
           return toolResult(`Page ${page_id} has no status set.` + echo);
         }
@@ -4960,13 +5029,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         // the status is unchanged. A loop of identical set_page_status
         // calls would otherwise balloon version history — short-circuit
         // when the current state already matches.
-        const current = await getContentState(page_id);
+        const { state: current, container } = await getContentStateAnyStatus(page_id);
         if (current && current.name === name && current.color === color) {
           return toolResult(
             `Set status on page ${page_id}: "${name}" (${color}) (no-op: status unchanged)` + echo
           );
         }
-        await setContentState(page_id, name, color);
+        if (container.length > 0) await setContentState(page_id, name, color, 0, ...container);
+        else await setContentState(page_id, name, color);
         return toolResult(`Set status on page ${page_id}: "${name}" (${color})` + echo);
       } catch (err) {
         return toolErrorWithContext(err, { operation: "set_page_status", resource: `page ${page_id}`, profile: config.profile });
@@ -4997,11 +5067,11 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         await checkSpaceAllowed({ pageId: page_id });
         // Dedup, as set_page_status: Confluence creates a version on every
         // DELETE, even when no status is set (GitHub issue #6).
-        const current = await getContentState(page_id);
+        const { state: current, container } = await getContentStateAnyStatus(page_id);
         if (!current) {
           return toolResult(`Removed status from page ${page_id} (no-op: no status set)` + echo);
         }
-        await removeContentState(page_id);
+        await removeContentState(page_id, ...container);
         return toolResult(`Removed status from page ${page_id}` + echo);
       } catch (err) {
         return toolErrorWithContext(err, { operation: "remove_page_status", resource: `page ${page_id}`, profile: config.profile });
@@ -5168,10 +5238,26 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           // A reply is keyed by its parent comment. A new top-level comment
           // names its container, so resolve whether the id is a page or a
           // blog post (A3: side writes on blog posts are allowed).
-          const contentType: ContentType = parent_comment_id
-            ? "page"
-            : await resolveContentType(page_id);
-          comment = await createFooterComment(page_id, body, parent_comment_id, contentType);
+          try {
+            const contentType: ContentType = parent_comment_id
+              ? "page"
+              : await resolveContentType(page_id);
+            comment = await createFooterComment(page_id, body, parent_comment_id, contentType);
+          } catch (err) {
+            // Confluence does not take comments on a blog post draft (probed
+            // live: the v2 endpoint looks for a current container only).
+            if (
+              err instanceof ConfluenceNotFoundError &&
+              !parent_comment_id &&
+              (await resolveContainerStatus(page_id).catch(() => "current")) === "draft"
+            ) {
+              throw new Error(
+                `Blog post ${page_id} is a draft, and Confluence does not accept comments on drafts. ` +
+                  `Nothing was posted. Comment after the post is published.`
+              );
+            }
+            throw err;
+          }
         }
         return toolResult(
           `Created ${type} comment ${comment.id} on page ${page_id}` + echo

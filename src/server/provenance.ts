@@ -8,6 +8,7 @@
 
 import {
   type Config,
+  type ContainerOptions,
   ConfluencePermissionError,
   getContentState,
   getSiteDefaultLocale,
@@ -126,8 +127,9 @@ export async function resolveUnverifiedStatus(
  */
 export async function markPageUnverified(
   pageId: string,
-  cfg: Config
-): Promise<{ warning?: string }> {
+  cfg: Config,
+  container?: ContainerOptions
+): Promise<{ warning?: string; applied?: true }> {
   // Feature disabled — bail out immediately without any API calls.
   if (cfg.unverifiedStatus === false) {
     return {};
@@ -138,7 +140,9 @@ export async function markPageUnverified(
   // --- Idempotency check via getContentState ---
   let skipSet = false;
   try {
-    const current = await getContentState(pageId);
+    const current = container
+      ? await getContentState(pageId, container)
+      : await getContentState(pageId);
     if (
       current != null &&
       current.color === target.color &&
@@ -164,8 +168,11 @@ export async function markPageUnverified(
   // backoff). This wrapper just converts the final outcome — success or
   // exhausted-retries — into a warning string for tool output.
   try {
-    await setContentState(pageId, target.name, target.color);
-    return {};
+    if (container) await setContentState(pageId, target.name, target.color, 0, container);
+    else await setContentState(pageId, target.name, target.color);
+    // Setting a status creates a Confluence version on a published page or
+    // post; callers that report a version re-read it when this is set.
+    return { applied: true };
   } catch (err) {
     if (err instanceof ConfluencePermissionError) {
       return {
