@@ -2313,8 +2313,14 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
             !publishing && confirm_deletions && body
               ? tryForecastDeletions(currentStorage, body, confluence_base_url ?? cfg.url)
               : null;
+          // The token covers what readers will see: the publish step, the
+          // title and the body. A draft stays at version 1 on every edit, so
+          // the version alone cannot tell that the draft changed.
           const diffHash = (cloudId && pageVersion > 0)
-            ? computeDiffHash(`${publishing ? "publish\n" : ""}${body ?? currentStorage}`, pageVersion)
+            ? computeDiffHash(
+                `${publishing ? "publish\n" : ""}title:${title}\n${body ?? currentStorage}`,
+                pageVersion
+              )
             : undefined;
           const where = spaceKey !== undefined ? ` in space ${spaceKey}` : "";
           const summary = publishing

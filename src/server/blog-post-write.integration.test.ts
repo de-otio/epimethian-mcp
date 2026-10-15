@@ -940,6 +940,17 @@ describe("update_blog_post: drafts and publishing", () => {
     expect(posts.get(DRAFT_ID)?.status).toBe("current");
   });
 
+  it("a publish token is bound to the title", async () => {
+    const first = await updateDraft({ publish: true });
+    const token = first.structured?.confirm_token as string;
+    expect(token).toBeTruthy();
+    const second = await updateDraft({ publish: true, title: "A different headline", confirm_token: token });
+    expect(second.isError).toBe(true);
+    expect(second.text).toContain("no longer valid");
+    expect(writes()).toEqual([]);
+    expect(posts.get(DRAFT_ID)?.status).toBe("draft");
+  });
+
   it("a publish token is refused after the draft body changed (a draft stays at version 1)", async () => {
     const first = await updateDraft({ publish: true });
     const token = first.structured?.confirm_token as string;
