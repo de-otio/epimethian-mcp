@@ -269,6 +269,8 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `get_page`            | Read a page or blog post by ID (`headings_only`, `section`, `max_length`, `format`) |
 | `get_page_by_title`   | Look up a page by title (same options as `get_page`)                   |
 | `update_page`         | Update an existing page                                                |
+| `create_blog_post`    | Create a blog post: a draft by default; `publish: true` publishes it (notifies readers, always confirmed) |
+| `update_blog_post`    | Update a blog post with `update_page`'s safety checks; `publish: true` publishes a draft (always confirmed) |
 | `update_page_section` | Update a single section by heading name                                |
 | `update_page_sections` | Update multiple sections atomically in one version bump                |
 | `delete_page`         | Delete a page                                                          |
@@ -277,20 +279,20 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `get_page_children`   | Get child pages                                                        |
 | `search_pages`        | Search via CQL (excerpts, last-modified time and editor; scoped by the profile's `read_spaces`) |
 | `get_spaces`          | List available spaces                                                  |
-| `add_attachment`      | Upload a file attachment (`overwrite` uploads a new version)           |
+| `add_attachment`      | Upload a file attachment to a page or blog post (`overwrite` uploads a new version) |
 | `get_attachments`     | List attachments on a page, with versions                              |
 | `download_attachment` | Download an attachment's bytes to a local file (works in read-only profiles) |
 | `add_drawio_diagram`  | Add a draw.io diagram                                                  |
 | `update_drawio_diagram` | Replace an existing draw.io diagram in place                         |
 | `get_labels`          | Get all labels on a page                                               |
-| `add_label`           | Add one or more labels to a page                                       |
-| `remove_label`        | Remove a label from a page                                             |
+| `add_label`           | Add one or more labels to a page or blog post                          |
+| `remove_label`        | Remove a label from a page or blog post                                |
 | `get_comments`        | Read page or blog post comments (footer and inline)                    |
-| `create_comment`      | Add a comment to a page                                                |
+| `create_comment`      | Add a comment to a page or blog post                                   |
 | `resolve_comment`     | Resolve or reopen an inline comment                                    |
 | `delete_comment`      | Delete a comment                                                       |
 | `get_page_status`     | Get the content status badge on a page                                 |
-| `set_page_status`     | Set the content status badge on a page                                 |
+| `set_page_status`     | Set the content status badge on a page or blog post                    |
 | `remove_page_status`  | Remove the content status badge from a page                            |
 | `get_page_versions`   | List version history for a page                                        |
 | `get_page_version`    | Get page content at a specific historical version (read-only markdown) |

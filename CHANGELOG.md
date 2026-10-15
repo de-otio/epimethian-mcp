@@ -5,9 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] - write blog posts
+
+Plan: `plans/blog-post-writes.md`.
+
+### Added
+- `create_blog_post` creates a blog post in a space's blog. It makes a
+  **draft** by default: nobody is notified, and the result says how to
+  publish it. `publish: true` publishes at once.
+- `update_blog_post` updates a blog post through the same pipeline as
+  `update_page`: content-safety guards, version check (a stale version is a
+  conflict), confirmation for destructive flags, write budget, mutation log
+  (`create_blog_post` / `update_blog_post` operations) and attribution.
+  `publish: true` publishes a draft. A published post cannot be turned back
+  into a draft. Given a page ID it refuses, naming it as a page.
+- Publishing a blog post emails the space's watchers and everyone subscribed
+  to all blog posts, and cannot be done quietly. So publishing, with either
+  tool, always asks the user to confirm (elicitation, or
+  `SOFT_CONFIRMATION_REQUIRED` and a `confirm_token`), is never covered by a
+  `batch_token`, and is refused when `source` is `chained_tool_output`. To
+  allow page writes but not blog posts, deny the two tools in the profile's
+  tool list.
+- Not included: deleting or reverting a blog post, section, prepend and
+  append edits to one, and setting the post date.
+
+### Changed
+- The `spaces` allowlist resolves blog posts. A blog post ID is judged by the
+  space the post is in, like a page. Before, the allowlist looked every ID up
+  as a page, so with an allowlist the label, status, attachment and comment
+  tools refused a blog post ID, while without one they changed it. A blog post
+  whose space cannot be determined is refused, including when `/blogposts`
+  answers with a server error.
+- Labels, status, attachments and comments on a blog post are allowed, with
+  or without an allowlist. `add_label`, `remove_label`, `set_page_status`,
+  `add_attachment` and `create_comment` say "page or blog post". A new
+  top-level footer comment on a blog post now names the post (`blogPostId`);
+  a new top-level inline comment still works on pages only.
 
 ### Fixed
+- `add_drawio_diagram` uploaded the diagram attachment before reading the
+  page, so an ID it could not read (missing, not visible, or a blog post) left
+  an orphaned attachment behind. It now reads the page first and uploads
+  nothing when the read fails.
 - `upgrade` (the MCP tool and the CLI command) failed its integrity check on
   every run, so no upgrade could succeed. It ran
   `npm audit signatures @de-otio/epimethian-mcp@<version>`, but that command

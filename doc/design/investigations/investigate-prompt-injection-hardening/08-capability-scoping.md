@@ -76,6 +76,31 @@ resolution requires one extra `get_page` call (metadata only). Cache
 the mapping in `pageCache` to avoid the double-fetch on repeat
 access.
 
+**Blog posts (implemented, `plans/blog-post-writes.md` A2).** The
+`page_id` of a write tool can be a blog post id: pages and blog posts
+share one id space. `resolveContentSpace(id) → { type, spaceKey }`
+(`src/server/space-allowlist.ts`) resolves either, using the read
+side's content-type resolver: `GET /pages/{id}` first, and
+`GET /blogposts/{id}` only after a pages 404. A blog post is judged by
+its space, like a page. Two rules are unchanged:
+
+- A space that cannot be resolved means the write is refused. That
+  includes a pages 404 followed by a `/blogposts` 5xx (the error is
+  passed on; the post is not treated as unknown and let through), and
+  both reads returning 404. A never-published draft may be visible only
+  as `GET /blogposts/{id}?status=draft`, so that read is tried before
+  refusing; it can only turn a not-found into a post Confluence
+  returned.
+- The allowlist decides which space a write targets, not which writes
+  are allowed. Every tool keeps its own type checks: the page-body
+  tools still refuse a blog post id, and `update_blog_post` refuses a
+  page id.
+
+Before this, the check looked every id up as a page, so with an
+allowlist set the side writes (labels, status, attachments, comments)
+refused a blog post id, while without one they reached it. They now
+behave the same either way (A3).
+
 ### 8.3 Parent-subtree allowlist
 
 Narrower than per-space: "this profile can only operate on pages

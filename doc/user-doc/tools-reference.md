@@ -1,10 +1,10 @@
 # Tools Reference
 
-The Epimethian MCP server provides **39 tools** for managing Confluence pages, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
+The Epimethian MCP server provides **41 tools** for managing Confluence pages, blog posts, spaces, attachments, labels, diagrams, comments, content status badges, and version history. All tools return plain text output suitable for AI consumption.
 
 _Last updated: 2026-10-06 — v7.1.0_
 
-Every tool declares a title and the annotation hints `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`. The hints are advisory; the server's own guards never depend on them. `update_page`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `update_drawio_diagram`, `revert_page`, `download_attachment`, `remove_label`, `set_page_status`, `remove_page_status` and `upgrade` declare `destructiveHint: true`. `delete_page`, `revert_page`, `delete_comment`, `authorise_destructive_writes` and `upgrade` also set `_meta["anthropic/requiresUserInteraction"]`, so Claude Code asks for approval on every call.
+Every tool declares a title and the annotation hints `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`. The hints are advisory; the server's own guards never depend on them. `update_page`, `update_blog_post`, `update_page_section`, `update_page_sections`, `add_drawio_diagram`, `update_drawio_diagram`, `revert_page`, `download_attachment`, `remove_label`, `set_page_status`, `remove_page_status` and `upgrade` declare `destructiveHint: true`. `delete_page`, `revert_page`, `delete_comment`, `authorise_destructive_writes` and `upgrade` also set `_meta["anthropic/requiresUserInteraction"]`, so Claude Code asks for approval on every call.
 
 **Untrusted-content fence.** Text read from Confluence (page bodies, titles, search results, comments) is wrapped in a fence the agent must not treat as instructions. Within the fence, text is Unicode-normalised (NFKC) and zero-width, bidirectional and control characters are removed.
 
@@ -66,9 +66,9 @@ Returns title, ID, space, version, URL, and optionally the page content. Page bo
 
 **Blog posts.** You do not say which type the ID is. The tool tries it as a page first and, only if Confluence answers 404, as a blog post. A page read costs the same as before; a blog post read costs one extra request, and blog posts are not cached. Blog post output has a `Type: blog post` line after `ID:`; page output is unchanged. `headings_only`, `section` and `format: "markdown"` work on blog posts. For a blog URL such as `/wiki/spaces/<KEY>/blog/<yyyy>/<mm>/<dd>/<id>/<slug>`, pass `<id>`.
 
-The tools that rewrite a page body accept pages only: `update_page`, `update_page_section`, `update_page_sections`, `prepend_to_page`, `append_to_page`, `revert_page`, `add_drawio_diagram`, `update_drawio_diagram` and `delete_page`. Given a blog post ID, they refuse with an error that names it as a blog post, and nothing is written. `get_page_by_title`, `get_page_version` and `diff_page_versions` do not support blog posts.
+The tools that rewrite a page body accept pages only: `update_page`, `update_page_section`, `update_page_sections`, `prepend_to_page`, `append_to_page`, `revert_page`, `add_drawio_diagram`, `update_drawio_diagram` and `delete_page`. Given a blog post ID, they refuse with an error that names it as a blog post, and nothing is written. To write a blog post, use `create_blog_post` and `update_blog_post` (see [Blog posts](#blog-posts)). `get_page_by_title`, `get_page_version` and `diff_page_versions` do not support blog posts.
 
-`get_labels`, `get_page_status`, `get_attachments` and `get_page_versions` also work with a blog post ID. `add_label`, `remove_label`, `set_page_status` and `remove_page_status` change a blog post when the profile has no `spaces` allowlist. With an allowlist, they refuse a blog post ID, because the space check looks the ID up as a page.
+`get_labels`, `get_page_status`, `get_attachments` and `get_page_versions` also work with a blog post ID. The label, status and attachment tools and `create_comment` change a blog post as they change a page, with or without a `spaces` allowlist: the allowlist judges a blog post by the space it is in, exactly as it judges a page.
 
 ---
 
@@ -378,15 +378,68 @@ Does **not** accept `version: "current"` — this tool relies on optimistic lock
 
 ---
 
+## Blog posts
+
+Blog posts have their own two write tools; the page tools do not write them. Creating a post makes a **draft** unless you ask for it to be published.
+
+**Publishing is a broadcast.** When a post is published, Confluence emails the space's watchers, people watching the space's blog, and every user who subscribed to all blog posts they can view, including people who never watched the space. No API parameter suppresses this. So publishing, with either tool:
+
+- always asks the user to confirm (an elicitation prompt, or `SOFT_CONFIRMATION_REQUIRED` and a `confirm_token` when the client cannot prompt; see "Soft confirmation" in install-agent.md);
+- is never covered by a `batch_token` from `authorise_destructive_writes`, which covers page writes only;
+- is refused when `source` is `chained_tool_output`.
+
+Set `publish` only when the user asked for the post to be published. Turning a published post back into a draft is not supported, nor are deleting or reverting a blog post, or section, prepend and append edits to one.
+
+### `create_blog_post`
+
+Creates a blog post in a space's blog. A blog post has no parent and no position; for a page in the page tree, use `create_page`. Body formats are as for `create_page`.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `space_key` | string | Yes | Space key (e.g., `DEV`) |
+| `title` | string | Yes | Post title |
+| `body` | string | Yes | Post content — GFM markdown or Confluence storage format, never mixed |
+| `publish` | boolean | No | Publish now instead of creating a draft (default: false). Always asks the user to confirm. |
+| `allow_raw_html` | boolean | No | Allow raw HTML passthrough inside markdown bodies (default: false) |
+| `confluence_base_url` | string (URL) | No | Override the Confluence base URL used by the link rewriter |
+| `source` | string | No | Where the request came from (see `update_page`). `chained_tool_output` is refused with `publish: true`. |
+| `confirm_token` | string | No | Soft-confirmation token from a prior `SOFT_CONFIRMATION_REQUIRED` response. Single-use; bound to this space, title and body. |
+
+By default the result says the post is a draft, that nobody was notified, and how to publish it: `update_blog_post` with its ID, version and `publish: true`.
+
+The post date is the creation date; it cannot be set. There is no duplicate-title check before writing: blog post titles only need to be unique per space per day, and a clash is reported with Confluence's own error. The post gets the same attribution as a page: the version message, the `epimethian-edited` label and the "unverified" status.
+
+### `update_blog_post`
+
+Updates a blog post through the same pipeline as `update_page`: the content-safety guards, the version check (a stale version is a conflict), confirmation for destructive flags, the write budget and the mutation log. Given a page ID, it refuses with an error that names it as a page, and nothing is written.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `blog_post_id` | string | Yes | Numeric blog post ID |
+| `title` | string | Yes | Post title (use the title from `get_page` if unchanged) |
+| `version` | number \| `"current"` | Yes | Version from your most recent `get_page` call (as for `update_page`) |
+| `body` | string | No | New body — GFM markdown or Confluence storage format. Omit to change only the title; the current body is sent unchanged. |
+| `version_message` | string | No | Version comment |
+| `publish` | boolean | No | Publish a draft (default: false). Always asks the user to confirm. No effect on a post that is already published. |
+| `confirm_deletions`, `replace_body`, `confirm_shrinkage`, `confirm_structure_loss` | boolean | No | As for `update_page`; each asks the user to confirm. |
+| `allow_raw_html` | boolean | No | Allow raw HTML passthrough inside markdown bodies (default: false). |
+| `confluence_base_url` | string (URL) | No | Override the Confluence base URL used by the link rewriter. |
+| `source` | string | No | As for `update_page`. `chained_tool_output` is refused with `publish: true` or a destructive flag. |
+| `confirm_token` | string | No | Soft-confirmation token from a prior `SOFT_CONFIRMATION_REQUIRED` response. |
+
+A draft stays a draft unless `publish: true` is passed. There is no `batch_token` parameter.
+
+---
+
 ## Attachments
 
 ### `add_attachment`
 
-Uploads a local file as an attachment to a Confluence page. By default it only creates: if the page already has an attachment with that name, Confluence refuses, and the error suggests `overwrite: true` or, for a diagram shown on the page, `update_drawio_diagram`. With `overwrite: true` it uploads a new version of the existing attachment instead (the old version stays in Confluence's history, and watchers are notified).
+Uploads a local file as an attachment to a Confluence page or blog post. By default it only creates: if the page already has an attachment with that name, Confluence refuses, and the error suggests `overwrite: true` or, for a diagram shown on the page, `update_drawio_diagram`. With `overwrite: true` it uploads a new version of the existing attachment instead (the old version stays in Confluence's history, and watchers are notified).
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `page_id` | string | Yes | Numeric page ID |
+| `page_id` | string | Yes | Numeric page or blog post ID |
 | `file_path` | string | Yes | Absolute path to the local file (must be under the working directory) |
 | `filename` | string | No | Name to use for the attachment (defaults to the file's basename). Must not contain control characters. |
 | `comment` | string | No | Comment describing the attachment |
@@ -475,6 +528,8 @@ The result text includes both `attachment_id` and `macro_id` so a follow-up call
 | `after_section` | string | No | Heading text of a section to place the diagram in. The macro is inserted at the **end of that section** (before the next heading) instead of at the end of the page. Takes precedence over `append`. |
 | `return_macro_only` | boolean | No | If true, upload the attachment but **do not modify the page body**; the result returns the draw.io macro storage markup so you can position it yourself with `update_page` / `update_page_section` (default: false). Takes precedence over `after_section` and `append`. The attachment is created regardless; an un-embedded macro leaves it orphaned. |
 
+The page is read before the attachment is uploaded, so an ID that cannot be read as a page (missing, not visible to this account, or a blog post) fails before anything is created.
+
 If the page already has an attachment with that name, Confluence refuses and the error points at `update_drawio_diagram`.
 
 **Placement.** By default the diagram is appended at the end of the page. Use
@@ -554,22 +609,22 @@ Returns each label's prefix and name.
 
 ### `add_label`
 
-Adds one or more labels to a Confluence page. Labels must be lowercase, alphanumeric, hyphens, or underscores.
+Adds one or more labels to a Confluence page or blog post. Labels must be lowercase, alphanumeric, hyphens, or underscores.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `page_id` | string | Yes | Confluence page ID |
+| `page_id` | string | Yes | Confluence page or blog post ID |
 | `labels` | array of strings | Yes | Labels to add (1–20 items; lowercase, alphanumeric, hyphens, underscores) |
 
 ---
 
 ### `remove_label`
 
-Removes a label from a Confluence page.
+Removes a label from a Confluence page or blog post.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `page_id` | string | Yes | Confluence page ID |
+| `page_id` | string | Yes | Confluence page or blog post ID |
 | `label` | string | Yes | Label to remove |
 
 ---
@@ -590,11 +645,11 @@ Returns the status name and color, or indicates that no status is set.
 
 ### `set_page_status`
 
-Sets the content status badge on a page.
+Sets the content status badge on a page or blog post.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `page_id` | string | Yes | Confluence page ID |
+| `page_id` | string | Yes | Confluence page or blog post ID |
 | `name` | string | Yes | Status name (max 20 characters, no control characters) |
 | `color` | string | Yes | Status badge color: `#FFC400` (yellow), `#2684FF` (blue), `#57D9A3` (green), `#FF7452` (red), `#8777D9` (purple) |
 
@@ -631,18 +686,18 @@ Returns all comments of the specified type with author, creation date, and conte
 
 ### `create_comment`
 
-Adds a new comment to a page.
+Adds a new comment to a page or blog post.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `page_id` | string | Yes | Confluence page ID |
+| `page_id` | string | Yes | Confluence page or blog post ID |
 | `body` | string | Yes | Comment body (plain text or simple HTML paragraphs — macros not supported) |
 | `type` | string | No | Comment type: `footer` or `inline` (default: `footer`) |
 | `parent_comment_id` | string | No | Parent comment ID to reply to (creates a nested reply) |
 | `text_selection` | string | No | Exact text to highlight for inline comments (required for top-level inline comments; ignored for footer) |
 | `text_selection_match_index` | number | No | Zero-based index of which occurrence to highlight when text appears multiple times (default: 0) |
 
-Footer comments appear at the bottom of the page. Inline comments are anchored to specific text on the page. All comments are prefixed with `[AI-generated via Epimethian]`.
+Footer comments appear at the bottom of the page. Inline comments are anchored to specific text on the page. On a blog post you can start a footer comment or reply to any comment; a new top-level inline comment works on pages only. All comments are prefixed with `[AI-generated via Epimethian]`.
 
 ---
 
