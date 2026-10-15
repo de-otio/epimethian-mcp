@@ -30,6 +30,8 @@ export const KNOWN_TOOLS = [
   "create_page",
   "get_page",
   "update_page",
+  "create_blog_post",
+  "update_blog_post",
   "delete_page",
   "update_page_section",
   "update_page_sections",

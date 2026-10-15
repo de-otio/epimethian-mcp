@@ -540,3 +540,333 @@ describe("A4: add_drawio_diagram reads the page before uploading", () => {
     expect(w[1]).toBe(`PUT ${v2(`/pages/${PAGE_ID}`)}`);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Stage B: create_blog_post
+// ---------------------------------------------------------------------------
+
+describe("create_blog_post", () => {
+  beforeAll(async () => {
+    await boot(undefined);
+  });
+
+  it("by default: POST /blogposts with status draft, no confirmation, no title pre-check", async () => {
+    const r = await createBlog({});
+    expect(r.isError).toBe(false);
+    expect(r.text).toContain(`Created DRAFT blog post ${NEW_POST_ID} in space DOCS`);
+    expect(r.text).toContain("nobody was notified");
+    expect(r.text).toContain("publish: true");
+    expect(r.text).toContain("Type: blog post");
+    expect(r.structured).toMatchObject({ kind: "written", page_id: NEW_POST_ID, new_version: 1 });
+    expect(mockElicitInput).not.toHaveBeenCalled();
+
+    const posts = writes().filter((w) => w.path === v2("/blogposts"));
+    expect(posts).toHaveLength(1);
+    expect(posts[0].method).toBe("POST");
+    const sent = posts[0].body as Record<string, unknown>;
+    expect(sent).toMatchObject({
+      spaceId: DOCS_ID,
+      title: "Hello",
+      status: "draft",
+      body: { representation: "storage" },
+    });
+    expect((sent.body as { value: string }).value).toContain("Hello world");
+    for (const k of ["createdAt", "parentId", "subtype"]) expect(sent).not.toHaveProperty(k);
+    // Never the page duplicate-title lookup, never /pages at all.
+    expect(requests.some((x) => x.path.startsWith(v2("/pages")))).toBe(false);
+    // Attribution goes through v1 /content/{id}, which accepts blog posts.
+    expect(writes().map((w) => `${w.method} ${w.path}`)).toContain(`POST ${v1(`/content/${NEW_POST_ID}/label`)}`);
+  });
+
+  it("the mutation log records create_blog_post", async () => {
+    await createBlog({});
+    const ops = mockLogMutation.mock.calls.map((c) => (c[0] as { operation: string }).operation);
+    expect(ops).toEqual(["create_blog_post"]);
+  });
+
+  it("publish: true with no confirmation: SOFT_CONFIRMATION_REQUIRED and no POST", async () => {
+    const r = await createBlog({ publish: true });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(r.text).toContain("Publishing emails");
+    expect(r.structured).toMatchObject({ kind: "confirmation_required" });
+    expect(writes()).toEqual([]);
+  });
+
+  it("publish: true with a batch token alone: still refused, no POST", async () => {
+    const { mintBatchToken } = await import("./batch-tokens.js");
+    const batch = mintBatchToken({ cloudId: CLOUD_ID, pageIds: ["__new_blog_post__", NEW_POST_ID], ttlSeconds: 600, maxOperations: 4 });
+    const r = await createBlog({ publish: true, batch_token: batch.token });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(writes()).toEqual([]);
+  });
+
+  it("source chained_tool_output with publish: true: refused, no POST", async () => {
+    const r = await createBlog({ publish: true, source: "chained_tool_output" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("source=chained_tool_output");
+    expect(r.text).toContain("publish");
+    expect(writes()).toEqual([]);
+  });
+
+  it("source chained_tool_output for a draft is allowed (only publishing is a broadcast)", async () => {
+    const r = await createBlog({ source: "chained_tool_output" });
+    expect(r.isError).toBe(false);
+    expect(writes().filter((w) => w.path === v2("/blogposts"))).toHaveLength(1);
+  });
+
+  it("publish: true, confirmed with the token: POST /blogposts with status current", async () => {
+    const first = await createBlog({ publish: true });
+    const token = first.structured?.confirm_token as string;
+    expect(token).toBeTruthy();
+    const second = await createBlog({ publish: true, confirm_token: token });
+    expect(second.isError).toBe(false);
+    expect(second.text).toContain(`Published blog post ${NEW_POST_ID}`);
+    const posted = writes().filter((w) => w.path === v2("/blogposts"));
+    expect(posted).toHaveLength(1);
+    expect(posted[0].body).toMatchObject({ status: "current", title: "Hello", spaceId: DOCS_ID });
+    expect(posted[0].body).not.toHaveProperty("createdAt");
+  });
+
+  it("a token minted for one post does not publish a different body", async () => {
+    const first = await createBlog({ publish: true });
+    const token = first.structured?.confirm_token as string;
+    const second = await createBlog({ publish: true, body: "<p>Something else</p>", confirm_token: token });
+    expect(second.isError).toBe(true);
+    expect(second.text).toContain("no longer valid");
+    expect(writes()).toEqual([]);
+  });
+});
+
+describe("create_blog_post with an allowlist", () => {
+  beforeAll(async () => {
+    await boot({ spaces: ["DOCS"] });
+  });
+
+  it("a space outside the allowlist is refused before any request", async () => {
+    const r = await createBlog({ space_key: "OPS" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain('Space "OPS"');
+    expect(requests).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stage B: update_blog_post
+// ---------------------------------------------------------------------------
+
+/**
+ * The update_page content-safety guard cases, run against a page and a blog
+ * post with the same body. Each must fire on both, with the same message,
+ * and neither may send a PUT.
+ */
+const FENCE = "<<<CONFLUENCE_UNTRUSTED pageId=1 field=body>>>";
+const GUARD_CASES: Array<[string, Record<string, unknown>, RegExp]> = [
+  ["deletion (macro dropped, no confirm_deletions)", { body: BODY.replace(MACRO, "<p>pad</p>".repeat(20)) }, /delet|macro/i],
+  ["shrinkage (>50% smaller)", { body: `<h1>Intro</h1><p>a</p>${MACRO}<h2>Details</h2><p>b</p><h2>More</h2><h2>End</h2>` }, /shrink|smaller|size/i],
+  ["structure loss (headings dropped)", { body: BODY.replace(/<h2>/g, "<p>").replace(/<\/h2>/g, "</p>") }, /heading|structure/i],
+  ["mixed markdown and storage", { body: `# Title\n\n- item\n\n${MACRO}` }, /BOTH Confluence storage tags/],
+  ["untrusted-fence echo", { body: `${FENCE}\n${BODY}` }, /fence|untrusted/i],
+  ["invented placeholder token", { body: "# Intro\n\n[[epi:T9999]]\n" }, /T9999|token|placeholder/i],
+  ["empty body", { body: "<p></p>" }, /empty|shrink|smaller/i],
+];
+
+describe("update_blog_post: content-safety guards match update_page", () => {
+  beforeAll(async () => {
+    await boot(undefined);
+  });
+
+  for (const [name, args, pattern] of GUARD_CASES) {
+    it(name, async () => {
+      const page = await updatePage(args);
+      const pageWrites = writes();
+      requests.length = 0;
+      const blog = await updateBlog(args);
+      expect(page.isError, page.text).toBe(true);
+      expect(blog.isError, blog.text).toBe(true);
+      expect(blog.text).toMatch(pattern);
+      // Same guard, same message, whatever the content type.
+      expect(blog.text.replaceAll(BLOG_ID, "ID")).toBe(page.text.replaceAll(PAGE_ID, "ID"));
+      expect(pageWrites).toEqual([]);
+      expect(writes()).toEqual([]);
+    });
+  }
+});
+
+describe("update_blog_post", () => {
+  beforeAll(async () => {
+    await boot(undefined);
+  });
+
+  it("a plain update: GET then PUT /blogposts/{id}, status current, version + 1", async () => {
+    const newBody = BODY.replace("Details", "Details (updated)");
+    const r = await updateBlog({ body: newBody });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain(`Updated blog post: Release notes (ID: ${BLOG_ID}, version: 5`);
+    expect(r.structured).toMatchObject({ kind: "written", page_id: BLOG_ID, new_version: 5 });
+    expect(mockElicitInput).not.toHaveBeenCalled();
+    const read = requests.find((x) => x.method === "GET" && x.path === v2(`/blogposts/${BLOG_ID}`));
+    expect(read?.query.get("body-format")).toBe("storage");
+    const puts = writes().filter((w) => w.method === "PUT" && w.path.startsWith(v2("/")));
+    expect(puts).toHaveLength(1);
+    expect(puts[0].path).toBe(v2(`/blogposts/${BLOG_ID}`));
+    expect(puts[0].body).toMatchObject({
+      id: BLOG_ID,
+      status: "current",
+      title: "Release notes",
+      version: { number: 5 },
+      body: { representation: "storage" },
+    });
+    expect((puts[0].body as { body: { value: string } }).body.value).toContain("Details (updated)");
+    expect(requests.some((x) => x.path.startsWith(v2("/pages")))).toBe(false);
+  });
+
+  it("the mutation log records update_blog_post, and the write budget is consumed once", async () => {
+    const { writeBudget } = await import("./write-budget.js");
+    const consume = vi.spyOn(writeBudget, "consume");
+    try {
+      const r = await updateBlog({ body: BODY.replace("Details", "Details 2") });
+      expect(r.isError, r.text).toBe(false);
+      expect(consume).toHaveBeenCalledTimes(1);
+    } finally {
+      consume.mockRestore();
+    }
+    const records = mockLogMutation.mock.calls.map((c) => c[0] as { operation: string; pageId: string; oldVersion?: number; newVersion?: number });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ operation: "update_blog_post", pageId: BLOG_ID, oldVersion: 4, newVersion: 5 });
+  });
+
+  it("a stale version gives a conflict, and the re-read goes to /blogposts/{id}", async () => {
+    conflictOnNextBlogPut = true;
+    const r = await updateBlog({ body: BODY.replace("Details", "Details 3") });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("Version conflict");
+    expect(r.text).toContain("version 5");
+    const afterPut = requests.slice(requests.findIndex((x) => x.method === "PUT") + 1);
+    expect(afterPut.map((x) => `${x.method} ${x.path}`)).toEqual([`GET ${v2(`/blogposts/${BLOG_ID}`)}`]);
+    expect(requests.some((x) => x.path.startsWith(v2("/pages")))).toBe(false);
+    expect(mockLogMutation.mock.calls.map((c) => (c[0] as { operation: string }).operation)).toEqual(["update_blog_post"]);
+  });
+
+  it("a page id is refused by name, with no PUT", async () => {
+    const r = await updateBlog({ blog_post_id: PAGE_ID, body: "<p>x</p>" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain(`id ${PAGE_ID} is a page, not a blog post`);
+    expect(r.text).toContain("update_page");
+    expect(writes()).toEqual([]);
+  });
+
+  it("a blog post id given to update_page is refused, with no PUT", async () => {
+    const r = await updatePage({ page_id: BLOG_ID, body: "<p>x</p>" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain(`id ${BLOG_ID} is a blog post`);
+    expect(writes()).toEqual([]);
+  });
+
+  it("a destructive flag goes through the gate (soft confirmation), with no PUT", async () => {
+    const r = await updateBlog({ body: "<p>short</p>", replace_body: true, confirm_shrinkage: true });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(writes()).toEqual([]);
+  });
+
+  it("a title-only update re-sends the current body (the blog PUT requires one)", async () => {
+    const r = await updateBlog({ title: "Release notes v2" });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("title only");
+    const put = writes().find((w) => w.method === "PUT");
+    expect(put?.body).toMatchObject({ title: "Release notes v2", status: "current", body: { value: BODY } });
+  });
+
+  it("the blog body is never cached in pageCache", async () => {
+    const { pageCache } = await import("./page-cache.js");
+    await updateBlog({ body: BODY.replace("Details", "Details 4") });
+    expect(pageCache.has(BLOG_ID)).toBeUndefined();
+    expect(pageCache.getSnapshot(BLOG_ID, 4)).toBeUndefined();
+  });
+});
+
+describe("update_blog_post: drafts and publishing", () => {
+  beforeAll(async () => {
+    await boot(undefined);
+  });
+
+  const updateDraft = (args: Record<string, unknown>) =>
+    updateBlog({ blog_post_id: DRAFT_ID, title: "Coming soon", version: 1, ...args });
+
+  it("a draft is read through status=draft and stays a draft without publish", async () => {
+    const r = await updateDraft({ body: BODY.replace("Details", "Draft details") });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("still a draft");
+    expect(mockElicitInput).not.toHaveBeenCalled();
+    expect(requests.some((x) => x.path === v2(`/blogposts/${DRAFT_ID}`) && x.query.get("status") === "draft" && x.query.get("body-format") === "storage")).toBe(true);
+    const put = writes().find((w) => w.method === "PUT");
+    expect(put?.path).toBe(v2(`/blogposts/${DRAFT_ID}`));
+    expect(put?.body).toMatchObject({ status: "draft", version: { number: 2 } });
+  });
+
+  it("publish: true on a draft with no confirmation: SOFT_CONFIRMATION_REQUIRED and no PUT", async () => {
+    const r = await updateDraft({ publish: true });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(r.text).toContain(`Publish blog post ${DRAFT_ID}`);
+    expect(r.text).toContain("in space DOCS");
+    expect(writes()).toEqual([]);
+  });
+
+  it("publish: true with a batch token for the post: still refused, no PUT", async () => {
+    const { mintBatchToken } = await import("./batch-tokens.js");
+    const batch = mintBatchToken({ cloudId: CLOUD_ID, pageIds: [DRAFT_ID], ttlSeconds: 600, maxOperations: 2 });
+    const r = await updateDraft({ publish: true, batch_token: batch.token });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("SOFT_CONFIRMATION_REQUIRED");
+    expect(writes()).toEqual([]);
+  });
+
+  it("publish: true with source chained_tool_output: refused, no PUT", async () => {
+    const r = await updateDraft({ publish: true, source: "chained_tool_output" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("source=chained_tool_output");
+    expect(writes()).toEqual([]);
+  });
+
+  it("publish: true, confirmed: PUT with status current even though the body is unchanged", async () => {
+    const first = await updateDraft({ publish: true });
+    const token = first.structured?.confirm_token as string;
+    expect(token).toBeTruthy();
+    const second = await updateDraft({ publish: true, confirm_token: token });
+    expect(second.isError, second.text).toBe(false);
+    expect(second.text).toContain(`Published blog post: Coming soon (ID: ${DRAFT_ID}`);
+    const puts = writes().filter((w) => w.method === "PUT" && w.path === v2(`/blogposts/${DRAFT_ID}`));
+    expect(puts).toHaveLength(1);
+    expect(puts[0].body).toMatchObject({ status: "current", version: { number: 2 }, body: { value: BODY } });
+  });
+
+  it("a publish token does not cover a plain update (and vice versa it is bound to publishing)", async () => {
+    const first = await updateDraft({ publish: true });
+    const token = first.structured?.confirm_token as string;
+    // Same post, same version, but a destructive update that does not publish.
+    const r = await updateDraft({ body: "<p>tiny</p>", replace_body: true, confirm_token: token });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("no longer valid");
+    expect(writes()).toEqual([]);
+  });
+
+  it("publish: true on an already published post is a plain update (no gate)", async () => {
+    const r = await updateBlog({ publish: true, body: BODY.replace("Details", "Details 5") });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.text).toContain("Updated blog post");
+    const put = writes().find((w) => w.method === "PUT");
+    expect(put?.body).toMatchObject({ status: "current" });
+  });
+});
+
+describe("tool allowlist: denying create_blog_post", () => {
+  it("the tool is not registered, and create_page still is", async () => {
+    await boot({ denied_tools: ["create_blog_post"] });
+    expect(handlers.has("create_blog_post")).toBe(false);
+    expect(handlers.has("update_blog_post")).toBe(true);
+    expect(handlers.has("create_page")).toBe(true);
+  });
+});

@@ -59,8 +59,11 @@
  */
 
 import {
+  _rawCreateContent,
   _rawCreatePage,
+  _rawUpdateContent,
   _rawUpdatePage,
+  type ContentType,
   extractSection,
   extractSectionBody,
   getPageByTitle,
@@ -369,6 +372,30 @@ export interface SafePrepareBodyOutput {
 export interface SafeSubmitPageInput {
   /** `undefined` → create; string → update. */
   pageId: string | undefined;
+
+  /**
+   * What is being written. Default `"page"`. `"blogpost"` routes the write
+   * to `/blogposts` through the generalised raw writers, skips the
+   * duplicate-title check on create (blog titles are unique per space per
+   * day only; Confluence's own error is passed on), and defaults the
+   * mutation-log operation to `create_blog_post` / `update_blog_post`.
+   * Every other step of the pipeline is the same for both types.
+   */
+  contentType?: ContentType;
+
+  /**
+   * Blog posts only: the status to write (`draft` or `current`). Ignored for
+   * pages. On create it decides draft vs published; on update, `current`
+   * when `previousStatus` is `draft` is the publish step.
+   */
+  status?: "current" | "draft";
+
+  /**
+   * Blog posts only: the status the post had when it was read. A status
+   * change disables the byte-identical short-circuit, so publishing a draft
+   * whose body is unchanged still reaches Confluence.
+   */
+  previousStatus?: "current" | "draft";
 
   /** Required for create; ignored on update. */
   spaceId?: string;
@@ -1684,11 +1711,18 @@ export async function safeSubmitPage(
     source,
     assertGrowth,
     cloudId,
+    contentType = "page",
+    status,
+    previousStatus,
   } = input;
 
   const isCreate = pageId === undefined;
+  const isBlogPost = contentType === "blogpost";
   const resolvedOperation: MutationRecord["operation"] =
-    operation ?? (isCreate ? "create_page" : "update_page");
+    operation ??
+    (isBlogPost
+      ? (isCreate ? "create_blog_post" : "update_blog_post")
+      : (isCreate ? "create_page" : "update_page"));
 
   // C2/C3: single computation of the effective destructive-flag list,
   // reused for both the Confluence version-message suffix (C3) and the
@@ -1720,11 +1754,14 @@ export async function safeSubmitPage(
   // src/server/index.ts — see plans/centralized-write-safety.md §A6 (
   // "Preserve duplicate-title error verbatim"). The wording is asserted by
   // a regression test in safe-write.test.ts.
+  //
+  // Pages only: blog post titles need only be unique per space per day, and
+  // `getPageByTitle` searches `/pages`, so it would not find a clashing post.
   if (isCreate) {
     if (!spaceId) {
       throw new Error("safeSubmitPage: spaceId is required for create");
     }
-    const existing = await getPageByTitle(spaceId, title, false);
+    const existing = isBlogPost ? null : await getPageByTitle(spaceId, title, false);
     if (existing) {
       throw new Error(
         `A page titled "${title}" already exists in this space (page ID: ${existing.id}). ` +
@@ -1784,11 +1821,15 @@ export async function safeSubmitPage(
   // Skipped for creates (no previousBody), title-only updates (no body
   // to compare), and operations that explicitly want a version bump
   // (none today, but future tools could opt out).
+  //
+  // Also skipped when a blog post's status changes (publishing a draft):
+  // the write is the status change, whatever the body.
   if (
     !isCreate &&
     !isTitleOnly &&
     previousBody !== undefined &&
-    finalStorage !== undefined
+    finalStorage !== undefined &&
+    status === previousStatus
   ) {
     const normalizedFinal = normalizeBodyForSubmit(finalStorage);
     const normalizedPrev = normalizeBodyForSubmit(previousBody);
@@ -1832,13 +1873,18 @@ export async function safeSubmitPage(
     if (isCreate) {
       // finalStorage is guaranteed defined here (isTitleOnly && isCreate
       // would have thrown above).
-      page = await _rawCreatePage(
-        spaceId!,
-        title,
-        finalStorage!,
-        parentId,
-        clientLabel,
-      );
+      page = isBlogPost
+        ? await _rawCreateContent("blogpost", spaceId!, title, finalStorage!, {
+            clientLabel,
+            status,
+          })
+        : await _rawCreatePage(
+            spaceId!,
+            title,
+            finalStorage!,
+            parentId,
+            clientLabel,
+          );
       newVersion = page.version?.number ?? 1;
     } else {
       if (version === undefined) {
@@ -1848,7 +1894,7 @@ export async function safeSubmitPage(
       // confluence-client.ts _rawUpdatePage) already supports
       // `body: undefined` by leaving the field out of the payload so the
       // Confluence API treats it as a title-only edit.
-      const res = await _rawUpdatePage(pageId!, {
+      const updateOpts = {
         title,
         body: finalStorage,
         version,
@@ -1856,7 +1902,10 @@ export async function safeSubmitPage(
         previousBody,
         clientLabel,
         destructiveFlags,
-      });
+      };
+      const res = isBlogPost
+        ? await _rawUpdateContent("blogpost", pageId!, { ...updateOpts, status })
+        : await _rawUpdatePage(pageId!, updateOpts);
       page = res.page;
       newVersion = res.newVersion;
     }

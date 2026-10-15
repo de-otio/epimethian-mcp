@@ -14,6 +14,9 @@ import {
   getContent,
   resolveContentType,
   ContentIsBlogPostError,
+  ContentIsPageError,
+  getBlogPost,
+  getSpaceKeyById,
   type ContentType,
   deletePage,
   searchContent,
@@ -640,9 +643,10 @@ export function toolErrorWithContext(err: unknown, ctx: ErrCtx): ToolResult {
       isError: true,
     };
   }
-  // Must precede the ConfluenceNotFoundError branch (it is a subclass): the
-  // agent needs "this is a blog post", not the generic not-found text.
-  if (err instanceof ContentIsBlogPostError) {
+  // Must precede the ConfluenceNotFoundError branch (both are subclasses):
+  // the agent needs "this is a blog post" / "this is a page", not the
+  // generic not-found text.
+  if (err instanceof ContentIsBlogPostError || err instanceof ContentIsPageError) {
     return {
       content: [{ type: "text", text: `Error: ${err.message}` }],
       isError: true,
@@ -739,6 +743,8 @@ export const WRITE_TOOLS = new Set([
   "authorise_destructive_writes",
   "create_page",
   "update_page",
+  "create_blog_post",
+  "update_blog_post",
   "append_to_page",
   "prepend_to_page",
   "update_page_section",
@@ -856,6 +862,27 @@ const VERSION_PARAM_NOTE =
   "and applies on top of the latest version; it bypasses optimistic concurrency (a " +
   "concurrent write still conflicts), so use a number unless concurrent writes are " +
   "impossible (e.g. right after create_page).";
+
+/**
+ * Publishing a blog post is a broadcast (plans/blog-post-writes.md, "What the
+ * Confluence v2 API says"): no API parameter suppresses the notifications.
+ * Shared by the create_blog_post / update_blog_post descriptions.
+ */
+const BLOG_PUBLISH_NOTE =
+  "Publishing is a broadcast: Confluence emails the space's watchers and everyone " +
+  "subscribed to all blog posts, and cannot do it quietly. So publishing always asks " +
+  "the user to confirm (a batch_token never covers it) and is refused when source is " +
+  "chained_tool_output.";
+
+/** The consequence line of the publish confirmation prompt. Server-authored. */
+const BLOG_PUBLISH_BROADCAST =
+  "Publishing emails the space's watchers and everyone subscribed to all blog posts.";
+
+/**
+ * Synthetic content id that a create_blog_post publish confirmation binds to:
+ * the post does not exist yet. The token's diffHash carries the binding.
+ */
+const NEW_BLOG_POST_ID = "__new_blog_post__";
 
 /** Prepend the untrusted-content paragraph to a read-tool description. */
 function withUntrustedNote(description: string): string {
@@ -1924,6 +1951,447 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           return formatSoftConfirmationResult(err, { pageId: page_id });
         }
         return toolErrorWithContext(err, { operation: "update_page", resource: `page ${page_id}`, profile: config.profile });
+      }
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Blog posts (create_blog_post / update_blog_post)
+  //
+  // Separate tools, not a flag on the page tools: a post has no parent or
+  // position, and publishing one is a broadcast, so an operator can allow
+  // page writes and deny blog publishing through the tool allowlist.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Gate the publish step (and, on update, any destructive flag) through the
+   * same confirm_token / gateOperation path destructive writes use. Never
+   * satisfied by a batch_token: neither blog tool accepts one.
+   */
+  async function confirmBlogWrite(opts: {
+    tool: "create_blog_post" | "update_blog_post";
+    cloudId: string | undefined;
+    contentId: string;
+    version: number;
+    diffHash: string | undefined;
+    summary: string;
+    details: Record<string, string | number | boolean | DeletionSummary | undefined>;
+    confirm_token: string | undefined;
+  }): Promise<void> {
+    const tokenResult = await maybeConsumeConfirmToken({
+      confirm_token: opts.confirm_token,
+      tool: opts.tool,
+      cloudId: opts.cloudId,
+      pageId: opts.contentId,
+      pageVersion: opts.version,
+      diffHash: opts.diffHash,
+    });
+    if (tokenResult === "invalid") {
+      throw new ConverterError(
+        "The confirmation token is no longer valid. Mint a new one by " +
+        "re-calling this tool without confirm_token, ask the user again, " +
+        "then retry with the new token.",
+        "CONFIRMATION_TOKEN_INVALID",
+      );
+    }
+    if (tokenResult === "no_token") {
+      await gateOperation(server, {
+        tool: opts.tool,
+        summary: opts.summary,
+        details: opts.details,
+        cloudId: opts.cloudId,
+        pageId: opts.contentId,
+        pageVersion: opts.version,
+        diffHash: opts.diffHash,
+      });
+    }
+    // tokenResult === "ok": token consumed; skip the gate.
+  }
+
+  /** A title quoted in a confirmation prompt: one line, bounded. */
+  const promptTitle = (title: string): string =>
+    // eslint-disable-next-line no-control-regex
+    JSON.stringify(title.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 120));
+
+  // create_blog_post
+  server.registerTool(
+    "create_blog_post",
+    {
+      description: describeWithLock(
+        withDestructiveWarning(
+          "Create a blog post in a Confluence space's blog (for a page in the page tree, use create_page). " +
+          "By default the post is a DRAFT: it is not on the blog, nobody is notified, and the result says how to publish it. " +
+          "publish: true publishes at once. " + BLOG_PUBLISH_NOTE + " " +
+          "Set publish only when the user asked for the post to be published. " +
+          MARKDOWN_BODY_NOTE + " " +
+          SOFT_CONFIRM_NOTE
+        ),
+        config
+      ),
+      inputSchema: {
+        space_key: z
+          .string()
+          .describe("Confluence space key, e.g. 'DEV' or 'TEAM'"),
+        title: z.string().min(1).describe("Blog post title"),
+        body: z
+          .string()
+          .describe("Post content: GFM markdown or storage XHTML, never mixed. See the tool description."),
+        publish: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Publish now instead of creating a draft. Notifies readers by email; always asks the " +
+            "user to confirm. Default false (draft)."
+          ),
+        allow_raw_html: z
+          .boolean()
+          .default(false)
+          .describe("Allow raw HTML passthrough inside markdown bodies (disabled by default; only enable for trusted content)."),
+        confluence_base_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("Override the Confluence base URL used by the link rewriter. Defaults to the configured Confluence URL."),
+        source: sourceSchema,
+        confirm_token: z
+          .string()
+          .optional()
+          .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact post."),
+      },
+      outputSchema: writeOutputSchema,
+      ...writeTool("Create blog post"),
+    },
+    async ({ space_key, title, body, publish, allow_raw_html, confluence_base_url, source, confirm_token }) => {
+      const blocked = writeGuard("create_blog_post", config);
+      if (blocked) return blocked;
+      try {
+        // F3: space allowlist — before resolveSpaceId, as in create_page.
+        await checkSpaceAllowed({ spaceKey: space_key });
+        // E2: publishing is a broadcast, so it counts as a destructive flag:
+        // content chained from another tool's output cannot trigger it.
+        const effectiveSource = validateSource(source, publish ? ["publish"] : []);
+        const spaceId = await resolveSpaceId(space_key);
+        const cfg = await getConfig();
+        const cloudId = cfg.sealedCloudId;
+
+        const prepared = await safePrepareBody({
+          body,
+          currentBody: undefined,
+          allowRawHtml: allow_raw_html,
+          confluenceBaseUrl: confluence_base_url ?? cfg.url,
+        });
+
+        if (publish) {
+          // There is no post yet, so the token binds a synthetic id and a
+          // digest of exactly what would be published (as
+          // authorise_destructive_writes binds its request).
+          const diffHash = cloudId
+            ? createHash("sha256")
+                .update(JSON.stringify({
+                  tool: "create_blog_post",
+                  cloudId,
+                  spaceId,
+                  title,
+                  body: prepared.finalStorage,
+                }))
+                .digest("hex")
+            : undefined;
+          await confirmBlogWrite({
+            tool: "create_blog_post",
+            cloudId,
+            contentId: NEW_BLOG_POST_ID,
+            version: 1,
+            diffHash,
+            summary:
+              `Publish a new blog post ${promptTitle(title)} in space ${space_key}? ` +
+              BLOG_PUBLISH_BROADCAST,
+            details: { space_key, publish: true, source: effectiveSource },
+            confirm_token,
+          });
+        }
+
+        const submitted = await safeSubmitPage({
+          pageId: undefined,
+          contentType: "blogpost",
+          status: publish ? "current" : "draft",
+          spaceId,
+          title,
+          finalStorage: prepared.finalStorage,
+          versionMessage: prepared.versionMessage,
+          deletedTokens: prepared.deletedTokens,
+          clientLabel: getClientLabel(server),
+          source: effectiveSource,
+        });
+
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(submitted.page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(submitted.page.id, cfg);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+
+        const id = submitted.page.id;
+        const note = publish
+          ? `Published blog post ${id} in space ${space_key}.`
+          : `Created DRAFT blog post ${id} in space ${space_key}. It is not on the blog and nobody ` +
+            `was notified. To publish it, call update_blog_post with blog_post_id ${id}, ` +
+            `version ${submitted.newVersion}, the same title, and publish: true (the user is asked to confirm).`;
+        const page = await formatPage({ ...submitted.page, contentType: "blogpost" }, false);
+        return {
+          ...toolResult(appendWarnings(`${note}\n\n${page}`, warnings) + echo),
+          structuredContent: {
+            kind: "written" as const,
+            page_id: id,
+            new_version: submitted.newVersion,
+            title: submitted.page.title,
+          },
+        };
+      } catch (err) {
+        if (err instanceof SoftConfirmationRequiredError) {
+          return formatSoftConfirmationResult(err, { pageId: err.pageId });
+        }
+        return toolErrorWithContext(err, { operation: "create_blog_post", resource: `space ${space_key}`, profile: config.profile });
+      }
+    }
+  );
+
+  // update_blog_post
+  server.registerTool(
+    "update_blog_post",
+    {
+      description: describeWithLock(
+        withDestructiveWarning(
+          "Update a Confluence blog post (for a page, use update_page), with update_page's safety checks. " +
+          MARKDOWN_BODY_NOTE + " " +
+          "Pass the `version` from your latest get_page; omit body for a title-only change.\n\n" +
+          "publish: true on a DRAFT publishes it. " + BLOG_PUBLISH_NOTE + " " +
+          "Set publish only when the user asked for it. A published post cannot become a draft again.\n\n" +
+          "Flags (default false), as on update_page: confirm_deletions, confirm_shrinkage, " +
+          "confirm_structure_loss, replace_body.\n\n" +
+          SOFT_CONFIRM_NOTE
+        ),
+        config
+      ),
+      inputSchema: {
+        blog_post_id: pageIdSchema.describe("The Confluence blog post ID"),
+        title: z
+          .string()
+          .min(1)
+          .describe("Post title (use the title from get_page if unchanged)"),
+        version: versionField
+          .describe(VERSION_PARAM_NOTE),
+        body: z
+          .string()
+          .optional()
+          .describe("New body: GFM markdown or storage XHTML, never mixed. Omit to keep the current body."),
+        version_message: z
+          .string()
+          .optional()
+          .describe("Optional version comment"),
+        publish: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Publish a draft. Notifies readers by email; always asks the user to confirm. " +
+            "No effect on a post that is already published. Default false."
+          ),
+        confirm_deletions: z
+          .boolean()
+          .default(false)
+          .describe("Set to true to acknowledge that your markdown removes preserved macros or rich elements. Required when any preserved element would be deleted."),
+        replace_body: z
+          .boolean()
+          .default(false)
+          .describe("Set to true for a wholesale rewrite that skips token preservation. All existing macros will be lost."),
+        confirm_shrinkage: z
+          .boolean()
+          .default(false)
+          .describe("Set to true to acknowledge that the new body is more than 50% smaller than the existing body."),
+        confirm_structure_loss: z
+          .boolean()
+          .default(false)
+          .describe("Set to true to acknowledge that the new body has more than 50% fewer headings than the existing body."),
+        allow_raw_html: z
+          .boolean()
+          .default(false)
+          .describe("Allow raw HTML passthrough inside markdown bodies (disabled by default)."),
+        confluence_base_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("Override the Confluence base URL used by the link rewriter. Defaults to the configured Confluence URL."),
+        source: sourceSchema,
+        confirm_token: z
+          .string()
+          .optional()
+          .describe("Soft-confirmation token from a prior SOFT_CONFIRMATION_REQUIRED response. Single-use; bound to this exact diff and post version."),
+      },
+      outputSchema: writeOutputSchema,
+      ...destructiveTool("Update blog post"),
+    },
+    async ({ blog_post_id, title, version, body, version_message, publish, confirm_deletions, replace_body, confirm_shrinkage, confirm_structure_loss, allow_raw_html, confluence_base_url, source, confirm_token }) => {
+      const blocked = writeGuard("update_blog_post", config);
+      if (blocked) return blocked;
+      try {
+        // The steps of update_page, in the same order.
+        assertBodyVersionPinned(body ?? undefined, version);
+        // F3: space allowlist (A2: resolves a blog post's space).
+        await checkSpaceAllowed({ pageId: blog_post_id });
+        // E2: validate source vs. the destructive-flag set; publishing counts.
+        const flagsSet = listDestructiveFlagsSet({
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          confirmDeletions: confirm_deletions,
+          replaceBody: replace_body,
+        });
+        const effectiveSource = validateSource(source, publish ? [...flagsSet, "publish"] : flagsSet);
+
+        const cfg = await getConfig();
+        const cloudId = cfg.sealedCloudId;
+        // A page id fails here with ContentIsPageError: no write is sent.
+        const current = await getBlogPost(blog_post_id, true);
+        const currentStorage = current.body?.storage?.value ?? current.body?.value ?? "";
+        const pageVersion = current.version?.number ?? 0;
+        // The status decides whether this write publishes. Anything but a
+        // known one is refused rather than guessed: guessing "current" for a
+        // draft would publish it without confirmation.
+        const currentStatus = current.status;
+        if (currentStatus !== "current" && currentStatus !== "draft") {
+          throw new Error(
+            `Blog post ${blog_post_id} is neither published nor a draft (or its status could not be read); ` +
+            `update_blog_post edits published posts and drafts only. Nothing was written.`
+          );
+        }
+        const publishing = publish && currentStatus === "draft";
+
+        // E4: gate destructive flags (as update_page) and the publish step.
+        if (flagsSet.length > 0 || publishing) {
+          let spaceKey: string | undefined;
+          try {
+            spaceKey = current.spaceId !== undefined ? await getSpaceKeyById(current.spaceId) : undefined;
+          } catch {
+            spaceKey = undefined;
+          }
+          // The publish prompt must say it publishes, so the deletion
+          // forecast (which replaces the summary on the soft path) is only
+          // used for a destructive update of a post that stays as it is.
+          const deletionSummary =
+            !publishing && confirm_deletions && body
+              ? tryForecastDeletions(currentStorage, body, confluence_base_url ?? cfg.url)
+              : null;
+          const diffHash = (cloudId && pageVersion > 0)
+            ? computeDiffHash(`${publishing ? "publish\n" : ""}${body ?? currentStorage}`, pageVersion)
+            : undefined;
+          const where = spaceKey !== undefined ? ` in space ${spaceKey}` : "";
+          const summary = publishing
+            ? `Publish blog post ${blog_post_id} ${promptTitle(title)}${where}` +
+              `${flagsSet.length > 0 ? " with destructive flags" : ""}? ${BLOG_PUBLISH_BROADCAST}`
+            : `Update blog post ${blog_post_id} with destructive flags?`;
+          await confirmBlogWrite({
+            tool: "update_blog_post",
+            cloudId,
+            contentId: blog_post_id,
+            version: pageVersion,
+            diffHash,
+            summary,
+            details: {
+              blog_post_id,
+              ...(flagsSet.length > 0 ? { flags: flagsSet.join(",") } : {}),
+              ...(publishing ? { publish: true } : {}),
+              source: effectiveSource,
+              version,
+              ...(deletionSummary ? { deletionSummary } : {}),
+            },
+            confirm_token,
+          });
+        }
+
+        // C2: resolve `version: "current"` against the live metadata.
+        const resolvedVersion =
+          version === "current"
+            ? pageVersion
+            : version;
+        if (resolvedVersion <= 0) {
+          throw new Error(
+            `Could not resolve current version for blog post ${blog_post_id} (server returned no version metadata)`
+          );
+        }
+
+        const prepared = await safePrepareBody({
+          body: body ?? undefined,
+          currentBody: currentStorage,
+          confirmDeletions: confirm_deletions || undefined,
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          replaceBody: replace_body,
+          allowRawHtml: allow_raw_html,
+          confluenceBaseUrl: confluence_base_url ?? cfg.url,
+        });
+
+        const mergedVersionMessage =
+          prepared.versionMessage && version_message
+            ? `${version_message}; ${prepared.versionMessage}`
+            : prepared.versionMessage || version_message || "";
+
+        const submitted = await safeSubmitPage({
+          pageId: blog_post_id,
+          contentType: "blogpost",
+          // A published post stays published; a draft stays a draft unless
+          // this call publishes it. Published → draft is not offered.
+          status: publishing ? "current" : currentStatus,
+          previousStatus: currentStatus,
+          title,
+          finalStorage: prepared.finalStorage,
+          previousBody: currentStorage,
+          version: resolvedVersion,
+          versionMessage: mergedVersionMessage,
+          deletedTokens: prepared.deletedTokens,
+          clientLabel: getClientLabel(server),
+          replaceBody: replace_body,
+          confirmShrinkage: confirm_shrinkage,
+          confirmStructureLoss: confirm_structure_loss,
+          confirmDeletions: confirm_deletions,
+          source: effectiveSource,
+          cloudId,
+        });
+
+        const warnings: WarningAccumulator = [];
+        const labelResult = await ensureAttributionLabel(submitted.page.id);
+        if (labelResult.warning) warnings.push(labelResult.warning);
+        const badgeResult = await markPageUnverified(submitted.page.id, cfg);
+        if (badgeResult.warning) warnings.push(badgeResult.warning);
+
+        const isTitleOnly = prepared.finalStorage === undefined;
+        const verb = publishing ? "Published" : "Updated";
+        const bodyNote = isTitleOnly
+          ? "title only, body unchanged"
+          : `body: ${submitted.oldLen}→${submitted.newLen} chars`;
+        const removalNote =
+          submitted.deletedTokens.length > 0
+            ? `; removed ${submitted.deletedTokens.length} preserved macro${submitted.deletedTokens.length === 1 ? "" : "s"}: ${submitted.deletedTokens.map((t) => t.fingerprint).join(", ")}`
+            : "";
+        const draftNote =
+          currentStatus === "draft" && !publishing
+            ? " It is still a draft: nobody was notified. Pass publish: true to publish it."
+            : "";
+        const text =
+          `${verb} blog post: ${submitted.page.title} (ID: ${submitted.page.id}, version: ${submitted.newVersion}, ${bodyNote}${removalNote}).${draftNote}`;
+        return {
+          ...toolResult(appendWarnings(text, warnings) + echo),
+          structuredContent: {
+            kind: "written" as const,
+            page_id: blog_post_id,
+            new_version: submitted.newVersion,
+            ...(isTitleOnly
+              ? {}
+              : { body_bytes_before: submitted.oldLen, body_bytes_after: submitted.newLen }),
+            title: submitted.page.title,
+          },
+        };
+      } catch (err) {
+        if (err instanceof SoftConfirmationRequiredError) {
+          return formatSoftConfirmationResult(err, { pageId: blog_post_id });
+        }
+        return toolErrorWithContext(err, { operation: "update_blog_post", resource: `blog post ${blog_post_id}`, profile: config.profile });
       }
     }
   );

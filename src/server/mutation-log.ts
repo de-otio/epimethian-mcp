@@ -46,7 +46,10 @@ export interface MutationRecord {
     | "revert_page"
     | "add_drawio_diagram"
     | "update_drawio_diagram"
-    | "update_attachment";
+    | "update_attachment"
+    | "create_blog_post"
+    | "update_blog_post";
+  /** Content id: a page id, or a blog post id for the blog post operations. */
   pageId: string;
   oldVersion?: number;
   newVersion?: number;

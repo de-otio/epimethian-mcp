@@ -105,6 +105,8 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
     getContent: (...args: unknown[]) => (getPage as (...a: unknown[]) => unknown)(...args),
     resolveContentType: vi.fn().mockResolvedValue("page"),
     ContentIsBlogPostError: actual.ContentIsBlogPostError,
+    ContentIsPageError: actual.ContentIsPageError,
+    getBlogPost: vi.fn(),
     _rawCreatePage: vi.fn(),
     _rawUpdatePage: vi.fn(),
     deletePage: vi.fn(),
@@ -5206,7 +5208,7 @@ describe("Track O2 — Conditional tool registration", () => {
     }
   });
 
-  it("O2-7: WRITE_TOOLS set contains exactly the 19 expected write tools", async () => {
+  it("O2-7: WRITE_TOOLS set contains exactly the 21 expected write tools", async () => {
     const { WRITE_TOOLS } = await import("./index.js");
     const expected = new Set([
       // 7.0.0: always failed in a read-only profile (writeGuard), so it is no
@@ -5214,6 +5216,7 @@ describe("Track O2 — Conditional tool registration", () => {
       "authorise_destructive_writes",
       "create_page", "update_page", "append_to_page", "prepend_to_page",
       "update_page_section", "update_page_sections",
+      "create_blog_post", "update_blog_post",
       "delete_page", "add_drawio_diagram", "update_drawio_diagram", "revert_page",
       "add_attachment", "add_label", "remove_label", "create_comment",
       "delete_comment", "resolve_comment", "set_page_status", "remove_page_status",
@@ -6694,9 +6697,9 @@ describe("download_attachment in a read-only profile", () => {
     const { WRITE_TOOLS } = await import("./index.js");
     expect(WRITE_TOOLS.has("download_attachment")).toBe(false);
     // Guard the count too: adding it to WRITE_TOOLS would silently unregister
-    // the tool in read-only profiles. (19 = the 17 body/label/comment/status
-    // writers, authorise_destructive_writes (7.0.0) and update_drawio_diagram
-    // (7.2.0).)
-    expect(WRITE_TOOLS.size).toBe(19);
+    // the tool in read-only profiles. (21 = the 17 body/label/comment/status
+    // writers, authorise_destructive_writes (7.0.0), update_drawio_diagram
+    // (7.2.0), create_blog_post and update_blog_post.)
+    expect(WRITE_TOOLS.size).toBe(21);
   });
 });
