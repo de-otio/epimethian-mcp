@@ -139,8 +139,9 @@ Credentials are **never** written to:
 The server's upgrade path is check-and-notify by default: a daily
 background check records a pending update, the stderr banner and
 `get_version` tool surface the signal, and the user installs by running
-`epimethian-mcp upgrade` from their terminal. The CLI runs
-`npm audit signatures` before fetching and refuses to install without a
+`epimethian-mcp upgrade` from their terminal. The CLI installs the
+exact version into a temporary directory without running its scripts,
+runs `npm audit signatures` there, and refuses to install without a
 verified npm provenance attestation — closing both publisher-credential
 compromise and registry-tampering attack paths.
 

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `upgrade` (the MCP tool and the CLI command) failed its integrity check on
+  every run, so no upgrade could succeed. It ran
+  `npm audit signatures @de-otio/epimethian-mcp@<version>`, but that command
+  ignores the package argument and audits the installed tree of the current
+  directory, so it failed with "found no installed dependencies to audit". The
+  check now installs the exact version into a temporary directory with
+  `--ignore-scripts`, runs `npm audit signatures` there, and also requires the
+  registry to list a provenance attestation for the package itself.
+
 ## [7.3.0] - 2026-10-15 - read blog posts
 
 ### Added
