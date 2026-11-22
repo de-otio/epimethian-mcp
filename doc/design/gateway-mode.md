@@ -1,6 +1,6 @@
 # Gateway mode (7.6.0, W-GW build brief)
 
-Status: contracts C1/C2 landed, behaviour not switched on. Plan: [next-release-sdk2-and-v2-api.md](../../plans/next-release-sdk2-and-v2-api.md)
+Status: built on `ws/760-gw` (decisions in §9). Do not release before the W-V2READ and W-HIST lanes land (see §8, last item). Plan: [next-release-sdk2-and-v2-api.md](../../plans/next-release-sdk2-and-v2-api.md)
 §4, §5.3, §5.4, §11. Line numbers are as of the contracts commit on `release/7.6.0`.
 
 ## 1. What already exists (do not re-create)
@@ -148,3 +148,56 @@ export function tokenExpiryState(expiry: string | undefined, today: string /* YY
   `testConnection` is already v2 (§5.4's last row names the wrong function).
 - Row 2's gateway `true` values assume W-V2READ/W-HIST land; until then those functions call
   `requireV1` and would throw. Do not switch gateway mode on before both.
+
+## 9. Decisions taken in the build
+
+1. **Tenant identity in gateway mode.** The v1 `/user/current` email check
+   (`verifyTenantIdentity`) cannot run: the gateway does not serve v1. It is replaced by
+   two checks, in this order: (a) `GET {site}/_edge/tenant_info` must return the sealed
+   `cloudId` (fail closed on a mismatch or an unreachable endpoint, as in site mode);
+   (b) `GET {gateway}/wiki/api/v2/spaces?limit=1` must succeed. **Why this is enough:** a
+   request can only reach tenant T if three things all point at T: the gateway prefix is
+   built from the sealed `cloudId` and from nothing else (no URL, no response field; every
+   outgoing and followed URL must pass `isCredentialedUrl`), the site URL still resolves
+   to that same `cloudId` at every start, and the scoped token is bound by Atlassian to one
+   site, so the gateway refuses it for any other. The email check only proved that a
+   credential matched a user on a host; it never bound the host to a tenant, which the
+   seal does. A mismatch between any two of the three fails startup before a write tool is
+   registered. The startup banner says the email check is skipped and why.
+2. **tenant_info is unauthenticated in gateway mode.** `fetchTenantInfo(url, email, token,
+   { authenticated: false })` sends no `Authorization` header: a scoped token must never be
+   sent to the site origin, which does not serve it. Site mode still sends Basic auth, as
+   before. Setup uses the same call, so the seal is read and confirmed before any
+   credentialed request.
+3. **Refusal to start without a seal.** `getConfig()` exits with a message naming
+   `epimethian-mcp setup --profile <p>` for a gateway record without a `cloudId` (or with a
+   malformed one). `buildKeychainRecord` and `saveToKeychain` both refuse to write
+   `apiMode: "gateway"` without a `cloudId`.
+4. **Hidden tools, silent side writes** (Q3/Q4 as decided). `TOOL_FEATURES` in
+   `api-capabilities.ts` maps every tool to the features its core call needs, including
+   every step of a multi-step write; a test pins its keys to `KNOWN_TOOLS`, and an unmapped
+   tool is unavailable in gateway mode. The attribution label and unverified badge return
+   `{}` without a request or a warning; the version comment is unchanged.
+5. **Expiry** lives in the keychain record, is shown by `status`, warned at
+   14 days or fewer on the stderr banner (day 0 included), and is a startup error once past.
+   It is not in `get_version` or `check_permissions` (Q5).
+6. **Setup order.** The "scoped token?" question comes after the email. The gateway flow
+   reads the seal unauthenticated, has the user confirm it, tests through the gateway,
+   asks for expiry and posture, prints the scope list, runs the scope probe (read-only
+   posture: the dry-run write must be refused), then saves mode, `cloudId` and expiry in
+   one `buildKeychainRecord` call. A gateway profile needs `--profile`.
+7. **Keychain round-trip.** `parseKeychainRecord` (pure, in `keychain.ts`) copies every
+   field a record can hold, so the opportunistic seal re-save cannot erase `apiMode` or
+   `tokenExpiry`.
+
+### Open points for the live scoped-token check
+
+- The scope list in `src/shared/gateway-scopes.ts` and `doc/user-doc/installation.md` is
+  unconfirmed.
+- Whether `tenant_info` and the v2 `spaces` call behave as assumed with a scoped token,
+  including the exact status for a missing scope (401 vs 403).
+- Whether the dry-run `PUT /pages/999999999999` answers 403 for a read-only token on the
+  gateway (the setup scope probe relies on it).
+- Whether `_links.next` on v2 lists carries the `/ex/confluence/{cloudId}` prefix or not
+  (`resolveNextLink` accepts both).
+- A gateway download path for attachments (`attachments.download` stays `false`).

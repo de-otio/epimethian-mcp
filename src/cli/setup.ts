@@ -1,15 +1,24 @@
 import * as readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { execSync } from "node:child_process";
-import { testConnection, fetchTenantInfo } from "../shared/test-connection.js";
+import {
+  testConnection,
+  fetchTenantInfo,
+  probeGatewayWriteScope,
+} from "../shared/test-connection.js";
 import {
   saveToKeychain,
   readFromKeychain,
+  buildKeychainRecord,
   PROFILE_NAME_RE,
 } from "../shared/keychain.js";
 import { addToProfileRegistry, setProfileSettings } from "../shared/profiles.js";
 import { renderConfigSnippet, knownClientIds } from "./client-configs.js";
 import { KNOWN_TOOLS } from "../server/tool-allowlist.js";
+import { requestBaseFor } from "../server/api-base.js";
+import { toolAvailableIn, unavailableToolsFor } from "../server/api-capabilities.js";
+import { GATEWAY_SCOPES, classifyScopeProbe } from "../shared/gateway-scopes.js";
+import { isValidExpiryDate } from "../shared/token-expiry.js";
 
 /** Resolve the absolute path to the running epimethian-mcp binary. */
 function resolveBinPath(): string {
@@ -75,6 +84,207 @@ function readPassword(prompt: string): Promise<string> {
     };
     stdin.on("data", onData);
   });
+}
+
+type Posture = "read-only" | "read-write" | "detect";
+
+/** Prompt for the MCP access posture (shared by the site and gateway flows). */
+async function promptPosture(): Promise<Posture> {
+  const rl2 = readline.createInterface({ input: stdin, output: stdout });
+  try {
+    let posture: Posture = "read-only"; // default
+
+    let validInput = false;
+    while (!validInput) {
+      const answer = (await rl2.question(
+        `MCP access mode for this profile:
+  [1] Read-only — the agent cannot modify Confluence through this profile,
+                  regardless of what the API token can do. Recommended for
+                  untrusted agents, exploratory work, and defense-in-depth.
+  [2] Read-write — the agent can create, update, and delete pages.
+  [3] Detect at startup — infer from the token's actual permissions.
+Your choice [default: 1]: `
+      )).trim();
+
+      if (answer === "" || answer === "1") {
+        posture = "read-only";
+        validInput = true;
+      } else if (answer === "2") {
+        posture = "read-write";
+        validInput = true;
+      } else if (answer === "3") {
+        posture = "detect";
+        validInput = true;
+      } else {
+        // Invalid input, loop will re-prompt
+        console.log(`Invalid choice "${answer}". Please enter 1, 2, or 3.`);
+      }
+    }
+    return posture;
+  } finally {
+    rl2.close();
+  }
+}
+
+/** Show the tenant behind the URL and ask the user to confirm it (exits 1 on "no"). */
+async function confirmTenant(url: string, cloudId: string, displayName: string): Promise<void> {
+  console.log(
+    `\nTenant identity:\n` +
+      `  Display name : ${displayName}\n` +
+      `  Cloud ID     : ${cloudId}\n` +
+      `  URL          : ${url}\n`
+  );
+
+  const rlConfirm = readline.createInterface({ input: stdin, output: stdout });
+  try {
+    const args = process.argv.slice(2);
+    const assumeYes = args.includes("--yes") || args.includes("-y");
+    let answer = "y";
+    if (!assumeYes) {
+      answer = (
+        await rlConfirm.question("Is this the tenant you intended? [y/N] ")
+      ).trim().toLowerCase();
+    }
+    if (answer !== "y" && answer !== "yes") {
+      console.error(
+        "\nAborted: tenant identity not confirmed. No credentials were saved."
+      );
+      process.exit(1);
+    }
+  } finally {
+    rlConfirm.close();
+  }
+}
+
+/** Ask for the token expiry date until it is blank or a real YYYY-MM-DD date. */
+async function promptTokenExpiry(): Promise<string | undefined> {
+  const rlExp = readline.createInterface({ input: stdin, output: stdout });
+  try {
+    for (;;) {
+      const answer = (
+        await rlExp.question("Token expiry date (YYYY-MM-DD, blank to skip): ")
+      ).trim();
+      if (answer === "") return undefined;
+      if (isValidExpiryDate(answer)) return answer;
+      console.log(`"${answer}" is not a real date. Use YYYY-MM-DD, or leave it blank.`);
+    }
+  } finally {
+    rlExp.close();
+  }
+}
+
+/**
+ * Gateway-mode setup (scoped API token), after the token has been read.
+ * Order matters: the scoped token fails on the site URL, and no credentialed
+ * request may go anywhere before the tenant is confirmed.
+ *   1. tenant_info on the site URL, WITHOUT credentials; the user confirms it
+ *   2. spaces read through the gateway pinned to that cloudId
+ *   3. optional expiry, posture, scope list
+ *   4. scope probe (read-only posture: the dry-run write must be refused)
+ *   5. save mode + cloudId + expiry together
+ */
+async function runGatewaySetup(
+  profile: string,
+  url: string,
+  email: string,
+  apiToken: string
+): Promise<void> {
+  console.log("\nChecking the tenant (no credentials are sent to the site)...");
+  const tenantResult = await fetchTenantInfo(url, email, apiToken, { authenticated: false });
+  if (!tenantResult.ok) {
+    console.error(
+      `Error: Could not fetch the tenant identity (${tenantResult.message}).\n` +
+        "Gateway mode is built from the tenant seal, so it cannot continue without it. No credentials were saved."
+    );
+    process.exit(1);
+  }
+  const { cloudId, displayName } = tenantResult.info;
+  await confirmTenant(url, cloudId, displayName);
+
+  let requestBase: string;
+  try {
+    requestBase = requestBaseFor({ url, apiMode: "gateway", sealedCloudId: cloudId });
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)} No credentials were saved.`);
+    process.exit(1);
+  }
+
+  console.log("Testing connection through the Atlassian API gateway...");
+  const result = await testConnection(requestBase, email, apiToken, { gateway: true });
+  if (!result.ok) {
+    console.error(`Connection failed: ${result.message}`);
+    process.exit(1);
+  }
+  console.log(`${result.message}`);
+
+  const tokenExpiry = await promptTokenExpiry();
+  const posture = await promptPosture();
+
+  const scopes = GATEWAY_SCOPES[posture === "read-only" ? "read-only" : "read-write"];
+  console.log(
+    `\nScopes this token needs for ${posture === "read-only" ? "read-only" : "read-write"} use ` +
+      `(to be confirmed by the live probe):\n  ${scopes.join("\n  ")}\n`
+  );
+
+  if (posture === "read-only") {
+    const verdict = classifyScopeProbe(await probeGatewayWriteScope(requestBase, email, apiToken));
+    if (verdict === "narrow") {
+      console.log("Scope check: the token cannot write, as the read-only posture expects.");
+    } else if (verdict === "broad") {
+      console.log(
+        "Warning: this token is broader than the read-only posture: a write attempt was not refused. " +
+          "Consider creating a token with only the read scopes above."
+      );
+    } else {
+      console.log("Scope check inconclusive: the write probe gave no clear answer.");
+    }
+  }
+
+  await saveToKeychain(
+    buildKeychainRecord({
+      url,
+      email,
+      apiToken,
+      cloudId,
+      tenantDisplayName: displayName,
+      apiMode: "gateway",
+      ...(tokenExpiry ? { tokenExpiry } : {}),
+    }),
+    profile
+  );
+  await addToProfileRegistry(profile);
+  await setProfileSettings(profile, { posture });
+  console.log(
+    `Credentials saved to OS keychain (profile: ${profile}, mode: gateway, posture: ${posture}` +
+      `${tokenExpiry ? `, token expires ${tokenExpiry}` : ""}).\n`
+  );
+
+  const available = TOOLS.filter((t) => toolAvailableIn("gateway", t));
+  console.log(`Available tools in gateway mode (${available.length}):`);
+  console.log(`  ${available.join(", ")}`);
+  console.log(`Not available in gateway mode: ${unavailableToolsFor("gateway").join(", ")}`);
+  console.log(
+    "\nSetup complete. Restart your MCP client to use the new credentials."
+  );
+}
+
+/** Print config snippet(s) for the requested client (or all clients if omitted). */
+async function printClientSnippets(profile: string | undefined, clientId: string | undefined): Promise<void> {
+  const binPath = resolveBinPath();
+  const effectiveProfile = profile ?? "default";
+  const clientsToShow = clientId ? [clientId] : knownClientIds();
+
+  for (const id of clientsToShow) {
+    const entry = (await import("./client-configs.js")).CLIENT_CONFIGS.find(
+      (c) => c.id === id
+    )!;
+    const { snippet, warning } = renderConfigSnippet(id, effectiveProfile, binPath);
+    console.log(`\n--- ${entry.displayName} config (${entry.configFileHint}) ---`);
+    console.log(snippet);
+    if (warning) {
+      console.log(`\nNote: ${warning}`);
+    }
+  }
 }
 
 export async function runSetup(profile?: string, clientId?: string): Promise<void> {
@@ -160,6 +370,18 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
       process.exit(1);
     }
 
+    // Scoped API tokens only work through the Atlassian API gateway (gateway mode).
+    const scopedAnswer = (
+      await rl.question("Is this a scoped API token? [y/N] ")
+    ).trim().toLowerCase();
+    const gateway = scopedAnswer === "y" || scopedAnswer === "yes";
+    if (gateway && !profile) {
+      console.error(
+        "Error: gateway mode (scoped API token) needs a named profile. Re-run with --profile <name>."
+      );
+      process.exit(1);
+    }
+
     // Close readline before raw mode password input
     rl.close();
 
@@ -170,6 +392,12 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
     if (!apiToken) {
       console.error("Error: API token is required.");
       process.exit(1);
+    }
+
+    if (gateway) {
+      await runGatewaySetup(profile!, url, email, apiToken);
+      await printClientSnippets(profile, clientId);
+      return;
     }
 
     console.log("\nTesting connection...");
@@ -191,32 +419,7 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
 
     if (tenantResult.ok) {
       const { cloudId, displayName } = tenantResult.info;
-      console.log(
-        `\nTenant identity:\n` +
-          `  Display name : ${displayName}\n` +
-          `  Cloud ID     : ${cloudId}\n` +
-          `  URL          : ${url}\n`
-      );
-
-      const rlConfirm = readline.createInterface({ input: stdin, output: stdout });
-      try {
-        const args = process.argv.slice(2);
-        const assumeYes = args.includes("--yes") || args.includes("-y");
-        let answer = "y";
-        if (!assumeYes) {
-          answer = (
-            await rlConfirm.question("Is this the tenant you intended? [y/N] ")
-          ).trim().toLowerCase();
-        }
-        if (answer !== "y" && answer !== "yes") {
-          console.error(
-            "\nAborted: tenant identity not confirmed. No credentials were saved."
-          );
-          process.exit(1);
-        }
-      } finally {
-        rlConfirm.close();
-      }
+      await confirmTenant(url, cloudId, displayName);
 
       sealedCloudId = cloudId;
       sealedDisplayName = displayName;
@@ -228,56 +431,22 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
     }
 
     await saveToKeychain(
-      {
+      buildKeychainRecord({
         url,
         email,
         apiToken,
         ...(sealedCloudId ? { cloudId: sealedCloudId } : {}),
         ...(sealedDisplayName ? { tenantDisplayName: sealedDisplayName } : {}),
-      },
+      }),
       profile
     );
     if (profile) {
       await addToProfileRegistry(profile);
 
       // Prompt for MCP access posture (replaces old read-only/write binary)
-      const rl2 = readline.createInterface({ input: stdin, output: stdout });
-      try {
-        let posture: "read-only" | "read-write" | "detect" = "read-only"; // default
-
-        let validInput = false;
-        while (!validInput) {
-          const answer = (await rl2.question(
-            `MCP access mode for this profile:
-  [1] Read-only — the agent cannot modify Confluence through this profile,
-                  regardless of what the API token can do. Recommended for
-                  untrusted agents, exploratory work, and defense-in-depth.
-  [2] Read-write — the agent can create, update, and delete pages.
-  [3] Detect at startup — infer from the token's actual permissions.
-Your choice [default: 1]: `
-          )).trim();
-
-          if (answer === "" || answer === "1") {
-            posture = "read-only";
-            validInput = true;
-          } else if (answer === "2") {
-            posture = "read-write";
-            validInput = true;
-          } else if (answer === "3") {
-            posture = "detect";
-            validInput = true;
-          } else {
-            // Invalid input, loop will re-prompt
-            console.log(`Invalid choice "${answer}". Please enter 1, 2, or 3.`);
-          }
-        }
-
-        await setProfileSettings(profile, { posture });
-        console.log(`Credentials saved to OS keychain (profile: ${profile}, posture: ${posture}).\n`);
-      } finally {
-        rl2.close();
-      }
-
+      const posture = await promptPosture();
+      await setProfileSettings(profile, { posture });
+      console.log(`Credentials saved to OS keychain (profile: ${profile}, posture: ${posture}).\n`);
     } else {
       console.log("Credentials saved to OS keychain.\n");
       console.log(
@@ -291,22 +460,7 @@ Your choice [default: 1]: `
       "\nSetup complete. Restart your MCP client to use the new credentials."
     );
 
-    // Print config snippet(s) for the requested client (or all clients if omitted).
-    const binPath = resolveBinPath();
-    const effectiveProfile = profile ?? "default";
-    const clientsToShow = clientId ? [clientId] : knownClientIds();
-
-    for (const id of clientsToShow) {
-      const entry = (await import("./client-configs.js")).CLIENT_CONFIGS.find(
-        (c) => c.id === id
-      )!;
-      const { snippet, warning } = renderConfigSnippet(id, effectiveProfile, binPath);
-      console.log(`\n--- ${entry.displayName} config (${entry.configFileHint}) ---`);
-      console.log(snippet);
-      if (warning) {
-        console.log(`\nNote: ${warning}`);
-      }
-    }
+    await printClientSnippets(profile, clientId);
   } finally {
     rl.close();
   }

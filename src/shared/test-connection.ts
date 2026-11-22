@@ -50,9 +50,11 @@ export async function verifyTenantIdentity(
  * Atlassian Cloud edge endpoint used for identifying the tenant backing a
  * given `*.atlassian.net` host.
  *
- * The endpoint is site-scoped and does not require authentication, but we
- * still pass the Basic auth header so the call shares cache/connection with
- * the authenticated API calls and so a broken token surfaces consistently.
+ * The endpoint is site-scoped and does not require authentication. In site
+ * mode we still pass the Basic auth header so the call shares cache/connection
+ * with the authenticated API calls and so a broken token surfaces consistently.
+ * In gateway mode (`authenticated: false`) NO Authorization header is sent: a
+ * scoped token must never reach the site origin, which does not serve it.
  *
  * Returns `{ ok: false }` (graceful degrade) on any failure — callers should
  * treat a missing tenant_info as "cannot seal" rather than a hard error, so
@@ -66,11 +68,15 @@ export interface TenantInfo {
 export async function fetchTenantInfo(
   url: string,
   email: string,
-  apiToken: string
+  apiToken: string,
+  opts: { authenticated?: boolean } = {}
 ): Promise<{ ok: true; info: TenantInfo } | { ok: false; message: string }> {
   const base = url.replace(/\/+$/, '');
   const endpoint = `${base}/_edge/tenant_info`;
-  const auth = Buffer.from(`${email}:${apiToken}`).toString('base64');
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (opts.authenticated !== false) {
+    headers.Authorization = `Basic ${Buffer.from(`${email}:${apiToken}`).toString('base64')}`;
+  }
 
   // Derive a fallback display name from the host (e.g. "globex" from
   // "globex.atlassian.net"). Used if the response has no cloudName.
@@ -83,13 +89,7 @@ export async function fetchTenantInfo(
   }
 
   try {
-    const response = await fetch(endpoint, {
-      method: 'GET',
-      headers: {
-        Authorization: `Basic ${auth}`,
-        Accept: 'application/json',
-      },
-    });
+    const response = await fetch(endpoint, { method: 'GET', headers });
     if (!response.ok) {
       return { ok: false, message: `HTTP ${response.status}: ${response.statusText}` };
     }
@@ -109,12 +109,21 @@ export async function fetchTenantInfo(
   }
 }
 
+/**
+ * `GET {requestBase}/wiki/api/v2/spaces?limit=1`.
+ *
+ * `requestBase` is `requestBaseFor(...)`: the site URL in site mode, the
+ * pinned `https://api.atlassian.com/ex/confluence/{cloudId}` in gateway mode.
+ * `opts.gateway` only changes the wording of a 401/403, which on the gateway
+ * means an expired, revoked or under-scoped token rather than a bad key.
+ */
 export async function testConnection(
-  url: string,
+  requestBase: string,
   email: string,
-  apiToken: string
+  apiToken: string,
+  opts: { gateway?: boolean } = {}
 ): Promise<{ ok: boolean; message: string }> {
-  const endpoint = `${url.replace(/\/+$/, '')}/wiki/api/v2/spaces?limit=1`;
+  const endpoint = `${requestBase.replace(/\/+$/, '')}/wiki/api/v2/spaces?limit=1`;
   const auth = Buffer.from(`${email}:${apiToken}`).toString('base64');
 
   try {
@@ -128,6 +137,15 @@ export async function testConnection(
 
     if (!response.ok) {
       const status = response.status;
+      if (opts.gateway && (status === 401 || status === 403)) {
+        return {
+          ok: false,
+          message:
+            `HTTP ${status} from the Atlassian API gateway: the scoped API token is expired, revoked, ` +
+            'or missing a scope (this check needs read:space:confluence). ' +
+            'Create a new token at https://id.atlassian.com/manage-profile/security/api-tokens',
+        };
+      }
       if (status === 401) {
         return {
           ok: false,
@@ -151,5 +169,37 @@ export async function testConnection(
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, message: `Connection failed: ${message}` };
+  }
+}
+
+/**
+ * Setup-time scope probe (R4: one call must pass, one must fail). Sends the
+ * same dry-run write the server's capability probe uses, `PUT /pages/999999999999`
+ * with an empty body, to the pinned gateway base, and returns only the HTTP
+ * status (or undefined on a transport error). The page does not exist, so a
+ * token that is allowed to write answers 400/404 and nothing is modified.
+ * Classify with `classifyScopeProbe` (gateway-scopes.ts).
+ */
+export async function probeGatewayWriteScope(
+  requestBase: string,
+  email: string,
+  apiToken: string
+): Promise<number | undefined> {
+  const endpoint = `${requestBase.replace(/\/+$/, '')}/wiki/api/v2/pages/999999999999`;
+  const auth = Buffer.from(`${email}:${apiToken}`).toString('base64');
+  try {
+    const response = await fetch(endpoint, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({}),
+    });
+    await Promise.resolve(response.body?.cancel?.()).catch(() => {});
+    return response.status;
+  } catch {
+    return undefined;
   }
 }

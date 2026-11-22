@@ -1,5 +1,7 @@
 import { testConnection } from "../shared/test-connection.js";
 import { readFromKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
+import { requestBaseFor } from "../server/api-base.js";
+import { tokenExpiryState, describeExpiry, todayUtc } from "../shared/token-expiry.js";
 import { describeCopies, findInstalledCopies } from "../shared/installed-copies.js";
 
 declare const __PKG_VERSION__: string;
@@ -32,6 +34,8 @@ export async function runStatus(): Promise<void> {
   let email: string;
   let apiToken: string;
   let mode: string;
+  // Gateway-mode details (scoped token); undefined for site mode.
+  let gateway: { cloudId?: string; tokenExpiry?: string } | undefined;
 
   if (profile) {
     if (!PROFILE_NAME_RE.test(profile)) {
@@ -49,6 +53,9 @@ export async function runStatus(): Promise<void> {
     email = creds.email;
     apiToken = creds.apiToken;
     mode = `profile: ${profile}`;
+    if (creds.apiMode === "gateway") {
+      gateway = { cloudId: creds.cloudId, tokenExpiry: creds.tokenExpiry };
+    }
   } else if (urlEnv && emailEnv && tokenEnv) {
     url = urlEnv;
     email = emailEnv;
@@ -71,8 +78,27 @@ export async function runStatus(): Promise<void> {
   console.log(`Profile:  ${mode}`);
   console.log(`URL:      ${url}`);
   console.log(`Email:    ${email}`);
+  console.log(`Mode:     ${gateway ? "gateway (scoped token)" : "site"}`);
+  if (gateway?.tokenExpiry) {
+    const state = tokenExpiryState(gateway.tokenExpiry, todayUtc());
+    console.log(`Token expires: ${describeExpiry(gateway.tokenExpiry, state)}`);
+  }
+
+  // Gateway mode tests through the pinned gateway base: the site URL does not
+  // serve a scoped token. A gateway record without a seal cannot be pinned.
+  let base = url;
+  if (gateway) {
+    try {
+      base = requestBaseFor({ url, apiMode: "gateway", sealedCloudId: gateway.cloudId });
+    } catch (err) {
+      console.log(`Status:   Failed - ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+  }
 
   console.log("Testing connection...");
-  const result = await testConnection(url, email, apiToken);
+  const result = gateway
+    ? await testConnection(base, email, apiToken, { gateway: true })
+    : await testConnection(base, email, apiToken);
   console.log(`Status:   ${result.ok ? "Connected" : "Failed"} - ${result.message}`);
 }

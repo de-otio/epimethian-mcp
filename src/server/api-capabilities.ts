@@ -70,3 +70,81 @@ const SITE: Readonly<Record<Feature, boolean>> = Object.freeze(
 export function capabilitiesFor(mode: ApiMode): Readonly<Record<Feature, boolean>> {
   return mode === "gateway" ? GATEWAY : SITE;
 }
+
+/**
+ * The features each tool's core call needs (plan §5.3 item 5). A tool is
+ * available in a mode iff every feature listed is available there. An empty
+ * list means the tool needs no Confluence API feature (it works in every mode).
+ *
+ * Insertion order is the order the unavailable list is printed in the server
+ * instructions, so it is part of the deterministic `tools/list` surface.
+ * `gateway-mode.test.ts` pins that the keys equal `KNOWN_TOOLS`, so a new tool
+ * cannot reach gateway mode without a deliberate entry here.
+ *
+ * A tool that writes in two steps over two APIs (add_drawio_diagram uploads
+ * over v1, then edits the page over v2) lists the feature of EVERY step: if
+ * any step is unavailable the tool is not registered, so no half-completed
+ * state can arise.
+ */
+export const TOOL_FEATURES: Readonly<Record<string, readonly Feature[]>> = Object.freeze({
+  create_page: ["content.write"],
+  get_page: ["content.read"],
+  authorise_destructive_writes: [],
+  update_page: ["content.write"],
+  create_blog_post: ["content.write"],
+  update_blog_post: ["content.write"],
+  delete_page: ["content.write"],
+  update_page_section: ["content.write"],
+  update_page_sections: ["content.write"],
+  prepend_to_page: ["content.write"],
+  append_to_page: ["content.write"],
+  search_pages: ["search.cql"],
+  list_pages: ["content.read"],
+  get_page_children: ["content.read"],
+  get_spaces: ["content.read"],
+  check_permissions: [],
+  get_page_by_title: ["pageByTitle"],
+  add_attachment: ["attachments.upload"],
+  add_drawio_diagram: ["attachments.upload", "content.write"],
+  update_drawio_diagram: ["attachments.upload", "attachments.read", "content.write"],
+  get_attachments: ["attachments.read"],
+  download_attachment: ["attachments.read", "attachments.download"],
+  get_labels: ["labels.read"],
+  add_label: ["labels.write"],
+  remove_label: ["labels.write"],
+  get_page_status: ["contentState"],
+  set_page_status: ["contentState"],
+  remove_page_status: ["contentState"],
+  get_comments: ["content.comments"],
+  create_comment: ["content.comments"],
+  resolve_comment: ["content.comments"],
+  delete_comment: ["content.comments"],
+  get_page_versions: ["versions.read"],
+  get_page_version: ["versions.read"],
+  diff_page_versions: ["versions.read"],
+  get_recent_changes: ["recentChanges", "search.cql"],
+  revert_page: ["versions.read", "content.write"],
+  lookup_user: ["users.byName"],
+  resolve_page_link: ["search.cql"],
+  get_version: [],
+  upgrade: [],
+});
+
+/**
+ * True when the tool can work in `mode`. Unknown names are treated as
+ * available in site mode and unavailable in gateway mode (fail closed: an
+ * unmapped tool is never advertised to a gateway profile).
+ */
+export function toolAvailableIn(mode: ApiMode | undefined, toolName: string): boolean {
+  if (mode !== "gateway") return true;
+  const needs = TOOL_FEATURES[toolName];
+  if (needs === undefined) return false;
+  const caps = capabilitiesFor("gateway");
+  return needs.every((f) => caps[f]);
+}
+
+/** Tools `mode` cannot serve, in table order. Empty in site mode. */
+export function unavailableToolsFor(mode: ApiMode | undefined): readonly string[] {
+  if (mode !== "gateway") return [];
+  return Object.keys(TOOL_FEATURES).filter((name) => !toolAvailableIn(mode, name));
+}

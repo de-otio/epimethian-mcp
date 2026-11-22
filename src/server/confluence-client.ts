@@ -32,9 +32,19 @@ import {
   resolveUnverifiedStatusFlag,
   resolveUnverifiedStatusLocale,
 } from "./config.js";
-import { buildApiBases, requestBaseFor, requireV1, type ApiMode } from "./api-base.js";
 import { resolveV2NextLink } from "./pagination-cursor.js";
 import type { HistoricalSource } from "./historical-source.js";
+import {
+  buildApiBases,
+  requestBaseFor,
+  requireV1,
+  isCredentialedUrl,
+  assertCredentialedUrl,
+  resolveNextLink,
+  type ApiMode,
+} from "./api-base.js";
+import { capabilitiesFor } from "./api-capabilities.js";
+import { tokenExpiryState, todayUtc } from "../shared/token-expiry.js";
 
 // --- Client label (set once from index.ts after MCP initialize handshake) ---
 
@@ -90,8 +100,8 @@ export interface Config {
   /**
    * Contract C1. "site": requests go to the site URL (Basic auth, v1 + v2).
    * "gateway": requests go to api.atlassian.com/ex/confluence/{sealedCloudId}
-   * (scoped tokens; v2 only). getConfig() always yields "site" in 7.6.0 until
-   * W-GW switches it on. Built by `buildApiBases` (api-base.ts) only.
+   * (scoped tokens; v2 only). Set from the keychain record's `apiMode`; env-var
+   * mode is always "site". Built by `buildApiBases` (api-base.ts) only.
    */
   apiMode: ApiMode;
   /** v2 REST base. Every v2 URL is built from this. */
@@ -104,6 +114,8 @@ export interface Config {
   sealedCloudId?: string;
   /** Tenant seal: display name stored alongside the cloudId, used for human-readable error messages. */
   sealedDisplayName?: string;
+  /** Scoped token expiry (`YYYY-MM-DD`) from the keychain record. Gateway mode only; read by validateStartup. */
+  tokenExpiry?: string;
   /**
    * Effective posture after resolving configured tri-state + probe result.
    * Populated by validateStartup() — always set at runtime after startup.
@@ -160,6 +172,8 @@ export async function resolveCredentials(): Promise<{
   profile: string | null;
   sealedCloudId?: string;
   sealedDisplayName?: string;
+  apiMode?: "gateway";
+  tokenExpiry?: string;
 }> {
   const profileEnv = process.env.CONFLUENCE_PROFILE || "";
   const urlEnv = process.env.CONFLUENCE_URL?.replace(/\/$/, "") || "";
@@ -185,6 +199,8 @@ export async function resolveCredentials(): Promise<{
       profile: profileEnv,
       sealedCloudId: creds.cloudId,
       sealedDisplayName: creds.tenantDisplayName,
+      ...(creds.apiMode === "gateway" ? { apiMode: "gateway" as const } : {}),
+      ...(creds.tokenExpiry !== undefined ? { tokenExpiry: creds.tokenExpiry } : {}),
     };
   }
 
@@ -223,8 +239,20 @@ export async function resolveCredentials(): Promise<{
 export async function getConfig(): Promise<Config> {
   if (_config) return _config;
 
-  const { url, email, apiToken, profile, sealedCloudId, sealedDisplayName } =
+  const { url, email, apiToken, profile, sealedCloudId, sealedDisplayName, apiMode, tokenExpiry } =
     await resolveCredentials();
+
+  // Gateway mode derives its base from the sealed cloudId only. A record that
+  // claims gateway mode without one (hand-edited keychain) must stop here, with
+  // a message, rather than fall back to the site URL: a scoped token is not
+  // valid there and the fallback would hide the broken seal.
+  if (apiMode === "gateway" && !sealedCloudId) {
+    console.error(
+      `Error: Profile "${profile}" is in gateway mode (scoped API token) but has no tenant seal (cloudId).\n` +
+        `Run \`epimethian-mcp setup --profile ${profile}\` to configure it again.`
+    );
+    process.exit(1);
+  }
 
   // Resolve configuration from profile registry and environment.
   const registrySettings = profile ? await getProfileSettings(profile) : undefined;
@@ -262,6 +290,15 @@ export async function getConfig(): Promise<Config> {
     "Content-Type": "application/json",
   });
 
+  let bases: ReturnType<typeof buildApiBases>;
+  try {
+    bases = buildApiBases({ url, apiMode: apiMode ?? "site", sealedCloudId });
+  } catch (err) {
+    // Only gateway mode can throw (a malformed seal). Say why and stop.
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
   _config = Object.freeze({
     url,
     email,
@@ -273,12 +310,14 @@ export async function getConfig(): Promise<Config> {
     unverifiedStatusLocale,
     unverifiedStatusName,
     unverifiedStatusColor,
-    // C1: the only derivation of API bases; always site mode in this release.
-    ...buildApiBases({ url, apiMode: "site" }),
+    // C1: the only derivation of API bases. Gateway mode is built from the
+    // sealed cloudId alone, never from the site URL or any user input.
+    ...bases,
     authHeader,
     jsonHeaders,
     sealedCloudId,
     sealedDisplayName,
+    ...(tokenExpiry !== undefined ? { tokenExpiry } : {}),
     // Placeholders — overwritten by validateStartup() once the probe runs.
     // Until then, treat as read-write to preserve existing behavior.
     effectivePosture: (posture === "read-only" ? "read-only" : "read-write") as "read-only" | "read-write",
@@ -381,10 +420,18 @@ export async function probeWriteCapability(): Promise<"write" | "read-only" | "i
 
 /**
  * Validate credentials against the Confluence instance before accepting tool calls.
+ * Site mode:
  * 1. Test authentication (GET spaces)
  * 2. Verify tenant identity (email matches)
  * 3. Tenant seal: verify cloudId matches the one sealed at setup time.
  *    Opportunistically seal pre-5.5 profiles on first startup after upgrade.
+ * Gateway mode (scoped token; doc/design/gateway-mode.md §4), in this order:
+ * 1. Token expiry: an expired date is a startup error, before any request.
+ * 2. Tenant seal: tenant_info on the site URL (unauthenticated) must return the
+ *    sealed cloudId. This is the tenant guard: the v1 email identity check
+ *    cannot run on the gateway.
+ * 3. GET spaces?limit=1 through the pinned gateway base.
+ * Both modes then:
  * 4. Capability probe (when posture === "detect") + effective-posture resolution
  * 5. Log connection info to stderr
  */
@@ -399,38 +446,85 @@ export async function validateStartup(config: Config): Promise<void> {
   const colonIndex = decoded.indexOf(":");
   const apiToken = decoded.slice(colonIndex + 1);
 
-  // Step 1: Authentication check
-  const connResult = await testConnection(url, email, apiToken);
-  if (!connResult.ok) {
-    const profileHint = profile
-      ? `Run \`epimethian-mcp setup --profile ${profile}\` to update credentials.`
-      : "Check your CONFLUENCE_URL, CONFLUENCE_EMAIL, and CONFLUENCE_API_TOKEN.";
-    console.error(
-      `Error: Confluence credentials rejected by ${url}\n${connResult.message}\n${profileHint}`
-    );
-    process.exit(1);
-  }
+  const gateway = config.apiMode === "gateway";
+  let expiryWarning: string | undefined;
 
-  // Step 2: Tenant identity verification
-  const identityResult = await verifyTenantIdentity(url, email, apiToken);
-  if (!identityResult.ok) {
-    const profileHint = profile
-      ? `Run \`epimethian-mcp setup --profile ${profile}\` to reconfigure.`
-      : "Check your credential configuration.";
-    console.error(
-      `Error: Tenant identity mismatch for ${profile ? `profile "${profile}"` : "configured credentials"}.\n` +
-        `Expected user: ${email}\n` +
-        (identityResult.authenticatedEmail
-          ? `Authenticated as: ${identityResult.authenticatedEmail}\n`
-          : "") +
-        `This may indicate a DNS or configuration issue. ${profileHint}`
-    );
-    process.exit(1);
-  }
+  if (gateway) {
+    // Gateway mode needs a profile (and with it a seal): env-var mode is site-only.
+    if (!profile) {
+      console.error("Error: gateway mode needs a profile with a tenant seal.");
+      process.exit(1);
+    }
+    const setupHint = `Run \`epimethian-mcp setup --profile ${profile}\` to configure a new token.`;
 
-  // Step 3: Tenant seal verification (skipped for env-var mode — no keychain entry to seal).
-  if (profile) {
+    // G1: token expiry, before any request leaves the machine.
+    const expiry = tokenExpiryState(config.tokenExpiry, todayUtc());
+    if (expiry.kind === "expired") {
+      console.error(
+        `Error: the scoped API token for profile "${profile}" expired on ${config.tokenExpiry}.\n` +
+          `Create a new token at https://id.atlassian.com/manage-profile/security/api-tokens. ${setupHint}`
+      );
+      process.exit(1);
+    }
+    if (expiry.kind === "soon") {
+      const when =
+        expiry.daysLeft === 0
+          ? "today"
+          : `in ${expiry.daysLeft} day${expiry.daysLeft === 1 ? "" : "s"}`;
+      expiryWarning =
+        `warning — the scoped API token for profile "${profile}" expires ${when} ` +
+        `(${config.tokenExpiry}). ${setupHint}`;
+    }
+
+    // G2: the site must still be the sealed tenant. Unauthenticated, so the
+    // scoped token never reaches the site origin.
     await verifyOrSealTenant(config, apiToken);
+
+    // G3: the token must work through the pinned gateway base.
+    const connResult = await testConnection(requestBaseFor(config), email, apiToken, { gateway: true });
+    if (!connResult.ok) {
+      console.error(
+        `Error: Atlassian API gateway rejected the credentials for profile "${profile}"\n${connResult.message}\n${setupHint}`
+      );
+      process.exit(1);
+    }
+    // G4: verifyTenantIdentity is skipped on purpose: it calls v1 /user/current, which
+    // the gateway does not serve. The sealed cloudId (G2) plus the pinned gateway
+    // prefix and a token scoped to one site are the tenant guard in this mode.
+  } else {
+    // Step 1: Authentication check
+    const connResult = await testConnection(url, email, apiToken);
+    if (!connResult.ok) {
+      const profileHint = profile
+        ? `Run \`epimethian-mcp setup --profile ${profile}\` to update credentials.`
+        : "Check your CONFLUENCE_URL, CONFLUENCE_EMAIL, and CONFLUENCE_API_TOKEN.";
+      console.error(
+        `Error: Confluence credentials rejected by ${url}\n${connResult.message}\n${profileHint}`
+      );
+      process.exit(1);
+    }
+
+    // Step 2: Tenant identity verification
+    const identityResult = await verifyTenantIdentity(url, email, apiToken);
+    if (!identityResult.ok) {
+      const profileHint = profile
+        ? `Run \`epimethian-mcp setup --profile ${profile}\` to reconfigure.`
+        : "Check your credential configuration.";
+      console.error(
+        `Error: Tenant identity mismatch for ${profile ? `profile "${profile}"` : "configured credentials"}.\n` +
+          `Expected user: ${email}\n` +
+          (identityResult.authenticatedEmail
+            ? `Authenticated as: ${identityResult.authenticatedEmail}\n`
+            : "") +
+          `This may indicate a DNS or configuration issue. ${profileHint}`
+      );
+      process.exit(1);
+    }
+
+    // Step 3: Tenant seal verification (skipped for env-var mode — no keychain entry to seal).
+    if (profile) {
+      await verifyOrSealTenant(config, apiToken);
+    }
   }
 
   // Step 4: Capability probe + effective-posture resolution
@@ -467,9 +561,22 @@ export async function validateStartup(config: Config): Promise<void> {
   const profileLabel = profile ? `profile: ${profile}` : "env-var mode";
   const readOnlyLabel = config.readOnly ? ", READ-ONLY" : "";
   const attributionLabel = config.attribution ? "" : ", NO-ATTRIBUTION";
-  console.error(
-    `epimethian-mcp: connected to ${url} as ${email} (${profileLabel}${readOnlyLabel}${attributionLabel})`
-  );
+  if (gateway) {
+    console.error(
+      `epimethian-mcp: connected to ${url} as ${email} via the Atlassian API gateway ` +
+        `(scoped token, tenant sealed; ${profileLabel}${readOnlyLabel})`
+    );
+    console.error(
+      `[epimethian-mcp] Gateway mode: the email identity check is skipped; the sealed tenant ` +
+        `(cloudId ${config.sealedCloudId}) and the pinned gateway path are the tenant guard. ` +
+        `Tools that need the v1 API are not registered.`
+    );
+    if (expiryWarning) console.error(`epimethian-mcp: ${expiryWarning}`);
+  } else {
+    console.error(
+      `epimethian-mcp: connected to ${url} as ${email} (${profileLabel}${readOnlyLabel}${attributionLabel})`
+    );
+  }
 
   const modeLabel = resolved.effective === "read-only" ? "read-only" : "read-write";
   console.error(
@@ -500,7 +607,11 @@ async function verifyOrSealTenant(config: Config, apiToken: string): Promise<voi
   const { url, email, profile, sealedCloudId, sealedDisplayName } = config;
   if (!profile) return;
 
-  const live = await fetchTenantInfo(url, email, apiToken);
+  // Gateway mode: no credential may reach the site origin, so ask unauthenticated.
+  const live =
+    config.apiMode === "gateway"
+      ? await fetchTenantInfo(url, email, apiToken, { authenticated: false })
+      : await fetchTenantInfo(url, email, apiToken);
   if (!live.ok) {
     if (sealedCloudId) {
       // Sealed profile: we cannot verify the live tenant, so we must refuse.
@@ -1182,11 +1293,18 @@ async function sendGuarded<T>(
   url: string,
   init: RequestInit,
   kind: HttpKind,
-  consume: (res: Response) => Promise<T>
+  consume: (res: Response) => Promise<T>,
+  requestBase: string
 ): Promise<T> {
   const method = (init.method ?? "GET").toUpperCase();
   const isRead = method === "GET" || method === "HEAD";
   const timeoutMs = httpTimeoutMs(kind, process.env.EPIMETHIAN_HTTP_TIMEOUT_MS);
+
+  // Origin (and, in gateway mode, path-prefix) pinning, before anything is sent.
+  // Every caller carries the credential, and every base comes from C1, so this
+  // only fires if a URL was built some other way (belt and braces).
+  // Synchronous on purpose: no await may sit between the caller and the permit.
+  assertCredentialedUrl(url, requestBase);
 
   for (let attempt = 1; ; attempt++) {
     // The permit covers one attempt and is released before any Retry-After
@@ -1243,7 +1361,7 @@ async function confluenceFetch<T>(
   const cfg = await getConfig();
   const method = (options.method ?? "GET").toUpperCase();
   const kind: HttpKind = method === "GET" || method === "HEAD" ? "read" : "write";
-  return sendGuarded(url, { headers: cfg.jsonHeaders, ...options }, kind, consume);
+  return sendGuarded(url, { headers: cfg.jsonHeaders, ...options }, kind, consume, requestBaseFor(cfg));
 }
 
 /** Send a request and return its parsed JSON body. */
@@ -2055,23 +2173,12 @@ function normaliseSearchResult(r: unknown): SearchHit | "other" | "unreadable" {
 export const MAX_SEARCH_REQUESTS = 10;
 
 /**
- * Resolve a `_links.next` value to a same-origin URL, or null when it is not
- * provably safe to follow (credentials must never leave the tenant origin).
+ * Resolve a `_links.next` value to a URL that is provably safe to follow with
+ * credentials, or null (credentials must never leave the pinned request base:
+ * the tenant origin in site mode, the sealed gateway prefix in gateway mode).
  */
-function resolveSearchNext(next: unknown, baseUrl: string): string | null {
-  if (typeof next !== "string") return null;
-  if (!next.startsWith("/") || next.startsWith("//")) return null;
-  if (next.includes("://") || next.includes("\\")) return null;
-  try {
-    // Build on the origin, not the configured URL, so a base URL with a path
-    // or trailing slash cannot double the `/wiki` context.
-    const origin = new URL(baseUrl).origin;
-    const prefix = next.startsWith("/wiki/") ? "" : "/wiki";
-    const full = `${origin}${prefix}${next}`;
-    return new URL(full).origin === origin ? full : null;
-  } catch {
-    return null;
-  }
+function resolveSearchNext(next: unknown, requestBase: string): string | null {
+  return resolveNextLink(next, requestBase);
 }
 
 export async function searchContent(
@@ -2305,7 +2412,9 @@ export async function searchPagesByTitle(
     const spaceObj = content.space ?? r.space;
     const key = (spaceObj?.key ?? spaceKey) as string;
     const links = content._links ?? r._links ?? {};
-    const base: string = links.base ?? cfg.url + "/wiki";
+    // Human links come from the site URL; in gateway mode never from a response.
+    const base: string =
+      (cfg.apiMode === "gateway" ? undefined : links.base) ?? cfg.url + "/wiki";
     const webui: string = links.webui ?? "";
     if (!id || !pageTitle) continue;
     results.push({
@@ -2686,7 +2795,8 @@ export async function uploadAttachmentVersion(
           body: form,
         },
         "transfer",
-        (res) => res.json() as Promise<unknown>
+        (res) => res.json() as Promise<unknown>,
+        requestBaseFor(cfg)
       ),
       "POST",
       dataUrl
@@ -2780,27 +2890,35 @@ export async function getAttachmentMetadata(
  * already carrying the context (`/wiki/download/...`), or an absolute URL.
  * Build from the request base (`requestBaseFor(cfg)`, the site URL in site
  * mode) rather than concatenating onto an API base — the download servlet
- * does not live under `/rest/api` or `/api/v2`. Origin check only: gateway
- * mode must add the path-prefix check (doc/design/gateway-mode.md).
+ * does not live under `/rest/api` or `/api/v2`. The result must pass
+ * `isCredentialedUrl` against the request base: the same origin in site mode,
+ * the same origin AND the sealed `/ex/confluence/{cloudId}/` prefix in gateway
+ * mode (so a link naming another cloudId, or `api.atlassian.com` without the
+ * prefix, is refused).
  *
- * An absolute link pointing at a different host is refused: the caller would
- * have to decide whether to forward credentials, and the safe answer there is
- * to not follow an unexpected host at all.
+ * An absolute link pointing anywhere else is refused: the caller would have
+ * to decide whether to forward credentials, and the safe answer there is to
+ * not follow an unexpected host (or tenant) at all.
  */
-export function resolveDownloadUrl(downloadLink: string, siteUrl: string): string {
-  const siteOrigin = new URL(siteUrl).origin;
-  if (/^https?:\/\//i.test(downloadLink)) {
-    const parsed = new URL(downloadLink);
-    if (parsed.origin !== siteOrigin) {
-      throw new Error(
-        `Refusing to download from ${parsed.origin}, which is not the configured Confluence site.`
-      );
-    }
-    return parsed.toString();
+export function resolveDownloadUrl(downloadLink: string, requestBase: string): string {
+  const absolute = /^https?:\/\//i.test(downloadLink);
+  let resolved: string;
+  if (absolute) {
+    resolved = new URL(downloadLink).toString();
+  } else if (downloadLink.startsWith("/wiki/")) {
+    resolved = `${requestBase}${downloadLink}`;
+  } else if (downloadLink.startsWith("/")) {
+    resolved = `${requestBase}/wiki${downloadLink}`;
+  } else {
+    resolved = `${requestBase}/wiki/${downloadLink}`;
   }
-  if (downloadLink.startsWith("/wiki/")) return `${siteUrl}${downloadLink}`;
-  if (downloadLink.startsWith("/")) return `${siteUrl}/wiki${downloadLink}`;
-  return `${siteUrl}/wiki/${downloadLink}`;
+  if (!isCredentialedUrl(resolved, requestBase)) {
+    const where = absolute ? new URL(downloadLink).origin : "a location outside the configured request base";
+    throw new Error(
+      `Refusing to download from ${where}, which is not the configured Confluence site.`
+    );
+  }
+  return resolved;
 }
 
 /**
@@ -2836,9 +2954,8 @@ export async function downloadAttachmentBytes(
   }
 
   const requestBase = requestBaseFor(cfg);
-  const siteOrigin = new URL(requestBase).origin;
   let url = resolveDownloadUrl(meta.downloadLink, requestBase);
-  // Latched, not recomputed: once the chain has left the site origin the
+  // Latched, not recomputed: once the chain has left the pinned request base the
   // credential stays off for every remaining hop. Recomputing per hop would
   // re-attach it on a site → third-party → site chain, which is exactly the
   // shape an open redirect would take.
@@ -2866,7 +2983,7 @@ export async function downloadAttachmentBytes(
           const next = new URL(location, url);
           return {
             next: next.toString(),
-            credentialed: credentialed && next.origin === siteOrigin,
+            credentialed: credentialed && isCredentialedUrl(next.toString(), requestBase),
           };
         }
       );
@@ -3270,7 +3387,8 @@ export async function uploadAttachment(
           body: form,
         },
         "transfer",
-        (res) => res.json() as Promise<unknown>
+        (res) => res.json() as Promise<unknown>,
+        requestBaseFor(cfg)
       ),
       "POST",
       attachUrl
@@ -3303,6 +3421,11 @@ const LEGACY_ATTRIBUTION_LABEL = "epimethian-managed";
 export async function ensureAttributionLabel(
   pageId: string
 ): Promise<{ warning?: string }> {
+  // Gateway mode: labels need the v1 API, so the attribution label is skipped
+  // SILENTLY (decided for 7.6.0: no opt-in flag, no per-write warning). The
+  // version comment still carries the attribution.
+  const cfg = await getConfig();
+  if (!capabilitiesFor(cfg.apiMode)["attribution.label"]) return {};
   try {
     await addLabels(pageId, [ATTRIBUTION_LABEL]);
     // Best-effort cleanup of the legacy label. The label read is v2 and cannot
@@ -4382,7 +4505,8 @@ export async function formatPage(
   const spaceKey = page.spaceId ?? page.space?.key ?? "N/A";
   const version = page.version?.number ?? 0;
   const webui = page._links?.webui ?? "";
-  const base = page._links?.base ?? `${cfg.url}/wiki`;
+  // Gateway mode: a response's `_links.base` may name the gateway; build from the site URL.
+  const base = (cfg.apiMode === "gateway" ? undefined : page._links?.base) ?? `${cfg.url}/wiki`;
   const url = webui
     ? `${base}${webui}`
     : `${cfg.url}/wiki/pages/${page.id}`;
