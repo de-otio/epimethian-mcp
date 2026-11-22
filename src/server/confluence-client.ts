@@ -32,6 +32,20 @@ import {
   resolveUnverifiedStatusFlag,
   resolveUnverifiedStatusLocale,
 } from "./config.js";
+import { resolveV2NextLink } from "./pagination-cursor.js";
+import type { HistoricalSource } from "./historical-source.js";
+import {
+  buildApiBases,
+  requestBaseFor,
+  requireV1,
+  isCredentialedUrl,
+  assertCredentialedUrl,
+  resolveNextLink,
+  type ApiMode,
+} from "./api-base.js";
+import { capabilitiesFor } from "./api-capabilities.js";
+import { tokenExpiryState, todayUtc } from "../shared/token-expiry.js";
+import { bodySaysScopeMismatch } from "../shared/gateway-scopes.js";
 
 // --- Client label (set once from index.ts after MCP initialize handshake) ---
 
@@ -84,14 +98,25 @@ export interface Config {
   unverifiedStatusName?: string;
   /** Optional color override. */
   unverifiedStatusColor?: "#FFC400" | "#2684FF" | "#57D9A3" | "#FF7452" | "#8777D9";
+  /**
+   * Contract C1. "site": requests go to the site URL (Basic auth, v1 + v2).
+   * "gateway": requests go to api.atlassian.com/ex/confluence/{sealedCloudId}
+   * (scoped tokens; v2 only). Set from the keychain record's `apiMode`; env-var
+   * mode is always "site". Built by `buildApiBases` (api-base.ts) only.
+   */
+  apiMode: ApiMode;
+  /** v2 REST base. Every v2 URL is built from this. */
   apiV2: string;
-  apiV1: string;
+  /** v1 REST base; `null` in gateway mode. Read it only through `requireV1`. */
+  apiV1: string | null;
   authHeader: string;
   jsonHeaders: Record<string, string>;
   /** Tenant seal: cloudId stored in the keychain entry for this profile (undefined for env-var mode or pre-seal profiles). */
   sealedCloudId?: string;
   /** Tenant seal: display name stored alongside the cloudId, used for human-readable error messages. */
   sealedDisplayName?: string;
+  /** Scoped token expiry (`YYYY-MM-DD`) from the keychain record. Gateway mode only; read by validateStartup. */
+  tokenExpiry?: string;
   /**
    * Effective posture after resolving configured tri-state + probe result.
    * Populated by validateStartup() — always set at runtime after startup.
@@ -148,6 +173,8 @@ export async function resolveCredentials(): Promise<{
   profile: string | null;
   sealedCloudId?: string;
   sealedDisplayName?: string;
+  apiMode?: "gateway";
+  tokenExpiry?: string;
 }> {
   const profileEnv = process.env.CONFLUENCE_PROFILE || "";
   const urlEnv = process.env.CONFLUENCE_URL?.replace(/\/$/, "") || "";
@@ -173,6 +200,8 @@ export async function resolveCredentials(): Promise<{
       profile: profileEnv,
       sealedCloudId: creds.cloudId,
       sealedDisplayName: creds.tenantDisplayName,
+      ...(creds.apiMode === "gateway" ? { apiMode: "gateway" as const } : {}),
+      ...(creds.tokenExpiry !== undefined ? { tokenExpiry: creds.tokenExpiry } : {}),
     };
   }
 
@@ -211,8 +240,20 @@ export async function resolveCredentials(): Promise<{
 export async function getConfig(): Promise<Config> {
   if (_config) return _config;
 
-  const { url, email, apiToken, profile, sealedCloudId, sealedDisplayName } =
+  const { url, email, apiToken, profile, sealedCloudId, sealedDisplayName, apiMode, tokenExpiry } =
     await resolveCredentials();
+
+  // Gateway mode derives its base from the sealed cloudId only. A record that
+  // claims gateway mode without one (hand-edited keychain) must stop here, with
+  // a message, rather than fall back to the site URL: a scoped token is not
+  // valid there and the fallback would hide the broken seal.
+  if (apiMode === "gateway" && !sealedCloudId) {
+    console.error(
+      `Error: Profile "${profile}" is in gateway mode (scoped API token) but has no tenant seal (cloudId).\n` +
+        `Run \`epimethian-mcp setup --profile ${profile}\` to configure it again.`
+    );
+    process.exit(1);
+  }
 
   // Resolve configuration from profile registry and environment.
   const registrySettings = profile ? await getProfileSettings(profile) : undefined;
@@ -250,6 +291,15 @@ export async function getConfig(): Promise<Config> {
     "Content-Type": "application/json",
   });
 
+  let bases: ReturnType<typeof buildApiBases>;
+  try {
+    bases = buildApiBases({ url, apiMode: apiMode ?? "site", sealedCloudId });
+  } catch (err) {
+    // Only gateway mode can throw (a malformed seal). Say why and stop.
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
   _config = Object.freeze({
     url,
     email,
@@ -261,12 +311,14 @@ export async function getConfig(): Promise<Config> {
     unverifiedStatusLocale,
     unverifiedStatusName,
     unverifiedStatusColor,
-    apiV2: `${url}/wiki/api/v2`,
-    apiV1: `${url}/wiki/rest/api`,
+    // C1: the only derivation of API bases. Gateway mode is built from the
+    // sealed cloudId alone, never from the site URL or any user input.
+    ...bases,
     authHeader,
     jsonHeaders,
     sealedCloudId,
     sealedDisplayName,
+    ...(tokenExpiry !== undefined ? { tokenExpiry } : {}),
     // Placeholders — overwritten by validateStartup() once the probe runs.
     // Until then, treat as read-write to preserve existing behavior.
     effectivePosture: (posture === "read-only" ? "read-only" : "read-write") as "read-only" | "read-write",
@@ -286,12 +338,17 @@ export async function getConfig(): Promise<Config> {
  *  2. Fallback (when primary returns 404 or no spaces are available):
  *     PUT /wiki/api/v2/pages/999999999999 with a trivially bad body.
  *     - 403 → "read-only" (permission denied)
- *     - 404 / 400 → "write" (token can write; hit a non-existent page or bad body)
- *     - 401 → rethrown (auth failure, not a capability question)
- * 3. Any other unexpected error → "inconclusive" (logs a warning).
+ *     - 404 / 400 / 409 → "write" (token can write; hit a non-existent page, bad body or conflict)
+ *     - 401 → rethrown (auth failure, not a capability question), except in
+ *       gateway mode when the body says "scope does not match" → "read-only"
+ * 3. Any other answer or error (410, 429, other 4xx, 5xx, transport) →
+ *    "inconclusive" (logs a warning); posture "detect" then resolves to read-only.
  *
  * Returns one of: "write" | "read-only" | "inconclusive"
  */
+/** Dry-run `PUT /pages/999999999999` answers that prove the token may write (see probeWriteCapability). */
+const DRY_RUN_WRITE_CAPABLE_STATUSES: ReadonlySet<number> = new Set([400, 404, 409]);
+
 export async function probeWriteCapability(): Promise<"write" | "read-only" | "inconclusive"> {
   const cfg = await getConfig();
 
@@ -301,7 +358,7 @@ export async function probeWriteCapability(): Promise<"write" | "read-only" | "i
     if (spaces.length > 0) {
       const spaceKey = spaces[0].key;
       const permUrl = new URL(
-        `${cfg.apiV1}/user/current/permission/space/${encodeURIComponent(spaceKey)}`
+        `${requireV1(cfg, "writeProbe.spacePermissions")}/user/current/permission/space/${encodeURIComponent(spaceKey)}`
       );
       permUrl.searchParams.set("operationKey", "create");
       permUrl.searchParams.set("targetType", "page");
@@ -349,18 +406,27 @@ export async function probeWriteCapability(): Promise<"write" | "read-only" | "i
     // 2xx would be very surprising, but if it happens the token can write
     return "write";
   } catch (err) {
-    if (err instanceof ConfluenceAuthError) throw err;
+    if (err instanceof ConfluenceAuthError) {
+      // Gateway mode: a scoped token without the page-write scope answers
+      // 401 "Unauthorized; scope does not match" (live, 2026-11-22), not 403.
+      // The token authenticated (the spaces read before this passed); it just
+      // cannot update pages. Any other 401 is still an auth failure.
+      if (cfg.apiMode === "gateway" && bodySaysScopeMismatch(err.rawBody)) return "read-only";
+      throw err;
+    }
     if (err instanceof ConfluencePermissionError) return "read-only";
-    // 404 (page not found) or any 400-class body-validation error = token can write
-    if (err instanceof ConfluenceNotFoundError) return "write";
-    if (err instanceof ConfluenceApiError && err.status >= 400 && err.status < 500) {
-      // 400 Bad Request = body rejected by schema, but token had permission to attempt the write
+    // Only the answers that show the write got past the scope check and failed on
+    // the (missing) page or the empty body prove write capability:
+    //   404 page not found, 400 body rejected, 409 version conflict.
+    // Anything else (410 gone, 429 throttled, 422, 5xx, a refused redirect,
+    // a transport error) proves nothing: inconclusive, which "detect" resolves
+    // to read-only (resolveEffectivePosture).
+    if (err instanceof ConfluenceApiError && DRY_RUN_WRITE_CAPABLE_STATUSES.has(err.status)) {
       return "write";
     }
-    // Unexpected / network error
     console.error(
-      `epimethian-mcp: warning — write-capability probe failed with unexpected error: ${
-        err instanceof Error ? err.message : String(err)
+      `epimethian-mcp: warning — write-capability probe was inconclusive: ${
+        err instanceof Error ? sanitizeError(err.message) : String(err)
       }`
     );
     return "inconclusive";
@@ -369,10 +435,18 @@ export async function probeWriteCapability(): Promise<"write" | "read-only" | "i
 
 /**
  * Validate credentials against the Confluence instance before accepting tool calls.
+ * Site mode:
  * 1. Test authentication (GET spaces)
  * 2. Verify tenant identity (email matches)
  * 3. Tenant seal: verify cloudId matches the one sealed at setup time.
  *    Opportunistically seal pre-5.5 profiles on first startup after upgrade.
+ * Gateway mode (scoped token; doc/design/gateway-mode.md §4), in this order:
+ * 1. Token expiry: an expired date is a startup error, before any request.
+ * 2. Tenant seal: tenant_info on the site URL (unauthenticated) must return the
+ *    sealed cloudId. This is the tenant guard: the v1 email identity check
+ *    cannot run on the gateway.
+ * 3. GET spaces?limit=1 through the pinned gateway base.
+ * Both modes then:
  * 4. Capability probe (when posture === "detect") + effective-posture resolution
  * 5. Log connection info to stderr
  */
@@ -387,38 +461,89 @@ export async function validateStartup(config: Config): Promise<void> {
   const colonIndex = decoded.indexOf(":");
   const apiToken = decoded.slice(colonIndex + 1);
 
-  // Step 1: Authentication check
-  const connResult = await testConnection(url, email, apiToken);
-  if (!connResult.ok) {
-    const profileHint = profile
-      ? `Run \`epimethian-mcp setup --profile ${profile}\` to update credentials.`
-      : "Check your CONFLUENCE_URL, CONFLUENCE_EMAIL, and CONFLUENCE_API_TOKEN.";
-    console.error(
-      `Error: Confluence credentials rejected by ${url}\n${connResult.message}\n${profileHint}`
-    );
-    process.exit(1);
-  }
+  const gateway = config.apiMode === "gateway";
+  let expiryWarning: string | undefined;
 
-  // Step 2: Tenant identity verification
-  const identityResult = await verifyTenantIdentity(url, email, apiToken);
-  if (!identityResult.ok) {
-    const profileHint = profile
-      ? `Run \`epimethian-mcp setup --profile ${profile}\` to reconfigure.`
-      : "Check your credential configuration.";
-    console.error(
-      `Error: Tenant identity mismatch for ${profile ? `profile "${profile}"` : "configured credentials"}.\n` +
-        `Expected user: ${email}\n` +
-        (identityResult.authenticatedEmail
-          ? `Authenticated as: ${identityResult.authenticatedEmail}\n`
-          : "") +
-        `This may indicate a DNS or configuration issue. ${profileHint}`
-    );
-    process.exit(1);
-  }
+  if (gateway) {
+    // Gateway mode needs a profile (and with it a seal): env-var mode is site-only.
+    if (!profile) {
+      console.error("Error: gateway mode needs a profile with a tenant seal.");
+      process.exit(1);
+    }
+    const setupHint = `Run \`epimethian-mcp setup --profile ${profile}\` to configure a new token.`;
 
-  // Step 3: Tenant seal verification (skipped for env-var mode — no keychain entry to seal).
-  if (profile) {
+    // G1: token expiry, before any request leaves the machine.
+    const expiry = tokenExpiryState(config.tokenExpiry, todayUtc());
+    if (expiry.kind === "expired") {
+      console.error(
+        `Error: the scoped API token for profile "${profile}" expired on ${config.tokenExpiry}.\n` +
+          `Create a new token at https://id.atlassian.com/manage-profile/security/api-tokens. ${setupHint}`
+      );
+      process.exit(1);
+    }
+    if (expiry.kind === "soon") {
+      const when =
+        expiry.daysLeft === 0
+          ? "today"
+          : `in ${expiry.daysLeft} day${expiry.daysLeft === 1 ? "" : "s"}`;
+      expiryWarning =
+        `warning — the scoped API token for profile "${profile}" expires ${when} ` +
+        `(${config.tokenExpiry}). ${setupHint}`;
+    }
+
+    // G2: the site must still be the sealed tenant. Unauthenticated, so the
+    // scoped token never reaches the site origin.
     await verifyOrSealTenant(config, apiToken);
+
+    // G3: the token must work through the pinned gateway base.
+    const connResult = await testConnection(requestBaseFor(config), email, apiToken, { gateway: true });
+    if (!connResult.ok) {
+      console.error(
+        `Error: Atlassian API gateway rejected the credentials for profile "${profile}"\n${connResult.message}\n${setupHint}`
+      );
+      process.exit(1);
+    }
+    // G4: verifyTenantIdentity is skipped on purpose: it calls v1 /user/current, which
+    // the gateway does not serve. The tenant guard in this mode has two legs, both
+    // ours: (1) the sealed cloudId, checked against the site's tenant_info (G2) at
+    // every start; (2) the gateway-prefix pin on every credentialed request
+    // (sendGuarded: isCredentialedUrl, no redirects). The token is NOT assumed to be
+    // bound to one site: Atlassian most likely picks the site from the cloudId in
+    // the path, so the pin is what keeps requests on the sealed tenant.
+  } else {
+    // Step 1: Authentication check
+    const connResult = await testConnection(url, email, apiToken);
+    if (!connResult.ok) {
+      const profileHint = profile
+        ? `Run \`epimethian-mcp setup --profile ${profile}\` to update credentials.`
+        : "Check your CONFLUENCE_URL, CONFLUENCE_EMAIL, and CONFLUENCE_API_TOKEN.";
+      console.error(
+        `Error: Confluence credentials rejected by ${url}\n${connResult.message}\n${profileHint}`
+      );
+      process.exit(1);
+    }
+
+    // Step 2: Tenant identity verification
+    const identityResult = await verifyTenantIdentity(url, email, apiToken);
+    if (!identityResult.ok) {
+      const profileHint = profile
+        ? `Run \`epimethian-mcp setup --profile ${profile}\` to reconfigure.`
+        : "Check your credential configuration.";
+      console.error(
+        `Error: Tenant identity mismatch for ${profile ? `profile "${profile}"` : "configured credentials"}.\n` +
+          `Expected user: ${email}\n` +
+          (identityResult.authenticatedEmail
+            ? `Authenticated as: ${identityResult.authenticatedEmail}\n`
+            : "") +
+          `This may indicate a DNS or configuration issue. ${profileHint}`
+      );
+      process.exit(1);
+    }
+
+    // Step 3: Tenant seal verification (skipped for env-var mode — no keychain entry to seal).
+    if (profile) {
+      await verifyOrSealTenant(config, apiToken);
+    }
   }
 
   // Step 4: Capability probe + effective-posture resolution
@@ -455,9 +580,22 @@ export async function validateStartup(config: Config): Promise<void> {
   const profileLabel = profile ? `profile: ${profile}` : "env-var mode";
   const readOnlyLabel = config.readOnly ? ", READ-ONLY" : "";
   const attributionLabel = config.attribution ? "" : ", NO-ATTRIBUTION";
-  console.error(
-    `epimethian-mcp: connected to ${url} as ${email} (${profileLabel}${readOnlyLabel}${attributionLabel})`
-  );
+  if (gateway) {
+    console.error(
+      `epimethian-mcp: connected to ${url} as ${email} via the Atlassian API gateway ` +
+        `(scoped token, tenant sealed; ${profileLabel}${readOnlyLabel})`
+    );
+    console.error(
+      `[epimethian-mcp] Gateway mode: the email identity check is skipped; the sealed tenant ` +
+        `(cloudId ${config.sealedCloudId}) and the pinned gateway path are the tenant guard. ` +
+        `Tools that need the v1 API are not registered.`
+    );
+    if (expiryWarning) console.error(`epimethian-mcp: ${expiryWarning}`);
+  } else {
+    console.error(
+      `epimethian-mcp: connected to ${url} as ${email} (${profileLabel}${readOnlyLabel}${attributionLabel})`
+    );
+  }
 
   const modeLabel = resolved.effective === "read-only" ? "read-only" : "read-write";
   console.error(
@@ -488,7 +626,11 @@ async function verifyOrSealTenant(config: Config, apiToken: string): Promise<voi
   const { url, email, profile, sealedCloudId, sealedDisplayName } = config;
   if (!profile) return;
 
-  const live = await fetchTenantInfo(url, email, apiToken);
+  // Gateway mode: no credential may reach the site origin, so ask unauthenticated.
+  const live =
+    config.apiMode === "gateway"
+      ? await fetchTenantInfo(url, email, apiToken, { authenticated: false })
+      : await fetchTenantInfo(url, email, apiToken);
   if (!live.ok) {
     if (sealedCloudId) {
       // Sealed profile: we cannot verify the live tenant, so we must refuse.
@@ -706,6 +848,8 @@ const VersionMetadataSchema = z.object({
   by: z.object({
     displayName: z.string().default("unknown user"),
     accountId: z.string().default(""),
+    // v2 only: false when the account id stands in for a name the author lookup could not give.
+    nameResolved: z.boolean().optional(),
   }).prefault({}),
   when: z.string(),
   message: z.string().default(""),
@@ -767,13 +911,30 @@ export class ConfluenceApiError extends Error {
 export class ConfluenceAuthError extends ConfluenceApiError {}        // 401
 
 /**
- * 410 Gone: Atlassian has removed the endpoint. Seen first on v1 REST
- * endpoints reached through the api.atlassian.com gateway. A definite
+ * 410 Gone: Atlassian has removed the endpoint. Reported first for v1 REST
+ * endpoints reached through the api.atlassian.com gateway with classic
+ * tokens (a scoped token gets 401 from v1 there, live 2026-11-22). A definite
  * answer for THIS request (not applied), and no retry will help, so the
  * message says so instead of echoing a bare status the agent might keep
  * retrying. It must not claim the whole tool call changed nothing: a
  * multi-step write (create_page then its v1 label) can fail on a later step.
  */
+/**
+ * Gateway mode: Confluence (or the gateway) answered a credentialed request
+ * with a redirect. It is never followed: a hop on the same origin keeps the
+ * Authorization header and could name another tenant's cloudId, and a 307/308
+ * would replay a write body there.
+ */
+export class ConfluenceRedirectRefusedError extends ConfluenceApiError {
+  constructor(status: number, method: string, url: string) {
+    super(status, "");
+    this.name = "ConfluenceRedirectRefusedError";
+    this.message =
+      `Confluence ${method} ${endpointPath(url)} answered with a redirect (HTTP ${status}). ` +
+      `In gateway mode credentialed requests never follow redirects, so it was not followed.`;
+  }
+}
+
 export class ConfluenceEndpointRemovedError extends ConfluenceApiError {
   endpoint: string | undefined;
   constructor(status: number, body: string, method?: string, url?: string) {
@@ -1168,11 +1329,23 @@ async function sendGuarded<T>(
   url: string,
   init: RequestInit,
   kind: HttpKind,
-  consume: (res: Response) => Promise<T>
+  consume: (res: Response) => Promise<T>,
+  requestBase: string
 ): Promise<T> {
   const method = (init.method ?? "GET").toUpperCase();
   const isRead = method === "GET" || method === "HEAD";
   const timeoutMs = httpTimeoutMs(kind, process.env.EPIMETHIAN_HTTP_TIMEOUT_MS);
+
+  // Origin (and, in gateway mode, path-prefix) pinning, before anything is sent.
+  // Every caller carries the credential, and every base comes from C1, so this
+  // only fires if a URL was built some other way (belt and braces).
+  // Synchronous on purpose: no await may sit between the caller and the permit.
+  assertCredentialedUrl(url, requestBase);
+  // Gateway mode (a request base pinned to a path prefix): never follow a
+  // redirect automatically. Same-origin hops keep the credential, so a 3xx to
+  // another cloudId's prefix would carry it there. Site mode is unchanged.
+  const pinnedToPrefix = new URL(requestBase).pathname.replace(/\/+$/, "") !== "";
+  const sendInit: RequestInit = pinnedToPrefix ? { ...init, redirect: "manual" } : init;
 
   for (let attempt = 1; ; attempt++) {
     // The permit covers one attempt and is released before any Retry-After
@@ -1180,11 +1353,20 @@ async function sendGuarded<T>(
     const step = await httpSemaphore.run(async (): Promise<Step<T>> => {
       let res: Response;
       try {
-        res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+        res = await fetch(url, { ...sendInit, signal: AbortSignal.timeout(timeoutMs) });
       } catch (err) {
         if (!isRead) throw new WriteOutcomeUnknownError(method, url, err, "request");
         if (isAbortLike(err)) throw new ConfluenceTimeoutError(method, url, timeoutMs);
         throw err;
+      }
+
+      if (pinnedToPrefix && (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400))) {
+        await Promise.resolve(res.body?.cancel?.()).catch(() => {});
+        const refused = new ConfluenceRedirectRefusedError(res.status, method, url);
+        console.error(`epimethian-mcp: ${refused.message}`);
+        // A write that drew a redirect is not known to be unapplied: say so.
+        if (!isRead) throw new WriteOutcomeUnknownError(method, url, refused, "response");
+        throw refused;
       }
 
       if (res.ok) {
@@ -1229,7 +1411,7 @@ async function confluenceFetch<T>(
   const cfg = await getConfig();
   const method = (options.method ?? "GET").toUpperCase();
   const kind: HttpKind = method === "GET" || method === "HEAD" ? "read" : "write";
-  return sendGuarded(url, { headers: cfg.jsonHeaders, ...options }, kind, consume);
+  return sendGuarded(url, { headers: cfg.jsonHeaders, ...options }, kind, consume, requestBaseFor(cfg));
 }
 
 /** Send a request and return its parsed JSON body. */
@@ -1394,15 +1576,22 @@ async function fetchContent(
   id: string,
   includeBody: boolean
 ): Promise<PageData> {
+  const type: ContentType = segment === "blogposts" ? "blogpost" : "page";
   if (!includeBody) {
     const raw = await v2Get(`/${segment}/${id}`, {});
-    return PageSchema.parse(raw);
+    const data = PageSchema.parse(raw);
+    await rememberContentType(id, type);
+    return data;
   }
   if (segment === "blogposts") {
     const raw = await v2Get(`/blogposts/${id}`, { "body-format": "storage" });
-    return PageSchema.parse(raw);
+    const data = PageSchema.parse(raw);
+    await rememberContentType(id, type);
+    return data;
   }
-  return fetchPageWithCache(id);
+  const data = await fetchPageWithCache(id);
+  await rememberContentType(id, type);
+  return data;
 }
 
 /**
@@ -1467,12 +1656,14 @@ export async function resolveContentType(id: string): Promise<ContentType> {
   assertNumericContentId(id);
   try {
     PageSchema.parse(await v2Get(`/pages/${id}`, {}));
+    await rememberContentType(id, "page");
     return "page";
   } catch (err) {
     if (!(err instanceof ConfluenceNotFoundError)) throw err;
   }
   try {
     PageSchema.parse(await v2Get(`/blogposts/${id}`, {}));
+    await rememberContentType(id, "blogpost");
     return "blogpost";
   } catch (err) {
     if (err instanceof ConfluenceNotFoundError) throw notFoundAsPageOrBlogPost(id);
@@ -1498,7 +1689,9 @@ export async function getDraftBlogPost(id: string, includeBody: boolean): Promis
   assertNumericContentId(id);
   const params: Record<string, string> = { status: "draft" };
   if (includeBody) params["body-format"] = "storage";
-  return BlogPostSchema.parse(await v2Get(`/blogposts/${id}`, params));
+  const draft = BlogPostSchema.parse(await v2Get(`/blogposts/${id}`, params));
+  await rememberContentType(id, "blogpost");
+  return draft;
 }
 
 /**
@@ -1515,12 +1708,14 @@ export async function resolveContainerStatus(id: string): Promise<"current" | "d
   assertNumericContentId(id);
   try {
     PageSchema.parse(await v2Get(`/pages/${id}`, {}));
+    await rememberContentType(id, "page");
     return "current";
   } catch (err) {
     if (!(err instanceof ConfluenceNotFoundError)) throw err;
   }
   try {
     const post = BlogPostSchema.parse(await v2Get(`/blogposts/${id}`, {}));
+    await rememberContentType(id, "blogpost");
     return post.status === "draft" ? "draft" : "current";
   } catch (err) {
     if (!(err instanceof ConfluenceNotFoundError)) throw err;
@@ -1538,6 +1733,12 @@ export async function resolveContainerStatus(id: string): Promise<"current" | "d
 export interface ContainerOptions {
   /** The container is a blog post draft: send `status=draft`. */
   draft?: boolean;
+  /**
+   * The container's content type, when the caller already knows it. The v2
+   * reads route on it (`/pages/...` or `/blogposts/...`); when absent the type
+   * comes from the memo or a metadata read of the object (withContentType).
+   */
+  contentType?: ContentType;
 }
 
 /** Add `status=draft` to a v1 container URL when the container is a draft. */
@@ -1564,7 +1765,9 @@ export async function getBlogPost(
   let notFound: ConfluenceNotFoundError;
   try {
     const raw = await v2Get(`/blogposts/${id}`, includeBody ? { "body-format": "storage" } : {});
-    return { ...BlogPostSchema.parse(raw), contentType: "blogpost" };
+    const post = { ...BlogPostSchema.parse(raw), contentType: "blogpost" as const };
+    await rememberContentType(id, "blogpost");
+    return post;
   } catch (err) {
     if (!(err instanceof ConfluenceNotFoundError)) throw err;
     notFound = err;
@@ -1663,6 +1866,8 @@ export async function _rawCreateContent(
     // The POST succeeded; an unreadable answer must not read as "not created".
     throw new WriteOutcomeUnknownError("POST", `${cfg.apiV2}/${segment}`, err, "response");
   }
+
+  await rememberContentType(page.id, type);
 
   // Cache the body we just sent (new pages start at version 1). Pages only.
   if (type === "page") pageCache.set(page.id, page.version?.number ?? 1, pageBody);
@@ -2018,23 +2223,12 @@ function normaliseSearchResult(r: unknown): SearchHit | "other" | "unreadable" {
 export const MAX_SEARCH_REQUESTS = 10;
 
 /**
- * Resolve a `_links.next` value to a same-origin URL, or null when it is not
- * provably safe to follow (credentials must never leave the tenant origin).
+ * Resolve a `_links.next` value to a URL that is provably safe to follow with
+ * credentials, or null (credentials must never leave the pinned request base:
+ * the tenant origin in site mode, the sealed gateway prefix in gateway mode).
  */
-function resolveSearchNext(next: unknown, baseUrl: string): string | null {
-  if (typeof next !== "string") return null;
-  if (!next.startsWith("/") || next.startsWith("//")) return null;
-  if (next.includes("://") || next.includes("\\")) return null;
-  try {
-    // Build on the origin, not the configured URL, so a base URL with a path
-    // or trailing slash cannot double the `/wiki` context.
-    const origin = new URL(baseUrl).origin;
-    const prefix = next.startsWith("/wiki/") ? "" : "/wiki";
-    const full = `${origin}${prefix}${next}`;
-    return new URL(full).origin === origin ? full : null;
-  } catch {
-    return null;
-  }
+function resolveSearchNext(next: unknown, requestBase: string): string | null {
+  return resolveNextLink(next, requestBase);
 }
 
 export async function searchContent(
@@ -2050,7 +2244,7 @@ export async function searchContent(
 
   for (let request = 0; request < MAX_SEARCH_REQUESTS; request++) {
     if (url === null) {
-      const first = new URL(`${cfg.url}/wiki/rest/api/search`);
+      const first = new URL(`${requireV1(cfg, "search.cql")}/search`);
       first.searchParams.set("cql", cql);
       first.searchParams.set("limit", String(Math.min(opts.limit - hits.length, 100)));
       first.searchParams.set(
@@ -2093,7 +2287,7 @@ export async function searchContent(
       more = true;
       break;
     }
-    const resolved = resolveSearchNext(next, cfg.url);
+    const resolved = resolveSearchNext(next, requestBaseFor(cfg));
     if (resolved === null || request === MAX_SEARCH_REQUESTS - 1) {
       more = true; // unsafe link or request cap: cannot prove completeness
       break;
@@ -2223,7 +2417,7 @@ export async function searchUsers(
   limit = 10
 ): Promise<UserResult[]> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/search/user`);
+  const url = new URL(`${requireV1(cfg, "users.byName")}/search/user`);
   url.searchParams.set("cql", `user.fullname~"${escapeCqlString(query)}"`);
   url.searchParams.set("limit", String(Math.min(limit, 10)));
   const raw = await confluenceJson(url.toString());
@@ -2254,7 +2448,7 @@ export async function searchPagesByTitle(
 ): Promise<PageLinkResult[]> {
   const cql = `title="${escapeCqlString(title)}" AND space.key="${escapeCqlString(spaceKey)}" AND type=page`;
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/search`);
+  const url = new URL(`${requireV1(cfg, "search.cql")}/search`);
   url.searchParams.set("cql", cql);
   url.searchParams.set("limit", "10");
   url.searchParams.set("expand", "space");
@@ -2268,7 +2462,9 @@ export async function searchPagesByTitle(
     const spaceObj = content.space ?? r.space;
     const key = (spaceObj?.key ?? spaceKey) as string;
     const links = content._links ?? r._links ?? {};
-    const base: string = links.base ?? cfg.url + "/wiki";
+    // Human links come from the site URL; in gateway mode never from a response.
+    const base: string =
+      (cfg.apiMode === "gateway" ? undefined : links.base) ?? cfg.url + "/wiki";
     const webui: string = links.webui ?? "";
     if (!id || !pageTitle) continue;
     results.push({
@@ -2281,19 +2477,172 @@ export async function searchPagesByTitle(
   return results;
 }
 
+// --- v2 list reads: content-type routing and cursor pagination ---
+
+// Content type by id, scoped by tenant URL like the space-key cache. Learned
+// ONLY from authoritative answers: a successful read of the object itself
+// (`GET /pages/{id}` or `/blogposts/{id}`, via fetchContent, resolveContentType,
+// resolveContainerStatus, getDraftBlogPost) or a create. Never from a
+// sub-collection (`/pages/{id}/attachments`, `/labels`, `/versions`): such an
+// endpoint has been seen to answer 200 with an empty list for an id that is
+// not a page, which would route a blog post's reads to an empty page listing.
+// An id's type never changes (ids are unique across pages and blog posts), so
+// entries never expire. The memo only routes v2 reads.
+const contentTypeMemo = new Map<string, ContentType>();
+
+async function rememberContentType(id: string, type: ContentType): Promise<void> {
+  const cfg = await getConfig();
+  contentTypeMemo.set(`${cfg.url}\u0000${id}`, type);
+}
+
+async function recallContentType(id: string): Promise<ContentType | undefined> {
+  const cfg = await getConfig();
+  return contentTypeMemo.get(`${cfg.url}\u0000${id}`);
+}
+
+/** Testing only. */
+export function _resetContentTypeMemoForTests(): void {
+  contentTypeMemo.clear();
+}
+
+/**
+ * Run a v2 read against `/pages/{id}/...` or `/blogposts/{id}/...` (contract C3).
+ *
+ * The type comes from the `type` argument, else the memo, else
+ * `resolveContentType` (a metadata read of the object itself, which also
+ * fills the memo; both 404 → one combined not-found). Exactly one request
+ * path is then used for `read`. A sub-collection answering 200 is never taken
+ * as proof of the type and teaches the memo nothing (see the memo comment):
+ * an unknown id costs one metadata read first, never a wrong-but-plausible
+ * empty list. A not-found from `read` itself is passed through unchanged:
+ * the object exists, so it is not reported as a missing page or blog post.
+ */
+async function withContentType<T>(
+  id: string,
+  type: ContentType | undefined,
+  read: (type: ContentType) => Promise<T>
+): Promise<T> {
+  assertNumericContentId(id);
+  const known = type ?? (await recallContentType(id)) ?? (await resolveContentType(id));
+  return read(known);
+}
+
+/** Pages followed per list read: bounds the work a hostile or buggy cursor chain can cause. */
+export const MAX_V2_LIST_PAGES = 20;
+/** v2 list endpoints cap `limit` at 250. */
+const V2_MAX_PAGE_SIZE = 250;
+
+const V2NextLinkSchema = z.object({ next: z.string().nullish() });
+
+/**
+ * Walk a v2 list by cursor.
+ *
+ * Stops once `wanted` items are in hand (or at the end of the list, or at
+ * MAX_V2_LIST_PAGES). `moreAvailable` is true whenever the list continues past
+ * what was returned, so callers that must see everything can refuse to decide.
+ * A cursor that fails `resolveV2NextLink` (another origin, path prefix or
+ * endpoint) throws: credentials are never sent to it and the list is never
+ * silently cut short.
+ */
+async function walkV2List<T>(
+  path: string,
+  params: Record<string, string | number>,
+  itemSchema: z.ZodType<T>,
+  wanted: number | "all"
+): Promise<{ items: T[]; moreAvailable: boolean }> {
+  const cfg = await getConfig();
+  const first = new URL(`${cfg.apiV2}${path}`);
+  for (const [k, v] of Object.entries(params)) first.searchParams.set(k, String(v));
+  const pageSchema = z.object({
+    results: z.array(itemSchema).default([]),
+    _links: V2NextLinkSchema.nullish(),
+  });
+  const items: T[] = [];
+  let url = first.toString();
+  for (let page = 0; page < MAX_V2_LIST_PAGES; page++) {
+    const parsed = pageSchema.parse(await confluenceJson(url));
+    items.push(...parsed.results);
+    const next = parsed._links?.next;
+    if (next === undefined || next === null || next === "") return { items, moreAvailable: false };
+    if (wanted !== "all" && items.length >= wanted) return { items, moreAvailable: true };
+    const resolved = resolveV2NextLink(next, cfg.apiV2, first.toString());
+    if (resolved === null) {
+      throw new Error(
+        "Refusing to follow a pagination link that does not stay on this Confluence API; " +
+          "the list was not read to the end."
+      );
+    }
+    url = resolved;
+  }
+  return { items, moreAvailable: true };
+}
+
+const V2AttachmentSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  /** `current`, `archived`, `trashed`, ... Lists default to current+archived. */
+  status: z.string().optional(),
+  mediaType: z.string().optional(),
+  fileSize: z.number().optional(),
+  downloadLink: z.string().optional(),
+  version: z.object({ number: z.number().int().positive() }).optional(),
+});
+
+/**
+ * Drop every attachment the answer marks as not current. The list requests ask
+ * for `status=current` (v2 attachment lists otherwise return archived files as
+ * well); this is the defensive second check, so an archived file can never be
+ * the target of a new version. An item without `status` is kept: the server
+ * was asked for current items only.
+ */
+function currentOnly<T extends { status?: string }>(items: readonly T[]): T[] {
+  return items.filter((a) => a.status === undefined || a.status === "current");
+}
+
+/** Map a v2 attachment to the v1-shaped `AttachmentData` the tools already consume. */
+function v2AttachmentToData(a: z.infer<typeof V2AttachmentSchema>): AttachmentData {
+  return {
+    id: a.id,
+    title: a.title,
+    ...(a.version ? { version: { number: a.version.number } } : {}),
+    ...(a.fileSize !== undefined || a.mediaType !== undefined
+      ? {
+          extensions: {
+            ...(a.fileSize !== undefined ? { fileSize: a.fileSize } : {}),
+            ...(a.mediaType !== undefined ? { mediaType: a.mediaType } : {}),
+          },
+        }
+      : {}),
+    ...(a.downloadLink !== undefined ? { _links: { download: a.downloadLink } } : {}),
+  };
+}
+
 export async function getAttachments(
   pageId: string,
   limit: number,
   container?: ContainerOptions
 ): Promise<AttachmentData[]> {
-  // Attachments only available via v1 REST API
-  const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/child/attachment`);
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("expand", "version");
-  if (container?.draft) url.searchParams.set("status", "draft");
-  const raw = await confluenceJson(url.toString());
-  return AttachmentsResultSchema.parse(raw).results;
+  if (container?.draft) {
+    // A never-published blog post draft is only reachable through v1 with
+    // `status=draft`; v2's attachment list has no draft status. Stays v1.
+    const cfg = await getConfig();
+    const url = new URL(`${requireV1(cfg, "attachments.read")}/content/${pageId}/child/attachment`);
+    url.searchParams.set("limit", String(limit));
+    url.searchParams.set("expand", "version");
+    url.searchParams.set("status", "draft");
+    const raw = await confluenceJson(url.toString());
+    return AttachmentsResultSchema.parse(raw).results;
+  }
+  const pageSize = Math.min(Math.max(Math.trunc(limit), 1), V2_MAX_PAGE_SIZE);
+  const { items } = await withContentType(pageId, container?.contentType, (type) =>
+    walkV2List(
+      `/${segmentFor(type)}/${pageId}/attachments`,
+      { status: "current", limit: pageSize },
+      V2AttachmentSchema,
+      Math.max(Math.trunc(limit), 1)
+    )
+  );
+  return currentOnly(items).slice(0, Math.max(Math.trunc(limit), 1)).map(v2AttachmentToData);
 }
 
 // --- Attachment lookup and new versions ---
@@ -2329,20 +2678,44 @@ function toAttachmentInfo(a: AttachmentData): AttachmentInfo {
 }
 
 export interface AttachmentLookup {
-  /** The attachment whose title equals `filename` exactly, or null. */
+  /** The current attachment whose title equals `filename` exactly, or null. */
   exact: AttachmentInfo | null;
-  /** Other attachments the server matched (its `filename` filter ignores case). */
+  /** Current attachments whose title equals `filename` ignoring case, but not exactly. */
   near: AttachmentInfo[];
 }
 
 /**
- * Find a page's attachment by its exact title.
+ * The attachments whose title equals `name` exactly (case-sensitive).
  *
- * The v1 `filename` filter narrows the search on the server, but it ignores
- * case (probed live: `Example.drawio` returns `example.drawio`). The title is
- * therefore compared again here, exactly: an update must never pick a file
- * the caller did not name. Server matches that differ only in case come back
- * in `near`, so the caller can say "did you mean".
+ * The server's `filename` filter is only a narrowing step: it has matched
+ * loosely (v1 ignores case) and its behaviour may differ between APIs, so the
+ * decision is always made here, on the title, with `===`.
+ */
+export function exactAttachmentMatches<T extends { title: string }>(
+  attachments: readonly T[],
+  name: string
+): T[] {
+  return attachments.filter((a) => a.title === name);
+}
+
+/**
+ * Find a page's current attachment by its exact title.
+ *
+ * v2: the page's whole CURRENT attachment list is read (`status=current`,
+ * every cursor page) and both answers are computed here: `exact` with `===`,
+ * `near` as equal ignoring case but not exactly. No `filename=` filter is
+ * sent: its case semantics are the server's and have differed between APIs,
+ * and a case-sensitive filter would hide `A.drawio` from a lookup of
+ * `a.drawio` (so an overwrite would create a second file, and the draw.io
+ * preview guard would miss `X.drawio.PNG`). An update must never pick a file
+ * the caller did not name (`a.drawio` must not match `a.drawio.bak` or
+ * `A.drawio`). No exact match is "not found"; more than one is refused, never
+ * resolved by taking the first.
+ *
+ * If the list cannot be read to the end the lookup throws instead of deciding.
+ *
+ * A blog post draft keeps the v1 lookup (`status=draft` has no v2 equivalent);
+ * v1's `filename` filter ignores case, and the decision is still made here.
  */
 export async function findAttachmentByName(
   pageId: string,
@@ -2350,23 +2723,42 @@ export async function findAttachmentByName(
   container?: ContainerOptions
 ): Promise<AttachmentLookup> {
   assertPageId(pageId);
-  const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/child/attachment`);
-  url.searchParams.set("filename", filename);
-  url.searchParams.set("expand", "version");
-  url.searchParams.set("limit", "25");
-  if (container?.draft) url.searchParams.set("status", "draft");
-  const raw = await confluenceJson(url.toString());
-  const all = AttachmentsResultSchema.parse(raw).results.map(toAttachmentInfo);
-  const exact = all.filter((a) => a.title === filename);
-  if (exact.length === 0 && all.length >= 25) {
-    // A full page of case-variants without the exact name: the exact match
-    // could be on a later page, so "absent" cannot be trusted.
-    throw new Error(
-      `Confluence returned ${all.length} attachments whose names match "${filename}" ignoring case; ` +
-        `refusing to decide that the exact name is absent.`
+  let all: AttachmentInfo[];
+  if (container?.draft) {
+    const cfg = await getConfig();
+    const url = new URL(`${requireV1(cfg, "attachments.read")}/content/${pageId}/child/attachment`);
+    url.searchParams.set("filename", filename);
+    url.searchParams.set("expand", "version");
+    url.searchParams.set("limit", "25");
+    url.searchParams.set("status", "draft");
+    const raw = await confluenceJson(url.toString());
+    all = AttachmentsResultSchema.parse(raw).results.map(toAttachmentInfo);
+    if (all.length >= 25 && exactAttachmentMatches(all, filename).length === 0) {
+      // A full page of case-variants without the exact name: the exact match
+      // could be on a later page, so "absent" cannot be trusted.
+      throw new Error(
+        `Confluence returned ${all.length} attachments whose names match "${filename}" ignoring case; ` +
+          `refusing to decide that the exact name is absent.`
+      );
+    }
+  } else {
+    const walked = await withContentType(pageId, container?.contentType, (type) =>
+      walkV2List(
+        `/${segmentFor(type)}/${pageId}/attachments`,
+        { status: "current", limit: V2_MAX_PAGE_SIZE },
+        V2AttachmentSchema,
+        "all"
+      )
     );
+    if (walked.moreAvailable) {
+      throw new Error(
+        `The attachment list for page ${pageId} is too long to read to the end; ` +
+          `refusing to decide whether "${filename}" is present or unique.`
+      );
+    }
+    all = currentOnly(walked.items).map((a) => toAttachmentInfo(v2AttachmentToData(a)));
   }
+  const exact = exactAttachmentMatches(all, filename);
   if (exact.length > 1) {
     // Confluence keeps attachment titles unique per page; two exact matches
     // mean the answer cannot be trusted to pick one.
@@ -2374,7 +2766,7 @@ export async function findAttachmentByName(
       `Confluence returned ${exact.length} attachments with the same name on page ${pageId}; refusing to choose one.`
     );
   }
-  // The server's match is looser than case alone; keep only true case-variants.
+  // Near: the same name ignoring case, never the exact name itself.
   const folded = filename.toLowerCase();
   return {
     exact: exact[0] ?? null,
@@ -2438,7 +2830,7 @@ export async function uploadAttachmentVersion(
   if (comment) form.append("comment", comment);
 
   const dataUrl = withContainerStatus(
-    `${cfg.apiV1}/content/${pageId}/child/attachment/${attachmentId}/data`,
+    `${requireV1(cfg, "attachments.upload")}/content/${pageId}/child/attachment/${attachmentId}/data`,
     container
   );
   // An upload is a write like a page update: it counts against the budget.
@@ -2457,7 +2849,8 @@ export async function uploadAttachmentVersion(
           body: form,
         },
         "transfer",
-        (res) => res.json() as Promise<unknown>
+        (res) => res.json() as Promise<unknown>,
+        requestBaseFor(cfg)
       ),
       "POST",
       dataUrl
@@ -2549,27 +2942,37 @@ export async function getAttachmentMetadata(
  * Confluence has returned this field in several shapes across versions: a
  * path rooted at the `/wiki` context (`/download/attachments/...`), a path
  * already carrying the context (`/wiki/download/...`), or an absolute URL.
- * Build from `cfg.url` rather than concatenating onto an API base — the
- * download servlet does not live under `/rest/api` or `/api/v2`.
+ * Build from the request base (`requestBaseFor(cfg)`, the site URL in site
+ * mode) rather than concatenating onto an API base — the download servlet
+ * does not live under `/rest/api` or `/api/v2`. The result must pass
+ * `isCredentialedUrl` against the request base: the same origin in site mode,
+ * the same origin AND the sealed `/ex/confluence/{cloudId}/` prefix in gateway
+ * mode (so a link naming another cloudId, or `api.atlassian.com` without the
+ * prefix, is refused).
  *
- * An absolute link pointing at a different host is refused: the caller would
- * have to decide whether to forward credentials, and the safe answer there is
- * to not follow an unexpected host at all.
+ * An absolute link pointing anywhere else is refused: the caller would have
+ * to decide whether to forward credentials, and the safe answer there is to
+ * not follow an unexpected host (or tenant) at all.
  */
-export function resolveDownloadUrl(downloadLink: string, siteUrl: string): string {
-  const siteOrigin = new URL(siteUrl).origin;
-  if (/^https?:\/\//i.test(downloadLink)) {
-    const parsed = new URL(downloadLink);
-    if (parsed.origin !== siteOrigin) {
-      throw new Error(
-        `Refusing to download from ${parsed.origin}, which is not the configured Confluence site.`
-      );
-    }
-    return parsed.toString();
+export function resolveDownloadUrl(downloadLink: string, requestBase: string): string {
+  const absolute = /^https?:\/\//i.test(downloadLink);
+  let resolved: string;
+  if (absolute) {
+    resolved = new URL(downloadLink).toString();
+  } else if (downloadLink.startsWith("/wiki/")) {
+    resolved = `${requestBase}${downloadLink}`;
+  } else if (downloadLink.startsWith("/")) {
+    resolved = `${requestBase}/wiki${downloadLink}`;
+  } else {
+    resolved = `${requestBase}/wiki/${downloadLink}`;
   }
-  if (downloadLink.startsWith("/wiki/")) return `${siteUrl}${downloadLink}`;
-  if (downloadLink.startsWith("/")) return `${siteUrl}/wiki${downloadLink}`;
-  return `${siteUrl}/wiki/${downloadLink}`;
+  if (!isCredentialedUrl(resolved, requestBase)) {
+    const where = absolute ? new URL(downloadLink).origin : "a location outside the configured request base";
+    throw new Error(
+      `Refusing to download from ${where}, which is not the configured Confluence site.`
+    );
+  }
+  return resolved;
 }
 
 /**
@@ -2604,9 +3007,9 @@ export async function downloadAttachmentBytes(
     throw new AttachmentTooLargeError(meta.id, meta.fileSize);
   }
 
-  const siteOrigin = new URL(cfg.url).origin;
-  let url = resolveDownloadUrl(meta.downloadLink, cfg.url);
-  // Latched, not recomputed: once the chain has left the site origin the
+  const requestBase = requestBaseFor(cfg);
+  let url = resolveDownloadUrl(meta.downloadLink, requestBase);
+  // Latched, not recomputed: once the chain has left the pinned request base the
   // credential stays off for every remaining hop. Recomputing per hop would
   // re-attach it on a site → third-party → site chain, which is exactly the
   // shape an open redirect would take.
@@ -2634,7 +3037,7 @@ export async function downloadAttachmentBytes(
           const next = new URL(location, url);
           return {
             next: next.toString(),
-            credentialed: credentialed && next.origin === siteOrigin,
+            credentialed: credentialed && isCredentialedUrl(next.toString(), requestBase),
           };
         }
       );
@@ -2699,64 +3102,325 @@ async function readDownloadResponse(
 
 // --- Version history ---
 
-export async function getPageVersions(
-  pageId: string,
-  limit: number
-): Promise<VersionMetadata[]> {
-  const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/version`);
-  url.searchParams.set("limit", String(limit));
-  const raw = await confluenceJson(url.toString());
-  const data = VersionsResultSchema.parse(raw);
-  // Truncate messages (untrusted user content)
-  return data.results.map((v) => ({
-    ...v,
-    message: v.message.slice(0, 500),
-  }));
+/** v2 version-list item. `authorId` is an account id; names come from users-bulk. */
+const V2VersionSchema = z.object({
+  number: z.number(),
+  createdAt: z.string(),
+  message: z.string().nullish(),
+  minorEdit: z.boolean().nullish(),
+  authorId: z.string().nullish(),
+});
+
+/** Version pages are capped at 200 per request; the complete-walk fallback uses them all. */
+const V2_VERSION_PAGE_SIZE = 200;
+
+// Account id -> display name, scoped by tenant URL like the space-key cache so
+// a process ever pointed at a second tenant cannot answer from the first one's
+// cache. Only hits are cached: a failed lookup is retried on the next call.
+const userNameCache = new Map<string, string>();
+
+/** Testing only. */
+export function _resetUserNameCacheForTests(): void {
+  userNameCache.clear();
 }
 
-export async function getPageVersionBody(
+const UsersBulkSchema = z.object({
+  results: z
+    .array(
+      z.object({
+        accountId: z.string(),
+        displayName: z.string().nullish(),
+        publicName: z.string().nullish(),
+      })
+    )
+    .default([]),
+});
+
+/** Account ids are safe to send in a JSON body when they look like what Atlassian issues. */
+const ACCOUNT_ID_RE = /^[A-Za-z0-9:_-]{1,128}$/;
+const USERS_BULK_MAX = 100;
+
+/**
+ * Resolve account ids to display names with `POST /users-bulk` (one request per
+ * 100 distinct uncached ids). NEVER throws: a failed or partial lookup just
+ * leaves ids out of the map, and the caller shows the account id instead.
+ * Reading history must not depend on being allowed to read user profiles.
+ */
+async function resolveAccountNames(accountIds: readonly string[]): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  try {
+    const cfg = await getConfig();
+    const wanted: string[] = [];
+    for (const id of new Set(accountIds)) {
+      if (!ACCOUNT_ID_RE.test(id)) continue;
+      const cached = userNameCache.get(`${cfg.url}\u0000${id}`);
+      if (cached !== undefined) names.set(id, cached);
+      else wanted.push(id);
+    }
+    for (let i = 0; i < wanted.length; i += USERS_BULK_MAX) {
+      const chunk = wanted.slice(i, i + USERS_BULK_MAX);
+      try {
+        const data = UsersBulkSchema.parse(await v2Post("/users-bulk", { accountIds: chunk }));
+        for (const u of data.results) {
+          // Only names for ids we asked about: the answer is never trusted to add keys.
+          if (!chunk.includes(u.accountId)) continue;
+          const name = (u.displayName ?? u.publicName ?? "").trim();
+          if (name === "") continue;
+          names.set(u.accountId, name);
+          userNameCache.set(`${cfg.url}\u0000${u.accountId}`, name);
+        }
+      } catch (err) {
+        console.error(
+          `epimethian-mcp: warning - author name lookup failed; showing account ids instead ` +
+            `(${sanitizeError(err instanceof Error ? err.message : String(err))})`
+        );
+      }
+    }
+  } catch {
+    // Config or cache trouble: fall through with whatever was resolved.
+  }
+  return names;
+}
+
+function strictlyNewestFirst(numbers: readonly number[]): boolean {
+  for (let i = 1; i < numbers.length; i++) if (!(numbers[i - 1]! > numbers[i]!)) return false;
+  return numbers.length >= 2;
+}
+
+/**
+ * Version history of a page or blog post, NEWEST FIRST (v2 `/versions`).
+ *
+ * The result is always sorted by version number, descending, whatever order
+ * the server used, and holds at most `limit` entries. When the server's order
+ * cannot be seen to be newest-first on a list that continues past the first
+ * answer, the whole list is read before truncating: taking the first `limit`
+ * of an oldest-first list would present the oldest versions as the latest.
+ *
+ * v2 gives `authorId` only. Names come from one deduplicated, per-tenant
+ * cached users-bulk lookup; if it fails the entry shows the account id
+ * (`by.nameResolved === false`) and the read still succeeds.
+ */
+export async function getPageVersions(
   pageId: string,
+  limit: number,
+  type?: ContentType
+): Promise<VersionMetadata[]> {
+  const want = Math.max(Math.trunc(limit), 1);
+  const pageSize = Math.min(want, V2_VERSION_PAGE_SIZE);
+  const read = (wanted: number | "all", size: number) =>
+    withContentType(pageId, type, (t) =>
+      walkV2List(`/${segmentFor(t)}/${pageId}/versions`, { limit: size }, V2VersionSchema, wanted)
+    );
+
+  let walked = await read(want, pageSize);
+  if (walked.moreAvailable && !strictlyNewestFirst(walked.items.map((v) => v.number))) {
+    walked = await read("all", V2_VERSION_PAGE_SIZE);
+    if (walked.moreAvailable) {
+      throw new Error(
+        `The version list for page ${pageId} is too long to read to the end, so its newest versions cannot be identified.`
+      );
+    }
+  }
+  const newest = [...walked.items].sort((a, b) => b.number - a.number).slice(0, want);
+  const names = await resolveAccountNames(
+    newest.flatMap((v) => (v.authorId ? [v.authorId] : []))
+  );
+  // Truncate messages (untrusted user content)
+  return newest.map((v) => {
+    const accountId = v.authorId ?? "";
+    const resolved = accountId !== "" ? names.get(accountId) : undefined;
+    return {
+      number: v.number,
+      by: {
+        // Unresolved: the account id stands in for the name (anonymous: placeholder).
+        displayName: resolved ?? (accountId !== "" ? accountId : "unknown user"),
+        accountId,
+        ...(accountId !== "" ? { nameResolved: resolved !== undefined } : {}),
+      },
+      when: v.createdAt,
+      message: (v.message ?? "").slice(0, 500),
+      minorEdit: v.minorEdit ?? false,
+    };
+  });
+}
+
+/**
+ * A historical read that cannot be shown to be the requested version of the
+ * requested content. Thrown instead of returning a body: a wrong historical
+ * body would become a silent no-op diff or, through `revert_page`, a wrong
+ * write. Never recovered by falling back to the current body.
+ */
+export class HistoricalReadMismatchError extends Error {
+  readonly contentId: string;
+  readonly requestedVersion: number;
+  constructor(contentId: string, requestedVersion: number, reason: string) {
+    super(
+      `Refusing to use the historical read of ${contentId} at version ${requestedVersion}: ${reason}. ` +
+        `Nothing was changed.`
+    );
+    this.name = "HistoricalReadMismatchError";
+    this.contentId = contentId;
+    this.requestedVersion = requestedVersion;
+  }
+}
+
+const V2HistoricalSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  version: z.object({ number: z.number() }),
+  body: z.object({
+    storage: z.object({ representation: z.string(), value: z.string() }),
+  }),
+});
+
+function assertHistoricalVersionNumber(version: number): void {
+  if (!Number.isInteger(version) || version < 1) {
+    throw new Error("Invalid version: expected a positive whole number.");
+  }
+}
+
+/**
+ * Storage body of a page or blog post at `version`, from v2
+ * `/{pages|blogposts}/{id}?version=N&body-format=storage`.
+ *
+ * FAIL CLOSED. The answer is used only when ALL of these hold; otherwise
+ * HistoricalReadMismatchError:
+ *   - it parses, with a body (a missing body is not an empty page);
+ *   - the content id is the one asked for;
+ *   - `version.number === version` (a server that ignores `?version=` answers
+ *     with the current version, which would otherwise pass as the old one);
+ *   - the body representation is `storage`.
+ * There is no fallback to the current body.
+ */
+export async function getHistoricalStorage(
+  id: string,
+  type: ContentType,
   version: number
 ): Promise<{ title: string; rawBody: string; version: number }> {
-  // Check versioned cache first
-  const cached = pageCache.getVersioned(pageId, version);
-  if (cached !== undefined) {
-    // Body is cached — lightweight metadata fetch for title
-    const raw = await v2Get(`/pages/${pageId}`, {});
-    const page = PageSchema.parse(raw);
-    return { title: page.title, rawBody: cached, version };
+  assertNumericContentId(id);
+  assertHistoricalVersionNumber(version);
+  const raw = await v2Get(`/${segmentFor(type)}/${id}`, {
+    version,
+    "body-format": "storage",
+  });
+  const parsed = V2HistoricalSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new HistoricalReadMismatchError(id, version, "the answer has no storage body");
   }
+  const data = parsed.data;
+  if (data.id !== id) {
+    throw new HistoricalReadMismatchError(id, version, "the answer is about different content");
+  }
+  if (data.version.number !== version) {
+    throw new HistoricalReadMismatchError(
+      id,
+      version,
+      `the answer is version ${data.version.number}, not the requested version`
+    );
+  }
+  if (data.body.storage.representation !== "storage") {
+    throw new HistoricalReadMismatchError(
+      id,
+      version,
+      `the body is in "${data.body.storage.representation}" representation, not storage`
+    );
+  }
+  return { title: data.title, rawBody: data.body.storage.value, version: data.version.number };
+}
 
-  // Cache miss — full v1 fetch with body
-  return fetchV1VersionBody(pageId, version);
+function versionNotFound(id: string, type: ContentType, version: number): ConfluenceNotFoundError {
+  const what = type === "blogpost" ? "blog post" : "page";
+  const message =
+    `Version ${version} of ${what} ${id} was not found, or this account cannot view it. ` +
+    `Use get_page_versions to list the versions that exist.`;
+  const err = new ConfluenceNotFoundError(404, message);
+  err.message = message;
+  return err;
+}
+
+async function fetchV2VersionBody(
+  pageId: string,
+  version: number,
+  type?: ContentType
+): Promise<{ title: string; rawBody: string; version: number }> {
+  const result = await withContentType(pageId, type, async (t) => {
+    try {
+      return await getHistoricalStorage(pageId, t, version);
+    } catch (err) {
+      // The object itself was found (its type is known), so a 404 here is
+      // about the version, not about the page or blog post.
+      if (err instanceof ConfluenceNotFoundError) throw versionNotFound(pageId, t, version);
+      throw err;
+    }
+  });
+  // Cached only after every assertion passed.
+  pageCache.setVersioned(pageId, version, result.rawBody, "v2");
+  return result;
+}
+
+/**
+ * Historical body, title and version number.
+ *
+ * `source` picks the API (default v2). It is part of the cache key, so a body
+ * read from one API is never reused for, or diffed against, the other.
+ * `revert_page` passes the source from `revertHistoricalSource`.
+ */
+export async function getPageVersionBody(
+  pageId: string,
+  version: number,
+  opts?: { source?: HistoricalSource; type?: ContentType }
+): Promise<{ title: string; rawBody: string; version: number }> {
+  const source = opts?.source ?? "v2";
+  const cached = pageCache.getVersioned(pageId, version, source);
+  if (cached !== undefined) {
+    // Body is cached; a lightweight metadata fetch supplies the title (pages and blog posts).
+    const meta = await getContent(pageId, false);
+    return { title: meta.title, rawBody: cached, version };
+  }
+  return source === "v1"
+    ? fetchV1VersionBody(pageId, version)
+    : fetchV2VersionBody(pageId, version, opts?.type);
 }
 
 /**
  * Storage body of a page or blog post at `version`. Unlike
- * `getPageVersionBody`, a cache hit costs no request (no title lookup), and
- * only v1 endpoints are used, so blog posts work too.
+ * `getPageVersionBody`, a cache hit costs no request (no title lookup). v2,
+ * with the same fail-closed assertions; works for blog posts.
  */
 export async function getVersionStorage(pageId: string, version: number): Promise<string> {
-  const cached = pageCache.getVersioned(pageId, version);
+  const cached = pageCache.getVersioned(pageId, version, "v2");
   if (cached !== undefined) return cached;
-  return (await fetchV1VersionBody(pageId, version)).rawBody;
+  return (await fetchV2VersionBody(pageId, version)).rawBody;
 }
 
+/**
+ * v1 historical read. Used by `revert_page` in site mode until the parity
+ * probe allows v2 (see historical-source.ts). Asserts the version number like
+ * the v2 path does.
+ */
 async function fetchV1VersionBody(
   pageId: string,
   version: number
 ): Promise<{ title: string; rawBody: string; version: number }> {
+  assertNumericContentId(pageId);
+  assertHistoricalVersionNumber(version);
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}`);
+  const url = new URL(`${requireV1(cfg, "versions.read")}/content/${pageId}`);
   url.searchParams.set("version", String(version));
   url.searchParams.set("expand", "body.storage,version");
   const raw = await confluenceJson(url.toString());
   const data = V1PageVersionSchema.parse(raw);
+  if (data.version.number !== version) {
+    throw new HistoricalReadMismatchError(
+      pageId,
+      version,
+      `the answer is version ${data.version.number}, not the requested version`
+    );
+  }
   const rawBody = data.body.storage.value;
 
   // Cache the raw body for reuse by diff
-  pageCache.setVersioned(pageId, version, rawBody);
+  pageCache.setVersioned(pageId, version, rawBody, "v1");
 
   return { title: data.title, rawBody, version: data.version.number };
 }
@@ -2774,7 +3438,10 @@ export async function uploadAttachment(
   form.append("file", new Blob([new Uint8Array(fileData)]), filename);
   if (comment) form.append("comment", comment);
 
-  const attachUrl = withContainerStatus(`${cfg.apiV1}/content/${pageId}/child/attachment`, container);
+  const attachUrl = withContainerStatus(
+    `${requireV1(cfg, "attachments.upload")}/content/${pageId}/child/attachment`,
+    container
+  );
   // POST: a transfer-length timeout, the shared permit, and no automatic
   // retry (a repeated upload would add a second copy or version). A failure
   // after the request was sent surfaces as WriteOutcomeUnknownError.
@@ -2793,7 +3460,8 @@ export async function uploadAttachment(
           body: form,
         },
         "transfer",
-        (res) => res.json() as Promise<unknown>
+        (res) => res.json() as Promise<unknown>,
+        requestBaseFor(cfg)
       ),
       "POST",
       attachUrl
@@ -2826,9 +3494,25 @@ const LEGACY_ATTRIBUTION_LABEL = "epimethian-managed";
 export async function ensureAttributionLabel(
   pageId: string
 ): Promise<{ warning?: string }> {
+  // Gateway mode: labels need the v1 API, so the attribution label is skipped
+  // SILENTLY (decided for 7.6.0: no opt-in flag, no per-write warning). The
+  // version comment still carries the attribution.
+  const cfg = await getConfig();
+  if (!capabilitiesFor(cfg.apiMode)["attribution.label"]) return {};
   try {
     await addLabels(pageId, [ATTRIBUTION_LABEL]);
-    const labels = await getLabels(pageId);
+    // Best-effort cleanup of the legacy label. The label read is v2 and cannot
+    // see a never-published blog post draft; failing to read it must not turn
+    // a write that already succeeded into an error. The legacy label is only
+    // ever removed by its exact name.
+    let labels: LabelData[] = [];
+    try {
+      labels = await getLabels(pageId);
+    } catch (readErr) {
+      if (!(readErr instanceof ConfluenceNotFoundError || readErr instanceof ConfluencePermissionError)) {
+        throw readErr;
+      }
+    }
     if (labels.some((l) => l.name === LEGACY_ATTRIBUTION_LABEL)) {
       await removeLabel(pageId, LEGACY_ATTRIBUTION_LABEL);
     }
@@ -2882,12 +3566,14 @@ export function normalizeBodyForSubmit(body: string): string {
   return stripAttributionFooter(toStorageFormat(body));
 }
 
-export async function getLabels(pageId: string): Promise<LabelData[]> {
-  const cfg = await getConfig();
-  const data = LabelsResultSchema.parse(
-    await confluenceJson(`${cfg.apiV1}/content/${pageId}/label`)
+export async function getLabels(pageId: string, type?: ContentType): Promise<LabelData[]> {
+  const { items, moreAvailable } = await withContentType(pageId, type, (t) =>
+    walkV2List(`/${segmentFor(t)}/${pageId}/labels`, { limit: V2_MAX_PAGE_SIZE }, LabelSchema, "all")
   );
-  return data.results;
+  if (moreAvailable) {
+    throw new Error(`The label list for page ${pageId} is too long to read to the end.`);
+  }
+  return items;
 }
 
 export async function addLabels(
@@ -2895,8 +3581,9 @@ export async function addLabels(
   labels: string[]
 ): Promise<void> {
   const cfg = await getConfig();
+  const labelUrl = `${requireV1(cfg, "labels.write")}/content/${pageId}/label`;
   await guardPageSideWrite(pageId, () =>
-    confluenceSend(`${cfg.apiV1}/content/${pageId}/label`, {
+    confluenceSend(labelUrl, {
       method: "POST",
       body: JSON.stringify(labels.map((name) => ({ prefix: "global", name }))),
     })
@@ -2908,7 +3595,7 @@ export async function removeLabel(
   label: string
 ): Promise<void> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/label`);
+  const url = new URL(`${requireV1(cfg, "labels.write")}/content/${pageId}/label`);
   url.searchParams.set("name", label);
   await guardPageSideWrite(pageId, () => confluenceSend(url.toString(), { method: "DELETE" }));
 }
@@ -2943,7 +3630,9 @@ export async function getSiteDefaultLocale(cfg: Config): Promise<string | undefi
 
   const promise = (async () => {
     try {
-      const data = (await confluenceJson(`${cfg.apiV1}/settings/systemInfo`)) as { defaultLocale?: unknown };
+      const data = (await confluenceJson(`${requireV1(cfg, "badgeLocale.site")}/settings/systemInfo`)) as {
+        defaultLocale?: unknown;
+      };
       const raw = typeof data?.defaultLocale === "string" ? data.defaultLocale : undefined;
       if (!raw) return undefined;
       // Confluence returns "en_GB"/"de_DE"; normalize to "en"/"de".
@@ -2964,7 +3653,7 @@ export async function getContentState(
   container?: ContainerOptions
 ): Promise<ContentStateData | null> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
+  const url = new URL(`${requireV1(cfg, "contentState")}/content/${pageId}/state`);
   url.searchParams.set("status", container?.draft ? "draft" : "current");
   try {
     const data = await confluenceJson(url.toString());
@@ -2994,7 +3683,7 @@ export async function setContentState(
   container?: ContainerOptions
 ): Promise<void> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
+  const url = new URL(`${requireV1(cfg, "contentState")}/content/${pageId}/state`);
   url.searchParams.set("status", container?.draft ? "draft" : "current");
   try {
     await guardPageSideWrite(pageId, () =>
@@ -3019,7 +3708,7 @@ export async function removeContentState(
   container?: ContainerOptions
 ): Promise<void> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
+  const url = new URL(`${requireV1(cfg, "contentState")}/content/${pageId}/state`);
   url.searchParams.set("status", container?.draft ? "draft" : "current");
   try {
     await guardPageSideWrite(pageId, () => confluenceSend(url.toString(), { method: "DELETE" }));
@@ -3889,7 +4578,8 @@ export async function formatPage(
   const spaceKey = page.spaceId ?? page.space?.key ?? "N/A";
   const version = page.version?.number ?? 0;
   const webui = page._links?.webui ?? "";
-  const base = page._links?.base ?? `${cfg.url}/wiki`;
+  // Gateway mode: a response's `_links.base` may name the gateway; build from the site URL.
+  const base = (cfg.apiMode === "gateway" ? undefined : page._links?.base) ?? `${cfg.url}/wiki`;
   const url = webui
     ? `${base}${webui}`
     : `${cfg.url}/wiki/pages/${page.id}`;

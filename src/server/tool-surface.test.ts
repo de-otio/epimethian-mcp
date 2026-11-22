@@ -474,6 +474,9 @@ describe("tool surface: registries agree with what is registered", () => {
     const { tools } = await bootServer("read-only");
     const { READ_ONLY_TOOLS, ALWAYS_ON_TOOLS } = await import("./index.js");
     expect(names(tools).sort()).toEqual([...READ_ONLY_TOOLS, ...ALWAYS_ON_TOOLS].sort());
+    // `setup` prints this set from the same table.
+    const { registeredToolsFor } = await import("./tool-posture.js");
+    expect(names(tools).sort()).toEqual([...registeredToolsFor("site", "read-only")].sort());
     // download_attachment stays available in read-only profiles, as before.
     expect(names(tools)).toContain("download_attachment");
     expect(names(tools)).toContain("check_permissions");

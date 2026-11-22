@@ -86,7 +86,7 @@ Manage profiles:
 ```bash
 epimethian-mcp profiles              # list all (shows read-only status)
 epimethian-mcp profiles --verbose    # show URLs, emails, and read-only status
-CONFLUENCE_PROFILE=globex epimethian-mcp status   # test connection
+epimethian-mcp status --profile globex           # test connection
 epimethian-mcp profiles --remove <name>           # delete profile and credentials
 ```
 
@@ -152,7 +152,7 @@ Probe outcomes:
 
 - Token can write → effective posture is `read-write`; all tools registered.
 - Token is read-only → effective posture is `read-only`; write tools not registered.
-- Probe inconclusive → effective posture defaults to `read-write` with a visible warning.
+- Probe inconclusive (an unexpected answer such as 410, 429 or 5xx, or a network error) → effective posture is `read-only` for the session, with a visible warning. Restart to probe again, or pin `read-write` in the profile.
 
 ### Checking permissions
 

@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import { isValidExpiryDate } from './token-expiry.js';
 
 const SERVICE = 'epimethian-mcp';
 const LEGACY_ACCOUNT = 'confluence-credentials';
@@ -33,6 +34,90 @@ export interface KeychainCredentials {
   cloudId?: string;
   /** Tenant seal: human-readable display name (cloudName or host) captured at setup. Purely for user-facing messages. */
   tenantDisplayName?: string;
+  /**
+   * Gateway mode (7.6.0): the token is a scoped API token and every request goes
+   * through api.atlassian.com/ex/confluence/{cloudId}. Absent means site mode;
+   * "site" is never written. Only ever stored together with `cloudId`
+   * (see `buildKeychainRecord`).
+   */
+  apiMode?: 'gateway';
+  /** Scoped token expiry as shown at token creation, `YYYY-MM-DD`. Optional; only asked for in gateway setup. */
+  tokenExpiry?: string;
+}
+
+/**
+ * The one place a keychain record is assembled for writing. Enforces the
+ * gateway invariant: a record never claims gateway mode without the tenant
+ * seal that the gateway base is derived from. Optional fields are omitted,
+ * never written as undefined or empty.
+ */
+export function buildKeychainRecord(input: {
+  url: string;
+  email: string;
+  apiToken: string;
+  cloudId?: string;
+  tenantDisplayName?: string;
+  apiMode?: 'gateway';
+  tokenExpiry?: string;
+}): KeychainCredentials {
+  if (input.apiMode === 'gateway' && !input.cloudId) {
+    throw new Error(
+      'Refusing to store gateway mode without a tenant seal (cloudId): the gateway base is derived from it.'
+    );
+  }
+  if (input.tokenExpiry !== undefined && !isValidExpiryDate(input.tokenExpiry)) {
+    throw new Error(`Invalid token expiry "${input.tokenExpiry}": use a real date as YYYY-MM-DD.`);
+  }
+  return {
+    url: input.url,
+    email: input.email,
+    apiToken: input.apiToken,
+    ...(input.cloudId ? { cloudId: input.cloudId } : {}),
+    ...(input.tenantDisplayName ? { tenantDisplayName: input.tenantDisplayName } : {}),
+    ...(input.apiMode === 'gateway' ? { apiMode: 'gateway' as const } : {}),
+    ...(input.tokenExpiry !== undefined ? { tokenExpiry: input.tokenExpiry } : {}),
+  };
+}
+
+/**
+ * Validate a parsed keychain JSON value. Returns null when the required
+ * fields (url, email, apiToken) are missing. Optional fields that fail
+ * validation are dropped silently (same policy for all of them), so a
+ * hand-edited record can never smuggle in a mode or date that the writer
+ * would have refused.
+ *
+ * Every field the record can hold MUST be copied here: the opportunistic
+ * tenant seal re-saves `{ ...stored, cloudId }`, and a field this function
+ * does not parse is erased by that re-save.
+ */
+export function parseKeychainRecord(parsed: unknown): KeychainCredentials | null {
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    typeof (parsed as Record<string, unknown>).apiToken !== 'string' ||
+    typeof (parsed as Record<string, unknown>).url !== 'string' ||
+    typeof (parsed as Record<string, unknown>).email !== 'string'
+  ) {
+    return null;
+  }
+  const p = parsed as Record<string, unknown>;
+  const result: KeychainCredentials = {
+    url: p.url as string,
+    email: p.email as string,
+    apiToken: p.apiToken as string,
+  };
+  // Tenant seal fields — optional, string-only. Silently drop non-strings.
+  if (typeof p.cloudId === 'string' && p.cloudId) result.cloudId = p.cloudId;
+  if (typeof p.tenantDisplayName === 'string' && p.tenantDisplayName) {
+    result.tenantDisplayName = p.tenantDisplayName;
+  }
+  // Gateway mode: kept only when exactly "gateway"; anything else is site mode.
+  if (p.apiMode === 'gateway') result.apiMode = 'gateway';
+  // Token expiry: kept only as a real YYYY-MM-DD date.
+  if (typeof p.tokenExpiry === 'string' && isValidExpiryDate(p.tokenExpiry)) {
+    result.tokenExpiry = p.tokenExpiry;
+  }
+  return result;
 }
 
 function exec(cmd: string, args: string[]): Promise<string> {
@@ -128,6 +213,10 @@ function resolveAccount(profile?: string): string {
  */
 export async function saveToKeychain(creds: KeychainCredentials, profile?: string): Promise<void> {
   const account = resolveAccount(profile);
+  // Last line of defence behind buildKeychainRecord: never persist gateway mode without the seal.
+  if (creds.apiMode === 'gateway' && !creds.cloudId) {
+    throw new Error('Refusing to store gateway mode without a tenant seal (cloudId).');
+  }
   const json = JSON.stringify(creds);
   if (process.platform === 'darwin') {
     await writeMacOS(account, json);
@@ -168,29 +257,12 @@ export async function readFromKeychain(profile?: string): Promise<KeychainCreden
     throw new Error(`Corrupted keychain entry for ${label}: invalid JSON.`);
   }
 
-  if (
-    !parsed ||
-    typeof parsed !== 'object' ||
-    typeof (parsed as Record<string, unknown>).apiToken !== 'string' ||
-    typeof (parsed as Record<string, unknown>).url !== 'string' ||
-    typeof (parsed as Record<string, unknown>).email !== 'string'
-  ) {
+  const result = parseKeychainRecord(parsed);
+  if (!result) {
     const label = profile ? `profile "${profile}"` : 'legacy keychain entry';
     throw new Error(
       `Corrupted keychain entry for ${label}: missing required fields (url, email, apiToken).`
     );
-  }
-
-  const p = parsed as Record<string, unknown>;
-  const result: KeychainCredentials = {
-    url: p.url as string,
-    email: p.email as string,
-    apiToken: p.apiToken as string,
-  };
-  // Tenant seal fields — optional, string-only. Silently drop non-strings.
-  if (typeof p.cloudId === 'string' && p.cloudId) result.cloudId = p.cloudId;
-  if (typeof p.tenantDisplayName === 'string' && p.tenantDisplayName) {
-    result.tenantDisplayName = p.tenantDisplayName;
   }
   return result;
 }

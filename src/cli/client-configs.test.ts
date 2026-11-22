@@ -206,7 +206,7 @@ describe("renderConfigSnippet", () => {
       }"
     `);
     expect(warning).toBe(
-      "OpenCode does not yet support MCP elicitation. The `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` env var above removes the interactive confirmation prompt for destructive operations. Read tools and additive writes work without any flag. Upgrade to epimethian-mcp v6.6.0 to get soft elicitation (confirmations routed through the agent), and remove the env var when you do."
+      "OpenCode does not yet support MCP elicitation. Without any flag, destructive operations use soft confirmation: the server answers with a one-time confirmation token, the agent asks you, and repeats the call with that token (an operation that cannot be confirmed this way is refused). The `EPIMETHIAN_ALLOW_UNGATED_WRITES=true` env var above skips that confirmation entirely; remove it if you want destructive operations confirmed. Read tools and additive writes work either way."
     );
   });
 

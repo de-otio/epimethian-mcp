@@ -65,6 +65,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     readOnly: false,
     attribution: false,
     apiV2: "https://example.atlassian.net/api/v2",
+    apiMode: "site" as const,
     apiV1: "https://example.atlassian.net/wiki/rest/api",
     authHeader: "Basic dGVzdA==",
     jsonHeaders: {},

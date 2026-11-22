@@ -8,6 +8,8 @@ Every tool declares a title and the annotation hints `readOnlyHint`, `destructiv
 
 **Untrusted-content fence.** Text read from Confluence (page bodies, titles, search results, comments) is wrapped in a fence the agent must not treat as instructions. Within the fence, text is Unicode-normalised (NFKC) and zero-width, bidirectional and control characters are removed.
 
+**Gateway mode.** A profile set up with a scoped API token (see [Installation](installation.md#gateway-mode-scoped-api-tokens)) registers 28 of the 41 tools (14 with the read-only posture). `search_pages`, `resolve_page_link`, `get_recent_changes`, `lookup_user`, `add_attachment`, `add_drawio_diagram`, `update_drawio_diagram`, `download_attachment`, `add_label`, `remove_label`, `get_page_status`, `set_page_status` and `remove_page_status` need the v1 API and are not registered; the server's instructions name them. The attribution label and the AI-edited badge are skipped without a warning.
+
 **Network behaviour.** Requests time out (30 s reads, 60 s writes, 120 s transfers; scaled by `EPIMETHIAN_HTTP_TIMEOUT_MS`, clamped to 5-300 s for reads). `GET` and `HEAD` are retried up to 3 attempts on 429 and 503, honouring `Retry-After` up to 60 s. At most 6 requests run at once. A write that times out or fails after being sent has an unknown outcome, and further `version: "current"` writes to that page are refused until you read it again.
 
 ---

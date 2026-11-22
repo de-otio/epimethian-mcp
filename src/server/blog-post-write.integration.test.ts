@@ -295,6 +295,21 @@ const fetchMock = vi.fn(async (input: unknown, init?: { method?: string; body?: 
   if ((m = p.match(/^v1:\/content\/(\d+)\/label$/))) {
     return json({ results: [] });
   }
+  // v2 container reads (labels, attachments). A never-published draft is
+  // not found here, like the plain /blogposts/{id} read: drafts keep using
+  // v1 with the draft status query for attachments.
+  if ((m = p.match(/^v2:\/(pages|blogposts)\/(\d+)\/(labels|attachments)$/)) && method === "GET") {
+    const [, kind, id, what] = m;
+    const found = kind === "pages" ? pages.has(id) : posts.has(id) && !isDraft(id);
+    if (!found) return json({ message: "nf" }, 404);
+    if (what === "labels") return json({ results: [] });
+    const name = url.searchParams.get("filename")?.toLowerCase();
+    const list = attachments.get(id) ?? [];
+    const hits = name ? list.filter((a) => a.title.toLowerCase() === name) : list;
+    return json({
+      results: hits.map((a) => ({ id: a.id, title: a.title, version: { number: a.version } })),
+    });
+  }
   if ((m = p.match(/^v1:\/content\/(\d+)\/state$/))) {
     const id = m[1];
     const asked = url.searchParams.get("status") ?? "current";
@@ -1045,14 +1060,20 @@ describe("drafts: attachments, status and comments", () => {
   it.each([
     ["a page", PAGE_ID],
     ["a published post", BLOG_ID],
-  ])("add_attachment and get_attachments on %s send no status (unchanged URLs)", async (_l, id) => {
+  ])("add_attachment and get_attachments on %s send no draft status", async (_l, id) => {
     const r = await call("add_attachment", { page_id: id, file_path: "/work/file.txt", overwrite: false });
     expect(r.isError, r.text).toBe(false);
     const list = await call("get_attachments", { page_id: id, limit: 25 });
     expect(list.isError, list.text).toBe(false);
     expect(list.text).toContain("file.txt");
-    expect(attachmentRequests().length).toBeGreaterThan(1);
+    // The upload is v1 and sends no status; the v2 listing asks for current
+    // attachments only (never draft).
+    expect(attachmentRequests().length).toBeGreaterThan(0);
     for (const x of attachmentRequests()) expect(x.query.has("status")).toBe(false);
+    const segment = id === PAGE_ID ? "pages" : "blogposts";
+    const listing = requests.filter((x) => x.method === "GET" && x.path === v2(`/${segment}/${id}/attachments`));
+    expect(listing.length).toBeGreaterThan(0);
+    for (const x of listing) expect(x.query.get("status")).toBe("current");
   });
 
   it("a failed status lookup uploads nothing", async () => {

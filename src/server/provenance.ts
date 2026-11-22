@@ -14,6 +14,7 @@ import {
   getSiteDefaultLocale,
   setContentState,
 } from "./confluence-client.js";
+import { capabilitiesFor } from "./api-capabilities.js";
 
 // ---------------------------------------------------------------------------
 // Label table
@@ -132,6 +133,12 @@ export async function markPageUnverified(
 ): Promise<{ warning?: string; applied?: true }> {
   // Feature disabled — bail out immediately without any API calls.
   if (cfg.unverifiedStatus === false) {
+    return {};
+  }
+
+  // Gateway mode: content states need the v1 API, so the badge is skipped
+  // SILENTLY (decided for 7.6.0: no opt-in flag, no per-write warning).
+  if (!capabilitiesFor(cfg.apiMode).unverifiedBadge) {
     return {};
   }
 

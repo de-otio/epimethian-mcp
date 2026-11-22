@@ -65,13 +65,15 @@ profile posture (user config)    × token capability (probe)    = effective mode
 "read-write" (user pinned)       × read-only token              = read-write  *
 "detect" (default)               × write-capable                = read-write
 "detect" (default)               × read-only token              = read-only
-"detect" (default)               × probe inconclusive           = read-write **
+"detect" (default)               × probe inconclusive           = read-only  **
 
  * User explicitly opted out of read-only. Writes will fail at call time with
    remediation messaging (Level 1b). A startup warning flags the mismatch but
    does not override the user's choice.
-** Preserves current behavior when detection cannot confirm. A visible warning
-   tells the user the probe could not determine capability.
+** Fails safe when detection cannot confirm (changed in 7.6.0; it was
+   read-write before). A visible warning tells the user the probe could not
+   determine capability. Only a dry-run answer of 400, 404 or 409 counts as
+   write-capable; 410, 429, other 4xx and 5xx are inconclusive.
 ```
 
 The `profile posture` setting is a tri-state: `"read-only"` | `"read-write"` | `"detect"` (default). Env var `CONFLUENCE_READ_ONLY=true|false` maps to the first two; anything else (or unset) is `"detect"`.

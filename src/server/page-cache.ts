@@ -57,10 +57,13 @@ export class PageCache {
 
   /**
    * Return cached body for a specific historical version.
-   * Uses composite key `${pageId}:v${version}` to coexist with current-version entries.
+   * Uses composite key `${pageId}:${source}:v${version}` to coexist with
+   * current-version entries. The source (`v1` or `v2` API) is part of the key
+   * so a body read from one API is never served for, or diffed against, a
+   * body read from the other (the two are not yet proven byte-identical).
    */
-  getVersioned(pageId: string, version: number): string | undefined {
-    const key = `${pageId}:v${version}`;
+  getVersioned(pageId: string, version: number, source: "v1" | "v2"): string | undefined {
+    const key = `${pageId}:${source}:v${version}`;
     const entry = this.cache.get(key);
     if (entry) {
       // Promote to most-recently-used
@@ -73,11 +76,12 @@ export class PageCache {
 
   /**
    * Store a historical version body.
-   * Uses composite key `${pageId}:v${version}` so multiple versions of the
-   * same page can coexist alongside the current-version entry.
+   * Uses composite key `${pageId}:${source}:v${version}` so multiple versions
+   * of the same page, from either API, can coexist alongside the
+   * current-version entry.
    */
-  setVersioned(pageId: string, version: number, body: string): void {
-    const key = `${pageId}:v${version}`;
+  setVersioned(pageId: string, version: number, body: string, source: "v1" | "v2"): void {
+    const key = `${pageId}:${source}:v${version}`;
     this.cache.delete(key);
     if (this.cache.size >= this.maxSize) {
       const oldest = this.cache.keys().next().value!;

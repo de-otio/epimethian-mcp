@@ -276,7 +276,7 @@ describe("R1 concurrency cap", () => {
         },
       } as unknown as Response;
     });
-    await Promise.all(Array.from({ length: 6 }, (_, i) => getLabels(String(i))));
+    await Promise.all(Array.from({ length: 6 }, (_, i) => getLabels(String(i), "page")));
     expect(peak).toBe(2);
     expect(active).toBe(0);
   });
@@ -314,7 +314,7 @@ describe("R1 concurrency cap", () => {
     });
     let first = true;
     setFetch((url) => {
-      if (url.includes("/content/1/")) {
+      if (url.includes("/pages/1/labels")) {
         if (first) {
           first = false;
           return json({}, 429, { "Retry-After": "1" });
@@ -324,10 +324,10 @@ describe("R1 concurrency cap", () => {
       return json({ results: [] });
     });
 
-    const p1 = getLabels("1");
+    const p1 = getLabels("1", "page");
     await started;
     // The only permit must be free now, so an unrelated request completes.
-    await expect(getLabels("2")).resolves.toEqual([]);
+    await expect(getLabels("2", "page")).resolves.toEqual([]);
     releaseSleep();
     await expect(p1).resolves.toEqual([]);
   });
@@ -342,8 +342,8 @@ describe("R1 concurrency cap", () => {
       await gate;
       return json({ results: [] });
     });
-    const held = getLabels("1");
-    await expect(getLabels("2")).rejects.toBeInstanceOf(ConcurrencyTimeoutError);
+    const held = getLabels("1", "page");
+    await expect(getLabels("2", "page")).rejects.toBeInstanceOf(ConcurrencyTimeoutError);
     expect(f).toHaveBeenCalledTimes(1);
     release();
     await held;

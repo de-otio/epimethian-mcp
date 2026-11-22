@@ -1,4 +1,5 @@
 import { main as startServer } from "../server/index.js";
+import { resolveProfileArg } from "./profile-arg.js";
 
 async function run(): Promise<void> {
   const command = process.argv[2];
@@ -15,7 +16,7 @@ async function run(): Promise<void> {
     await runProfiles();
   } else if (command === "status") {
     const { runStatus } = await import("./status.js");
-    await runStatus();
+    await runStatus(process.argv.slice(3));
   } else if (command === "permissions") {
     const profile = process.argv[3];
     const { runPermissions } = await import("./permissions.js");
@@ -38,6 +39,17 @@ async function run(): Promise<void> {
       process.exit(1);
     }
   } else {
+    // The server reads its profile from CONFLUENCE_PROFILE (getConfig, the
+    // recovery-mode server). `--profile <name>` (what setup's client snippets
+    // pass) is resolved against it first: a disagreement stops here, before
+    // any keychain read or request; an agreed name is put in the environment.
+    const resolved = resolveProfileArg(process.argv.slice(2), process.env);
+    if (!resolved.ok) {
+      console.error(`Error: ${resolved.error}`);
+      process.exit(1);
+      return;
+    }
+    if (resolved.profile !== undefined) process.env.CONFLUENCE_PROFILE = resolved.profile;
     await startServer();
   }
 }

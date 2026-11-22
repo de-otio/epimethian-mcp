@@ -70,8 +70,10 @@ SDK migration: https://github.com/modelcontextprotocol/typescript-sdk/tree/main/
 Confluence:
 
 - v1 REST answers **410** on the `api.atlassian.com/ex/confluence/{cloudId}` gateway (reports
-  from about 2026-08 and 2026-11). Site-URL Basic auth still reaches v1. Deprecation notice
-  CHANGE-864.
+  from about 2026-08 and 2026-11, with classic tokens). Site-URL Basic auth still reaches v1.
+  Deprecation notice CHANGE-864. Live 2026-11-22: a **scoped** token gets **401**, not 410,
+  from v1 through the gateway (the v1 label read answered 200); see
+  `doc/design/investigations/investigate-v1-v2-parity-2026-11.md`, Findings.
 - v2 has: `GET /pages/{id}?version=N&body-format=storage`, `GET /pages/{id}/versions`,
   `GET /pages/{id}/labels` (read only), `GET`/`DELETE /attachments`, ancestors, descendants,
   content properties, folders, tasks, restriction-state/permissions (new 2026-10-14),
@@ -305,13 +307,13 @@ rule only), new tests `gateway-mode.test.ts`, `api-capabilities.test.ts`.
    pagination cursors are checked against it. The credential latch on redirects is unchanged.
    Human-facing links are built from the site URL, never from a response's `_links.base`.
 5. **Capability map (C2) and degradation.** Fixed at startup (table below). Tools whose core
-   call is unavailable are **not registered** in gateway mode (decision pending, Q3), and the
+   call is unavailable are **not registered** in gateway mode (decided, Q3), and the
    main-server `instructions` gain one line naming the mode and the missing tools.
 6. **Side writes that degrade.** The attribution label (`ensureAttributionLabel`) and the
-   unverified badge (`markPageUnverified`) both need v1. In gateway mode both are skipped. The
-   startup banner and every write result carry one fixed warning ("gateway mode: no attribution
-   label or unverified status was set"). The version comment attribution still applies. Q4
-   asks whether this is acceptable.
+   unverified badge (`markPageUnverified`) both need v1. In gateway mode both are skipped
+   silently: no opt-in flag and no per-write warning (decided, Q4). The version comment
+   attribution still applies. A test asserts that a gateway-mode write makes no v1 call and
+   still sends the version comment.
 7. **Scopes.** Setup prints the granular scope list for the chosen posture. Read posture:
    `read:page:confluence`, `read:blogpost:confluence`, `read:space:confluence`,
    `read:attachment:confluence`, `read:label:confluence`, `read:comment:confluence`,
@@ -772,6 +774,27 @@ lists: Node floor, SDK package rename (only relevant to people embedding the ser
 2020-12 in `tools/list`, and any tool-surface change found by W-SHAPES.
 
 ## 11. Open questions for the user
+
+**Decided 2026-11-22:**
+
+- Q1: three releases, 7.6.0 → 8.0.0 → 8.1.0, as in §1.
+- Q2: the user creates a scoped, read-only, short-expiry token for the designated test profile;
+  gateway mode is live-verified with read-only calls before 7.6.0 ships.
+- Q3: tools that cannot work in gateway mode are left out of `tools/list`.
+- Q4: in gateway mode, writes proceed and simply omit the unverified badge and attribution
+  label. No opt-in flag and no per-write warning. The version comment (Epimethian version and
+  repo link) is still written, so provenance stays in the page history.
+
+Questions 6–12 are still open: 6–8 and 12 before 8.0.0, 9–11 before 8.1.0. Q5 is built to
+the recommendation (expiry asked at setup, shown in `status` and the banner, not in
+`get_version` / `check_permissions`) unless the user decides otherwise.
+
+**W-INV live runs.** The standing rules for the designated test profile allow only small,
+hand-run, read-only checks, and no subagent calls it. W-INV therefore builds and tests the
+probe script against stubbed `fetch` only; the user runs it by hand (or allows one run per
+invocation). Until its results are in, the conservative defaults apply: `revert_page` stays
+on v1 in site mode, `probeWriteCapability` keeps its v1 call in site mode, and every
+gateway-table row marked "to be confirmed" is treated as unavailable.
 
 1. **Release split.** 7.6.0 (v2 API + gateway mode) → 8.0.0 (SDK v2 + MRTR gate) → 8.1.0 (new
    tools). Agree, or fold 7.6.0 into 8.0.0?

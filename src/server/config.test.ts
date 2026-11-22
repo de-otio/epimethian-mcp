@@ -200,19 +200,19 @@ describe("resolveEffectivePosture", () => {
     expect(result).toEqual({ effective: "read-only", source: "probe" });
   });
 
-  // Row 6: configured detect + inconclusive → read-write / default / warning
-  it("detect + inconclusive probe → read-write, source: default, with warning", () => {
+  // Row 6: configured detect + inconclusive → read-only (fail safe) / default / warning
+  it("detect + inconclusive probe → read-only (fail safe), source: default, with warning", () => {
     const result = resolveEffectivePosture("detect", "inconclusive");
-    expect(result.effective).toBe("read-write");
+    expect(result.effective).toBe("read-only");
     expect(result.source).toBe("default");
     expect(result.warning).toMatch(/inconclusive/);
-    expect(result.warning).toMatch(/defaulting to read-write/);
+    expect(result.warning).toMatch(/read-only/);
   });
 
-  // Row 7: configured detect + null → read-write / default / warning
-  it("detect + null probe → read-write, source: default, with warning", () => {
+  // Row 7: configured detect + null → read-only (fail safe) / default / warning
+  it("detect + null probe → read-only (fail safe), source: default, with warning", () => {
     const result = resolveEffectivePosture("detect", null);
-    expect(result.effective).toBe("read-write");
+    expect(result.effective).toBe("read-only");
     expect(result.source).toBe("default");
     expect(result.warning).toMatch(/inconclusive/);
   });

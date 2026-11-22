@@ -10,11 +10,16 @@ vi.mock("../shared/test-connection.js", () => ({
   fetchTenantInfo: (...args: unknown[]) => mockFetchTenantInfo(...args),
 }));
 
-vi.mock("../shared/keychain.js", () => ({
-  saveToKeychain: (...args: unknown[]) => mockSaveToKeychain(...args),
-  readFromKeychain: (...args: unknown[]) => mockReadFromKeychain(...args),
-  PROFILE_NAME_RE: /^[a-z0-9][a-z0-9-]{0,62}$/,
-}));
+vi.mock("../shared/keychain.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../shared/keychain.js")>();
+  return {
+    // The pure record builder is the real one: setup's output is checked through it.
+    buildKeychainRecord: actual.buildKeychainRecord,
+    saveToKeychain: (...args: unknown[]) => mockSaveToKeychain(...args),
+    readFromKeychain: (...args: unknown[]) => mockReadFromKeychain(...args),
+    PROFILE_NAME_RE: /^[a-z0-9][a-z0-9-]{0,62}$/,
+  };
+});
 
 const mockAddToProfileRegistry = vi.fn().mockResolvedValue(undefined);
 const mockSetProfileSettings = vi.fn().mockResolvedValue(undefined);
@@ -109,7 +114,8 @@ describe("runSetup", () => {
   it("exits with error when API token is empty", async () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net")
-      .mockResolvedValueOnce("user@test.com");
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n"); // scoped token? no
 
     const originalOn = process.stdin.on;
     process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
@@ -130,7 +136,8 @@ describe("runSetup", () => {
   it("strips trailing slashes from URL", async () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net///")
-      .mockResolvedValueOnce("user@test.com");
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n"); // scoped token? no
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -168,7 +175,8 @@ describe("runSetup", () => {
     // User presses Enter for both prompts (accepts defaults)
     mockQuestion
       .mockResolvedValueOnce("") // accept default URL
-      .mockResolvedValueOnce(""); // accept default email
+      .mockResolvedValueOnce("") // accept default email
+      .mockResolvedValueOnce("n"); // scoped token? no
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -207,7 +215,8 @@ describe("runSetup", () => {
   it("handles backspace in password input", async () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net")
-      .mockResolvedValueOnce("user@test.com");
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n"); // scoped token? no
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -245,7 +254,8 @@ describe("runSetup", () => {
   it("saves to keychain on successful connection", async () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net") // url
-      .mockResolvedValueOnce("user@test.com"); // email
+      .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("n"); // scoped token? no
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -290,7 +300,8 @@ describe("runSetup", () => {
   it("exits on failed connection without saving", async () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net")
-      .mockResolvedValueOnce("user@test.com");
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n"); // scoped token? no
 
     mockTestConnection.mockResolvedValueOnce({
       ok: false,
@@ -324,6 +335,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net")
       .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("1"); // posture choice
 
     mockTestConnection.mockResolvedValueOnce({
@@ -373,6 +385,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net") // url
       .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce(""); // posture prompt → default (empty input)
 
     mockTestConnection.mockResolvedValueOnce({
@@ -390,9 +403,20 @@ describe("runSetup", () => {
     process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
     process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
 
+    const logSpy = vi.spyOn(console, "log");
     await runSetup("acme");
 
     expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-only" });
+    // The printed list is what a read-only site profile registers: no write tool.
+    const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    const listLine = out.split("\n").find((l) => l.startsWith("Available tools"))!;
+    expect(listLine).toMatch(/^Available tools, read-only \(\d+\):/);
+    const listed = out.split("Available tools, read-only")[1].split("\n")[1];
+    expect(listed).toContain("get_page");
+    expect(listed).toContain("search_pages");
+    expect(listed).not.toContain("create_page");
+    expect(listed).not.toContain("delete_page");
+    logSpy.mockRestore();
 
     process.stdin.on = originalOn;
   });
@@ -402,6 +426,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net") // url
       .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("1"); // posture choice
 
     mockTestConnection.mockResolvedValueOnce({
@@ -442,6 +467,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net") // url
       .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("2"); // posture choice → read-write
 
     mockTestConnection.mockResolvedValueOnce({
@@ -471,6 +497,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net") // url
       .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("3"); // posture choice → detect
 
     mockTestConnection.mockResolvedValueOnce({
@@ -488,9 +515,14 @@ describe("runSetup", () => {
     process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
     process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
 
+    const logSpy = vi.spyOn(console, "log");
     await runSetup("acme");
 
     expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "detect" });
+    const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain("Available tools depend on the startup probe (posture: detect).");
+    expect(out).toMatch(/Only if the probe finds the token can write \(\d+ more\): .*create_page/);
+    logSpy.mockRestore();
 
     process.stdin.on = originalOn;
   });
@@ -500,6 +532,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net") // url
       .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("99") // invalid choice
       .mockResolvedValueOnce("2"); // retry with valid choice
 
@@ -522,8 +555,8 @@ describe("runSetup", () => {
 
     // Verify setProfileSettings was called with the eventual valid choice
     expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-write" });
-    // Verify rl.question was called 4 times (url, email, invalid, retry)
-    expect(mockQuestion).toHaveBeenCalledTimes(4);
+    // Verify rl.question was called 5 times (url, email, scoped?, invalid, retry)
+    expect(mockQuestion).toHaveBeenCalledTimes(5);
 
     process.stdin.on = originalOn;
   });
@@ -533,6 +566,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net") // url
       .mockResolvedValueOnce("user@test.com") // email
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("foo") // invalid input
       .mockResolvedValueOnce("1"); // retry with valid choice
 
@@ -569,6 +603,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://globex.atlassian.net")
       .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("y") // tenant confirmation
       .mockResolvedValueOnce("1"); // posture choice
 
@@ -612,6 +647,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://globex.atlassian.net")
       .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("n"); // tenant confirmation → No
 
     mockTestConnection.mockResolvedValueOnce({
@@ -645,6 +681,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://onprem.example.com")
       .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("1"); // posture choice
 
     mockTestConnection.mockResolvedValueOnce({
@@ -696,6 +733,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net")
       .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("1"); // posture choice
 
     mockTestConnection.mockResolvedValueOnce({
@@ -737,7 +775,8 @@ describe("runSetup", () => {
     });
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net")
-      .mockResolvedValueOnce("user@test.com");
+      .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n"); // scoped token? no
 
     mockTestConnection.mockResolvedValueOnce({
       ok: true,
@@ -781,6 +820,7 @@ describe("runSetup", () => {
     mockQuestion
       .mockResolvedValueOnce("https://test.atlassian.net")
       .mockResolvedValueOnce("user@test.com")
+      .mockResolvedValueOnce("n") // scoped token? no
       .mockResolvedValueOnce("1"); // posture choice
 
     mockTestConnection.mockResolvedValueOnce({

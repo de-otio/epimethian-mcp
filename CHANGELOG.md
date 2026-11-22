@@ -5,6 +5,135 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [7.6.0] - 2026-11-22 - gateway mode and v2 reads
+
+### Added
+- **Gateway mode for scoped API tokens.** Atlassian's scoped tokens work only
+  through `https://api.atlassian.com/ex/confluence/{cloudId}`. `epimethian-mcp
+  setup --profile <name>` now asks "Is this a scoped API token?"; a yes stores
+  the profile in gateway mode, bound to the tenant's sealed cloud ID. See
+  `doc/user-doc/installation.md` for the scope list.
+  - Every credentialed request must start with the gateway prefix for the
+    sealed cloud ID; at each start the site's `tenant_info` must still return
+    that cloud ID, and the scoped token is never sent to the site URL.
+  - Tools that need the v1 API, which the gateway does not serve to scoped
+    tokens, are not registered (13 of 41: search, attachment upload and
+    download, the draw.io tools, labels, page status, recent changes, user
+    lookup and link resolution). The server instructions name them.
+  - The attribution label and the unverified badge (both v1) are skipped; the
+    version comment with the Epimethian version is still written.
+  - An optional token expiry date (`YYYY-MM-DD`) entered at setup is shown by
+    `status`; the server warns 14 days ahead and refuses to start once it has
+    passed.
+  - Live-verified for reads with a read-only scoped token (2026-11-22); gateway
+    writes are not yet verified.
+- `scripts/live/v2-parity.mjs`: an opt-in, read-only probe that compares the v1
+  and v2 answers for the reads above on chosen pages, printing only counts,
+  statuses and hashes. Results: `doc/design/investigations/investigate-v1-v2-parity-2026-11.md`.
+
+### Changed
+- Attachment lists and lookups, version history and label reads now use the
+  Confluence v2 API (`get_attachments`, `get_page_versions`, `get_labels`, the
+  attachment lookup behind `add_attachment` with `overwrite` and the draw.io
+  tools). Blog posts keep working: every read is routed to `/pages/...` or
+  `/blogposts/...`. Output is unchanged except as noted below. Uploads, label
+  writes and content status stay on v1, which has no v2 equivalent.
+- Attachment lookup by name now reads every page of the answer, compares the
+  title exactly (case-sensitive), treats no match as "not found" and refuses
+  when two attachments have the same name, instead of picking one.
+- `get_page_versions` shows each version's author from a v2 account id. Names
+  come from one cached `users-bulk` lookup; if that fails the versions are
+  still listed with `account <id> (name unavailable)`.
+- A list cursor that points outside the Confluence API (another origin, another
+  tenant prefix, another endpoint) is refused instead of followed.
+- Reading a label list no longer fails a write that already succeeded when the
+  legacy-label cleanup cannot read the page's labels.
+- Historical page bodies (`get_page_version`, `diff_page_versions`, and the
+  per-page diffs in `get_recent_changes`) are read from the v2 API with a
+  fail-closed check: the answer must be the requested version, with a storage
+  body, for the requested content, otherwise the read fails. A server that
+  ignores `?version=` can no longer show the current body as an old version or
+  turn a diff into "No changes".
+- `revert_page` keeps reading the target version from the v1 API in site mode,
+  because a revert writes the body it reads. The live probe found v1 and v2
+  bodies byte-identical for 27 of 27 sampled versions, but the sample had no
+  restored or legacy-editor version; the switch waits for those. The v1 read
+  now asserts the version number too. In gateway mode (no v1) `revert_page`
+  uses v2 with the same assertion.
+- `get_attachments` may list files in a different order than before: the v2
+  API orders them differently.
+- The in-memory cache of historical bodies is keyed by source (v1 or v2), so a
+  body from one API is never reused for, or compared against, the other.
+
+### Fixed
+- Attachment lists and name lookups ask for current attachments only
+  (`status=current`) and drop any archived or trashed item in the answer, so an
+  overwrite or a draw.io update can never add a version to an archived file,
+  and a current file next to an archived one of the same name is no longer
+  refused as ambiguous.
+- The attachment lookup no longer relies on the server's `filename=` filter: it
+  reads the page's whole current list and decides exact and case-only matches
+  itself. With a case-sensitive server filter, `add_attachment` overwrite of
+  `A.drawio` next to `a.drawio` still refuses, and the draw.io preview guard
+  still sees `X.drawio.PNG`.
+- v2 reads of an id of unknown type now read the page or blog post itself
+  first and route on that answer; a sub-collection (attachments, labels,
+  versions) answering 200 under `/pages/` no longer marks a blog post as a
+  page.
+- A missing version of an existing page or blog post is reported as such,
+  not as "No page or blog post with id ...".
+- v2 list cursors in the gateway's prefixed form
+  (`/ex/confluence/{cloudId}/wiki/api/v2/...`) are followed when the prefix is
+  exactly the sealed one and the cursor continues the same listing; another
+  cloudId's prefix, and any `/ex/...` cursor in site mode, are refused.
+- Gateway mode: credentialed requests (API calls, the connection check and the
+  setup scope probe) never follow a redirect; a 3xx is an error, and a write
+  that drew one is reported as "outcome unknown". Path parameters (`;`, `..;`,
+  `%3b`) are refused under the gateway prefix. Site mode is unchanged.
+- The tenant check, the connection check and the setup scope probe time out
+  after 15 seconds instead of hanging.
+- Gateway setup always asks for the tenant confirmation (`--yes` no longer
+  skips it), requires an `*.atlassian.net` site unless
+  `--allow-non-atlassian-host` is given, and strips control characters from the
+  tenant name before printing or saving it.
+- The setup scope check now says what it actually tested: "this token can /
+  cannot update pages", and that other write scopes were not probed.
+- Posture `detect`: the startup write probe counts only a 400, 404 or 409
+  answer as write-capable. Any other answer (410, 429, 5xx, ...) is
+  inconclusive, and an inconclusive probe now runs the session read-only with a
+  warning (it used to default to read-write).
+- Docs: the gateway-mode tenant guard is described as two legs on
+  Epimethian's side, the sealed cloud ID (checked against the site's
+  `tenant_info` at every start) and the gateway-prefix pin on every
+  credentialed request. Atlassian probably does not bind a scoped token to one
+  site; the docs recommend a separate Atlassian account per customer.
+- The server and `epimethian-mcp status` ignored `--profile <name>` and read
+  only `CONFLUENCE_PROFILE`, so every client snippet printed by setup (which
+  passes `"args": ["--profile", "<name>"]`) started with "Missing Confluence
+  credentials". Both now accept `--profile`. If `--profile` and
+  `CONFLUENCE_PROFILE` name different profiles they refuse to start and name
+  both, rather than pick one; a missing or invalid name is an error before any
+  keychain read.
+- Setup printed every tool for the mode ("Available tools in gateway mode
+  (28)", write tools included) whatever posture was chosen. It now prints the
+  tools the server will register for that mode and posture, from the server's
+  own tables (14 for a read-only gateway profile); for posture `detect` it says
+  the list depends on the startup probe and shows both possibilities.
+- The OpenCode snippet note no longer tells 7.x users to "upgrade to v6.6.0":
+  it describes soft confirmation, the default without a flag, and what the
+  `EPIMETHIAN_ALLOW_UNGATED_WRITES` env var in the snippet turns off.
+- Gateway mode with a read-only scoped token: the gateway refuses the dry-run
+  page update with 401 `scope does not match`, not 403 (live check
+  2026-11-22). The setup scope check now reads that answer as "this token
+  cannot update pages" instead of "inconclusive", and posture `detect` resolves
+  it to read-only from the probe instead of logging "probe threw unexpectedly".
+  Any other 401 keeps its meaning; site mode is unchanged.
+- Docs: the 12 gateway read scopes are confirmed for reads (live check
+  2026-11-22); the write scopes are not yet verified. A scoped token gets 401,
+  not 410, from v1 through the gateway; the 410 reports concern classic tokens.
+
 ## [7.5.0] - 2026-11-22 - security updates and agent hints
 
 ### Security
