@@ -3542,29 +3542,33 @@ describe("Comments", () => {
   // getPageVersionBody
   // ---------------------------------------------------------------------------
   describe("getVersionStorage", () => {
-    it("fetches the v1 body for the version (works for blog posts) and caches it", async () => {
-      global.fetch = mockFetchResponse({
-        id: "20",
-        title: "A blog post",
-        version: { number: 4 },
-        body: { storage: { value: "<p>v4</p>" } },
-      });
+    const v2Hist = (id: string, n: number, body: string) => ({
+      id,
+      title: "A blog post",
+      version: { number: n },
+      body: { storage: { representation: "storage", value: body } },
+    });
+
+    it("fetches the v2 body for the version and caches it under the v2 source", async () => {
+      global.fetch = mockFetchResponse(v2Hist("20", 4, "<p>v4</p>"));
       expect(await getVersionStorage("20", 4)).toBe("<p>v4</p>");
       const url = (global.fetch as any).mock.calls[0][0] as string;
-      expect(url).toContain(`${API_V1}/content/20`);
+      expect(url).toContain(`${API_V2}/pages/20`);
       expect(url).toContain("version=4");
-      expect(url).not.toContain("/api/v2/");
-      expect(pageCache.getVersioned("20", 4)).toBe("<p>v4</p>");
+      expect(url).toContain("body-format=storage");
+      expect(url).not.toContain("/rest/api/");
+      expect(pageCache.getVersioned("20", 4, "v2")).toBe("<p>v4</p>");
+      expect(pageCache.getVersioned("20", 4, "v1")).toBeUndefined();
     });
 
     it("throws on a 403 instead of returning an empty body", async () => {
       global.fetch = mockFetchSequence([{ status: 403, body: { message: "no" } }]);
       await expect(getVersionStorage("20", 4)).rejects.toMatchObject({ status: 403 });
-      expect(pageCache.getVersioned("20", 4)).toBeUndefined();
+      expect(pageCache.getVersioned("20", 4, "v2")).toBeUndefined();
     });
 
     it("costs no request on a cache hit", async () => {
-      pageCache.setVersioned("20", 4, "<p>cached</p>");
+      pageCache.setVersioned("20", 4, "<p>cached</p>", "v2");
       global.fetch = vi.fn() as any;
       expect(await getVersionStorage("20", 4)).toBe("<p>cached</p>");
       expect(global.fetch).not.toHaveBeenCalled();
@@ -3572,24 +3576,24 @@ describe("Comments", () => {
   });
 
   describe("getPageVersionBody", () => {
-    const v1Response = {
+    const v2Response = {
       id: "10",
       title: "My Page",
       version: { number: 3 },
-      body: { storage: { value: "<p>hello version 3</p>" } },
+      body: { storage: { representation: "storage", value: "<p>hello version 3</p>" } },
     };
 
-    it("constructs correct v1 URL with version and expand params", async () => {
-      global.fetch = mockFetchResponse(v1Response);
+    it("constructs the v2 URL with version and body-format params", async () => {
+      global.fetch = mockFetchResponse(v2Response);
       await getPageVersionBody("10", 3);
-      const url = (global.fetch as any).mock.calls[0][0] as string;
-      expect(url).toContain(`${API_V1}/content/10`);
-      expect(url).toContain("version=3");
-      expect(url).toContain("expand=body.storage%2Cversion");
+      const url = new URL((global.fetch as any).mock.calls[0][0] as string);
+      expect(url.origin + url.pathname).toBe(`${API_V2}/pages/10`);
+      expect(url.searchParams.get("version")).toBe("3");
+      expect(url.searchParams.get("body-format")).toBe("storage");
     });
 
     it("returns parsed title, rawBody, and version number", async () => {
-      global.fetch = mockFetchResponse(v1Response);
+      global.fetch = mockFetchResponse(v2Response);
       const result = await getPageVersionBody("10", 3);
       expect(result.title).toBe("My Page");
       expect(result.rawBody).toBe("<p>hello version 3</p>");
@@ -3597,19 +3601,17 @@ describe("Comments", () => {
     });
 
     it("caches raw body via pageCache.setVersioned after fetch", async () => {
-      global.fetch = mockFetchResponse(v1Response);
+      global.fetch = mockFetchResponse(v2Response);
       await getPageVersionBody("10", 3);
-      expect(pageCache.getVersioned("10", 3)).toBe("<p>hello version 3</p>");
+      expect(pageCache.getVersioned("10", 3, "v2")).toBe("<p>hello version 3</p>");
     });
 
     it("returns cached body on second call (only metadata fetch)", async () => {
-      // Pre-populate cache
-      pageCache.setVersioned("10", 3, "<p>cached v3</p>");
+      pageCache.setVersioned("10", 3, "<p>cached v3</p>", "v2");
       // Mock returns v2 metadata (no body)
       global.fetch = mockFetchResponse({ id: "10", title: "My Page", spaceId: "s1" });
       const result = await getPageVersionBody("10", 3);
       expect(result.rawBody).toBe("<p>cached v3</p>");
-      // Should have made exactly one call (metadata only via v2)
       expect(global.fetch).toHaveBeenCalledOnce();
       const url = (global.fetch as any).mock.calls[0][0] as string;
       expect(url).toContain(`${API_V2}/pages/10`);
@@ -3625,14 +3627,13 @@ describe("Comments", () => {
       await expect(getPageVersionBody("999", 1)).rejects.toThrow(ConfluenceApiError);
     });
 
-    it("handles v1 response shape correctly (body.storage.value path)", async () => {
-      const response = {
+    it("reads the body from the v2 body.storage.value path", async () => {
+      global.fetch = mockFetchResponse({
         id: "5",
         title: "Deep Page",
         version: { number: 7 },
-        body: { storage: { value: "<h1>Title</h1><p>Content</p>" } },
-      };
-      global.fetch = mockFetchResponse(response);
+        body: { storage: { representation: "storage", value: "<h1>Title</h1><p>Content</p>" } },
+      });
       const result = await getPageVersionBody("5", 7);
       expect(result.rawBody).toBe("<h1>Title</h1><p>Content</p>");
     });

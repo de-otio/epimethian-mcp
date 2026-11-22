@@ -92,6 +92,7 @@ import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
 import { settleInChunks, DEFAULT_MAX_CONCURRENCY } from "./request-policy.js";
 import { markPageUnverified } from "./provenance.js";
+import { revertHistoricalSource } from "./historical-source.js";
 
 /**
  * The trailing container argument for the v1 attachment and content-state
@@ -5988,8 +5989,20 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           );
         }
 
-        // 2. Fetch historical version's raw storage (reuse existing function)
-        const historical = await getPageVersionBody(page_id, target_version);
+        // 2. Fetch historical version's raw storage. The source is v1 in site
+        //    mode until the parity probe allows v2 (REVERT_HISTORICAL_SOURCE_SITE
+        //    in historical-source.ts), v2 in gateway mode. Both assert that the
+        //    answer is the requested version; a mismatch throws here, before any
+        //    write is prepared.
+        const historical = await getPageVersionBody(page_id, target_version, {
+          source: revertHistoricalSource(cfg),
+          type: "page",
+        });
+        if (historical.version !== target_version) {
+          throw new Error(
+            `Refusing to revert: the historical read returned version ${historical.version}, not ${target_version}. Nothing was changed.`
+          );
+        }
 
         // 3. Prepare body — replaceBody: true intentionally skips token diff;
         //    shrinkage and macro-loss guards still apply.

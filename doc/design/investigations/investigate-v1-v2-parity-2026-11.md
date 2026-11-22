@@ -149,3 +149,11 @@ must be confirmed by a read-only run before the release ships; a wrong one fails
    `{"results": [{"accountId", "displayName", ...}]}`. A failure or missing id shows the account id.
 6. **Labels (R8).** `GET /pages|blogposts/{id}/labels` items carry `id`, `name`, `prefix`
    (`global`, `my`, `team`, `system`), same names and prefixes as v1.
+7. **Historical bodies (R7).** `GET /pages|blogposts/{id}?version=N&body-format=storage` answers
+   `id`, `title`, `version.number` (echoing N) and `body.storage.{representation, value}` with
+   `representation === "storage"`. The reader is fail-closed on all four; `get_page_version` and
+   `diff_page_versions` therefore stop working (with a clear error) if any is missing. Record
+   whether `version.number` is echoed for every sampled version and for restored versions.
+8. **`revert_page`.** Stays on the v1 historical read in site mode until the 30-version table above
+   shows byte-identical bodies. Then flip `REVERT_HISTORICAL_SOURCE_SITE` in
+   `src/server/historical-source.ts` to `"v2"` (one line; tests cover both values).

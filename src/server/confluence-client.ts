@@ -34,6 +34,7 @@ import {
 } from "./config.js";
 import { buildApiBases, requestBaseFor, requireV1, type ApiMode } from "./api-base.js";
 import { resolveV2NextLink } from "./pagination-cursor.js";
+import type { HistoricalSource } from "./historical-source.js";
 
 // --- Client label (set once from index.ts after MCP initialize handshake) ---
 
@@ -3072,48 +3073,164 @@ export async function getPageVersions(
   });
 }
 
-export async function getPageVersionBody(
-  pageId: string,
+/**
+ * A historical read that cannot be shown to be the requested version of the
+ * requested content. Thrown instead of returning a body: a wrong historical
+ * body would become a silent no-op diff or, through `revert_page`, a wrong
+ * write. Never recovered by falling back to the current body.
+ */
+export class HistoricalReadMismatchError extends Error {
+  readonly contentId: string;
+  readonly requestedVersion: number;
+  constructor(contentId: string, requestedVersion: number, reason: string) {
+    super(
+      `Refusing to use the historical read of ${contentId} at version ${requestedVersion}: ${reason}. ` +
+        `Nothing was changed.`
+    );
+    this.name = "HistoricalReadMismatchError";
+    this.contentId = contentId;
+    this.requestedVersion = requestedVersion;
+  }
+}
+
+const V2HistoricalSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  version: z.object({ number: z.number() }),
+  body: z.object({
+    storage: z.object({ representation: z.string(), value: z.string() }),
+  }),
+});
+
+function assertHistoricalVersionNumber(version: number): void {
+  if (!Number.isInteger(version) || version < 1) {
+    throw new Error("Invalid version: expected a positive whole number.");
+  }
+}
+
+/**
+ * Storage body of a page or blog post at `version`, from v2
+ * `/{pages|blogposts}/{id}?version=N&body-format=storage`.
+ *
+ * FAIL CLOSED. The answer is used only when ALL of these hold; otherwise
+ * HistoricalReadMismatchError:
+ *   - it parses, with a body (a missing body is not an empty page);
+ *   - the content id is the one asked for;
+ *   - `version.number === version` (a server that ignores `?version=` answers
+ *     with the current version, which would otherwise pass as the old one);
+ *   - the body representation is `storage`.
+ * There is no fallback to the current body.
+ */
+export async function getHistoricalStorage(
+  id: string,
+  type: ContentType,
   version: number
 ): Promise<{ title: string; rawBody: string; version: number }> {
-  // Check versioned cache first
-  const cached = pageCache.getVersioned(pageId, version);
-  if (cached !== undefined) {
-    // Body is cached — lightweight metadata fetch for title
-    const raw = await v2Get(`/pages/${pageId}`, {});
-    const page = PageSchema.parse(raw);
-    return { title: page.title, rawBody: cached, version };
+  assertNumericContentId(id);
+  assertHistoricalVersionNumber(version);
+  const raw = await v2Get(`/${segmentFor(type)}/${id}`, {
+    version,
+    "body-format": "storage",
+  });
+  const parsed = V2HistoricalSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new HistoricalReadMismatchError(id, version, "the answer has no storage body");
   }
+  const data = parsed.data;
+  if (data.id !== id) {
+    throw new HistoricalReadMismatchError(id, version, "the answer is about different content");
+  }
+  if (data.version.number !== version) {
+    throw new HistoricalReadMismatchError(
+      id,
+      version,
+      `the answer is version ${data.version.number}, not the requested version`
+    );
+  }
+  if (data.body.storage.representation !== "storage") {
+    throw new HistoricalReadMismatchError(
+      id,
+      version,
+      `the body is in "${data.body.storage.representation}" representation, not storage`
+    );
+  }
+  return { title: data.title, rawBody: data.body.storage.value, version: data.version.number };
+}
 
-  // Cache miss — full v1 fetch with body
-  return fetchV1VersionBody(pageId, version);
+async function fetchV2VersionBody(
+  pageId: string,
+  version: number,
+  type?: ContentType
+): Promise<{ title: string; rawBody: string; version: number }> {
+  const result = await withContentType(pageId, type, (t) => getHistoricalStorage(pageId, t, version));
+  // Cached only after every assertion passed.
+  pageCache.setVersioned(pageId, version, result.rawBody, "v2");
+  return result;
+}
+
+/**
+ * Historical body, title and version number.
+ *
+ * `source` picks the API (default v2). It is part of the cache key, so a body
+ * read from one API is never reused for, or diffed against, the other.
+ * `revert_page` passes the source from `revertHistoricalSource`.
+ */
+export async function getPageVersionBody(
+  pageId: string,
+  version: number,
+  opts?: { source?: HistoricalSource; type?: ContentType }
+): Promise<{ title: string; rawBody: string; version: number }> {
+  const source = opts?.source ?? "v2";
+  const cached = pageCache.getVersioned(pageId, version, source);
+  if (cached !== undefined) {
+    // Body is cached; a lightweight metadata fetch supplies the title (pages and blog posts).
+    const meta = await getContent(pageId, false);
+    return { title: meta.title, rawBody: cached, version };
+  }
+  return source === "v1"
+    ? fetchV1VersionBody(pageId, version)
+    : fetchV2VersionBody(pageId, version, opts?.type);
 }
 
 /**
  * Storage body of a page or blog post at `version`. Unlike
- * `getPageVersionBody`, a cache hit costs no request (no title lookup), and
- * only v1 endpoints are used, so blog posts work too.
+ * `getPageVersionBody`, a cache hit costs no request (no title lookup). v2,
+ * with the same fail-closed assertions; works for blog posts.
  */
 export async function getVersionStorage(pageId: string, version: number): Promise<string> {
-  const cached = pageCache.getVersioned(pageId, version);
+  const cached = pageCache.getVersioned(pageId, version, "v2");
   if (cached !== undefined) return cached;
-  return (await fetchV1VersionBody(pageId, version)).rawBody;
+  return (await fetchV2VersionBody(pageId, version)).rawBody;
 }
 
+/**
+ * v1 historical read. Used by `revert_page` in site mode until the parity
+ * probe allows v2 (see historical-source.ts). Asserts the version number like
+ * the v2 path does.
+ */
 async function fetchV1VersionBody(
   pageId: string,
   version: number
 ): Promise<{ title: string; rawBody: string; version: number }> {
+  assertNumericContentId(pageId);
+  assertHistoricalVersionNumber(version);
   const cfg = await getConfig();
   const url = new URL(`${requireV1(cfg, "versions.read")}/content/${pageId}`);
   url.searchParams.set("version", String(version));
   url.searchParams.set("expand", "body.storage,version");
   const raw = await confluenceJson(url.toString());
   const data = V1PageVersionSchema.parse(raw);
+  if (data.version.number !== version) {
+    throw new HistoricalReadMismatchError(
+      pageId,
+      version,
+      `the answer is version ${data.version.number}, not the requested version`
+    );
+  }
   const rawBody = data.body.storage.value;
 
   // Cache the raw body for reuse by diff
-  pageCache.setVersioned(pageId, version, rawBody);
+  pageCache.setVersioned(pageId, version, rawBody, "v1");
 
   return { title: data.title, rawBody, version: data.version.number };
 }

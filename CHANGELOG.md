@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tenant prefix, another endpoint) is refused instead of followed.
 - Reading a label list no longer fails a write that already succeeded when the
   legacy-label cleanup cannot read the page's labels.
+- Historical page bodies (`get_page_version`, `diff_page_versions`, and the
+  per-page diffs in `get_recent_changes`) are read from the v2 API with a
+  fail-closed check: the answer must be the requested version, with a storage
+  body, for the requested content, otherwise the read fails. A server that
+  ignores `?version=` can no longer show the current body as an old version or
+  turn a diff into "No changes".
+- `revert_page` keeps reading the target version from the v1 API in site mode.
+  v2 historical bodies have not yet been shown to be byte-identical to v1 on
+  live content, and a revert writes the body it reads. The v1 read now asserts
+  the version number too. Switching to v2 is a one-line change
+  (`REVERT_HISTORICAL_SOURCE_SITE` in `historical-source.ts`) once the parity
+  probe passes. In gateway mode (no v1) `revert_page` uses v2 with the same
+  assertion.
+- The in-memory cache of historical bodies is keyed by source (v1 or v2), so a
+  body from one API is never reused for, or compared against, the other.
 
 ## [7.5.0] - 2026-11-22 - security updates and agent hints
 
