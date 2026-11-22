@@ -11,6 +11,12 @@ const shared = {
   target: "node18",
   loader: { ".md": "text" },
   define: { __PKG_VERSION__: JSON.stringify(pkg.version) },
+  // zod 4: the MCP SDK imports `zod/v4`, our code imports `zod`. Both are the
+  // same classic API, but bundled side by side esbuild initialises the shared
+  // modules lazily and never calls that init on the `zod/v4` path, so the
+  // CLI crashed at startup ("Class2 is not a constructor"). One entry point
+  // gives one init path. CI smoke-tests the built CLI (build.yml).
+  alias: { "zod/v4": "zod" },
 };
 
 const isWatch = process.argv.includes("--watch");

@@ -61,6 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the comment and, for a reply, from its parents. A comment whose page
   cannot be found is refused. Without an allowlist, nothing changes and no
   extra request is made.
+- Dependencies: zod 3.25 → 4.6.7 (memory exhaustion on oversized arrays,
+  GHSA-mrhx-c7xc-m3w5) and markdown-it 14.3.3 (three quadratic-time parsing
+  bugs); the bundled MCP SDK dependencies hono, @hono/node-server,
+  body-parser, fast-uri and ip-address are on patched releases. Every
+  patched version was at least two weeks old when it was picked. Tool
+  schemas are unchanged for clients: every parameter that was required
+  still is.
+- CI and the publish workflow now start the bundled CLI before tests pass
+  a release. zod 4 first built into a bundle that crashed at startup while
+  every unit test passed.
 
 ### Added
 - Every Confluence version comment Epimethian writes on a create or update

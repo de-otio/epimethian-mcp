@@ -706,7 +706,7 @@ const VersionMetadataSchema = z.object({
   by: z.object({
     displayName: z.string().default("unknown user"),
     accountId: z.string().default(""),
-  }).default({}),
+  }).prefault({}),
   when: z.string(),
   message: z.string().default(""),
   minorEdit: z.boolean(),

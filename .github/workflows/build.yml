@@ -28,4 +28,10 @@ jobs:
 
       - run: npm run build
 
+      # The suite runs from source; this loads the published bundle itself.
+      # A bundling fault (e.g. the zod 4 lazy-init crash) passes every test
+      # and only shows here. agent-guide is offline and loads every module.
+      - name: Smoke-test the bundled CLI
+        run: node dist/cli/index.js agent-guide > /dev/null
+
       - run: npm test -- --coverage

@@ -17,10 +17,10 @@ import { z } from "zod";
  *     ("6.0"), negative strings ("-6"), zero (0), negative integers,
  *     non-integer floats (6.5), and any other string not matching `^\d+$`.
  */
+// Not z.preprocess: under zod 4 its input type is `unknown`, so the
+// advertised JSON Schema would mark `version` as optional.
 export const versionField = z.union([
-  z.preprocess(
-    (v) => (typeof v === "string" && /^\d+$/.test(v) ? Number(v) : v),
-    z.number().int().positive(),
-  ),
+  z.number().int().positive(),
+  z.string().regex(/^\d+$/).transform(Number).pipe(z.number().int().positive()),
   z.literal("current"),
 ]);

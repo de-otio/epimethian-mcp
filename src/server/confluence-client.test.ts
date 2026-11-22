@@ -3437,6 +3437,14 @@ describe("Comments", () => {
       expect(result[0].message).toHaveLength(500);
     });
 
+    it("fills a missing author with the placeholder (zod 4: prefault, not default)", async () => {
+      const versions = { results: [{ number: 1, when: "2025-01-01T00:00:00Z", minorEdit: false }] };
+      global.fetch = mockFetchResponse(versions);
+      const result = await getPageVersions("1", 25);
+      expect(result[0].by).toEqual({ displayName: "unknown user", accountId: "" });
+      expect(result[0].message).toBe("");
+    });
+
     it("returns empty array for empty results", async () => {
       global.fetch = mockFetchResponse({ results: [] });
       const result = await getPageVersions("1", 25);
