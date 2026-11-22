@@ -522,8 +522,8 @@ describe("Scenario 7: auth error → remediation message", () => {
     }) as { content: { text: string }[]; isError?: boolean };
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Reauthenticate");
-    expect(result.content[0].text).toContain("epimethian-mcp login");
+    expect(result.content[0].text).toContain("Create a new token");
+    expect(result.content[0].text).toContain("epimethian-mcp setup --profile");
   });
 });
 
@@ -822,8 +822,8 @@ describe("toolErrorWithContext remediation dispatch", () => {
     const err = new ConfluenceAuthError(401, "Unauthorized");
     const result = toolErrorWithContext(err, { operation: "create_page", profile: "my-profile" });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Reauthenticate");
-    expect(result.content[0].text).toContain("epimethian-mcp login my-profile");
+    expect(result.content[0].text).toContain("Create a new token");
+    expect(result.content[0].text).toContain("epimethian-mcp setup --profile my-profile");
   });
 
   it("ConfluencePermissionError → permission message with operation + resource", async () => {
@@ -852,6 +852,6 @@ describe("toolErrorWithContext remediation dispatch", () => {
     const result = toolErrorWithContext(err, { operation: "create_page" });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("something generic failed");
-    expect(result.content[0].text).not.toContain("Reauthenticate");
+    expect(result.content[0].text).not.toContain("Create a new token");
   });
 });

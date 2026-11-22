@@ -36,6 +36,9 @@ const boot = vi.hoisted(() => {
     readOnly: false,
     effectivePosture: undefined as "read-only" | "read-write" | undefined,
     missingProfile: undefined as string | undefined,
+    // Posture the startup probe resolves to (posture "detect"). Applied by the
+    // validateStartup mock, as the real one swaps in a new config object.
+    probedPosture: undefined as "read-only" | "read-write" | undefined,
   };
 });
 
@@ -83,7 +86,9 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
         jsonHeaders: {},
       };
     }),
-    validateStartup: vi.fn().mockResolvedValue(undefined),
+    validateStartup: vi.fn(async () => {
+      if (boot.probedPosture !== undefined) boot.effectivePosture = boot.probedPosture;
+    }),
   };
 });
 
@@ -362,6 +367,23 @@ describe("tool surface: annotations and _meta", () => {
     }
   });
 
+  it("marks exactly get_page and search_pages alwaysLoad, and raises the result size only on the large page reads", async () => {
+    const { tools } = await bootServer("unlocked");
+    const alwaysLoad = tools.filter((t) => t._meta?.["anthropic/alwaysLoad"] === true).map((t) => t.name);
+    expect(alwaysLoad.sort()).toEqual(["get_page", "search_pages"]);
+    const bigResult = Object.fromEntries(
+      tools
+        .filter((t) => t._meta?.["anthropic/maxResultSizeChars"] !== undefined)
+        .map((t) => [t.name, t._meta?.["anthropic/maxResultSizeChars"]]),
+    );
+    expect(bigResult).toEqual({
+      get_page: 200_000,
+      get_page_by_title: 200_000,
+      get_page_version: 200_000,
+      diff_page_versions: 200_000,
+    });
+  });
+
   it("never combines readOnlyHint with destructiveHint", async () => {
     const { tools } = await bootServer("unlocked");
     for (const t of tools) {
@@ -556,6 +578,14 @@ describe("tool surface: invalid arguments", () => {
     expect(result.isError).toBe(true);
   });
 
+  it("get_recent_changes accepts a +HHMM offset in since (resolveWindow is the one rule)", async () => {
+    const { callTool } = await bootServer("unlocked");
+    // Both hours and since: resolveWindow refuses before any request, so the
+    // message proves the schema let "+0100" through.
+    const result = await callTool("get_recent_changes", { hours: 1, since: "2026-10-05T09:00:00+0100" });
+    expect(JSON.stringify(result.content)).toContain("exactly one of hours or since");
+  });
+
   it("returns an isError result for a missing required argument", async () => {
     const { callTool } = await bootServer("unlocked");
     const result = await callTool("update_page", { page_id: "123" });
@@ -606,8 +636,47 @@ describe("recovery server (setup_profile)", () => {
     expect(text).toContain("should not flow through this conversation");
   });
 
-  it("the main server sets no instructions", async () => {
+  it("the main server's instructions stay within the 1,800-char budget in both postures", async () => {
+    for (const state of ["unlocked", "read-only"] as const) {
+      const { instructions } = await bootServer(state);
+      expect((instructions ?? "").length, state).toBeLessThanOrEqual(MAX_DESCRIPTION);
+    }
+  });
+});
+
+describe("tool surface: posture resolved by the startup probe", () => {
+  // validateStartup replaces the config with one holding the probed posture;
+  // main() must register tools from that one, not the config it read first.
+  it("a token the probe finds read-only gets no write tools and read-only instructions", async () => {
+    boot.probedPosture = "read-only";
+    try {
+      const { tools, instructions } = await bootServer("unlocked");
+      expect(tools.map((t) => t.name)).not.toContain("update_page");
+      expect(tools.map((t) => t.name)).toContain("get_page");
+      expect(instructions).toContain("This profile is read-only");
+    } finally {
+      boot.probedPosture = undefined;
+    }
+  });
+});
+
+describe("tool surface: server instructions", () => {
+  // Claude Code with tool search shows only tool names plus these
+  // instructions at session start, and cuts them at 4,096 chars.
+  it("sends instructions that fit Claude Code's limit and name the entry tools", async () => {
     const { instructions } = await bootServer("unlocked");
-    expect(instructions).toBeUndefined();
+    expect(instructions).toBeTruthy();
+    expect(instructions!.length).toBeLessThanOrEqual(4096);
+    expect(instructions).toContain("search_pages");
+    expect(instructions).toContain("get_page");
+    expect(instructions).toContain("untrusted");
+    expect(instructions).toContain("confirm");
+    expect(instructions).not.toContain("This profile is read-only");
+  });
+
+  it("says a read-only profile has no write tools, and drops the write guidance", async () => {
+    const { instructions } = await bootServer("read-only");
+    expect(instructions).toContain("This profile is read-only");
+    expect(instructions).not.toContain("update_page_section");
   });
 });

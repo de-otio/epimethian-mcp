@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { z } from "zod";
 import { versionField } from "./version-schema.js";
 
 describe("versionField", () => {
@@ -74,5 +75,20 @@ describe("versionField", () => {
   it("rejects non-integer float (6.5)", () => {
     const result = versionField.safeParse(6.5);
     expect(result.success).toBe(false);
+  });
+});
+
+describe("versionField JSON Schema", () => {
+  // zod 4 treats a z.preprocess input as `unknown`, which made `version`
+  // optional in the tools/list schema. The tool input must keep it required.
+  it("stays required in the advertised input schema", () => {
+    const schema = z.toJSONSchema(z.object({ version: versionField }), { io: "input" }) as {
+      required?: string[];
+    };
+    expect(schema.required).toEqual(["version"]);
+  });
+
+  it("rejects a missing version at runtime", () => {
+    expect(z.object({ version: versionField }).safeParse({}).success).toBe(false);
   });
 });

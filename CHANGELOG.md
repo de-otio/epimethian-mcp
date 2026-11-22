@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.5.0] - 2026-11-22 - security updates and agent hints
+
+### Security
+- Dependencies: zod 3.25 → 4.6.7 (memory exhaustion on oversized arrays,
+  GHSA-mrhx-c7xc-m3w5) and markdown-it 14.3.3 (three quadratic-time parsing
+  bugs); the bundled MCP SDK dependencies hono, @hono/node-server,
+  body-parser, fast-uri and ip-address are on patched releases. Every
+  patched version was at least two weeks old when it was picked. Tool
+  schemas are unchanged for clients: every parameter that was required
+  still is.
+- CI and the publish workflow now start the bundled CLI before tests pass
+  a release. zod 4 first built into a bundle that crashed at startup while
+  every unit test passed.
+
+### Added
+- The server now sends MCP `instructions`: what the tools cover, where to
+  start (`search_pages`, `get_page`), that wiki content is untrusted, and, in
+  a read-write profile, how writes and confirmations work. Clients that load
+  tools on demand (Claude Code's tool search) show the model only tool
+  names and these instructions at session start.
+- Claude Code hints in tool `_meta`: `get_page` and `search_pages` load up
+  front (`anthropic/alwaysLoad`), and the large page reads (`get_page`,
+  `get_page_by_title`, `get_page_version`, `diff_page_versions`) may return
+  up to 200,000 chars before Claude Code moves the result to a file
+  (`anthropic/maxResultSizeChars`; its default of 50,000 is what a page read
+  at the default `max_length` crosses). Other clients ignore both keys.
+- Every Confluence version comment Epimethian writes on a create or update
+  now links the project repo next to the Epimethian version, e.g.
+  `Updated by Claude Code (via Epimethian v7.5.0, https://github.com/de-otio/epimethian-mcp)`.
+  When a long `version_message` would push the comment past Confluence's
+  500-char limit, the caller's text is shortened instead of the attribution,
+  link and `[destructive: ...]` flags.
+
+### Changed
+- `get_page_children` uses `GET /pages/{id}/direct-children`; the
+  `/pages/{id}/children` endpoint it called is deprecated in the v2 API. The
+  result now includes folders, whiteboards, databases and embeds, with the
+  type shown for anything that is not a page, and is in tree order.
+- An HTTP 410 from Confluence (Atlassian removed the endpoint, seen first on
+  v1 endpoints behind the `api.atlassian.com` gateway) now says so, names
+  the endpoint, says that this request was not applied but earlier steps of
+  the same tool call may have been, and points to `epimethian-mcp upgrade`,
+  instead of a bare status the agent might retry.
+
+### Fixed
+- A profile with `posture: "detect"` whose token the startup probe found
+  read-only still registered the write tools (each write then failed with
+  403), because tools were registered from the configuration read before the
+  probe ran. Such a profile now starts read-only, with the read-only banner
+  and instructions, as `"detect"` was meant to work.
+- An expired or invalid API token told the agent to run
+  `epimethian-mcp login <profile>`, a command that does not exist. It now
+  points to `epimethian-mcp setup --profile <profile>` and says that
+  Atlassian tokens expire after at most a year.
+
 ## [7.4.1] - 2026-10-15
 
 ### Fixed

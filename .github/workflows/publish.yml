@@ -33,6 +33,10 @@ jobs:
       - name: Test
         run: npm test
 
+      # Never publish a bundle that cannot start (see build.yml).
+      - name: Smoke-test the bundled CLI
+        run: node dist/cli/index.js agent-guide > /dev/null
+
       - name: Publish
         timeout-minutes: 10
         run: npx npm@11.12.1 publish --provenance --access public

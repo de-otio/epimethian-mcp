@@ -30,6 +30,8 @@ import {
   getPage,
   _rawCreatePage,
   _rawUpdatePage,
+  buildVersionMessage,
+  EPIMETHIAN_REPO_URL,
   deletePage,
   searchPages,
   searchContent,
@@ -55,6 +57,7 @@ import {
   toMarkdownView,
   looksLikeMarkdown,
   ConfluenceApiError,
+  ConfluenceEndpointRemovedError,
   ConfluenceAuthError,
   ConfluencePermissionError,
   ConfluenceNotFoundError,
@@ -1333,6 +1336,10 @@ describe("_rawUpdatePage", () => {
     });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message.length).toBeLessThanOrEqual(500);
+    // The caller's text is what gets shortened: attribution, link and
+    // destructive flags all survive.
+    expect(putBody.version.message).toContain(EPIMETHIAN_REPO_URL);
+    expect(putBody.version.message.endsWith("[destructive: replace_body]")).toBe(true);
   });
 });
 
@@ -1474,6 +1481,7 @@ describe("version messages with client label", () => {
     const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(body.version.message).toMatch(/^Created by Epimethian v/);
     expect(body.version.message).not.toContain("Claude");
+    expect(body.version.message).toContain(EPIMETHIAN_REPO_URL);
   });
 
   it("_rawUpdatePage includes client label without versionMessage", async () => {
@@ -1503,6 +1511,70 @@ describe("version messages with client label", () => {
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message).toMatch(/^Updated by Epimethian v/);
     expect(putBody.version.message).not.toContain("Claude");
+    expect(putBody.version.message).toContain(EPIMETHIAN_REPO_URL);
+  });
+});
+
+describe("buildVersionMessage", () => {
+  const URL = "https://github.com/de-otio/epimethian-mcp";
+
+  it("names the version and links the repo in every shape", () => {
+    expect(buildVersionMessage({ action: "Created", version: "6.1.0" })).toBe(
+      `Created by Epimethian v6.1.0 (${URL})`
+    );
+    expect(buildVersionMessage({ action: "Updated", version: "6.1.0", clientLabel: "Claude Code" })).toBe(
+      `Updated by Claude Code (via Epimethian v6.1.0, ${URL})`
+    );
+    expect(buildVersionMessage({ action: "Updated", version: "6.1.0", message: "Fixed typo" })).toBe(
+      `Fixed typo (via Epimethian v6.1.0, ${URL})`
+    );
+    expect(
+      buildVersionMessage({ action: "Updated", version: "6.1.0", message: "Fixed typo", clientLabel: "Claude Code" })
+    ).toBe(`Fixed typo (Claude Code via Epimethian v6.1.0, ${URL})`);
+    expect(
+      buildVersionMessage({ action: "Updated", version: "6.1.0", message: "M", destructiveFlags: ["replace_body"] })
+    ).toBe(`M (via Epimethian v6.1.0, ${URL}) [destructive: replace_body]`);
+  });
+
+  it("leaves a message that fits exactly at 500 chars untouched", () => {
+    const tail = ` (via Epimethian v1.0.0, ${URL})`;
+    const msg = "a".repeat(500 - tail.length);
+    expect(buildVersionMessage({ action: "Updated", version: "1.0.0", message: msg })).toBe(msg + tail);
+  });
+
+  it("shortens the caller's message one char over the limit, keeping the tail", () => {
+    const tail = ` (via Epimethian v1.0.0, ${URL})`;
+    const msg = "a".repeat(501 - tail.length);
+    const out = buildVersionMessage({ action: "Updated", version: "1.0.0", message: msg });
+    expect(out.length).toBe(500);
+    expect(out.endsWith(`…${tail}`)).toBe(true);
+  });
+
+  it("does not cut an emoji in half when shortening", () => {
+    const tail = ` (via Epimethian v1.0.0, ${URL})`;
+    // The cut point (room - 1) lands between the two halves of the emoji.
+    const room = 500 - tail.length;
+    const msg = "a".repeat(room - 2) + "😀" + "b".repeat(50);
+    const out = buildVersionMessage({ action: "Updated", version: "1.0.0", message: msg });
+    expect(out.length).toBeLessThanOrEqual(500);
+    expect(out).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(out.endsWith(`…${tail}`)).toBe(true);
+  });
+
+  it("never exceeds 500 chars and always keeps the link (property)", () => {
+    fc.assert(
+      fc.property(
+        fc.string({ maxLength: 1200 }),
+        fc.option(fc.string({ minLength: 1, maxLength: 80 }), { nil: undefined }),
+        fc.array(fc.constantFrom("replace_body", "confirm_shrinkage", "confirm_deletions"), { maxLength: 3 }),
+        (message, clientLabel, destructiveFlags) => {
+          const out = buildVersionMessage({ action: "Updated", version: "6.1.0", message, clientLabel, destructiveFlags });
+          expect(out.length).toBeLessThanOrEqual(500);
+          expect(out).toContain(URL);
+          expect(out).toContain("Epimethian v6.1.0");
+        }
+      )
+    );
   });
 });
 
@@ -1953,6 +2025,32 @@ describe("getPageChildren", () => {
     const children = await getPageChildren("parent-1", 10);
     expect(children).toHaveLength(1);
     expect(children[0].id).toBe("c1");
+    expect(children[0].type).toBe("page");
+  });
+
+  it("calls direct-children, not the deprecated children endpoint", async () => {
+    global.fetch = mockFetchResponse({ results: [] });
+    await getPageChildren("parent-1", 10);
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).toContain("/pages/parent-1/direct-children");
+    expect(url).toContain("limit=10");
+  });
+
+  it("tolerates a child with a null title or type", async () => {
+    global.fetch = mockFetchResponse({ results: [{ id: "w1", title: null, type: null }] });
+    const children = await getPageChildren("parent-1", 10);
+    expect(children).toEqual([{ id: "w1", title: "", type: "page" }]);
+  });
+
+  it("keeps folders and other non-page children with their type", async () => {
+    global.fetch = mockFetchResponse({
+      results: [
+        { id: "c1", title: "Child", type: "page", status: "current", childPosition: 0 },
+        { id: "f1", title: "Specs", type: "folder", status: "current", childPosition: 1 },
+      ],
+    });
+    const children = await getPageChildren("parent-1", 10);
+    expect(children.map((c) => [c.id, c.type])).toEqual([["c1", "page"], ["f1", "folder"]]);
   });
 
   it("returns empty array when no children", async () => {
@@ -2639,6 +2737,42 @@ describe("downloadAttachmentBytes", () => {
 // =============================================================================
 
 describe("HTTP error handling", () => {
+  it("maps 410 Gone to ConfluenceEndpointRemovedError with the endpoint and no retry", async () => {
+    global.fetch = mockFetchResponse("This deprecated endpoint has been removed", 410);
+    const err = await getPageChildren("123", 5).catch((e) => e);
+    expect(err).toBeInstanceOf(ConfluenceEndpointRemovedError);
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect(err.status).toBe(410);
+    expect(err.message).toContain("HTTP 410 Gone");
+    expect(err.message).toContain("This request was not applied");
+    // Never claims the whole tool call changed nothing (multi-step writes).
+    expect(err.message).not.toMatch(/nothing was changed/i);
+    expect(err.message).toContain("read the current state");
+    expect(err.message).toContain("epimethian-mcp upgrade");
+    // Method and path only: no host, no query string.
+    expect(err.endpoint).toBe("GET /wiki/api/v2/pages/123/direct-children");
+    expect(err.message).not.toContain("limit=");
+    expect(err.message).toContain("This deprecated endpoint has been removed");
+    expect((global.fetch as any).mock.calls).toHaveLength(1);
+  });
+
+  it("keeps the guidance when Confluence's 410 body is long", async () => {
+    global.fetch = mockFetchResponse("x".repeat(5000), 410);
+    const err = await getPageChildren("123", 5).catch((e) => e);
+    expect(err.message.startsWith("Atlassian has removed")).toBe(true);
+    // toolError() passes messages through sanitizeError, which keeps 500
+    // chars: the guidance must survive that cut even with a long endpoint.
+    const long = new ConfluenceEndpointRemovedError(
+      410,
+      "x".repeat(2000),
+      "POST",
+      "https://site.example.net/wiki/rest/api/content/1234567890/child/attachment/att1234567890/data?x=1",
+    );
+    const shown = sanitizeError(long.message);
+    expect(shown).toContain("read the current state");
+    expect(shown).toContain("epimethian-mcp upgrade");
+  });
+
   it("throws ConfluenceApiError on 400 response", async () => {
     global.fetch = mockFetchResponse("Bad Request", 400);
     await expect(getPage("1", false)).rejects.toThrow(ConfluenceApiError);
@@ -3375,6 +3509,14 @@ describe("Comments", () => {
       global.fetch = mockFetchResponse(versions);
       const result = await getPageVersions("1", 25);
       expect(result[0].message).toHaveLength(500);
+    });
+
+    it("fills a missing author with the placeholder (zod 4: prefault, not default)", async () => {
+      const versions = { results: [{ number: 1, when: "2025-01-01T00:00:00Z", minorEdit: false }] };
+      global.fetch = mockFetchResponse(versions);
+      const result = await getPageVersions("1", 25);
+      expect(result[0].by).toEqual({ displayName: "unknown user", accountId: "" });
+      expect(result[0].message).toBe("");
     });
 
     it("returns empty array for empty results", async () => {

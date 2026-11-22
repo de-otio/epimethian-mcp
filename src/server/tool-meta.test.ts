@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  ALWAYS_LOAD_META_KEY,
+  MAX_RESULT_SIZE_META_KEY,
   REQUIRES_USER_INTERACTION_META_KEY,
   destructiveTool,
   readOnlyTool,
@@ -53,5 +55,22 @@ describe("tool-meta", () => {
 
   it("rejects an empty title", () => {
     expect(() => readOnlyTool("  ")).toThrow(/title must be non-empty/);
+  });
+
+  it("readOnlyTool adds alwaysLoad and maxResultSizeChars only when asked", () => {
+    expect(readOnlyTool("Get page", { alwaysLoad: true })._meta).toEqual({ [ALWAYS_LOAD_META_KEY]: true });
+    expect(readOnlyTool("Get page", { maxResultSizeChars: 200_000 })._meta).toEqual({
+      [MAX_RESULT_SIZE_META_KEY]: 200_000,
+    });
+    expect(readOnlyTool("Get page", { alwaysLoad: false })._meta).toBeUndefined();
+  });
+
+  it("rejects a maxResultSizeChars Claude Code would ignore or that lowers the default", () => {
+    // Claude Code's own threshold is 50,000 and its ceiling 500,000.
+    expect(() => readOnlyTool("X", { maxResultSizeChars: 50_000 })).toThrow();
+    expect(() => readOnlyTool("X", { maxResultSizeChars: 500_001 })).toThrow();
+    expect(() => readOnlyTool("X", { maxResultSizeChars: 100_000.5 })).toThrow();
+    expect(readOnlyTool("X", { maxResultSizeChars: 50_001 })._meta).toBeDefined();
+    expect(readOnlyTool("X", { maxResultSizeChars: 500_000 })._meta).toBeDefined();
   });
 });

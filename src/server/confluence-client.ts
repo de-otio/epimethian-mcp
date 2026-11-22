@@ -706,7 +706,7 @@ const VersionMetadataSchema = z.object({
   by: z.object({
     displayName: z.string().default("unknown user"),
     accountId: z.string().default(""),
-  }).default({}),
+  }).prefault({}),
   when: z.string(),
   message: z.string().default(""),
   minorEdit: z.boolean(),
@@ -765,6 +765,41 @@ export class ConfluenceApiError extends Error {
 }
 
 export class ConfluenceAuthError extends ConfluenceApiError {}        // 401
+
+/**
+ * 410 Gone: Atlassian has removed the endpoint. Seen first on v1 REST
+ * endpoints reached through the api.atlassian.com gateway. A definite
+ * answer for THIS request (not applied), and no retry will help, so the
+ * message says so instead of echoing a bare status the agent might keep
+ * retrying. It must not claim the whole tool call changed nothing: a
+ * multi-step write (create_page then its v1 label) can fail on a later step.
+ */
+export class ConfluenceEndpointRemovedError extends ConfluenceApiError {
+  endpoint: string | undefined;
+  constructor(status: number, body: string, method?: string, url?: string) {
+    super(status, body);
+    this.name = "ConfluenceEndpointRemovedError";
+    this.endpoint = url ? `${method ?? "GET"} ${endpointPath(url)}` : undefined;
+    this.message =
+      `Atlassian has removed the Confluence API endpoint this operation uses` +
+      (this.endpoint ? ` (${this.endpoint})` : "") +
+      ` — HTTP 410 Gone. This request was not applied, but earlier steps of the ` +
+      `same tool call may have been (for example a page created before its label), ` +
+      `so read the current state before trying again. Retrying will not help: run ` +
+      `\`epimethian-mcp upgrade\` for a version that uses the replacement endpoint, ` +
+      `or report it at https://github.com/de-otio/epimethian-mcp/issues. ` +
+      `Confluence said: ${sanitizeError(body)}`;
+  }
+}
+
+/** Path of a request URL without host or query (ids only, no credentials). */
+function endpointPath(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url.split("?")[0];
+  }
+}
 
 export class ConfluencePermissionError extends ConfluenceApiError {}  // 403
 
@@ -1102,8 +1137,14 @@ export function _resetHttpStateForTests(
   );
 }
 
-function apiErrorFor(status: number, body: string): ConfluenceApiError {
+function apiErrorFor(
+  status: number,
+  body: string,
+  method?: string,
+  url?: string
+): ConfluenceApiError {
   if (status === 401) return new ConfluenceAuthError(status, body);
+  if (status === 410) return new ConfluenceEndpointRemovedError(status, body, method, url);
   if (status === 403) return new ConfluencePermissionError(status, body);
   if (status === 404) return new ConfluenceNotFoundError(status, body);
   return new ConfluenceApiError(status, body);
@@ -1173,7 +1214,7 @@ async function sendGuarded<T>(
       if (!isRead && (res.status === 502 || res.status === 504)) {
         throw new WriteOutcomeUnknownError(method, url, new Error(`HTTP ${res.status}`), "response");
       }
-      throw apiErrorFor(res.status, body);
+      throw apiErrorFor(res.status, body, method, url);
     });
     if (step.done) return step.value;
     await httpHooks.sleep(step.delayMs);
@@ -1598,10 +1639,11 @@ export async function _rawCreateContent(
   const pageBody = normalizeBodyForSubmit(body);
   const segment = segmentFor(type);
 
-  const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
-  const versionMsg = cfg.attribution && opts.clientLabel
-    ? `Created by ${opts.clientLabel} (via ${epimethianTag})`
-    : `Created by ${epimethianTag}`;
+  const versionMsg = buildVersionMessage({
+    action: "Created",
+    version: __PKG_VERSION__,
+    clientLabel: cfg.attribution ? opts.clientLabel : undefined,
+  });
   const payload: Record<string, unknown> = {
     title,
     spaceId,
@@ -1629,6 +1671,63 @@ export async function _rawCreateContent(
   // caller chain so warnings can be surfaced. No call here.
 
   return page;
+}
+
+/** Project page linked from every Confluence version message we write. */
+export const EPIMETHIAN_REPO_URL = "https://github.com/de-otio/epimethian-mcp";
+
+/** Confluence rejects version messages longer than this. */
+const VERSION_MESSAGE_MAX = 500;
+
+/**
+ * Build the Confluence version message ("version comment") for a create or
+ * update. Every message names the Epimethian version and links the repo:
+ *
+ *   Created by Epimethian v6.1.0 (https://github.com/de-otio/epimethian-mcp)
+ *   Fixed typo (Claude Code via Epimethian v6.1.0, https://github.com/...)
+ *
+ * The result never exceeds Confluence's 500-char limit. When it would, the
+ * caller-supplied message is shortened (ending in "…") so the attribution,
+ * the link and any `[destructive: ...]` suffix survive intact.
+ */
+export function buildVersionMessage(opts: {
+  action: "Created" | "Updated";
+  version: string;
+  clientLabel?: string;
+  message?: string;
+  destructiveFlags?: string[];
+}): string {
+  const tag = `Epimethian v${opts.version}`;
+  const suffix =
+    opts.destructiveFlags && opts.destructiveFlags.length > 0
+      ? ` [destructive: ${opts.destructiveFlags.join(", ")}]`
+      : "";
+
+  let head: string;
+  let tail: string;
+  if (opts.message) {
+    head = opts.message;
+    tail = opts.clientLabel
+      ? ` (${opts.clientLabel} via ${tag}, ${EPIMETHIAN_REPO_URL})`
+      : ` (via ${tag}, ${EPIMETHIAN_REPO_URL})`;
+  } else {
+    head = "";
+    tail = opts.clientLabel
+      ? `${opts.action} by ${opts.clientLabel} (via ${tag}, ${EPIMETHIAN_REPO_URL})`
+      : `${opts.action} by ${tag} (${EPIMETHIAN_REPO_URL})`;
+  }
+  tail += suffix;
+
+  const room = VERSION_MESSAGE_MAX - tail.length;
+  if (head.length > room) {
+    let cut = room > 1 ? head.slice(0, room - 1) : "";
+    // Never leave half of a surrogate pair (an emoji cut in two).
+    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+    head = cut ? `${cut}…` : "";
+  }
+  const full = head + tail;
+  // Only reachable with an absurd flag list; hard cap as the last resort.
+  return full.length > VERSION_MESSAGE_MAX ? full.slice(0, VERSION_MESSAGE_MAX) : full;
 }
 
 export interface RawUpdateOptions {
@@ -1689,27 +1788,15 @@ export async function _rawUpdateContent(
   const keepsVersion = !isPage && opts.fromStatus === "draft";
   const newVersion = keepsVersion ? opts.version : opts.version + 1;
 
-  const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
-  const effectiveClient = cfg.attribution ? opts.clientLabel : undefined;
-
-  let versionMessage: string;
-  if (opts.versionMessage && effectiveClient)
-    versionMessage = `${opts.versionMessage} (${effectiveClient} via ${epimethianTag})`;
-  else if (opts.versionMessage)
-    versionMessage = `${opts.versionMessage} (via ${epimethianTag})`;
-  else if (effectiveClient)
-    versionMessage = `Updated by ${effectiveClient} (via ${epimethianTag})`;
-  else
-    versionMessage = `Updated by ${epimethianTag}`;
-
-  // C3: append destructive-flag metadata so Confluence's version history
-  // records it too. Cap the combined length so we never exceed Confluence's
-  // 500-char version-message limit.
-  if (opts.destructiveFlags && opts.destructiveFlags.length > 0) {
-    const suffix = ` [destructive: ${opts.destructiveFlags.join(", ")}]`;
-    const combined = versionMessage + suffix;
-    versionMessage = combined.length > 500 ? combined.slice(0, 500) : combined;
-  }
+  // C3: destructive-flag metadata goes into the message so Confluence's
+  // version history records it too; the builder keeps it within 500 chars.
+  const versionMessage = buildVersionMessage({
+    action: "Updated",
+    version: __PKG_VERSION__,
+    clientLabel: cfg.attribution ? opts.clientLabel : undefined,
+    message: opts.versionMessage,
+    destructiveFlags: opts.destructiveFlags,
+  });
 
   // Compute the cleaned body ONCE — avoids double-execution of
   // stripAttributionFooter which could diverge if regex state drifts.
@@ -2043,12 +2130,34 @@ export async function listPages(
   return PagesResultSchema.parse(raw).results;
 }
 
+/**
+ * One item under a page. `direct-children` returns every content type that
+ * can sit in the page tree (page, folder, whiteboard, database, embed), not
+ * just pages, so callers must look at `type` before treating an id as a page.
+ */
+const ChildContentSchema = z.object({
+  id: z.string(),
+  // An untitled whiteboard or embed must not fail the whole listing.
+  title: z.string().nullish().transform((t) => t ?? ""),
+  type: z.string().nullish().transform((t) => t ?? "page"),
+});
+export type ChildContent = z.infer<typeof ChildContentSchema>;
+
+const ChildContentResultSchema = z.object({
+  results: z.array(ChildContentSchema).default([]),
+});
+
+/**
+ * Direct children of a page, in tree order. Uses
+ * `GET /pages/{id}/direct-children`; the older `/pages/{id}/children` is
+ * deprecated in the v2 spec and returns pages only, so folders went missing.
+ */
 export async function getPageChildren(
   pageId: string,
   limit: number
-): Promise<PageData[]> {
-  const raw = await v2Get(`/pages/${pageId}/children`, { limit });
-  return PagesResultSchema.parse(raw).results;
+): Promise<ChildContent[]> {
+  const raw = await v2Get(`/pages/${pageId}/direct-children`, { limit });
+  return ChildContentResultSchema.parse(raw).results;
 }
 
 export async function getSpaces(

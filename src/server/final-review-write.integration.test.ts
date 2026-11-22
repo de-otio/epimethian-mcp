@@ -536,10 +536,13 @@ describe("R2.2: placeholder id scope is stated on reads, parameters and errors",
       let s: z.ZodTypeAny = schema;
       for (const key of path) {
         while (!(s instanceof z.ZodObject) && !(s instanceof z.ZodArray)) {
-          s = (s._def as { innerType?: z.ZodTypeAny; schema?: z.ZodTypeAny }).innerType ??
-            (s._def as { schema: z.ZodTypeAny }).schema;
+          // optional/default wrap with innerType; a pipe (transform) with `in`.
+          const def = s._def as unknown as { innerType?: z.ZodTypeAny; in?: z.ZodTypeAny };
+          const next = def.innerType ?? def.in;
+          if (!next) throw new Error(`cannot unwrap ${s.constructor.name}`);
+          s = next;
         }
-        s = s instanceof z.ZodArray ? s.element : (s as z.ZodObject<z.ZodRawShape>).shape[key];
+        s = s instanceof z.ZodArray ? (s.element as z.ZodTypeAny) : (s as z.ZodObject<z.ZodRawShape>).shape[key] as z.ZodTypeAny;
       }
       return s.description ?? "";
     };
