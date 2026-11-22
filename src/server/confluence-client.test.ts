@@ -1550,6 +1550,17 @@ describe("buildVersionMessage", () => {
     expect(out.endsWith(`…${tail}`)).toBe(true);
   });
 
+  it("does not cut an emoji in half when shortening", () => {
+    const tail = ` (via Epimethian v1.0.0, ${URL})`;
+    // The cut point (room - 1) lands between the two halves of the emoji.
+    const room = 500 - tail.length;
+    const msg = "a".repeat(room - 2) + "😀" + "b".repeat(50);
+    const out = buildVersionMessage({ action: "Updated", version: "1.0.0", message: msg });
+    expect(out.length).toBeLessThanOrEqual(500);
+    expect(out).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(out.endsWith(`…${tail}`)).toBe(true);
+  });
+
   it("never exceeds 500 chars and always keeps the link (property)", () => {
     fc.assert(
       fc.property(
@@ -2023,6 +2034,12 @@ describe("getPageChildren", () => {
     const url = (global.fetch as any).mock.calls[0][0] as string;
     expect(url).toContain("/pages/parent-1/direct-children");
     expect(url).toContain("limit=10");
+  });
+
+  it("tolerates a child with a null title or type", async () => {
+    global.fetch = mockFetchResponse({ results: [{ id: "w1", title: null, type: null }] });
+    const children = await getPageChildren("parent-1", 10);
+    expect(children).toEqual([{ id: "w1", title: "", type: "page" }]);
   });
 
   it("keeps folders and other non-page children with their type", async () => {

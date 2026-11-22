@@ -5028,14 +5028,17 @@ async function spinUpWithPosture(
   postureSource: "profile" | "probe" | "default" = "profile"
 ): Promise<Set<string>> {
   const { getConfig } = await import("./confluence-client.js");
-  (getConfig as any).mockResolvedValueOnce({
+  const cfg = {
     ...BASE_CONFIG,
     readOnly: effectivePosture === "read-only",
     posture: effectivePosture,
     effectivePosture,
     postureSource,
     probedCapability: null,
-  });
+  };
+  // main() reads the config twice: before validateStartup and again after it
+  // (the probe can change the posture).
+  (getConfig as any).mockResolvedValueOnce(cfg).mockResolvedValueOnce(cfg);
 
   mockRegisterTool.mockClear();
 
@@ -5137,14 +5140,16 @@ describe("Track O2 — Conditional tool registration", () => {
   it("O2-5: one-time note appears in the first tool response in read-only mode", async () => {
     // Set up a fresh read-only server run with a get_page handler
     const { getConfig, getPage, formatPage } = await import("./confluence-client.js");
-    (getConfig as any).mockResolvedValueOnce({
+    const cfg = {
       ...BASE_CONFIG,
       readOnly: true,
       posture: "read-only",
       effectivePosture: "read-only",
       postureSource: "profile",
       probedCapability: null,
-    });
+    };
+    // main() reads the config before and after validateStartup.
+    (getConfig as any).mockResolvedValueOnce(cfg).mockResolvedValueOnce(cfg);
     mockRegisterTool.mockClear();
 
     const { main, _resetReadOnlyNoteForTest } = await import("./index.js");
@@ -6630,14 +6635,16 @@ describe("download_attachment in a read-only profile", () => {
     effectivePosture: "read-only" | "read-write",
   ): Promise<Map<string, Function>> {
     const { getConfig } = await import("./confluence-client.js");
-    (getConfig as any).mockResolvedValueOnce({
+    const cfg = {
       ...BASE_CONFIG,
       readOnly: effectivePosture === "read-only",
       posture: effectivePosture,
       effectivePosture,
       postureSource: "profile",
       probedCapability: null,
-    });
+    };
+    // main() reads the config before and after validateStartup.
+    (getConfig as any).mockResolvedValueOnce(cfg).mockResolvedValueOnce(cfg);
 
     mockRegisterTool.mockClear();
     const { main, _resetReadOnlyNoteForTest } = await import("./index.js");

@@ -1720,7 +1720,10 @@ export function buildVersionMessage(opts: {
 
   const room = VERSION_MESSAGE_MAX - tail.length;
   if (head.length > room) {
-    head = room > 1 ? `${head.slice(0, room - 1)}…` : "";
+    let cut = room > 1 ? head.slice(0, room - 1) : "";
+    // Never leave half of a surrogate pair (an emoji cut in two).
+    if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+    head = cut ? `${cut}…` : "";
   }
   const full = head + tail;
   // Only reachable with an absurd flag list; hard cap as the last resort.
@@ -2134,8 +2137,9 @@ export async function listPages(
  */
 const ChildContentSchema = z.object({
   id: z.string(),
-  title: z.string().default(""),
-  type: z.string().default("page"),
+  // An untitled whiteboard or embed must not fail the whole listing.
+  title: z.string().nullish().transform((t) => t ?? ""),
+  type: z.string().nullish().transform((t) => t ?? "page"),
 });
 export type ChildContent = z.infer<typeof ChildContentSchema>;
 

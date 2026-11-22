@@ -36,6 +36,9 @@ const boot = vi.hoisted(() => {
     readOnly: false,
     effectivePosture: undefined as "read-only" | "read-write" | undefined,
     missingProfile: undefined as string | undefined,
+    // Posture the startup probe resolves to (posture "detect"). Applied by the
+    // validateStartup mock, as the real one swaps in a new config object.
+    probedPosture: undefined as "read-only" | "read-write" | undefined,
   };
 });
 
@@ -83,7 +86,9 @@ vi.mock("./confluence-client.js", async (importOriginal) => {
         jsonHeaders: {},
       };
     }),
-    validateStartup: vi.fn().mockResolvedValue(undefined),
+    validateStartup: vi.fn(async () => {
+      if (boot.probedPosture !== undefined) boot.effectivePosture = boot.probedPosture;
+    }),
   };
 });
 
@@ -573,6 +578,14 @@ describe("tool surface: invalid arguments", () => {
     expect(result.isError).toBe(true);
   });
 
+  it("get_recent_changes accepts a +HHMM offset in since (resolveWindow is the one rule)", async () => {
+    const { callTool } = await bootServer("unlocked");
+    // Both hours and since: resolveWindow refuses before any request, so the
+    // message proves the schema let "+0100" through.
+    const result = await callTool("get_recent_changes", { hours: 1, since: "2026-10-05T09:00:00+0100" });
+    expect(JSON.stringify(result.content)).toContain("exactly one of hours or since");
+  });
+
   it("returns an isError result for a missing required argument", async () => {
     const { callTool } = await bootServer("unlocked");
     const result = await callTool("update_page", { page_id: "123" });
@@ -627,6 +640,22 @@ describe("recovery server (setup_profile)", () => {
     for (const state of ["unlocked", "read-only"] as const) {
       const { instructions } = await bootServer(state);
       expect((instructions ?? "").length, state).toBeLessThanOrEqual(MAX_DESCRIPTION);
+    }
+  });
+});
+
+describe("tool surface: posture resolved by the startup probe", () => {
+  // validateStartup replaces the config with one holding the probed posture;
+  // main() must register tools from that one, not the config it read first.
+  it("a token the probe finds read-only gets no write tools and read-only instructions", async () => {
+    boot.probedPosture = "read-only";
+    try {
+      const { tools, instructions } = await bootServer("unlocked");
+      expect(tools.map((t) => t.name)).not.toContain("update_page");
+      expect(tools.map((t) => t.name)).toContain("get_page");
+      expect(instructions).toContain("This profile is read-only");
+    } finally {
+      boot.probedPosture = undefined;
     }
   });
 });

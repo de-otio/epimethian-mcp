@@ -5699,9 +5699,10 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           .max(MAX_WINDOW_HOURS)
           .optional()
           .describe("Window length in hours, counted back from now (max 720 = 30 days)"),
+        // Validated by resolveWindow (explicit offset, Date.parse). Not
+        // .datetime(): under zod 4 it rejects "+0100" offsets 7.4 accepted.
         since: z
           .string()
-          .datetime({ offset: true })
           .optional()
           .describe("Window start as ISO 8601 with offset (e.g. 2026-10-05T09:00:00Z); alternative to hours"),
         spaces: z
@@ -6314,6 +6315,11 @@ export async function main() {
     throw err;
   }
   await validateStartup(config);
+  // validateStartup swaps in a new frozen config holding the probed posture
+  // (posture "detect"). Re-read it: the object above still carries the
+  // pre-probe placeholder "read-write", which registered write tools and
+  // write instructions for a token the probe found read-only.
+  config = await getConfig();
 
   // Initialize mutation log by default (Track C1).
   //

@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of a bare status the agent might retry.
 
 ### Fixed
+- A profile with `posture: "detect"` whose token the startup probe found
+  read-only still registered the write tools (each write then failed with
+  403), because tools were registered from the configuration read before the
+  probe ran. Such a profile now starts read-only, with the read-only banner
+  and instructions, as `"detect"` was meant to work.
 - An expired or invalid API token told the agent to run
   `epimethian-mcp login <profile>`, a command that does not exist. It now
   points to `epimethian-mcp setup --profile <profile>` and says that
