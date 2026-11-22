@@ -542,7 +542,8 @@ export async function runProbe({ request, mode, origin, pages, blogposts, versio
 // ---------------------------------------------------------------------------
 
 const NOT_RUN = "not run yet";
-const mdCell = (s) => String(s).replace(/\|/g, "\\|");
+// Escape backslashes first, then pipes, so a cell cannot end in an escape that eats the separator.
+const mdCell = (s) => String(s).replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
 const statusLabel = (s) => (s === 0 ? "ERR" : String(s));
 
 function histogram(h) {

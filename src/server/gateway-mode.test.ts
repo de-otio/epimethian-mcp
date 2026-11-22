@@ -180,7 +180,7 @@ const rest = (r: Req) => r.url.includes("/wiki/rest/api/");
 afterEach(() => {
   for (const r of authorisedRequests()) {
     expect(r.url.startsWith(`${GATEWAY}/`), `credential went to ${r.url}`).toBe(true);
-    expect(r.url.startsWith(SITE), "credential reached the site origin").toBe(false);
+    expect(new URL(r.url).origin, "credential reached the site origin").not.toBe(new URL(SITE).origin);
   }
   // The scoped token never appears in any URL.
   for (const r of requests) expect(r.url).not.toContain(SECRET);
