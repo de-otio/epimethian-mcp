@@ -92,6 +92,7 @@ import { storageToMarkdown } from "./converter/storage-to-md.js";
 import { logMutation, errorRecord, initMutationLog } from "./mutation-log.js";
 import { settleInChunks, DEFAULT_MAX_CONCURRENCY } from "./request-policy.js";
 import { markPageUnverified } from "./provenance.js";
+import { revertHistoricalSource } from "./historical-source.js";
 
 /**
  * The trailing container argument for the v1 attachment and content-state
@@ -5415,7 +5416,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     {
       description: withUntrustedNote(
         "List version history for a Confluence page. Returns version numbers, " +
-        "authors, dates, and change messages. Costs 1 API call."
+        "authors, dates, and change messages. Costs 1-2 API calls (a second call resolves author names)."
       ),
       inputSchema: {
         page_id: pageIdSchema.describe("Confluence page ID"),
@@ -5438,7 +5439,13 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           // displayName and version message are tenant-authored free text;
           // fence them so prompt injection via a crafted version note
           // cannot escape into the agent's instructions.
-          const authorFenced = fenceUntrusted(v.by.displayName, {
+          // v2 gives an account id, not a name: when the name lookup failed the
+          // id is shown, and said to be one.
+          const authorText =
+            v.by.nameResolved === false
+              ? `account ${v.by.accountId} (name unavailable)`
+              : v.by.displayName;
+          const authorFenced = fenceUntrusted(authorText, {
             field: "displayName",
           });
           lines.push(
@@ -5982,8 +5989,20 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           );
         }
 
-        // 2. Fetch historical version's raw storage (reuse existing function)
-        const historical = await getPageVersionBody(page_id, target_version);
+        // 2. Fetch historical version's raw storage. The source is v1 in site
+        //    mode until the parity probe allows v2 (REVERT_HISTORICAL_SOURCE_SITE
+        //    in historical-source.ts), v2 in gateway mode. Both assert that the
+        //    answer is the requested version; a mismatch throws here, before any
+        //    write is prepared.
+        const historical = await getPageVersionBody(page_id, target_version, {
+          source: revertHistoricalSource(cfg),
+          type: "page",
+        });
+        if (historical.version !== target_version) {
+          throw new Error(
+            `Refusing to revert: the historical read returned version ${historical.version}, not ${target_version}. Nothing was changed.`
+          );
+        }
 
         // 3. Prepare body — replaceBody: true intentionally skips token diff;
         //    shrinkage and macro-loss guards still apply.

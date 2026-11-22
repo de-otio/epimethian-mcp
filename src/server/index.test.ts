@@ -6601,7 +6601,7 @@ describe("Phase 2: soft-confirm preamble on gated tools", () => {
     (getPageVersionBody as any).mockResolvedValueOnce({
       rawBody: "<p>current body with plenty of content here</p>",  // same size — no shrinkage
       title: "Rev Page",
-      version: CURRENT_VERSION,
+      version: TARGET_VERSION, // the historical read must report the version asked for
     });
     (_rawUpdatePage as any).mockResolvedValueOnce({
       page: { id: PAGE_ID, title: "Rev Page", version: { number: CURRENT_VERSION + 1 } },
@@ -6630,6 +6630,46 @@ describe("Phase 2: soft-confirm preamble on gated tools", () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Reverted");
+  });
+
+  it("2.C (revert_page): a historical read that reports another version is refused, with no write", async () => {
+    const { getConfig, getPage, getPageVersionBody, _rawUpdatePage } = await import("./confluence-client.js");
+    const PAGE_ID = "page-rev-mismatch";
+    const CURRENT_VERSION = 4;
+    const TARGET_VERSION = 2;
+
+    (getConfig as any).mockResolvedValueOnce(configWithCloudId);
+    (getPage as any).mockResolvedValueOnce({
+      id: PAGE_ID, title: "Rev Page", version: { number: CURRENT_VERSION },
+      body: { storage: { value: "<p>current body with plenty of content here</p>" } },
+    });
+    // A reader that lost the version assertion would hand back the current body here.
+    (getPageVersionBody as any).mockResolvedValueOnce({
+      rawBody: "<p>current body with plenty of content here</p>",
+      title: "Rev Page",
+      version: CURRENT_VERSION,
+    });
+    (_rawUpdatePage as any).mockClear();
+
+    const { token } = mintToken({
+      tool: "revert_page",
+      cloudId: CLOUD_ID,
+      pageId: PAGE_ID,
+      pageVersion: CURRENT_VERSION,
+      diffHash: computeDiffHash("", CURRENT_VERSION),
+    });
+    delete process.env.EPIMETHIAN_ALLOW_UNGATED_WRITES;
+
+    const result = await registeredTools.get("revert_page")!.handler({
+      page_id: PAGE_ID,
+      target_version: TARGET_VERSION,
+      current_version: CURRENT_VERSION,
+      confirm_token: token,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Nothing was changed");
+    expect(_rawUpdatePage).not.toHaveBeenCalled();
   });
 });
 

@@ -33,6 +33,8 @@ import {
   resolveUnverifiedStatusLocale,
 } from "./config.js";
 import { buildApiBases, requestBaseFor, requireV1, type ApiMode } from "./api-base.js";
+import { resolveV2NextLink } from "./pagination-cursor.js";
+import type { HistoricalSource } from "./historical-source.js";
 
 // --- Client label (set once from index.ts after MCP initialize handshake) ---
 
@@ -716,6 +718,8 @@ const VersionMetadataSchema = z.object({
   by: z.object({
     displayName: z.string().default("unknown user"),
     accountId: z.string().default(""),
+    // v2 only: false when the account id stands in for a name the author lookup could not give.
+    nameResolved: z.boolean().optional(),
   }).prefault({}),
   when: z.string(),
   message: z.string().default(""),
@@ -1404,15 +1408,22 @@ async function fetchContent(
   id: string,
   includeBody: boolean
 ): Promise<PageData> {
+  const type: ContentType = segment === "blogposts" ? "blogpost" : "page";
   if (!includeBody) {
     const raw = await v2Get(`/${segment}/${id}`, {});
-    return PageSchema.parse(raw);
+    const data = PageSchema.parse(raw);
+    await rememberContentType(id, type);
+    return data;
   }
   if (segment === "blogposts") {
     const raw = await v2Get(`/blogposts/${id}`, { "body-format": "storage" });
-    return PageSchema.parse(raw);
+    const data = PageSchema.parse(raw);
+    await rememberContentType(id, type);
+    return data;
   }
-  return fetchPageWithCache(id);
+  const data = await fetchPageWithCache(id);
+  await rememberContentType(id, type);
+  return data;
 }
 
 /**
@@ -1477,12 +1488,14 @@ export async function resolveContentType(id: string): Promise<ContentType> {
   assertNumericContentId(id);
   try {
     PageSchema.parse(await v2Get(`/pages/${id}`, {}));
+    await rememberContentType(id, "page");
     return "page";
   } catch (err) {
     if (!(err instanceof ConfluenceNotFoundError)) throw err;
   }
   try {
     PageSchema.parse(await v2Get(`/blogposts/${id}`, {}));
+    await rememberContentType(id, "blogpost");
     return "blogpost";
   } catch (err) {
     if (err instanceof ConfluenceNotFoundError) throw notFoundAsPageOrBlogPost(id);
@@ -1508,7 +1521,9 @@ export async function getDraftBlogPost(id: string, includeBody: boolean): Promis
   assertNumericContentId(id);
   const params: Record<string, string> = { status: "draft" };
   if (includeBody) params["body-format"] = "storage";
-  return BlogPostSchema.parse(await v2Get(`/blogposts/${id}`, params));
+  const draft = BlogPostSchema.parse(await v2Get(`/blogposts/${id}`, params));
+  await rememberContentType(id, "blogpost");
+  return draft;
 }
 
 /**
@@ -1525,12 +1540,14 @@ export async function resolveContainerStatus(id: string): Promise<"current" | "d
   assertNumericContentId(id);
   try {
     PageSchema.parse(await v2Get(`/pages/${id}`, {}));
+    await rememberContentType(id, "page");
     return "current";
   } catch (err) {
     if (!(err instanceof ConfluenceNotFoundError)) throw err;
   }
   try {
     const post = BlogPostSchema.parse(await v2Get(`/blogposts/${id}`, {}));
+    await rememberContentType(id, "blogpost");
     return post.status === "draft" ? "draft" : "current";
   } catch (err) {
     if (!(err instanceof ConfluenceNotFoundError)) throw err;
@@ -1548,6 +1565,12 @@ export async function resolveContainerStatus(id: string): Promise<"current" | "d
 export interface ContainerOptions {
   /** The container is a blog post draft: send `status=draft`. */
   draft?: boolean;
+  /**
+   * The container's content type, when the caller already knows it. The v2
+   * reads route on it (`/pages/...` or `/blogposts/...`); when absent they try
+   * pages first and fall back to blog posts on a 404.
+   */
+  contentType?: ContentType;
 }
 
 /** Add `status=draft` to a v1 container URL when the container is a draft. */
@@ -1574,7 +1597,9 @@ export async function getBlogPost(
   let notFound: ConfluenceNotFoundError;
   try {
     const raw = await v2Get(`/blogposts/${id}`, includeBody ? { "body-format": "storage" } : {});
-    return { ...BlogPostSchema.parse(raw), contentType: "blogpost" };
+    const post = { ...BlogPostSchema.parse(raw), contentType: "blogpost" as const };
+    await rememberContentType(id, "blogpost");
+    return post;
   } catch (err) {
     if (!(err instanceof ConfluenceNotFoundError)) throw err;
     notFound = err;
@@ -1673,6 +1698,8 @@ export async function _rawCreateContent(
     // The POST succeeded; an unreadable answer must not read as "not created".
     throw new WriteOutcomeUnknownError("POST", `${cfg.apiV2}/${segment}`, err, "response");
   }
+
+  await rememberContentType(page.id, type);
 
   // Cache the body we just sent (new pages start at version 1). Pages only.
   if (type === "page") pageCache.set(page.id, page.version?.number ?? 1, pageBody);
@@ -2291,19 +2318,171 @@ export async function searchPagesByTitle(
   return results;
 }
 
+// --- v2 list reads: content-type routing and cursor pagination ---
+
+// Content type by id, learned from reads and creates that SUCCEEDED, scoped by
+// tenant URL like the space-key cache. An id's type never changes (ids are
+// unique across pages and blog posts), so entries never expire. The memo only
+// routes v2 reads (`/pages/...` vs `/blogposts/...`): it saves the pages probe
+// for blog posts, so blog flows never touch `/pages`. A wrong or missing entry
+// costs a 404 and the other path, never wrong data.
+const contentTypeMemo = new Map<string, ContentType>();
+
+async function rememberContentType(id: string, type: ContentType): Promise<void> {
+  const cfg = await getConfig();
+  contentTypeMemo.set(`${cfg.url}\u0000${id}`, type);
+}
+
+async function recallContentType(id: string): Promise<ContentType | undefined> {
+  const cfg = await getConfig();
+  return contentTypeMemo.get(`${cfg.url}\u0000${id}`);
+}
+
+/** Testing only. */
+export function _resetContentTypeMemoForTests(): void {
+  contentTypeMemo.clear();
+}
+
+/**
+ * Run a v2 read against `/pages/{id}/...` or `/blogposts/{id}/...` (contract C3).
+ *
+ * With a known `type` (argument, else the memo) exactly one request path is
+ * used. Without one the page path is tried first and only a 404 falls through
+ * to blog posts (as `getContent` does), so page reads cost no extra request;
+ * both 404 give one combined not-found. A success is remembered.
+ */
+async function withContentType<T>(
+  id: string,
+  type: ContentType | undefined,
+  read: (type: ContentType) => Promise<T>
+): Promise<T> {
+  assertNumericContentId(id);
+  const known = type ?? (await recallContentType(id));
+  if (known !== undefined) {
+    const result = await read(known);
+    await rememberContentType(id, known);
+    return result;
+  }
+  try {
+    const result = await read("page");
+    await rememberContentType(id, "page");
+    return result;
+  } catch (err) {
+    if (!(err instanceof ConfluenceNotFoundError)) throw err;
+  }
+  try {
+    const result = await read("blogpost");
+    await rememberContentType(id, "blogpost");
+    return result;
+  } catch (err) {
+    if (err instanceof ConfluenceNotFoundError) throw notFoundAsPageOrBlogPost(id);
+    throw err;
+  }
+}
+
+/** Pages followed per list read: bounds the work a hostile or buggy cursor chain can cause. */
+export const MAX_V2_LIST_PAGES = 20;
+/** v2 list endpoints cap `limit` at 250. */
+const V2_MAX_PAGE_SIZE = 250;
+
+const V2NextLinkSchema = z.object({ next: z.string().nullish() });
+
+/**
+ * Walk a v2 list by cursor.
+ *
+ * Stops once `wanted` items are in hand (or at the end of the list, or at
+ * MAX_V2_LIST_PAGES). `moreAvailable` is true whenever the list continues past
+ * what was returned, so callers that must see everything can refuse to decide.
+ * A cursor that fails `resolveV2NextLink` (another origin, path prefix or
+ * endpoint) throws: credentials are never sent to it and the list is never
+ * silently cut short.
+ */
+async function walkV2List<T>(
+  path: string,
+  params: Record<string, string | number>,
+  itemSchema: z.ZodType<T>,
+  wanted: number | "all"
+): Promise<{ items: T[]; moreAvailable: boolean }> {
+  const cfg = await getConfig();
+  const first = new URL(`${cfg.apiV2}${path}`);
+  for (const [k, v] of Object.entries(params)) first.searchParams.set(k, String(v));
+  const pageSchema = z.object({
+    results: z.array(itemSchema).default([]),
+    _links: V2NextLinkSchema.nullish(),
+  });
+  const items: T[] = [];
+  let url = first.toString();
+  for (let page = 0; page < MAX_V2_LIST_PAGES; page++) {
+    const parsed = pageSchema.parse(await confluenceJson(url));
+    items.push(...parsed.results);
+    const next = parsed._links?.next;
+    if (next === undefined || next === null || next === "") return { items, moreAvailable: false };
+    if (wanted !== "all" && items.length >= wanted) return { items, moreAvailable: true };
+    const resolved = resolveV2NextLink(next, cfg.apiV2, first.toString());
+    if (resolved === null) {
+      throw new Error(
+        "Refusing to follow a pagination link that does not stay on this Confluence API; " +
+          "the list was not read to the end."
+      );
+    }
+    url = resolved;
+  }
+  return { items, moreAvailable: true };
+}
+
+const V2AttachmentSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  mediaType: z.string().optional(),
+  fileSize: z.number().optional(),
+  downloadLink: z.string().optional(),
+  version: z.object({ number: z.number().int().positive() }).optional(),
+});
+
+/** Map a v2 attachment to the v1-shaped `AttachmentData` the tools already consume. */
+function v2AttachmentToData(a: z.infer<typeof V2AttachmentSchema>): AttachmentData {
+  return {
+    id: a.id,
+    title: a.title,
+    ...(a.version ? { version: { number: a.version.number } } : {}),
+    ...(a.fileSize !== undefined || a.mediaType !== undefined
+      ? {
+          extensions: {
+            ...(a.fileSize !== undefined ? { fileSize: a.fileSize } : {}),
+            ...(a.mediaType !== undefined ? { mediaType: a.mediaType } : {}),
+          },
+        }
+      : {}),
+    ...(a.downloadLink !== undefined ? { _links: { download: a.downloadLink } } : {}),
+  };
+}
+
 export async function getAttachments(
   pageId: string,
   limit: number,
   container?: ContainerOptions
 ): Promise<AttachmentData[]> {
-  // Attachments only available via v1 REST API
-  const cfg = await getConfig();
-  const url = new URL(`${requireV1(cfg, "attachments.read")}/content/${pageId}/child/attachment`);
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("expand", "version");
-  if (container?.draft) url.searchParams.set("status", "draft");
-  const raw = await confluenceJson(url.toString());
-  return AttachmentsResultSchema.parse(raw).results;
+  if (container?.draft) {
+    // A never-published blog post draft is only reachable through v1 with
+    // `status=draft`; v2's attachment list has no draft status. Stays v1.
+    const cfg = await getConfig();
+    const url = new URL(`${requireV1(cfg, "attachments.read")}/content/${pageId}/child/attachment`);
+    url.searchParams.set("limit", String(limit));
+    url.searchParams.set("expand", "version");
+    url.searchParams.set("status", "draft");
+    const raw = await confluenceJson(url.toString());
+    return AttachmentsResultSchema.parse(raw).results;
+  }
+  const pageSize = Math.min(Math.max(Math.trunc(limit), 1), V2_MAX_PAGE_SIZE);
+  const { items } = await withContentType(pageId, container?.contentType, (type) =>
+    walkV2List(
+      `/${segmentFor(type)}/${pageId}/attachments`,
+      { limit: pageSize },
+      V2AttachmentSchema,
+      Math.max(Math.trunc(limit), 1)
+    )
+  );
+  return items.slice(0, Math.max(Math.trunc(limit), 1)).map(v2AttachmentToData);
 }
 
 // --- Attachment lookup and new versions ---
@@ -2346,13 +2525,34 @@ export interface AttachmentLookup {
 }
 
 /**
+ * The attachments whose title equals `name` exactly (case-sensitive).
+ *
+ * The server's `filename` filter is only a narrowing step: it has matched
+ * loosely (v1 ignores case) and its behaviour may differ between APIs, so the
+ * decision is always made here, on the title, with `===`.
+ */
+export function exactAttachmentMatches<T extends { title: string }>(
+  attachments: readonly T[],
+  name: string
+): T[] {
+  return attachments.filter((a) => a.title === name);
+}
+
+/**
  * Find a page's attachment by its exact title.
  *
- * The v1 `filename` filter narrows the search on the server, but it ignores
- * case (probed live: `Example.drawio` returns `example.drawio`). The title is
- * therefore compared again here, exactly: an update must never pick a file
- * the caller did not name. Server matches that differ only in case come back
- * in `near`, so the caller can say "did you mean".
+ * The `filename` query narrows the search on the server, but the title is
+ * compared again here, exactly and case-sensitively: an update must never pick
+ * a file the caller did not name (`a.drawio` must not match `a.drawio.bak` or
+ * `A.drawio`). No exact match is "not found"; more than one is refused, never
+ * resolved by taking the first. Server matches that differ only in case come
+ * back in `near`, so the caller can say "did you mean".
+ *
+ * Every page of the answer is read: an exact match, or a second exact match,
+ * could be on a later page. If the list cannot be read to the end the lookup
+ * throws instead of deciding.
+ *
+ * A blog post draft keeps the v1 lookup (`status=draft` has no v2 equivalent).
  */
 export async function findAttachmentByName(
   pageId: string,
@@ -2360,23 +2560,42 @@ export async function findAttachmentByName(
   container?: ContainerOptions
 ): Promise<AttachmentLookup> {
   assertPageId(pageId);
-  const cfg = await getConfig();
-  const url = new URL(`${requireV1(cfg, "attachments.read")}/content/${pageId}/child/attachment`);
-  url.searchParams.set("filename", filename);
-  url.searchParams.set("expand", "version");
-  url.searchParams.set("limit", "25");
-  if (container?.draft) url.searchParams.set("status", "draft");
-  const raw = await confluenceJson(url.toString());
-  const all = AttachmentsResultSchema.parse(raw).results.map(toAttachmentInfo);
-  const exact = all.filter((a) => a.title === filename);
-  if (exact.length === 0 && all.length >= 25) {
-    // A full page of case-variants without the exact name: the exact match
-    // could be on a later page, so "absent" cannot be trusted.
-    throw new Error(
-      `Confluence returned ${all.length} attachments whose names match "${filename}" ignoring case; ` +
-        `refusing to decide that the exact name is absent.`
+  let all: AttachmentInfo[];
+  if (container?.draft) {
+    const cfg = await getConfig();
+    const url = new URL(`${requireV1(cfg, "attachments.read")}/content/${pageId}/child/attachment`);
+    url.searchParams.set("filename", filename);
+    url.searchParams.set("expand", "version");
+    url.searchParams.set("limit", "25");
+    url.searchParams.set("status", "draft");
+    const raw = await confluenceJson(url.toString());
+    all = AttachmentsResultSchema.parse(raw).results.map(toAttachmentInfo);
+    if (all.length >= 25 && exactAttachmentMatches(all, filename).length === 0) {
+      // A full page of case-variants without the exact name: the exact match
+      // could be on a later page, so "absent" cannot be trusted.
+      throw new Error(
+        `Confluence returned ${all.length} attachments whose names match "${filename}" ignoring case; ` +
+          `refusing to decide that the exact name is absent.`
+      );
+    }
+  } else {
+    const walked = await withContentType(pageId, container?.contentType, (type) =>
+      walkV2List(
+        `/${segmentFor(type)}/${pageId}/attachments`,
+        { filename, limit: 100 },
+        V2AttachmentSchema,
+        "all"
+      )
     );
+    if (walked.moreAvailable) {
+      throw new Error(
+        `The attachment list for page ${pageId} is too long to read to the end; ` +
+          `refusing to decide whether "${filename}" is present or unique.`
+      );
+    }
+    all = walked.items.map((a) => toAttachmentInfo(v2AttachmentToData(a)));
   }
+  const exact = exactAttachmentMatches(all, filename);
   if (exact.length > 1) {
     // Confluence keeps attachment titles unique per page; two exact matches
     // mean the answer cannot be trusted to pick one.
@@ -2384,7 +2603,7 @@ export async function findAttachmentByName(
       `Confluence returned ${exact.length} attachments with the same name on page ${pageId}; refusing to choose one.`
     );
   }
-  // The server's match is looser than case alone; keep only true case-variants.
+  // The server's match may be looser than case alone; keep only true case-variants.
   const folded = filename.toLowerCase();
   return {
     exact: exact[0] ?? null,
@@ -2712,64 +2931,306 @@ async function readDownloadResponse(
 
 // --- Version history ---
 
-export async function getPageVersions(
-  pageId: string,
-  limit: number
-): Promise<VersionMetadata[]> {
-  const cfg = await getConfig();
-  const url = new URL(`${requireV1(cfg, "versions.read")}/content/${pageId}/version`);
-  url.searchParams.set("limit", String(limit));
-  const raw = await confluenceJson(url.toString());
-  const data = VersionsResultSchema.parse(raw);
-  // Truncate messages (untrusted user content)
-  return data.results.map((v) => ({
-    ...v,
-    message: v.message.slice(0, 500),
-  }));
+/** v2 version-list item. `authorId` is an account id; names come from users-bulk. */
+const V2VersionSchema = z.object({
+  number: z.number(),
+  createdAt: z.string(),
+  message: z.string().nullish(),
+  minorEdit: z.boolean().nullish(),
+  authorId: z.string().nullish(),
+});
+
+/** Version pages are capped at 200 per request; the complete-walk fallback uses them all. */
+const V2_VERSION_PAGE_SIZE = 200;
+
+// Account id -> display name, scoped by tenant URL like the space-key cache so
+// a process ever pointed at a second tenant cannot answer from the first one's
+// cache. Only hits are cached: a failed lookup is retried on the next call.
+const userNameCache = new Map<string, string>();
+
+/** Testing only. */
+export function _resetUserNameCacheForTests(): void {
+  userNameCache.clear();
 }
 
-export async function getPageVersionBody(
+const UsersBulkSchema = z.object({
+  results: z
+    .array(
+      z.object({
+        accountId: z.string(),
+        displayName: z.string().nullish(),
+        publicName: z.string().nullish(),
+      })
+    )
+    .default([]),
+});
+
+/** Account ids are safe to send in a JSON body when they look like what Atlassian issues. */
+const ACCOUNT_ID_RE = /^[A-Za-z0-9:_-]{1,128}$/;
+const USERS_BULK_MAX = 100;
+
+/**
+ * Resolve account ids to display names with `POST /users-bulk` (one request per
+ * 100 distinct uncached ids). NEVER throws: a failed or partial lookup just
+ * leaves ids out of the map, and the caller shows the account id instead.
+ * Reading history must not depend on being allowed to read user profiles.
+ */
+async function resolveAccountNames(accountIds: readonly string[]): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  try {
+    const cfg = await getConfig();
+    const wanted: string[] = [];
+    for (const id of new Set(accountIds)) {
+      if (!ACCOUNT_ID_RE.test(id)) continue;
+      const cached = userNameCache.get(`${cfg.url}\u0000${id}`);
+      if (cached !== undefined) names.set(id, cached);
+      else wanted.push(id);
+    }
+    for (let i = 0; i < wanted.length; i += USERS_BULK_MAX) {
+      const chunk = wanted.slice(i, i + USERS_BULK_MAX);
+      try {
+        const data = UsersBulkSchema.parse(await v2Post("/users-bulk", { accountIds: chunk }));
+        for (const u of data.results) {
+          // Only names for ids we asked about: the answer is never trusted to add keys.
+          if (!chunk.includes(u.accountId)) continue;
+          const name = (u.displayName ?? u.publicName ?? "").trim();
+          if (name === "") continue;
+          names.set(u.accountId, name);
+          userNameCache.set(`${cfg.url}\u0000${u.accountId}`, name);
+        }
+      } catch (err) {
+        console.error(
+          `epimethian-mcp: warning - author name lookup failed; showing account ids instead ` +
+            `(${sanitizeError(err instanceof Error ? err.message : String(err))})`
+        );
+      }
+    }
+  } catch {
+    // Config or cache trouble: fall through with whatever was resolved.
+  }
+  return names;
+}
+
+function strictlyNewestFirst(numbers: readonly number[]): boolean {
+  for (let i = 1; i < numbers.length; i++) if (!(numbers[i - 1]! > numbers[i]!)) return false;
+  return numbers.length >= 2;
+}
+
+/**
+ * Version history of a page or blog post, NEWEST FIRST (v2 `/versions`).
+ *
+ * The result is always sorted by version number, descending, whatever order
+ * the server used, and holds at most `limit` entries. When the server's order
+ * cannot be seen to be newest-first on a list that continues past the first
+ * answer, the whole list is read before truncating: taking the first `limit`
+ * of an oldest-first list would present the oldest versions as the latest.
+ *
+ * v2 gives `authorId` only. Names come from one deduplicated, per-tenant
+ * cached users-bulk lookup; if it fails the entry shows the account id
+ * (`by.nameResolved === false`) and the read still succeeds.
+ */
+export async function getPageVersions(
   pageId: string,
+  limit: number,
+  type?: ContentType
+): Promise<VersionMetadata[]> {
+  const want = Math.max(Math.trunc(limit), 1);
+  const pageSize = Math.min(want, V2_VERSION_PAGE_SIZE);
+  const read = (wanted: number | "all", size: number) =>
+    withContentType(pageId, type, (t) =>
+      walkV2List(`/${segmentFor(t)}/${pageId}/versions`, { limit: size }, V2VersionSchema, wanted)
+    );
+
+  let walked = await read(want, pageSize);
+  if (walked.moreAvailable && !strictlyNewestFirst(walked.items.map((v) => v.number))) {
+    walked = await read("all", V2_VERSION_PAGE_SIZE);
+    if (walked.moreAvailable) {
+      throw new Error(
+        `The version list for page ${pageId} is too long to read to the end, so its newest versions cannot be identified.`
+      );
+    }
+  }
+  const newest = [...walked.items].sort((a, b) => b.number - a.number).slice(0, want);
+  const names = await resolveAccountNames(
+    newest.flatMap((v) => (v.authorId ? [v.authorId] : []))
+  );
+  // Truncate messages (untrusted user content)
+  return newest.map((v) => {
+    const accountId = v.authorId ?? "";
+    const resolved = accountId !== "" ? names.get(accountId) : undefined;
+    return {
+      number: v.number,
+      by: {
+        // Unresolved: the account id stands in for the name (anonymous: placeholder).
+        displayName: resolved ?? (accountId !== "" ? accountId : "unknown user"),
+        accountId,
+        ...(accountId !== "" ? { nameResolved: resolved !== undefined } : {}),
+      },
+      when: v.createdAt,
+      message: (v.message ?? "").slice(0, 500),
+      minorEdit: v.minorEdit ?? false,
+    };
+  });
+}
+
+/**
+ * A historical read that cannot be shown to be the requested version of the
+ * requested content. Thrown instead of returning a body: a wrong historical
+ * body would become a silent no-op diff or, through `revert_page`, a wrong
+ * write. Never recovered by falling back to the current body.
+ */
+export class HistoricalReadMismatchError extends Error {
+  readonly contentId: string;
+  readonly requestedVersion: number;
+  constructor(contentId: string, requestedVersion: number, reason: string) {
+    super(
+      `Refusing to use the historical read of ${contentId} at version ${requestedVersion}: ${reason}. ` +
+        `Nothing was changed.`
+    );
+    this.name = "HistoricalReadMismatchError";
+    this.contentId = contentId;
+    this.requestedVersion = requestedVersion;
+  }
+}
+
+const V2HistoricalSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  version: z.object({ number: z.number() }),
+  body: z.object({
+    storage: z.object({ representation: z.string(), value: z.string() }),
+  }),
+});
+
+function assertHistoricalVersionNumber(version: number): void {
+  if (!Number.isInteger(version) || version < 1) {
+    throw new Error("Invalid version: expected a positive whole number.");
+  }
+}
+
+/**
+ * Storage body of a page or blog post at `version`, from v2
+ * `/{pages|blogposts}/{id}?version=N&body-format=storage`.
+ *
+ * FAIL CLOSED. The answer is used only when ALL of these hold; otherwise
+ * HistoricalReadMismatchError:
+ *   - it parses, with a body (a missing body is not an empty page);
+ *   - the content id is the one asked for;
+ *   - `version.number === version` (a server that ignores `?version=` answers
+ *     with the current version, which would otherwise pass as the old one);
+ *   - the body representation is `storage`.
+ * There is no fallback to the current body.
+ */
+export async function getHistoricalStorage(
+  id: string,
+  type: ContentType,
   version: number
 ): Promise<{ title: string; rawBody: string; version: number }> {
-  // Check versioned cache first
-  const cached = pageCache.getVersioned(pageId, version);
-  if (cached !== undefined) {
-    // Body is cached — lightweight metadata fetch for title
-    const raw = await v2Get(`/pages/${pageId}`, {});
-    const page = PageSchema.parse(raw);
-    return { title: page.title, rawBody: cached, version };
+  assertNumericContentId(id);
+  assertHistoricalVersionNumber(version);
+  const raw = await v2Get(`/${segmentFor(type)}/${id}`, {
+    version,
+    "body-format": "storage",
+  });
+  const parsed = V2HistoricalSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new HistoricalReadMismatchError(id, version, "the answer has no storage body");
   }
+  const data = parsed.data;
+  if (data.id !== id) {
+    throw new HistoricalReadMismatchError(id, version, "the answer is about different content");
+  }
+  if (data.version.number !== version) {
+    throw new HistoricalReadMismatchError(
+      id,
+      version,
+      `the answer is version ${data.version.number}, not the requested version`
+    );
+  }
+  if (data.body.storage.representation !== "storage") {
+    throw new HistoricalReadMismatchError(
+      id,
+      version,
+      `the body is in "${data.body.storage.representation}" representation, not storage`
+    );
+  }
+  return { title: data.title, rawBody: data.body.storage.value, version: data.version.number };
+}
 
-  // Cache miss — full v1 fetch with body
-  return fetchV1VersionBody(pageId, version);
+async function fetchV2VersionBody(
+  pageId: string,
+  version: number,
+  type?: ContentType
+): Promise<{ title: string; rawBody: string; version: number }> {
+  const result = await withContentType(pageId, type, (t) => getHistoricalStorage(pageId, t, version));
+  // Cached only after every assertion passed.
+  pageCache.setVersioned(pageId, version, result.rawBody, "v2");
+  return result;
+}
+
+/**
+ * Historical body, title and version number.
+ *
+ * `source` picks the API (default v2). It is part of the cache key, so a body
+ * read from one API is never reused for, or diffed against, the other.
+ * `revert_page` passes the source from `revertHistoricalSource`.
+ */
+export async function getPageVersionBody(
+  pageId: string,
+  version: number,
+  opts?: { source?: HistoricalSource; type?: ContentType }
+): Promise<{ title: string; rawBody: string; version: number }> {
+  const source = opts?.source ?? "v2";
+  const cached = pageCache.getVersioned(pageId, version, source);
+  if (cached !== undefined) {
+    // Body is cached; a lightweight metadata fetch supplies the title (pages and blog posts).
+    const meta = await getContent(pageId, false);
+    return { title: meta.title, rawBody: cached, version };
+  }
+  return source === "v1"
+    ? fetchV1VersionBody(pageId, version)
+    : fetchV2VersionBody(pageId, version, opts?.type);
 }
 
 /**
  * Storage body of a page or blog post at `version`. Unlike
- * `getPageVersionBody`, a cache hit costs no request (no title lookup), and
- * only v1 endpoints are used, so blog posts work too.
+ * `getPageVersionBody`, a cache hit costs no request (no title lookup). v2,
+ * with the same fail-closed assertions; works for blog posts.
  */
 export async function getVersionStorage(pageId: string, version: number): Promise<string> {
-  const cached = pageCache.getVersioned(pageId, version);
+  const cached = pageCache.getVersioned(pageId, version, "v2");
   if (cached !== undefined) return cached;
-  return (await fetchV1VersionBody(pageId, version)).rawBody;
+  return (await fetchV2VersionBody(pageId, version)).rawBody;
 }
 
+/**
+ * v1 historical read. Used by `revert_page` in site mode until the parity
+ * probe allows v2 (see historical-source.ts). Asserts the version number like
+ * the v2 path does.
+ */
 async function fetchV1VersionBody(
   pageId: string,
   version: number
 ): Promise<{ title: string; rawBody: string; version: number }> {
+  assertNumericContentId(pageId);
+  assertHistoricalVersionNumber(version);
   const cfg = await getConfig();
   const url = new URL(`${requireV1(cfg, "versions.read")}/content/${pageId}`);
   url.searchParams.set("version", String(version));
   url.searchParams.set("expand", "body.storage,version");
   const raw = await confluenceJson(url.toString());
   const data = V1PageVersionSchema.parse(raw);
+  if (data.version.number !== version) {
+    throw new HistoricalReadMismatchError(
+      pageId,
+      version,
+      `the answer is version ${data.version.number}, not the requested version`
+    );
+  }
   const rawBody = data.body.storage.value;
 
   // Cache the raw body for reuse by diff
-  pageCache.setVersioned(pageId, version, rawBody);
+  pageCache.setVersioned(pageId, version, rawBody, "v1");
 
   return { title: data.title, rawBody, version: data.version.number };
 }
@@ -2844,7 +3305,18 @@ export async function ensureAttributionLabel(
 ): Promise<{ warning?: string }> {
   try {
     await addLabels(pageId, [ATTRIBUTION_LABEL]);
-    const labels = await getLabels(pageId);
+    // Best-effort cleanup of the legacy label. The label read is v2 and cannot
+    // see a never-published blog post draft; failing to read it must not turn
+    // a write that already succeeded into an error. The legacy label is only
+    // ever removed by its exact name.
+    let labels: LabelData[] = [];
+    try {
+      labels = await getLabels(pageId);
+    } catch (readErr) {
+      if (!(readErr instanceof ConfluenceNotFoundError || readErr instanceof ConfluencePermissionError)) {
+        throw readErr;
+      }
+    }
     if (labels.some((l) => l.name === LEGACY_ATTRIBUTION_LABEL)) {
       await removeLabel(pageId, LEGACY_ATTRIBUTION_LABEL);
     }
@@ -2898,12 +3370,14 @@ export function normalizeBodyForSubmit(body: string): string {
   return stripAttributionFooter(toStorageFormat(body));
 }
 
-export async function getLabels(pageId: string): Promise<LabelData[]> {
-  const cfg = await getConfig();
-  const data = LabelsResultSchema.parse(
-    await confluenceJson(`${requireV1(cfg, "labels.read")}/content/${pageId}/label`)
+export async function getLabels(pageId: string, type?: ContentType): Promise<LabelData[]> {
+  const { items, moreAvailable } = await withContentType(pageId, type, (t) =>
+    walkV2List(`/${segmentFor(t)}/${pageId}/labels`, { limit: V2_MAX_PAGE_SIZE }, LabelSchema, "all")
   );
-  return data.results;
+  if (moreAvailable) {
+    throw new Error(`The label list for page ${pageId} is too long to read to the end.`);
+  }
+  return items;
 }
 
 export async function addLabels(

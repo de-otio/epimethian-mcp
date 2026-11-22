@@ -123,3 +123,37 @@ Not run yet. Fill in after the runs:
   section 5.3 item 7.
 - Decisions this unlocks: the `revert_page` switch (needs 30/30 byte-identical), the
   `probeWriteCapability` swap, and each "to be confirmed" gateway-table row.
+
+## v2 response-shape assumptions to confirm (W-V2READ, W-HIST)
+
+The 7.6.0 read swaps are written and tested against these shapes (stubbed `fetch` only). Each
+must be confirmed by a read-only run before the release ships; a wrong one fails the tool
+(closed), it does not return wrong data.
+
+1. **Attachments (R1).** `GET /pages|blogposts/{id}/attachments` items carry `id` (with the `att`
+   prefix), `title`, `fileSize`, `mediaType`, `downloadLink` and `version.number` at the top level
+   (not under `extensions`), and `_links.next` is either `/wiki/api/v2/...` or an absolute URL on
+   the same API. Confirm `version.number` equals what v1 reported (the draw.io tools compare it
+   with `expected_version`).
+2. **`filename=` filter.** Whether it is case-sensitive or exact. The lookup does not depend on it
+   (exact post-filter), but if it is case-sensitive the "differs only in case" hint in
+   `update_drawio_diagram` / `add_attachment` stops appearing.
+3. **Draft blog posts.** v2 attachment and label reads cannot see a never-published blog post
+   draft (like `GET /blogposts/{id}` without a status). Attachment reads on drafts therefore stay
+   on v1 with `status=draft`; the label read after a write treats a 404 as "no legacy label".
+4. **Versions (R5).** `GET /pages|blogposts/{id}/versions` items carry `number`, `createdAt`,
+   `message`, `minorEdit`, `authorId`. The default order is not assumed (the client re-sorts and
+   reads the whole list when the order is not visibly newest-first); if v2 is oldest-first by
+   default, add `sort=-modified-date` to avoid the full read.
+5. **Authors (R6).** `POST /users-bulk` with `{"accountIds": [...]}` answers
+   `{"results": [{"accountId", "displayName", ...}]}`. A failure or missing id shows the account id.
+6. **Labels (R8).** `GET /pages|blogposts/{id}/labels` items carry `id`, `name`, `prefix`
+   (`global`, `my`, `team`, `system`), same names and prefixes as v1.
+7. **Historical bodies (R7).** `GET /pages|blogposts/{id}?version=N&body-format=storage` answers
+   `id`, `title`, `version.number` (echoing N) and `body.storage.{representation, value}` with
+   `representation === "storage"`. The reader is fail-closed on all four; `get_page_version` and
+   `diff_page_versions` therefore stop working (with a clear error) if any is missing. Record
+   whether `version.number` is echoed for every sampled version and for restored versions.
+8. **`revert_page`.** Stays on the v1 historical read in site mode until the 30-version table above
+   shows byte-identical bodies. Then flip `REVERT_HISTORICAL_SOURCE_SITE` in
+   `src/server/historical-source.ts` to `"v2"` (one line; tests cover both values).
