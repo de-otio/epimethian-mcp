@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.6.0] - 2026-11-22 - gateway mode and v2 reads
+
+### Added
+- **Gateway mode for scoped API tokens.** Atlassian's scoped tokens work only
+  through `https://api.atlassian.com/ex/confluence/{cloudId}`. `epimethian-mcp
+  setup --profile <name>` now asks "Is this a scoped API token?"; a yes stores
+  the profile in gateway mode, bound to the tenant's sealed cloud ID. See
+  `doc/user-doc/installation.md` for the scope list.
+  - Every credentialed request must start with the gateway prefix for the
+    sealed cloud ID; at each start the site's `tenant_info` must still return
+    that cloud ID, and the scoped token is never sent to the site URL.
+  - Tools that need the v1 API, which the gateway does not serve to scoped
+    tokens, are not registered (13 of 41: search, attachment upload and
+    download, the draw.io tools, labels, page status, recent changes, user
+    lookup and link resolution). The server instructions name them.
+  - The attribution label and the unverified badge (both v1) are skipped; the
+    version comment with the Epimethian version is still written.
+  - An optional token expiry date (`YYYY-MM-DD`) entered at setup is shown by
+    `status`; the server warns 14 days ahead and refuses to start once it has
+    passed.
+  - Live-verified for reads with a read-only scoped token (2026-11-22); gateway
+    writes are not yet verified.
+- `scripts/live/v2-parity.mjs`: an opt-in, read-only probe that compares the v1
+  and v2 answers for the reads above on chosen pages, printing only counts,
+  statuses and hashes. Results: `doc/design/investigations/investigate-v1-v2-parity-2026-11.md`.
+
 ### Changed
 - Attachment lists and lookups, version history and label reads now use the
   Confluence v2 API (`get_attachments`, `get_page_versions`, `get_labels`, the
@@ -30,13 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body, for the requested content, otherwise the read fails. A server that
   ignores `?version=` can no longer show the current body as an old version or
   turn a diff into "No changes".
-- `revert_page` keeps reading the target version from the v1 API in site mode.
-  v2 historical bodies have not yet been shown to be byte-identical to v1 on
-  live content, and a revert writes the body it reads. The v1 read now asserts
-  the version number too. Switching to v2 is a one-line change
-  (`REVERT_HISTORICAL_SOURCE_SITE` in `historical-source.ts`) once the parity
-  probe passes. In gateway mode (no v1) `revert_page` uses v2 with the same
-  assertion.
+- `revert_page` keeps reading the target version from the v1 API in site mode,
+  because a revert writes the body it reads. The live probe found v1 and v2
+  bodies byte-identical for 27 of 27 sampled versions, but the sample had no
+  restored or legacy-editor version; the switch waits for those. The v1 read
+  now asserts the version number too. In gateway mode (no v1) `revert_page`
+  uses v2 with the same assertion.
+- `get_attachments` may list files in a different order than before: the v2
+  API orders them differently.
 - The in-memory cache of historical bodies is keyed by source (v1 or v2), so a
   body from one API is never reused for, or compared against, the other.
 
@@ -81,9 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Epimethian's side, the sealed cloud ID (checked against the site's
   `tenant_info` at every start) and the gateway-prefix pin on every
   credentialed request. Atlassian probably does not bind a scoped token to one
-  site; the docs recommend a separate Atlassian account per customer and state
-  that gateway mode is not live-verified until the probe and the scoped-token
-  check have run.
+  site; the docs recommend a separate Atlassian account per customer.
 - The server and `epimethian-mcp status` ignored `--profile <name>` and read
   only `CONFLUENCE_PROFILE`, so every client snippet printed by setup (which
   passes `"args": ["--profile", "<name>"]`) started with "Missing Confluence
