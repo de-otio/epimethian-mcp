@@ -1,11 +1,10 @@
 # Investigation: v1 / v2 Confluence REST parity (2026-11)
 
-**STATUS: site mode run 2026-11-22 (results below); gateway mode not run yet.** A person runs
+**STATUS: site and gateway mode run 2026-11-22 (results below); gateway writes not verified.** A person runs
 the probe by hand against the designated test profile and pastes the output below.
 
-**Gateway mode is not live-verified** until both the gateway run of this probe and the
-scoped-token check (question 4) have run. Until then every gateway claim in the docs is a
-design assumption.
+**Gateway mode is live-verified for reads** (scoped read-only token, 2026-11-22). Gateway
+writes and question 4 (a scoped token against a second cloudId) are not verified.
 
 Plan: `plans/next-release-sdk2-and-v2-api.md` section 5.1 (W-INV), with the call inventory in
 section 5.4 and the gateway capability table in section 5.3. Until results are in, the
@@ -156,8 +155,76 @@ Byte-identical: 27/27 compared. v2 echoed the requested version: 27/27.
 
 ### Gateway mode
 
-(Not verified: no scoped token yet. Paste the gateway run here, replacing this line. The table
-shape is the same as above.)
+Run by hand on 2026-11-22 with a scoped, read-only token (the 12 read scopes from
+`src/shared/gateway-scopes.ts`) for the designated test profile, same items as the site run.
+
+#### Run summary
+
+- Mode: gateway
+- Date: 2026-11-22
+- Items: 5 page(s), 2 blog post(s)
+- Requests: 63 of a cap of 150 (GET/HEAD only)
+- Versions sampled: 27 (cap 30)
+- Run status: complete
+- Token scopes declared by the person running: read:page:confluence, read:blogpost:confluence, read:space:confluence, read:attachment:confluence, read:label:confluence, read:comment:confluence, read:hierarchical-content:confluence, read:folder:confluence, read:task:confluence, read:content.property:confluence, read:user:confluence, read:space.permission:confluence
+
+#### Parity matrix
+
+| # | Row | v1 call | v2 call | Site: v1 | Site: v2 | Site: parity | Gateway: v1 | Gateway: v2 | Gateway: parity | Expected v2 scope | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| R1 | Attachment list | GET content/{id}/child/attachment | GET /pages\|blogposts/{id}/attachments | not run in this mode | not run in this mode | - | 401x1 | 200x7 | - | read:attachment:confluence |  |
+| R2 | Attachment download | GET content/{id}/child/attachment/{attId}/data | GET downloadLink (v2 attachment) | not run in this mode | not run in this mode | - | 401x1 | 200x1 | - | read:attachment:confluence |  |
+| R3 | Attachment upload | POST content/{id}/child/attachment | none | not probed (write) | not probed (write) | - | not probed (write) | not probed (write) | - | n/a | write; never probed |
+| R4 | Attachment new version | POST content/{id}/child/attachment/{attId}/data | none | not probed (write) | not probed (write) | - | not probed (write) | not probed (write) | - | n/a | write; never probed |
+| R5 | Version list | GET content/{id}/version | GET /pages\|blogposts/{id}/versions | not run in this mode | not run in this mode | - | 401x1 | 200x7 | - | read:page:confluence (blog posts: read:blogpost:confluence) |  |
+| R6 | Version authors | inline in R5 | POST /users-bulk | - | not probed (POST) | - | - | not probed (POST) | - | read:user:confluence | POST read; not probed by the GET/HEAD-only rule |
+| R7 | Historical body | GET content/{id}?version=N&expand=body.storage | GET /pages\|blogposts/{id}?version=N&body-format=storage | not run in this mode | not run in this mode | - | 401x1 | 200x27 | - | read:page:confluence (blog posts: read:blogpost:confluence) |  |
+| R8 | Labels read | GET content/{id}/label | GET /pages\|blogposts/{id}/labels | not run in this mode | not run in this mode | - | 200x1 | 200x7 | count 1/1; fields 1/1; order: samex1; paging: single-pagex1 | read:label:confluence |  |
+| R9 | Labels write | POST/DELETE content/{id}/label | none | not probed (write) | not probed (write) | - | not probed (write) | not probed (write) | - | n/a | write; never probed |
+| R10 | Content state read | GET content/{id}/state | none | not run in this mode | not run in this mode | - | 401x1 | n/a (no v2) | - | n/a |  |
+| R11 | Content state write | PUT/DELETE content/{id}/state | none | not probed (write) | not probed (write) | - | not probed (write) | not probed (write) | - | n/a | write; never probed |
+| R12 | CQL search | GET /search | none | not run in this mode | not run in this mode | - | 401x1 | n/a (no v2) | - | n/a |  |
+| R13 | User search | GET /search/user | none (POST /users-bulk by id only) | not run in this mode | not run in this mode | - | 401x1 | n/a (no v2) | - | n/a |  |
+| R14 | Write-capability probe | GET user/current/permission/space/{key} | GET /spaces/{id}/operations | not run in this mode | not run in this mode | - | 401x1 | 200x1 | - | read:space:confluence |  |
+| R15 | Site locale | GET settings/systemInfo | none | not run in this mode | not run in this mode | - | 401x1 | n/a (no v2) | - | n/a |  |
+| R16 | Connection check | GET user/current | GET /spaces?limit=1 | not run in this mode | not run in this mode | - | 401x1 | 200x1 | - | read:space:confluence |  |
+
+#### Historical bodies (R7)
+
+| Item | Version | v1 status | v2 status | v1 sha256 (first 12) | v2 sha256 (first 12) | Byte-identical | v2 echoes version |
+|---|---|---|---|---|---|---|---|
+| p1 | 1 | 401 | 200 | - | 0e640c3dc7c8 | n/a | yes |
+| p1 | 2 | not probed | 200 | - | 0e640c3dc7c8 | n/a | yes |
+| p1 | 3 | not probed | 200 | - | c7dfe2de0e4a | n/a | yes |
+| p2 | 1 | not probed | 200 | - | d50551c273a7 | n/a | yes |
+| p2 | 2 | not probed | 200 | - | d50551c273a7 | n/a | yes |
+| p2 | 3 | not probed | 200 | - | 9d49ec6cb912 | n/a | yes |
+| p2 | 4 | not probed | 200 | - | 027f2b859f53 | n/a | yes |
+| p2 | 5 | not probed | 200 | - | d1b8e01c26a7 | n/a | yes |
+| p3 | 1 | not probed | 200 | - | 553532ed3298 | n/a | yes |
+| p3 | 7 | not probed | 200 | - | e0c83b4ded6a | n/a | yes |
+| p3 | 14 | not probed | 200 | - | 8c6d624d35cb | n/a | yes |
+| p3 | 20 | not probed | 200 | - | a50eac09bb86 | n/a | yes |
+| p4 | 1 | not probed | 200 | - | 9042807ceb8c | n/a | yes |
+| p4 | 7 | not probed | 200 | - | fb2b1f17b82e | n/a | yes |
+| p4 | 12 | not probed | 200 | - | 5b6d38b3d2d7 | n/a | yes |
+| p4 | 18 | not probed | 200 | - | 1ce166d4282a | n/a | yes |
+| p5 | 1 | not probed | 200 | - | badbeb2644d5 | n/a | yes |
+| p5 | 2 | not probed | 200 | - | badbeb2644d5 | n/a | yes |
+| p5 | 3 | not probed | 200 | - | e5b3ba84dfd3 | n/a | yes |
+| b1 | 1 | not probed | 200 | - | d0d1ce7eaf01 | n/a | yes |
+| b1 | 2 | not probed | 200 | - | ce82adde7c71 | n/a | yes |
+| b1 | 4 | not probed | 200 | - | d742fed4b4ec | n/a | yes |
+| b1 | 5 | not probed | 200 | - | 12a213677338 | n/a | yes |
+| b2 | 1 | not probed | 200 | - | 245d8112c235 | n/a | yes |
+| b2 | 3 | not probed | 200 | - | 1d1d4f6785c5 | n/a | yes |
+| b2 | 4 | not probed | 200 | - | bb0d200e7c67 | n/a | yes |
+| b2 | 6 | not probed | 200 | - | 03c7def9f39b | n/a | yes |
+
+Byte-identical: 0/0 compared. v2 echoed the requested version: 27/27.
+
+The v2 historical-body hashes above equal the site-mode hashes for all 27 versions, so the
+gateway returns the same bytes as v1 and v2 on the site URL.
 
 ## Findings
 
@@ -188,8 +255,27 @@ Decisions:
   fail-closed checks.
 - `probeWriteCapability` keeps its current order (v1 permission call, then the dry-run).
 
-Gateway mode: not run (no scoped token yet). Question 4 (a scoped token against a second
-cloudId): not run.
+Gateway mode (2026-11-22, scoped read-only token, 12 read scopes):
+
+- **Every v2 read we use answers 200:** attachments, the v2 attachment `downloadLink`, versions,
+  historical bodies (27/27, same hashes as site mode, version echoed 27/27), labels,
+  `/spaces/{id}/operations` and `/spaces?limit=1`. The 12 read scopes are sufficient for reads.
+- **v1 through the gateway answers 401, not 410,** for a scoped token, with one exception: the v1
+  label read answers 200. Gateway mode never calls v1, so nothing depends on this; docs that say
+  "v1 answers 410 on the gateway" describe classic-token reports, not scoped tokens.
+- **`POST /users-bulk` (R6)** works with `read:user:confluence`: `get_page_versions` through the
+  gateway shows display names.
+- **A missing write scope answers `401 {"message":"Unauthorized; scope does not match"}`** on the
+  dry-run `PUT /pages/999999999999`, not 403. The setup scope check therefore reported
+  "inconclusive", and the server's posture probe treats a 401 as an authentication failure.
+  Fixed in 7.6.0: that 401 body means "cannot update pages".
+- **Server start:** a read-only gateway profile registers 14 tools (the gateway set minus writes),
+  none of the 13 v1-only tools, and the instructions name gateway mode. `status` shows
+  "gateway (scoped token)".
+- **Download works through the gateway** (v2 `downloadLink`, 200). `download_attachment` stays
+  hidden in 7.6.0; enabling it is a candidate for a later release.
+- **Not checked:** write scopes (the token was read-only by design) and question 4 (a scoped token
+  against a second cloudId); the tenant guard does not rely on either.
 
 ## v2 response-shape assumptions to confirm (W-V2READ, W-HIST)
 
