@@ -32,6 +32,7 @@ import {
   resolveUnverifiedStatusFlag,
   resolveUnverifiedStatusLocale,
 } from "./config.js";
+import { buildApiBases, requestBaseFor, requireV1, type ApiMode } from "./api-base.js";
 
 // --- Client label (set once from index.ts after MCP initialize handshake) ---
 
@@ -84,8 +85,17 @@ export interface Config {
   unverifiedStatusName?: string;
   /** Optional color override. */
   unverifiedStatusColor?: "#FFC400" | "#2684FF" | "#57D9A3" | "#FF7452" | "#8777D9";
+  /**
+   * Contract C1. "site": requests go to the site URL (Basic auth, v1 + v2).
+   * "gateway": requests go to api.atlassian.com/ex/confluence/{sealedCloudId}
+   * (scoped tokens; v2 only). getConfig() always yields "site" in 7.6.0 until
+   * W-GW switches it on. Built by `buildApiBases` (api-base.ts) only.
+   */
+  apiMode: ApiMode;
+  /** v2 REST base. Every v2 URL is built from this. */
   apiV2: string;
-  apiV1: string;
+  /** v1 REST base; `null` in gateway mode. Read it only through `requireV1`. */
+  apiV1: string | null;
   authHeader: string;
   jsonHeaders: Record<string, string>;
   /** Tenant seal: cloudId stored in the keychain entry for this profile (undefined for env-var mode or pre-seal profiles). */
@@ -261,8 +271,8 @@ export async function getConfig(): Promise<Config> {
     unverifiedStatusLocale,
     unverifiedStatusName,
     unverifiedStatusColor,
-    apiV2: `${url}/wiki/api/v2`,
-    apiV1: `${url}/wiki/rest/api`,
+    // C1: the only derivation of API bases; always site mode in this release.
+    ...buildApiBases({ url, apiMode: "site" }),
     authHeader,
     jsonHeaders,
     sealedCloudId,
@@ -301,7 +311,7 @@ export async function probeWriteCapability(): Promise<"write" | "read-only" | "i
     if (spaces.length > 0) {
       const spaceKey = spaces[0].key;
       const permUrl = new URL(
-        `${cfg.apiV1}/user/current/permission/space/${encodeURIComponent(spaceKey)}`
+        `${requireV1(cfg, "writeProbe.spacePermissions")}/user/current/permission/space/${encodeURIComponent(spaceKey)}`
       );
       permUrl.searchParams.set("operationKey", "create");
       permUrl.searchParams.set("targetType", "page");
@@ -2050,7 +2060,7 @@ export async function searchContent(
 
   for (let request = 0; request < MAX_SEARCH_REQUESTS; request++) {
     if (url === null) {
-      const first = new URL(`${cfg.url}/wiki/rest/api/search`);
+      const first = new URL(`${requireV1(cfg, "search.cql")}/search`);
       first.searchParams.set("cql", cql);
       first.searchParams.set("limit", String(Math.min(opts.limit - hits.length, 100)));
       first.searchParams.set(
@@ -2093,7 +2103,7 @@ export async function searchContent(
       more = true;
       break;
     }
-    const resolved = resolveSearchNext(next, cfg.url);
+    const resolved = resolveSearchNext(next, requestBaseFor(cfg));
     if (resolved === null || request === MAX_SEARCH_REQUESTS - 1) {
       more = true; // unsafe link or request cap: cannot prove completeness
       break;
@@ -2223,7 +2233,7 @@ export async function searchUsers(
   limit = 10
 ): Promise<UserResult[]> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/search/user`);
+  const url = new URL(`${requireV1(cfg, "users.byName")}/search/user`);
   url.searchParams.set("cql", `user.fullname~"${escapeCqlString(query)}"`);
   url.searchParams.set("limit", String(Math.min(limit, 10)));
   const raw = await confluenceJson(url.toString());
@@ -2254,7 +2264,7 @@ export async function searchPagesByTitle(
 ): Promise<PageLinkResult[]> {
   const cql = `title="${escapeCqlString(title)}" AND space.key="${escapeCqlString(spaceKey)}" AND type=page`;
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/search`);
+  const url = new URL(`${requireV1(cfg, "search.cql")}/search`);
   url.searchParams.set("cql", cql);
   url.searchParams.set("limit", "10");
   url.searchParams.set("expand", "space");
@@ -2288,7 +2298,7 @@ export async function getAttachments(
 ): Promise<AttachmentData[]> {
   // Attachments only available via v1 REST API
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/child/attachment`);
+  const url = new URL(`${requireV1(cfg, "attachments.read")}/content/${pageId}/child/attachment`);
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("expand", "version");
   if (container?.draft) url.searchParams.set("status", "draft");
@@ -2351,7 +2361,7 @@ export async function findAttachmentByName(
 ): Promise<AttachmentLookup> {
   assertPageId(pageId);
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/child/attachment`);
+  const url = new URL(`${requireV1(cfg, "attachments.read")}/content/${pageId}/child/attachment`);
   url.searchParams.set("filename", filename);
   url.searchParams.set("expand", "version");
   url.searchParams.set("limit", "25");
@@ -2438,7 +2448,7 @@ export async function uploadAttachmentVersion(
   if (comment) form.append("comment", comment);
 
   const dataUrl = withContainerStatus(
-    `${cfg.apiV1}/content/${pageId}/child/attachment/${attachmentId}/data`,
+    `${requireV1(cfg, "attachments.upload")}/content/${pageId}/child/attachment/${attachmentId}/data`,
     container
   );
   // An upload is a write like a page update: it counts against the budget.
@@ -2549,8 +2559,10 @@ export async function getAttachmentMetadata(
  * Confluence has returned this field in several shapes across versions: a
  * path rooted at the `/wiki` context (`/download/attachments/...`), a path
  * already carrying the context (`/wiki/download/...`), or an absolute URL.
- * Build from `cfg.url` rather than concatenating onto an API base — the
- * download servlet does not live under `/rest/api` or `/api/v2`.
+ * Build from the request base (`requestBaseFor(cfg)`, the site URL in site
+ * mode) rather than concatenating onto an API base — the download servlet
+ * does not live under `/rest/api` or `/api/v2`. Origin check only: gateway
+ * mode must add the path-prefix check (doc/design/gateway-mode.md).
  *
  * An absolute link pointing at a different host is refused: the caller would
  * have to decide whether to forward credentials, and the safe answer there is
@@ -2604,8 +2616,9 @@ export async function downloadAttachmentBytes(
     throw new AttachmentTooLargeError(meta.id, meta.fileSize);
   }
 
-  const siteOrigin = new URL(cfg.url).origin;
-  let url = resolveDownloadUrl(meta.downloadLink, cfg.url);
+  const requestBase = requestBaseFor(cfg);
+  const siteOrigin = new URL(requestBase).origin;
+  let url = resolveDownloadUrl(meta.downloadLink, requestBase);
   // Latched, not recomputed: once the chain has left the site origin the
   // credential stays off for every remaining hop. Recomputing per hop would
   // re-attach it on a site → third-party → site chain, which is exactly the
@@ -2704,7 +2717,7 @@ export async function getPageVersions(
   limit: number
 ): Promise<VersionMetadata[]> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/version`);
+  const url = new URL(`${requireV1(cfg, "versions.read")}/content/${pageId}/version`);
   url.searchParams.set("limit", String(limit));
   const raw = await confluenceJson(url.toString());
   const data = VersionsResultSchema.parse(raw);
@@ -2748,7 +2761,7 @@ async function fetchV1VersionBody(
   version: number
 ): Promise<{ title: string; rawBody: string; version: number }> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}`);
+  const url = new URL(`${requireV1(cfg, "versions.read")}/content/${pageId}`);
   url.searchParams.set("version", String(version));
   url.searchParams.set("expand", "body.storage,version");
   const raw = await confluenceJson(url.toString());
@@ -2774,7 +2787,10 @@ export async function uploadAttachment(
   form.append("file", new Blob([new Uint8Array(fileData)]), filename);
   if (comment) form.append("comment", comment);
 
-  const attachUrl = withContainerStatus(`${cfg.apiV1}/content/${pageId}/child/attachment`, container);
+  const attachUrl = withContainerStatus(
+    `${requireV1(cfg, "attachments.upload")}/content/${pageId}/child/attachment`,
+    container
+  );
   // POST: a transfer-length timeout, the shared permit, and no automatic
   // retry (a repeated upload would add a second copy or version). A failure
   // after the request was sent surfaces as WriteOutcomeUnknownError.
@@ -2885,7 +2901,7 @@ export function normalizeBodyForSubmit(body: string): string {
 export async function getLabels(pageId: string): Promise<LabelData[]> {
   const cfg = await getConfig();
   const data = LabelsResultSchema.parse(
-    await confluenceJson(`${cfg.apiV1}/content/${pageId}/label`)
+    await confluenceJson(`${requireV1(cfg, "labels.read")}/content/${pageId}/label`)
   );
   return data.results;
 }
@@ -2895,8 +2911,9 @@ export async function addLabels(
   labels: string[]
 ): Promise<void> {
   const cfg = await getConfig();
+  const labelUrl = `${requireV1(cfg, "labels.write")}/content/${pageId}/label`;
   await guardPageSideWrite(pageId, () =>
-    confluenceSend(`${cfg.apiV1}/content/${pageId}/label`, {
+    confluenceSend(labelUrl, {
       method: "POST",
       body: JSON.stringify(labels.map((name) => ({ prefix: "global", name }))),
     })
@@ -2908,7 +2925,7 @@ export async function removeLabel(
   label: string
 ): Promise<void> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/label`);
+  const url = new URL(`${requireV1(cfg, "labels.write")}/content/${pageId}/label`);
   url.searchParams.set("name", label);
   await guardPageSideWrite(pageId, () => confluenceSend(url.toString(), { method: "DELETE" }));
 }
@@ -2943,7 +2960,9 @@ export async function getSiteDefaultLocale(cfg: Config): Promise<string | undefi
 
   const promise = (async () => {
     try {
-      const data = (await confluenceJson(`${cfg.apiV1}/settings/systemInfo`)) as { defaultLocale?: unknown };
+      const data = (await confluenceJson(`${requireV1(cfg, "badgeLocale.site")}/settings/systemInfo`)) as {
+        defaultLocale?: unknown;
+      };
       const raw = typeof data?.defaultLocale === "string" ? data.defaultLocale : undefined;
       if (!raw) return undefined;
       // Confluence returns "en_GB"/"de_DE"; normalize to "en"/"de".
@@ -2964,7 +2983,7 @@ export async function getContentState(
   container?: ContainerOptions
 ): Promise<ContentStateData | null> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
+  const url = new URL(`${requireV1(cfg, "contentState")}/content/${pageId}/state`);
   url.searchParams.set("status", container?.draft ? "draft" : "current");
   try {
     const data = await confluenceJson(url.toString());
@@ -2994,7 +3013,7 @@ export async function setContentState(
   container?: ContainerOptions
 ): Promise<void> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
+  const url = new URL(`${requireV1(cfg, "contentState")}/content/${pageId}/state`);
   url.searchParams.set("status", container?.draft ? "draft" : "current");
   try {
     await guardPageSideWrite(pageId, () =>
@@ -3019,7 +3038,7 @@ export async function removeContentState(
   container?: ContainerOptions
 ): Promise<void> {
   const cfg = await getConfig();
-  const url = new URL(`${cfg.apiV1}/content/${pageId}/state`);
+  const url = new URL(`${requireV1(cfg, "contentState")}/content/${pageId}/state`);
   url.searchParams.set("status", container?.draft ? "draft" : "current");
   try {
     await guardPageSideWrite(pageId, () => confluenceSend(url.toString(), { method: "DELETE" }));

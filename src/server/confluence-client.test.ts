@@ -3740,6 +3740,7 @@ describe("probeWriteCapability", () => {
       posture: "read-only",
       attribution: true,
       apiV2: `${BASE_URL}/wiki/api/v2`,
+      apiMode: "site" as const,
       apiV1: `${BASE_URL}/wiki/rest/api`,
       authHeader: "Basic dXNlcjp0b2tlbg==",
       jsonHeaders: Object.freeze({ Authorization: "Basic dXNlcjp0b2tlbg==", "Content-Type": "application/json" }),
