@@ -495,8 +495,12 @@ export async function validateStartup(config: Config): Promise<void> {
       process.exit(1);
     }
     // G4: verifyTenantIdentity is skipped on purpose: it calls v1 /user/current, which
-    // the gateway does not serve. The sealed cloudId (G2) plus the pinned gateway
-    // prefix and a token scoped to one site are the tenant guard in this mode.
+    // the gateway does not serve. The tenant guard in this mode has two legs, both
+    // ours: (1) the sealed cloudId, checked against the site's tenant_info (G2) at
+    // every start; (2) the gateway-prefix pin on every credentialed request
+    // (sendGuarded: isCredentialedUrl, no redirects). The token is NOT assumed to be
+    // bound to one site: Atlassian most likely picks the site from the cloudId in
+    // the path, so the pin is what keeps requests on the sealed tenant.
   } else {
     // Step 1: Authentication check
     const connResult = await testConnection(url, email, apiToken);

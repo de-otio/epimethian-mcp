@@ -158,15 +158,24 @@ export function tokenExpiryState(expiry: string | undefined, today: string /* YY
    (`verifyTenantIdentity`) cannot run: the gateway does not serve v1. It is replaced by
    two checks, in this order: (a) `GET {site}/_edge/tenant_info` must return the sealed
    `cloudId` (fail closed on a mismatch or an unreachable endpoint, as in site mode);
-   (b) `GET {gateway}/wiki/api/v2/spaces?limit=1` must succeed. **Why this is enough:** a
-   request can only reach tenant T if three things all point at T: the gateway prefix is
-   built from the sealed `cloudId` and from nothing else (no URL, no response field; every
-   outgoing and followed URL must pass `isCredentialedUrl`), the site URL still resolves
-   to that same `cloudId` at every start, and the scoped token is bound by Atlassian to one
-   site, so the gateway refuses it for any other. The email check only proved that a
-   credential matched a user on a host; it never bound the host to a tenant, which the
-   seal does. A mismatch between any two of the three fails startup before a write tool is
-   registered. The startup banner says the email check is skipped and why.
+   (b) `GET {gateway}/wiki/api/v2/spaces?limit=1` must succeed. **The tenant guard has
+   two legs, both on our side.** Atlassian probably does NOT bind a scoped token to a
+   single site: the site a request reaches is chosen by the `cloudId` in the request path,
+   and the token is likely accepted for every site its account can see (unverified; it is
+   a live-check item in `doc/design/investigations/investigate-v1-v2-parity-2026-11.md`).
+   So the token is not a leg. The legs are:
+   - **Leg 1, the sealed `cloudId`.** Read unauthenticated from the site's `tenant_info`
+     and confirmed by a person at setup; checked against the site's `tenant_info` again at
+     every start (fail closed).
+   - **Leg 2, the gateway-prefix pin on every credentialed request.** The prefix is built
+     from the sealed `cloudId` and from nothing else (no URL, no response field); every
+     outgoing URL and cursor must pass `isCredentialedUrl`; redirects are never followed
+     with the credential (item 8).
+   A request carrying the token can only reach tenant T if both legs point at T. The email
+   check only proved that a credential matched a user on a host; it never bound the host
+   to a tenant, which the seal does. Recommend a separate Atlassian account per customer
+   where possible, so that even a token accepted for every site of its account can reach
+   only one customer. The startup banner says the email check is skipped and why.
 2. **tenant_info is unauthenticated in gateway mode.** `fetchTenantInfo(url, email, token,
    { authenticated: false })` sends no `Authorization` header: a scoped token must never be
    sent to the site origin, which does not serve it. Site mode still sends Basic auth, as
@@ -213,6 +222,13 @@ export function tokenExpiryState(expiry: string | undefined, today: string /* YY
    stderr warning (both modes).
 
 ### Open points for the live scoped-token check
+
+Gateway mode is not live-verified until the probe and the scoped-token check below have
+run.
+
+- Does a scoped token work against a second cloudId (another site the same Atlassian
+  account can see)? Expected: yes, which is why the tenant guard does not rely on the
+  token (§9 item 1).
 
 - The scope list in `src/shared/gateway-scopes.ts` and `doc/user-doc/installation.md` is
   unconfirmed.

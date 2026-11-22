@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer as write-capable. Any other answer (410, 429, 5xx, ...) is
   inconclusive, and an inconclusive probe now runs the session read-only with a
   warning (it used to default to read-write).
+- Docs: the gateway-mode tenant guard is described as two legs on
+  Epimethian's side, the sealed cloud ID (checked against the site's
+  `tenant_info` at every start) and the gateway-prefix pin on every
+  credentialed request. Atlassian probably does not bind a scoped token to one
+  site; the docs recommend a separate Atlassian account per customer and state
+  that gateway mode is not live-verified until the probe and the scoped-token
+  check have run.
 
 ## [7.5.0] - 2026-11-22 - security updates and agent hints
 

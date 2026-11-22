@@ -97,18 +97,20 @@ Each project's `.mcp.json` specifies which profile to use. Profiles are fully is
 
 ## Gateway Mode (Scoped API Tokens)
 
-Atlassian can issue **scoped API tokens**: tokens limited to named permissions (scopes) on one site. A scoped token does not work against your site URL. It works only through the Atlassian API gateway, `https://api.atlassian.com/ex/confluence/{cloudId}`, and only against the Confluence v2 REST API. Epimethian supports this as an optional **gateway mode**. Ordinary (unscoped) tokens and every existing profile keep working exactly as before.
+Atlassian can issue **scoped API tokens**: tokens limited to named permissions (scopes). A scoped token does not work against your site URL. It works only through the Atlassian API gateway, `https://api.atlassian.com/ex/confluence/{cloudId}`, and only against the Confluence v2 REST API. The site a request reaches is chosen by the `cloudId` in that path; Atlassian probably does **not** bind a scoped token to a single site, so the token may work for every site your Atlassian account can see. Epimethian supports this as an optional **gateway mode**. Ordinary (unscoped) tokens and every existing profile keep working exactly as before.
+
+> **Not yet live-verified.** Gateway mode is built and tested against stubs only. Until the live probe and the scoped-token check (see the parity investigation in `doc/design/investigations/investigate-v1-v2-parity-2026-11.md`) have run, treat the scope list, the scope check and the behaviour described here as unconfirmed.
 
 ### Why use it
 
-A scoped token can only do what its scopes allow, so a read-only token cannot write even if the agent or the profile is misconfigured. It also expires on a date you choose.
+A scoped token can only do what its scopes allow, so a token created without write scopes cannot write even if the agent or the profile is misconfigured. It also expires on a date you choose.
 
 ### Set up a gateway profile
 
 1. Create the token at [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens) with **Create API token with scopes**, pick **Confluence**, and select the scopes below.
 2. Run `epimethian-mcp setup --profile <name>` and answer `y` to "Is this a scoped API token?". Gateway mode needs a named profile.
-3. Setup shows the tenant behind the URL (name and cloud ID) and asks you to confirm it **before** any credential is used. It then tests the token through the gateway, asks for the token's expiry date (optional, `YYYY-MM-DD`, as shown when you created the token), asks for the access mode, and prints the scope list.
-4. For a read-only profile, setup also checks that the token **cannot** write (a harmless write attempt against a page that does not exist must be refused with 403). If it is not refused, setup warns that the token is broader than the read-only mode.
+3. Setup shows the tenant behind the URL (name and cloud ID) and asks you to confirm it **before** any credential is used. In gateway mode this question is always asked, even with `--yes`. The URL must be an Atlassian Cloud site (`https://<site>.atlassian.net`); pass `--allow-non-atlassian-host` only if your site really lives on another host. Setup then tests the token through the gateway, asks for the token's expiry date (optional, `YYYY-MM-DD`, as shown when you created the token), asks for the access mode, and prints the scope list.
+4. For a read-only profile, setup also checks that the token **cannot update pages** (a harmless page update against a page that does not exist must be refused with 403). If it is not refused, setup warns that the token can update pages, which is broader than the read-only mode. This check covers page updates only: the other write scopes (blog posts, comments, attachments, deletes) are not probed, so check the scopes you selected when you created the token.
 
 The mode, the tenant's cloud ID and the expiry are stored together in the OS keychain record. Gateway mode is only ever stored together with the cloud ID: it cannot be switched on for a profile without a tenant seal.
 
@@ -170,10 +172,14 @@ Because the label and the badge are skipped without a warning, pages written in 
 
 A request or credential reaching the wrong Atlassian site is the failure that matters most when you work across several tenants, so gateway mode is pinned several ways:
 
-- The gateway address is built **only** from the cloud ID sealed at setup, never from a URL you type or a value a response contains.
-- At every start, the server asks the site URL for its cloud ID (without sending any credential) and refuses to start if it differs from the sealed one or cannot be read.
-- It then confirms the token works through the gateway (`GET /spaces?limit=1`). The v1 identity check by email cannot run on the gateway, so the sealed cloud ID, the pinned gateway address and a token scoped to one site take its place.
-- The credential is sent only to `https://api.atlassian.com/ex/confluence/{sealed cloudId}/`. Pagination links and download redirects that point anywhere else are refused or followed without the credential.
+The token itself is probably **not** what keeps requests on the right site: Atlassian chooses the site from the cloud ID in the request path, and a scoped token may well be accepted for any site your Atlassian account can reach. The tenant guard therefore has two legs, both on Epimethian's side:
+
+1. **The sealed cloud ID.** Setup reads the site's cloud ID (without sending any credential) and you confirm it. At every start the server asks the site URL for its cloud ID again and refuses to start if it differs from the sealed one or cannot be read.
+2. **The gateway-prefix pin on every credentialed request.** The gateway address is built **only** from the sealed cloud ID, never from a URL you type or a value a response contains, and the credential is sent only to `https://api.atlassian.com/ex/confluence/{sealed cloudId}/`. Pagination links that point anywhere else are refused, redirects are never followed with the credential, and path tricks (`..`, `;`, encoded separators) are refused.
+
+The server then confirms the token works through the gateway (`GET /spaces?limit=1`). The v1 identity check by email cannot run on the gateway; the two legs above take its place.
+
+**Recommendation:** where you can, use a separate Atlassian account per customer, each with its own token. Then even a token that Atlassian would accept for every site of its account can only reach that one customer's sites.
 
 ### Token expiry
 

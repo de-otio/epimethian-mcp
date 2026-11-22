@@ -3,6 +3,10 @@
 **STATUS: NOT RUN YET.** The probe is built and tested against stubbed responses only. A person
 runs it by hand against the designated test profile, then pastes the output below.
 
+**Gateway mode is not live-verified** until both the gateway run of this probe and the
+scoped-token check (question 4) have run. Until then every gateway claim in the docs is a
+design assumption.
+
 Plan: `plans/next-release-sdk2-and-v2-api.md` section 5.1 (W-INV), with the call inventory in
 section 5.4 and the gateway capability table in section 5.3. Until results are in, the
 conservative defaults in section 11 of the plan apply: `revert_page` stays on v1 in site mode,
@@ -18,6 +22,12 @@ confirmed" is treated as unavailable.
    `revert_page` switch, W-HIST.)
 3. Gateway mode (scoped token): which v1 GETs answer 410, and does each v2 read pass with the
    expected granular scope?
+4. Scoped-token check: does a scoped token work against a second cloudId (another site the same
+   Atlassian account can see) through `https://api.atlassian.com/ex/confluence/{otherCloudId}`?
+   Expected: yes. The tenant guard does not rely on the token being bound to one site
+   (`doc/design/gateway-mode.md` §9 item 1); a "no" would add a third leg, a "yes" confirms the
+   per-customer-account recommendation. Run it read-only (one `GET /spaces?limit=1`), only
+   against sites the account owner has approved for the check.
 
 ## Method
 
@@ -123,6 +133,7 @@ Not run yet. Fill in after the runs:
   section 5.3 item 7.
 - Decisions this unlocks: the `revert_page` switch (needs 30/30 byte-identical), the
   `probeWriteCapability` swap, and each "to be confirmed" gateway-table row.
+- Scoped-token check (question 4): whether the token was accepted for a second cloudId.
 
 ## v2 response-shape assumptions to confirm (W-V2READ, W-HIST)
 
@@ -135,9 +146,10 @@ must be confirmed by a read-only run before the release ships; a wrong one fails
    (not under `extensions`), and `_links.next` is either `/wiki/api/v2/...` or an absolute URL on
    the same API. Confirm `version.number` equals what v1 reported (the draw.io tools compare it
    with `expected_version`).
-2. **`filename=` filter.** Whether it is case-sensitive or exact. The lookup does not depend on it
-   (exact post-filter), but if it is case-sensitive the "differs only in case" hint in
-   `update_drawio_diagram` / `add_attachment` stops appearing.
+2. **`filename=` filter.** No longer sent on v2: the lookup reads the container's whole current
+   attachment list and computes exact and case-only matches itself, so the filter's case
+   semantics cannot change the result. Confirm that `status=current` is honoured and that items
+   carry `status` (archived files are dropped defensively either way).
 3. **Draft blog posts.** v2 attachment and label reads cannot see a never-published blog post
    draft (like `GET /blogposts/{id}` without a status). Attachment reads on drafts therefore stay
    on v1 with `status=draft`; the label read after a write treats a 404 as "no legacy label".
