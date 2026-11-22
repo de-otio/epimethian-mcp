@@ -91,6 +91,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONFLUENCE_PROFILE` name different profiles they refuse to start and name
   both, rather than pick one; a missing or invalid name is an error before any
   keychain read.
+- Setup printed every tool for the mode ("Available tools in gateway mode
+  (28)", write tools included) whatever posture was chosen. It now prints the
+  tools the server will register for that mode and posture, from the server's
+  own tables (14 for a read-only gateway profile); for posture `detect` it says
+  the list depends on the startup probe and shows both possibilities.
+- The OpenCode snippet note no longer tells 7.x users to "upgrade to v6.6.0":
+  it describes soft confirmation, the default without a flag, and what the
+  `EPIMETHIAN_ALLOW_UNGATED_WRITES` env var in the snippet turns off.
 - Gateway mode with a read-only scoped token: the gateway refuses the dry-run
   page update with 401 `scope does not match`, not 403 (live check
   2026-11-22). The setup scope check now reads that answer as "this token

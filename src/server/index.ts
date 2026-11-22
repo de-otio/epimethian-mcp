@@ -94,6 +94,7 @@ import { settleInChunks, DEFAULT_MAX_CONCURRENCY } from "./request-policy.js";
 import { markPageUnverified } from "./provenance.js";
 import { revertHistoricalSource } from "./historical-source.js";
 import { toolAvailableIn, unavailableToolsFor, type ApiMode } from "./api-capabilities.js";
+import { WRITE_TOOLS } from "./tool-posture.js";
 
 /**
  * The trailing container argument for the v1 attachment and content-state
@@ -798,34 +799,10 @@ export const READ_ONLY_TOOLS = new Set([
   "resolve_page_link",
 ]);
 
-/**
- * O2: The set of write tools that are only registered when effectivePosture === "read-write".
- * This complements READ_ONLY_TOOLS — the registration-time gate (O2) is the primary
- * enforcement; writeGuard remains a belt-and-suspenders runtime check.
- */
-export const WRITE_TOOLS = new Set([
-  "authorise_destructive_writes",
-  "create_page",
-  "update_page",
-  "create_blog_post",
-  "update_blog_post",
-  "append_to_page",
-  "prepend_to_page",
-  "update_page_section",
-  "update_page_sections",
-  "delete_page",
-  "add_drawio_diagram",
-  "update_drawio_diagram",
-  "revert_page",
-  "add_attachment",
-  "add_label",
-  "remove_label",
-  "create_comment",
-  "delete_comment",
-  "resolve_comment",
-  "set_page_status",
-  "remove_page_status",
-]);
+// O2: WRITE_TOOLS (write tools registered only in the read-write posture)
+// lives in tool-posture.ts so `setup` can print the registered set without
+// loading the server.
+export { WRITE_TOOLS };
 
 /**
  * Tools registered in every posture that do not call `writeGuard`, so they

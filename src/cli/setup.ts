@@ -16,7 +16,8 @@ import { addToProfileRegistry, setProfileSettings } from "../shared/profiles.js"
 import { renderConfigSnippet, knownClientIds } from "./client-configs.js";
 import { KNOWN_TOOLS } from "../server/tool-allowlist.js";
 import { requestBaseFor } from "../server/api-base.js";
-import { toolAvailableIn, unavailableToolsFor } from "../server/api-capabilities.js";
+import { unavailableToolsFor, type ApiMode } from "../server/api-capabilities.js";
+import { registeredToolsFor } from "../server/tool-posture.js";
 import { GATEWAY_SCOPES, classifyScopeProbe } from "../shared/gateway-scopes.js";
 import { isValidExpiryDate } from "../shared/token-expiry.js";
 import { sanitizeDisplayName } from "../shared/display-text.js";
@@ -56,6 +57,31 @@ function resolveBinPath(): string {
  * given profile exposes depends on its posture and tool filters.
  */
 export const TOOLS: readonly string[] = KNOWN_TOOLS;
+
+/**
+ * The tools the server will register for this mode and posture, from the
+ * server's own tables (`registeredToolsFor`). Posture "detect" has two
+ * possible lists; which one applies is decided by the startup probe.
+ */
+export function describeRegisteredTools(mode: ApiMode, posture: "read-only" | "read-write" | "detect"): string {
+  const where = mode === "gateway" ? " in gateway mode" : "";
+  if (posture !== "detect") {
+    const tools = registeredToolsFor(mode, posture);
+    return `Available tools${where}, ${posture} (${tools.length}):\n  ${tools.join(", ")}`;
+  }
+  const readOnly = registeredToolsFor(mode, "read-only");
+  const readOnlySet = new Set(readOnly);
+  const writeOnly = registeredToolsFor(mode, "read-write").filter((t) => !readOnlySet.has(t));
+  return (
+    `Available tools${where} depend on the startup probe (posture: detect).\n` +
+    `  Always (${readOnly.length}): ${readOnly.join(", ")}\n` +
+    `  Only if the probe finds the token can write (${writeOnly.length} more): ${writeOnly.join(", ")}`
+  );
+}
+
+function printRegisteredTools(mode: ApiMode, posture: "read-only" | "read-write" | "detect"): void {
+  console.log(describeRegisteredTools(mode, posture));
+}
 
 function readPassword(prompt: string): Promise<string> {
   stdout.write(prompt);
@@ -278,9 +304,7 @@ async function runGatewaySetup(
       `${tokenExpiry ? `, token expires ${tokenExpiry}` : ""}).\n`
   );
 
-  const available = TOOLS.filter((t) => toolAvailableIn("gateway", t));
-  console.log(`Available tools in gateway mode (${available.length}):`);
-  console.log(`  ${available.join(", ")}`);
+  printRegisteredTools("gateway", posture);
   console.log(`Not available in gateway mode: ${unavailableToolsFor("gateway").join(", ")}`);
   console.log(
     "\nSetup complete. Restart your MCP client to use the new credentials."
@@ -474,11 +498,15 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
       }),
       profile
     );
+    // Without a profile there is no posture setting: the server resolves it
+    // at startup (CONFLUENCE_READ_ONLY or the probe), so the list is "detect".
+    let profilePosture: Posture = "detect";
     if (profile) {
       await addToProfileRegistry(profile);
 
       // Prompt for MCP access posture (replaces old read-only/write binary)
       const posture = await promptPosture();
+      profilePosture = posture;
       await setProfileSettings(profile, { posture });
       console.log(`Credentials saved to OS keychain (profile: ${profile}, posture: ${posture}).\n`);
     } else {
@@ -488,8 +516,7 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
       );
     }
 
-    console.log(`Available tools (${TOOLS.length}):`);
-    console.log(`  ${TOOLS.join(", ")}`);
+    printRegisteredTools("site", profilePosture);
     console.log(
       "\nSetup complete. Restart your MCP client to use the new credentials."
     );

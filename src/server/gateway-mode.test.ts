@@ -813,6 +813,8 @@ describe("tools/list in gateway mode", () => {
   it("equals the golden list, hides every v1-only tool, and is byte-identical across two calls", async () => {
     const s = await bootServer();
     expect(s.tools.map((t) => t.name)).toEqual(GOLDEN_GATEWAY_TOOLS);
+    const { registeredToolsFor } = await import("./tool-posture.js");
+    expect([...registeredToolsFor("gateway", "read-write")].sort()).toEqual([...GOLDEN_GATEWAY_TOOLS].sort());
 
     const first = await s.list();
     const second = await s.list();
@@ -839,6 +841,9 @@ describe("tools/list in gateway mode", () => {
     }
     expect(names).toContain("get_page");
     expect(names).toContain("get_page_versions");
+    // What setup prints for this profile is what the server registers.
+    const { registeredToolsFor } = await import("./tool-posture.js");
+    expect([...names].sort()).toEqual([...registeredToolsFor("gateway", "read-only")].sort());
   });
 
   it("posture 'detect' with a read-only scoped token (live 401 'scope does not match') boots with the read set", async () => {

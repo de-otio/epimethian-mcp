@@ -403,9 +403,20 @@ describe("runSetup", () => {
     process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
     process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
 
+    const logSpy = vi.spyOn(console, "log");
     await runSetup("acme");
 
     expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-only" });
+    // The printed list is what a read-only site profile registers: no write tool.
+    const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    const listLine = out.split("\n").find((l) => l.startsWith("Available tools"))!;
+    expect(listLine).toMatch(/^Available tools, read-only \(\d+\):/);
+    const listed = out.split("Available tools, read-only")[1].split("\n")[1];
+    expect(listed).toContain("get_page");
+    expect(listed).toContain("search_pages");
+    expect(listed).not.toContain("create_page");
+    expect(listed).not.toContain("delete_page");
+    logSpy.mockRestore();
 
     process.stdin.on = originalOn;
   });
@@ -504,9 +515,14 @@ describe("runSetup", () => {
     process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
     process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
 
+    const logSpy = vi.spyOn(console, "log");
     await runSetup("acme");
 
     expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "detect" });
+    const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain("Available tools depend on the startup probe (posture: detect).");
+    expect(out).toMatch(/Only if the probe finds the token can write \(\d+ more\): .*create_page/);
+    logSpy.mockRestore();
 
     process.stdin.on = originalOn;
   });

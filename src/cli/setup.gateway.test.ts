@@ -198,6 +198,58 @@ describe("gateway setup", () => {
   });
 });
 
+describe("tool list printed after gateway setup", () => {
+  /** What a read-only gateway profile registers (live check 2026-11-22: 14 tools). */
+  const READ_ONLY_GATEWAY = [
+    "get_page",
+    "list_pages",
+    "get_page_children",
+    "get_spaces",
+    "check_permissions",
+    "get_page_by_title",
+    "get_attachments",
+    "get_labels",
+    "get_comments",
+    "get_page_versions",
+    "get_page_version",
+    "diff_page_versions",
+    "get_version",
+    "upgrade",
+  ];
+  const listedAfter = (out: string, header: RegExp): string[] => {
+    const lines = out.split("\n");
+    const i = lines.findIndex((l) => header.test(l));
+    expect(i, `no line matching ${header}`).toBeGreaterThanOrEqual(0);
+    return lines[i + 1].trim().split(", ");
+  };
+
+  it("read-only: the 14 tools a read-only gateway profile registers, and no write tool", async () => {
+    answers("y", "y", "", "1");
+    await runSetup("gw-test");
+    const out = logs.join("\n");
+    expect(out).toContain("Available tools in gateway mode, read-only (14):");
+    expect(listedAfter(out, /^Available tools in gateway mode, read-only/).sort()).toEqual([...READ_ONLY_GATEWAY].sort());
+    expect(out).not.toMatch(/Available tools in gateway mode \(28\)/);
+  });
+
+  it("read-write: the 28 gateway tools", async () => {
+    answers("y", "y", "", "2");
+    await runSetup("gw-test");
+    const out = logs.join("\n");
+    expect(out).toContain("Available tools in gateway mode, read-write (28):");
+    expect(listedAfter(out, /^Available tools in gateway mode, read-write/)).toContain("update_page");
+  });
+
+  it("detect: says the list depends on the startup probe, with both possibilities", async () => {
+    answers("y", "y", "", "3");
+    await runSetup("gw-test");
+    const out = logs.join("\n");
+    expect(out).toContain("Available tools in gateway mode depend on the startup probe (posture: detect).");
+    expect(out).toContain("Always (14):");
+    expect(out).toMatch(/Only if the probe finds the token can write \(14 more\): .*update_page/);
+  });
+});
+
 describe("scope probe: the gateway's live 401 answer", () => {
   it("401 'scope does not match' reads as a token that cannot update pages", async () => {
     mockProbeWriteScope.mockResolvedValue({ status: 401, scopeMismatch: true });
