@@ -1685,8 +1685,8 @@ export interface ContainerOptions {
   draft?: boolean;
   /**
    * The container's content type, when the caller already knows it. The v2
-   * reads route on it (`/pages/...` or `/blogposts/...`); when absent they try
-   * pages first and fall back to blog posts on a 404.
+   * reads route on it (`/pages/...` or `/blogposts/...`); when absent the type
+   * comes from the memo or a metadata read of the object (withContentType).
    */
   contentType?: ContentType;
 }
@@ -2429,12 +2429,15 @@ export async function searchPagesByTitle(
 
 // --- v2 list reads: content-type routing and cursor pagination ---
 
-// Content type by id, learned from reads and creates that SUCCEEDED, scoped by
-// tenant URL like the space-key cache. An id's type never changes (ids are
-// unique across pages and blog posts), so entries never expire. The memo only
-// routes v2 reads (`/pages/...` vs `/blogposts/...`): it saves the pages probe
-// for blog posts, so blog flows never touch `/pages`. A wrong or missing entry
-// costs a 404 and the other path, never wrong data.
+// Content type by id, scoped by tenant URL like the space-key cache. Learned
+// ONLY from authoritative answers: a successful read of the object itself
+// (`GET /pages/{id}` or `/blogposts/{id}`, via fetchContent, resolveContentType,
+// resolveContainerStatus, getDraftBlogPost) or a create. Never from a
+// sub-collection (`/pages/{id}/attachments`, `/labels`, `/versions`): such an
+// endpoint has been seen to answer 200 with an empty list for an id that is
+// not a page, which would route a blog post's reads to an empty page listing.
+// An id's type never changes (ids are unique across pages and blog posts), so
+// entries never expire. The memo only routes v2 reads.
 const contentTypeMemo = new Map<string, ContentType>();
 
 async function rememberContentType(id: string, type: ContentType): Promise<void> {
@@ -2455,10 +2458,14 @@ export function _resetContentTypeMemoForTests(): void {
 /**
  * Run a v2 read against `/pages/{id}/...` or `/blogposts/{id}/...` (contract C3).
  *
- * With a known `type` (argument, else the memo) exactly one request path is
- * used. Without one the page path is tried first and only a 404 falls through
- * to blog posts (as `getContent` does), so page reads cost no extra request;
- * both 404 give one combined not-found. A success is remembered.
+ * The type comes from the `type` argument, else the memo, else
+ * `resolveContentType` (a metadata read of the object itself, which also
+ * fills the memo; both 404 → one combined not-found). Exactly one request
+ * path is then used for `read`. A sub-collection answering 200 is never taken
+ * as proof of the type and teaches the memo nothing (see the memo comment):
+ * an unknown id costs one metadata read first, never a wrong-but-plausible
+ * empty list. A not-found from `read` itself is passed through unchanged:
+ * the object exists, so it is not reported as a missing page or blog post.
  */
 async function withContentType<T>(
   id: string,
@@ -2466,27 +2473,8 @@ async function withContentType<T>(
   read: (type: ContentType) => Promise<T>
 ): Promise<T> {
   assertNumericContentId(id);
-  const known = type ?? (await recallContentType(id));
-  if (known !== undefined) {
-    const result = await read(known);
-    await rememberContentType(id, known);
-    return result;
-  }
-  try {
-    const result = await read("page");
-    await rememberContentType(id, "page");
-    return result;
-  } catch (err) {
-    if (!(err instanceof ConfluenceNotFoundError)) throw err;
-  }
-  try {
-    const result = await read("blogpost");
-    await rememberContentType(id, "blogpost");
-    return result;
-  } catch (err) {
-    if (err instanceof ConfluenceNotFoundError) throw notFoundAsPageOrBlogPost(id);
-    throw err;
-  }
+  const known = type ?? (await recallContentType(id)) ?? (await resolveContentType(id));
+  return read(known);
 }
 
 /** Pages followed per list read: bounds the work a hostile or buggy cursor chain can cause. */
@@ -2542,11 +2530,24 @@ async function walkV2List<T>(
 const V2AttachmentSchema = z.object({
   id: z.string(),
   title: z.string(),
+  /** `current`, `archived`, `trashed`, ... Lists default to current+archived. */
+  status: z.string().optional(),
   mediaType: z.string().optional(),
   fileSize: z.number().optional(),
   downloadLink: z.string().optional(),
   version: z.object({ number: z.number().int().positive() }).optional(),
 });
+
+/**
+ * Drop every attachment the answer marks as not current. The list requests ask
+ * for `status=current` (v2 attachment lists otherwise return archived files as
+ * well); this is the defensive second check, so an archived file can never be
+ * the target of a new version. An item without `status` is kept: the server
+ * was asked for current items only.
+ */
+function currentOnly<T extends { status?: string }>(items: readonly T[]): T[] {
+  return items.filter((a) => a.status === undefined || a.status === "current");
+}
 
 /** Map a v2 attachment to the v1-shaped `AttachmentData` the tools already consume. */
 function v2AttachmentToData(a: z.infer<typeof V2AttachmentSchema>): AttachmentData {
@@ -2586,12 +2587,12 @@ export async function getAttachments(
   const { items } = await withContentType(pageId, container?.contentType, (type) =>
     walkV2List(
       `/${segmentFor(type)}/${pageId}/attachments`,
-      { limit: pageSize },
+      { status: "current", limit: pageSize },
       V2AttachmentSchema,
       Math.max(Math.trunc(limit), 1)
     )
   );
-  return items.slice(0, Math.max(Math.trunc(limit), 1)).map(v2AttachmentToData);
+  return currentOnly(items).slice(0, Math.max(Math.trunc(limit), 1)).map(v2AttachmentToData);
 }
 
 // --- Attachment lookup and new versions ---
@@ -2627,9 +2628,9 @@ function toAttachmentInfo(a: AttachmentData): AttachmentInfo {
 }
 
 export interface AttachmentLookup {
-  /** The attachment whose title equals `filename` exactly, or null. */
+  /** The current attachment whose title equals `filename` exactly, or null. */
   exact: AttachmentInfo | null;
-  /** Other attachments the server matched (its `filename` filter ignores case). */
+  /** Current attachments whose title equals `filename` ignoring case, but not exactly. */
   near: AttachmentInfo[];
 }
 
@@ -2648,20 +2649,23 @@ export function exactAttachmentMatches<T extends { title: string }>(
 }
 
 /**
- * Find a page's attachment by its exact title.
+ * Find a page's current attachment by its exact title.
  *
- * The `filename` query narrows the search on the server, but the title is
- * compared again here, exactly and case-sensitively: an update must never pick
- * a file the caller did not name (`a.drawio` must not match `a.drawio.bak` or
+ * v2: the page's whole CURRENT attachment list is read (`status=current`,
+ * every cursor page) and both answers are computed here: `exact` with `===`,
+ * `near` as equal ignoring case but not exactly. No `filename=` filter is
+ * sent: its case semantics are the server's and have differed between APIs,
+ * and a case-sensitive filter would hide `A.drawio` from a lookup of
+ * `a.drawio` (so an overwrite would create a second file, and the draw.io
+ * preview guard would miss `X.drawio.PNG`). An update must never pick a file
+ * the caller did not name (`a.drawio` must not match `a.drawio.bak` or
  * `A.drawio`). No exact match is "not found"; more than one is refused, never
- * resolved by taking the first. Server matches that differ only in case come
- * back in `near`, so the caller can say "did you mean".
+ * resolved by taking the first.
  *
- * Every page of the answer is read: an exact match, or a second exact match,
- * could be on a later page. If the list cannot be read to the end the lookup
- * throws instead of deciding.
+ * If the list cannot be read to the end the lookup throws instead of deciding.
  *
- * A blog post draft keeps the v1 lookup (`status=draft` has no v2 equivalent).
+ * A blog post draft keeps the v1 lookup (`status=draft` has no v2 equivalent);
+ * v1's `filename` filter ignores case, and the decision is still made here.
  */
 export async function findAttachmentByName(
   pageId: string,
@@ -2691,7 +2695,7 @@ export async function findAttachmentByName(
     const walked = await withContentType(pageId, container?.contentType, (type) =>
       walkV2List(
         `/${segmentFor(type)}/${pageId}/attachments`,
-        { filename, limit: 100 },
+        { status: "current", limit: V2_MAX_PAGE_SIZE },
         V2AttachmentSchema,
         "all"
       )
@@ -2702,7 +2706,7 @@ export async function findAttachmentByName(
           `refusing to decide whether "${filename}" is present or unique.`
       );
     }
-    all = walked.items.map((a) => toAttachmentInfo(v2AttachmentToData(a)));
+    all = currentOnly(walked.items).map((a) => toAttachmentInfo(v2AttachmentToData(a)));
   }
   const exact = exactAttachmentMatches(all, filename);
   if (exact.length > 1) {
@@ -2712,7 +2716,7 @@ export async function findAttachmentByName(
       `Confluence returned ${exact.length} attachments with the same name on page ${pageId}; refusing to choose one.`
     );
   }
-  // The server's match may be looser than case alone; keep only true case-variants.
+  // Near: the same name ignoring case, never the exact name itself.
   const folded = filename.toLowerCase();
   return {
     exact: exact[0] ?? null,
@@ -3274,12 +3278,31 @@ export async function getHistoricalStorage(
   return { title: data.title, rawBody: data.body.storage.value, version: data.version.number };
 }
 
+function versionNotFound(id: string, type: ContentType, version: number): ConfluenceNotFoundError {
+  const what = type === "blogpost" ? "blog post" : "page";
+  const message =
+    `Version ${version} of ${what} ${id} was not found, or this account cannot view it. ` +
+    `Use get_page_versions to list the versions that exist.`;
+  const err = new ConfluenceNotFoundError(404, message);
+  err.message = message;
+  return err;
+}
+
 async function fetchV2VersionBody(
   pageId: string,
   version: number,
   type?: ContentType
 ): Promise<{ title: string; rawBody: string; version: number }> {
-  const result = await withContentType(pageId, type, (t) => getHistoricalStorage(pageId, t, version));
+  const result = await withContentType(pageId, type, async (t) => {
+    try {
+      return await getHistoricalStorage(pageId, t, version);
+    } catch (err) {
+      // The object itself was found (its type is known), so a 404 here is
+      // about the version, not about the page or blog post.
+      if (err instanceof ConfluenceNotFoundError) throw versionNotFound(pageId, t, version);
+      throw err;
+    }
+  });
   // Cached only after every assertion passed.
   pageCache.setVersioned(pageId, version, result.rawBody, "v2");
   return result;

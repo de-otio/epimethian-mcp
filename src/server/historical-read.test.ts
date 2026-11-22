@@ -127,12 +127,25 @@ const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
   }
   const req = { method, url, body };
   requests.push(req);
-  return route(req) ?? json({ message: `unexpected ${method} ${url.pathname}` }, 404);
+  return route(req) ?? parentMeta(req) ?? json({ message: `unexpected ${method} ${url.pathname}` }, 404);
 });
+
+/**
+ * The fixtures' objects (page 10, blog post 20), answered unless a test routes
+ * them itself: a read of an id of unknown type first reads the object (B1).
+ */
+function parentMeta(req: { method: string; url: URL }): Response | undefined {
+  if (req.method !== "GET" || req.url.searchParams.has("version")) return undefined;
+  if (req.url.pathname === "/wiki/api/v2/pages/10") return json({ id: "10", title: "Page ten", version: { number: 9 } });
+  if (req.url.pathname === "/wiki/api/v2/blogposts/20") return json({ id: "20", title: "Post twenty", version: { number: 9 } });
+  return undefined;
+}
 
 const V2 = "/wiki/api/v2";
 const V1 = "/wiki/rest/api";
 const paths = () => requests.map((r) => r.url.pathname);
+/** Historical reads only (`?version=`), without the object's metadata read. */
+const histPaths = () => requests.filter((r) => r.url.pathname.startsWith(V1) || r.url.searchParams.has("version")).map((r) => r.url.pathname);
 const writes = () => requests.filter((r) => r.method !== "GET" && r.method !== "HEAD");
 
 let errSpy: ReturnType<typeof vi.spyOn>;
@@ -209,7 +222,7 @@ describe("getHistoricalStorage", () => {
   it("a mismatch is never papered over by falling back to the current body (no second request)", async () => {
     route = histRoute("pages", "10", () => hist("10", 9, "<p>CURRENT</p>"));
     await expect(getPageVersionBody("10", 3)).rejects.toThrow(/Refusing to use the historical read/);
-    expect(requests).toHaveLength(1);
+    expect(histPaths()).toEqual([`${V2}/pages/10`]);
   });
 
   it.each([
@@ -263,16 +276,19 @@ describe("getHistoricalStorage", () => {
 });
 
 describe("getPageVersionBody / getVersionStorage routing", () => {
-  it("page id: one request to /pages, none to v1", async () => {
+  it("page id: the page's metadata, then one historical read of /pages, none to v1", async () => {
     route = histRoute("pages", "10", (n) => hist("10", n));
     await getPageVersionBody("10", 3);
-    expect(paths()).toEqual([`${V2}/pages/10`]);
+    expect(paths()).toEqual([`${V2}/pages/10`, `${V2}/pages/10`]);
+    expect(requests[0].url.searchParams.has("version")).toBe(false);
+    expect(requests[1].url.searchParams.get("version")).toBe("3");
   });
 
-  it("blog post id: pages 404, then /blogposts with the same assertions", async () => {
+  it("blog post id: the page read 404s, the blog post read succeeds, then /blogposts with the same assertions", async () => {
     route = histRoute("blogposts", "20", (n) => hist("20", n));
     const out = await getPageVersionBody("20", 2);
-    expect(paths()).toEqual([`${V2}/pages/20`, `${V2}/blogposts/20`]);
+    expect(paths()).toEqual([`${V2}/pages/20`, `${V2}/blogposts/20`, `${V2}/blogposts/20`]);
+    expect(histPaths()).toEqual([`${V2}/blogposts/20`]);
     expect(out.rawBody).toBe("<p>v2</p>");
     // and a blog post answer for the wrong version is refused just the same
     pageCache.clear();
@@ -284,7 +300,8 @@ describe("getPageVersionBody / getVersionStorage routing", () => {
   it("a mismatch on /pages is not a 404: the blog post path is not tried", async () => {
     route = histRoute("pages", "10", () => hist("10", 9));
     await expect(getVersionStorage("10", 3)).rejects.toBeInstanceOf(HistoricalReadMismatchError);
-    expect(paths()).toEqual([`${V2}/pages/10`]);
+    expect(histPaths()).toEqual([`${V2}/pages/10`]);
+    expect(paths().some((p) => p.includes("/blogposts/"))).toBe(false);
   });
 
   it("neither a page nor a blog post: one combined not-found", async () => {
@@ -309,7 +326,7 @@ describe("the versioned cache never mixes v1 and v2 bodies", () => {
     expect(a.rawBody).toBe("<p>from v1</p>");
     expect(b.rawBody).toBe("<p>from v2</p>");
     // two fetches: the v1 entry did not answer the v2 read
-    expect(paths()).toEqual([`${V1}/content/10`, `${V2}/pages/10`]);
+    expect(histPaths()).toEqual([`${V1}/content/10`, `${V2}/pages/10`]);
     expect(pageCache.getVersioned("10", 3, "v1")).toBe("<p>from v1</p>");
     expect(pageCache.getVersioned("10", 3, "v2")).toBe("<p>from v2</p>");
   });

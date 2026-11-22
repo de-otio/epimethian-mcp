@@ -4447,7 +4447,8 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
         const shown = findDrawioMacros(body).filter(
           (m) => m.diagramName === diagram_name && (m.pageIdParam === undefined || m.pageIdParam === page_id)
         );
-        // Any name the server matched counts: it ignores case, and a preview
+        // A current attachment whose name equals "<diagram>.png" ignoring case
+        // counts (matched locally, not by the server's filter): a preview
         // saved as ".PNG" is still a preview.
         const hasPreview = png.exact !== null || png.near.length > 0;
         if (hasPreview || shown.some((m) => m.hasCustomContent)) {

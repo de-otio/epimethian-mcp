@@ -97,6 +97,7 @@ import {
   getAttachments,
   getLabels,
   getPageVersions,
+  getPageVersionBody,
   exactAttachmentMatches,
   uploadAttachmentVersion,
   MAX_V2_LIST_PAGES,
@@ -133,12 +134,29 @@ const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
   }
   const req = { method, url, body };
   requests.push(req);
-  return route(req) ?? json({ message: `unexpected ${method} ${url.pathname}` }, 404);
+  return route(req) ?? parentMeta(req) ?? json({ message: `unexpected ${method} ${url.pathname}` }, 404);
 });
+
+/**
+ * The objects the fixtures' ids name, answered unless a test routes them
+ * itself: a list read on an id of unknown type first reads the object (B1).
+ */
+const FIXTURE_PAGES = new Set(["11", "21", "31", "41", "5001"]);
+const FIXTURE_BLOG_POSTS = new Set(["12", "22", "32", "42"]);
+function parentMeta(req: { method: string; url: URL }): Response | undefined {
+  if (req.method !== "GET" || req.url.searchParams.has("version")) return undefined;
+  const m = /^\/wiki\/api\/v2\/(pages|blogposts)\/(\d+)$/.exec(req.url.pathname);
+  if (!m) return undefined;
+  const known = m[1] === "pages" ? FIXTURE_PAGES : FIXTURE_BLOG_POSTS;
+  return known.has(m[2]) ? json({ id: m[2], title: `content ${m[2]}`, spaceId: "1001", version: { number: 4 } }) : undefined;
+}
 
 const V2 = "/wiki/api/v2";
 const V1 = "/wiki/rest/api";
 const paths = () => requests.map((r) => r.url.pathname);
+/** Requests other than the metadata read of the object itself (B1: an unknown id's type is read first). */
+const PARENT_READ = /^\/wiki\/api\/v2\/(pages|blogposts)\/\d+$/;
+const listReqs = () => requests.filter((r) => !(r.method === "GET" && PARENT_READ.test(r.url.pathname)));
 
 let errSpy: ReturnType<typeof vi.spyOn>;
 
@@ -183,11 +201,11 @@ const listRoute =
 // ===========================================================================
 
 describe("getAttachments on v2", () => {
-  it("page id: one GET to /pages/{id}/attachments, never the v1 endpoint", async () => {
+  it("page id: reads the page, then one GET to /pages/{id}/attachments, never the v1 endpoint", async () => {
     route = listRoute(`${V2}/pages/11/attachments`, [att(1)]);
     const out = await getAttachments("11", 25);
-    expect(paths()).toEqual([`${V2}/pages/11/attachments`]);
-    expect(requests[0].url.searchParams.get("limit")).toBe("25");
+    expect(paths()).toEqual([`${V2}/pages/11`, `${V2}/pages/11/attachments`]);
+    expect(requests[1].url.searchParams.get("limit")).toBe("25");
     expect(paths().some((p) => p.includes("/rest/api/"))).toBe(false);
     expect(out).toEqual([
       {
@@ -200,10 +218,10 @@ describe("getAttachments on v2", () => {
     ]);
   });
 
-  it("blog post id: tries pages, gets a 404, then reads /blogposts/{id}/attachments", async () => {
+  it("blog post id: the page read 404s, the blog post read succeeds, then /blogposts/{id}/attachments", async () => {
     route = listRoute(`${V2}/blogposts/12/attachments`, [att(2)]);
     const out = await getAttachments("12", 25);
-    expect(paths()).toEqual([`${V2}/pages/12/attachments`, `${V2}/blogposts/12/attachments`]);
+    expect(paths()).toEqual([`${V2}/pages/12`, `${V2}/blogposts/12`, `${V2}/blogposts/12/attachments`]);
     expect(out.map((a) => a.title)).toEqual(["f2.png"]);
   });
 
@@ -215,7 +233,7 @@ describe("getAttachments on v2", () => {
 
   it("an id that is neither: one combined not-found", async () => {
     await expect(getAttachments("13", 25)).rejects.toThrow(/No page or blog post with id 13/);
-    expect(paths()).toEqual([`${V2}/pages/13/attachments`, `${V2}/blogposts/13/attachments`]);
+    expect(paths()).toEqual([`${V2}/pages/13`, `${V2}/blogposts/13`]);
   });
 
   it("a non-numeric id never reaches a URL", async () => {
@@ -248,7 +266,7 @@ describe("getAttachments on v2", () => {
     };
     const out = await getAttachments("11", 10);
     expect(out.map((a) => a.title)).toEqual(["f1.png", "f2.png", "f3.png", "f4.png", "f5.png"]);
-    expect(requests.map((r) => r.url.searchParams.get("cursor"))).toEqual([null, "c2", "c3"]);
+    expect(listReqs().map((r) => r.url.searchParams.get("cursor"))).toEqual([null, "c2", "c3"]);
   });
 
   it("stops following the cursor once `limit` items are in hand", async () => {
@@ -258,7 +276,7 @@ describe("getAttachments on v2", () => {
         : undefined;
     const out = await getAttachments("11", 2);
     expect(out).toHaveLength(2);
-    expect(requests).toHaveLength(1);
+    expect(listReqs()).toHaveLength(1);
   });
 
   it.each([
@@ -275,9 +293,9 @@ describe("getAttachments on v2", () => {
         ? json({ results: [att(1)], _links: { next } })
         : undefined;
     await expect(getAttachments("11", 10)).rejects.toThrow(/Refusing to follow a pagination link/);
-    // Only the first request was made: the credential never went to the cursor.
-    expect(requests).toHaveLength(1);
-    expect(requests[0].url.origin).toBe("https://test.atlassian.net");
+    // Only the first list request was made: the credential never went to the cursor.
+    expect(listReqs()).toHaveLength(1);
+    for (const r of requests) expect(r.url.origin).toBe("https://test.atlassian.net");
   });
 
   it("a cursor chain longer than the page cap stops instead of walking forever", async () => {
@@ -286,7 +304,7 @@ describe("getAttachments on v2", () => {
         ? json({ results: [att(1)], _links: { next: `${V2}/pages/11/attachments?cursor=${requests.length}` } })
         : undefined;
     const out = await getAttachments("11", 1_000_000);
-    expect(requests).toHaveLength(MAX_V2_LIST_PAGES);
+    expect(listReqs()).toHaveLength(MAX_V2_LIST_PAGES);
     expect(out.length).toBe(MAX_V2_LIST_PAGES);
   });
 });
@@ -296,14 +314,14 @@ describe("getAttachments on v2", () => {
 // ===========================================================================
 
 describe("findAttachmentByName on v2", () => {
-  it("sends filename= to /pages/{id}/attachments and matches the exact title only", async () => {
+  it("lists /pages/{id}/attachments (no filename= filter) and matches the exact title only", async () => {
     route = listRoute(`${V2}/pages/21/attachments`, [
       att(1, { title: "a.drawio.bak" }),
       att(2, { title: "a.drawio", version: { number: 4 } }),
     ]);
     const r = await findAttachmentByName("21", "a.drawio");
-    expect(paths()).toEqual([`${V2}/pages/21/attachments`]);
-    expect(requests[0].url.searchParams.get("filename")).toBe("a.drawio");
+    expect(paths()).toEqual([`${V2}/pages/21`, `${V2}/pages/21/attachments`]);
+    expect(requests[1].url.searchParams.has("filename")).toBe(false);
     expect(r.exact).toMatchObject({ id: "att2", title: "a.drawio", version: 4 });
     expect(r.near).toEqual([]);
   });
@@ -311,7 +329,7 @@ describe("findAttachmentByName on v2", () => {
   it("blog post id: a.drawio is looked up under /blogposts", async () => {
     route = listRoute(`${V2}/blogposts/22/attachments`, [att(1, { title: "a.drawio" })]);
     const r = await findAttachmentByName("22", "a.drawio");
-    expect(paths()).toEqual([`${V2}/pages/22/attachments`, `${V2}/blogposts/22/attachments`]);
+    expect(paths()).toEqual([`${V2}/pages/22`, `${V2}/blogposts/22`, `${V2}/blogposts/22/attachments`]);
     expect(r.exact?.title).toBe("a.drawio");
   });
 
@@ -345,7 +363,7 @@ describe("findAttachmentByName on v2", () => {
     route = (r) =>
       r.url.pathname === `${V2}/pages/21/attachments` ? answer(r.url.searchParams.get("cursor")) : undefined;
     await expect(findAttachmentByName("21", "a.drawio")).rejects.toThrow(/refusing to choose/);
-    expect(requests).toHaveLength(2);
+    expect(listReqs()).toHaveLength(2);
   });
 
   it("refuses to decide when the list cannot be read to the end", async () => {
@@ -362,7 +380,7 @@ describe("findAttachmentByName on v2", () => {
         ? json({ results: [], _links: { next: "https://evil.example/wiki/api/v2/pages/21/attachments?cursor=x" } })
         : undefined;
     await expect(findAttachmentByName("21", "a.drawio")).rejects.toThrow(/Refusing to follow a pagination link/);
-    expect(requests).toHaveLength(1);
+    expect(listReqs()).toHaveLength(1);
   });
 
   it("a v2 `att`-prefixed id round-trips into the v1 upload URL", async () => {
@@ -422,10 +440,10 @@ describe("findAttachmentByName on v2", () => {
 describe("getLabels on v2", () => {
   const lab = (n: number) => ({ id: String(n), name: `l${n}`, prefix: "global" });
 
-  it("page id: one GET to /pages/{id}/labels", async () => {
+  it("page id: reads the page, then one GET to /pages/{id}/labels", async () => {
     route = listRoute(`${V2}/pages/31/labels`, [lab(1), lab(2)]);
     const out = await getLabels("31");
-    expect(paths()).toEqual([`${V2}/pages/31/labels`]);
+    expect(paths()).toEqual([`${V2}/pages/31`, `${V2}/pages/31/labels`]);
     expect(out.map((l) => l.name)).toEqual(["l1", "l2"]);
     expect(out[0]).toEqual({ id: "1", name: "l1", prefix: "global" });
   });
@@ -433,7 +451,7 @@ describe("getLabels on v2", () => {
   it("blog post id: /blogposts/{id}/labels", async () => {
     route = listRoute(`${V2}/blogposts/32/labels`, [lab(1)]);
     const out = await getLabels("32");
-    expect(paths()).toEqual([`${V2}/pages/32/labels`, `${V2}/blogposts/32/labels`]);
+    expect(paths()).toEqual([`${V2}/pages/32`, `${V2}/blogposts/32`, `${V2}/blogposts/32/labels`]);
     expect(out).toHaveLength(1);
   });
 
@@ -492,16 +510,17 @@ describe("getPageVersions on v2", () => {
   it("page id: GET /pages/{id}/versions with the limit", async () => {
     route = both(listRoute(`${V2}/pages/41/versions`, [ver(2), ver(1)]), users({ u1: "Alice" }));
     await getPageVersions("41", 50);
-    expect(requests[0].method).toBe("GET");
-    expect(requests[0].url.pathname).toBe(`${V2}/pages/41/versions`);
-    expect(requests[0].url.searchParams.get("limit")).toBe("50");
+    const [list] = listReqs();
+    expect(list.method).toBe("GET");
+    expect(list.url.pathname).toBe(`${V2}/pages/41/versions`);
+    expect(list.url.searchParams.get("limit")).toBe("50");
     expect(paths().some((p) => p.includes("/rest/api/"))).toBe(false);
   });
 
   it("blog post id: GET /blogposts/{id}/versions", async () => {
     route = both(listRoute(`${V2}/blogposts/42/versions`, [ver(1)]), users({ u1: "Alice" }));
     const out = await getPageVersions("42", 25);
-    expect(paths().slice(0, 2)).toEqual([`${V2}/pages/42/versions`, `${V2}/blogposts/42/versions`]);
+    expect(paths().slice(0, 3)).toEqual([`${V2}/pages/42`, `${V2}/blogposts/42`, `${V2}/blogposts/42/versions`]);
     expect(out.map((v) => v.number)).toEqual([1]);
   });
 
@@ -550,7 +569,7 @@ describe("getPageVersions on v2", () => {
     );
     const out = await getPageVersions("41", 2);
     expect(out.map((v) => v.number)).toEqual([5, 4]);
-    expect(requests.filter((r) => r.method === "GET")).toHaveLength(1);
+    expect(listReqs().filter((r) => r.method === "GET")).toHaveLength(1);
   });
 
   it("resolves authors with ONE deduplicated users-bulk POST, and caches the names", async () => {
@@ -612,6 +631,149 @@ describe("getPageVersions on v2", () => {
         : undefined;
     // limit larger than one page so the cursor is needed
     await expect(getPageVersions("41", 5)).rejects.toThrow(/Refusing to follow a pagination link/);
+  });
+});
+
+
+// ===========================================================================
+// Review fixes (7.6.0): current-only lists, local case matching, routing memo
+// ===========================================================================
+
+/** A server whose `filename=` filter is CASE-SENSITIVE (and ignores `status`). */
+const caseSensitiveServer =
+  (path: string, items: unknown[]) =>
+  (r: Req): Response | undefined => {
+    if (r.method !== "GET" || r.url.pathname !== path) return undefined;
+    const f = r.url.searchParams.get("filename");
+    return json({ results: f === null ? items : items.filter((a) => (a as { title: string }).title === f) });
+  };
+
+describe("A1: attachment lists are current-only", () => {
+  it("sends status=current on getAttachments and findAttachmentByName", async () => {
+    route = listRoute(`${V2}/pages/61/attachments`, [att(1, { status: "current" })]);
+    await getAttachments("61", 25, { contentType: "page" });
+    await findAttachmentByName("61", "f1.png", { contentType: "page" });
+    const lists = requests.filter((r) => r.url.pathname === `${V2}/pages/61/attachments`);
+    expect(lists).toHaveLength(2);
+    for (const r of lists) expect(r.url.searchParams.get("status")).toBe("current");
+  });
+
+  it("an archived exact-name match and no current one: not found (the archived id is never offered)", async () => {
+    route = listRoute(`${V2}/pages/61/attachments`, [att(1, { id: "att61", title: "a.drawio", status: "archived" })]);
+    const r = await findAttachmentByName("61", "a.drawio", { contentType: "page" });
+    expect(r).toEqual({ exact: null, near: [] });
+  });
+
+  it("current + archived with the same name: the current one, no ambiguity error", async () => {
+    route = listRoute(`${V2}/pages/61/attachments`, [
+      att(1, { id: "att611", title: "a.drawio", status: "archived", version: { number: 9 } }),
+      att(2, { id: "att612", title: "a.drawio", status: "current", version: { number: 2 } }),
+    ]);
+    const r = await findAttachmentByName("61", "a.drawio", { contentType: "page" });
+    expect(r.exact).toMatchObject({ id: "att612", version: 2 });
+  });
+
+  it("getAttachments drops archived items too", async () => {
+    route = listRoute(`${V2}/pages/61/attachments`, [
+      att(1, { status: "archived" }),
+      att(2, { status: "current" }),
+      att(3, { status: "trashed" }),
+    ]);
+    const out = await getAttachments("61", 25, { contentType: "page" });
+    expect(out.map((a) => a.title)).toEqual(["f2.png"]);
+  });
+});
+
+describe("A2: exact and near matches are computed locally, not by the server's filename filter", () => {
+  it("a case-sensitive server filter: X.drawio.PNG is still a near match of X.drawio.png", async () => {
+    route = caseSensitiveServer(`${V2}/pages/62/attachments`, [
+      att(1, { title: "X.drawio" }),
+      att(2, { title: "X.drawio.PNG" }),
+    ]);
+    const r = await findAttachmentByName("62", "X.drawio.png", { contentType: "page" });
+    expect(r.exact).toBeNull();
+    expect(r.near.map((a) => a.title)).toEqual(["X.drawio.PNG"]);
+  });
+
+  it("a case-sensitive server filter: A.drawio sees a.drawio as a near match", async () => {
+    route = caseSensitiveServer(`${V2}/pages/62/attachments`, [att(1, { title: "a.drawio" })]);
+    const r = await findAttachmentByName("62", "A.drawio", { contentType: "page" });
+    expect(r.exact).toBeNull();
+    expect(r.near.map((a) => a.title)).toEqual(["a.drawio"]);
+  });
+
+  it("reads the whole list across pages to find a near match on a later page", async () => {
+    route = (r) => {
+      if (r.url.pathname !== `${V2}/pages/62/attachments`) return undefined;
+      return r.url.searchParams.get("cursor") === null
+        ? json({ results: [att(1)], _links: { next: `${V2}/pages/62/attachments?cursor=c2` } })
+        : json({ results: [att(2, { title: "A.DRAWIO" })] });
+    };
+    const r = await findAttachmentByName("62", "a.drawio", { contentType: "page" });
+    expect(r.near.map((a) => a.title)).toEqual(["A.DRAWIO"]);
+    expect(listReqs()).toHaveLength(2);
+  });
+
+  it("a blog post draft keeps the v1 lookup with filename= and status=draft", async () => {
+    route = (r) =>
+      r.url.pathname === `${V1}/content/63/child/attachment`
+        ? json({ results: [{ id: "att9", title: "a.drawio", version: { number: 1 } }] })
+        : undefined;
+    const r = await findAttachmentByName("63", "a.drawio", { draft: true });
+    expect(paths()).toEqual([`${V1}/content/63/child/attachment`]);
+    expect(requests[0].url.searchParams.get("filename")).toBe("a.drawio");
+    expect(requests[0].url.searchParams.get("status")).toBe("draft");
+    expect(r.exact?.id).toBe("att9");
+  });
+});
+
+describe("B1: the routing memo is learned from the parent object, never from a sub-collection", () => {
+  const blogMeta = { id: "64", title: "Post", spaceId: "1", version: { number: 3 } };
+
+  it("/pages/{blogId}/attachments answering 200 empty does not hide the blog post's attachments", async () => {
+    route = (r) => {
+      if (r.method !== "GET") return undefined;
+      if (r.url.pathname === `${V2}/pages/64/attachments`) return json({ results: [] });
+      if (r.url.pathname === `${V2}/pages/64`) return json({ message: "nope" }, 404);
+      if (r.url.pathname === `${V2}/blogposts/64` && !r.url.searchParams.has("version")) return json(blogMeta);
+      if (r.url.pathname === `${V2}/blogposts/64/attachments`) return json({ results: [att(1, { title: "real.png" })] });
+      if (r.url.pathname === `${V2}/blogposts/64` && r.url.searchParams.get("version") === "2") {
+        return json({ id: "64", title: "Post", version: { number: 2 }, body: { storage: { representation: "storage", value: "<p>v2</p>" } } });
+      }
+      return undefined;
+    };
+    const out = await getAttachments("64", 25);
+    expect(out.map((a) => a.title)).toEqual(["real.png"]);
+
+    requests.length = 0;
+    const body = await getPageVersionBody("64", 2);
+    expect(body.rawBody).toBe("<p>v2</p>");
+    expect(paths()).toEqual([`${V2}/blogposts/64`]);
+  });
+
+  it("a sub-collection 200 alone teaches nothing: labels on an unknown id resolve the parent first", async () => {
+    route = (r) => {
+      if (r.url.pathname === `${V2}/pages/65`) return json({ id: "65", title: "P" });
+      if (r.url.pathname === `${V2}/pages/65/labels`) return json({ results: [] });
+      return undefined;
+    };
+    await getLabels("65");
+    expect(paths()).toEqual([`${V2}/pages/65`, `${V2}/pages/65/labels`]);
+  });
+});
+
+describe("B2: a missing version of an existing page", () => {
+  it("says the version was not found, not that the page does not exist", async () => {
+    route = (r) => {
+      if (r.url.pathname === `${V2}/pages/66` && !r.url.searchParams.has("version")) return json({ id: "66", title: "P" });
+      return undefined; // ?version=99 -> 404
+    };
+    const err = await getPageVersionBody("66", 99).then(
+      () => new Error("expected a rejection"),
+      (e: unknown) => e as Error
+    );
+    expect(err.message).toMatch(/version 99 of page 66/i);
+    expect(err.message).not.toMatch(/No page or blog post/);
   });
 });
 
@@ -796,6 +958,54 @@ describe("handlers over the v2 reads", () => {
       expect(out.isError, out.text).toBe(false);
       const uploads = requests.filter((r) => r.method === "POST" && r.url.pathname.includes("/child/attachment"));
       expect(uploads.map((u) => u.url.pathname)).toEqual([`${V1}/content/${PAGE_ID}/child/attachment/att7002/data`]);
+    });
+  });
+  describe("A2/A1 through the handlers", () => {
+    const base = (r: Req): Response | undefined =>
+      r.method === "GET" && r.url.pathname === `${V2}/pages/${PAGE_ID}` ? json(pageMeta) : undefined;
+
+    it("add_attachment overwrite with A.drawio when only a.drawio exists (case-sensitive server): refused, nothing uploaded", async () => {
+      route = (r) => base(r) ?? caseSensitiveServer(`${V2}/pages/${PAGE_ID}/attachments`, [att(1, { title: "a.drawio" })])(r);
+      const args = { page_id: PAGE_ID, file_path: "/work/A.drawio", filename: "A.drawio", overwrite: true };
+      const first = await call("add_attachment", args);
+      const token = first.structured?.confirm_token as string | undefined;
+      const out = token ? await call("add_attachment", { ...args, confirm_token: token }) : first;
+      expect(out.isError, out.text).toBe(true);
+      expect(out.text).toMatch(/differs only in case/);
+      expect(out.text).not.toMatch(/new one was created/);
+      expect(writes()).toEqual([]);
+    });
+
+    it("add_attachment overwrite where the only exact match is archived: no upload to the archived id", async () => {
+      route = (r) =>
+        base(r) ??
+        listRoute(`${V2}/pages/${PAGE_ID}/attachments`, [att(1, { id: "att666", title: "a.drawio", status: "archived" })])(r);
+      const args = { page_id: PAGE_ID, file_path: "/work/a.drawio", filename: "a.drawio", overwrite: true };
+      const first = await call("add_attachment", args);
+      const token = first.structured?.confirm_token as string | undefined;
+      if (token) await call("add_attachment", { ...args, confirm_token: token });
+      expect(requests.some((r) => r.url.pathname.includes("att666"))).toBe(false);
+    });
+
+    it("update_drawio_diagram: a X.drawio.PNG preview is seen even when the server filters case-sensitively", async () => {
+      const body = '<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="diagramName">X.drawio</ac:parameter></ac:structured-macro>';
+      route = (r) => {
+        if (r.method === "GET" && r.url.pathname === `${V2}/pages/${PAGE_ID}`) {
+          return json({ ...pageMeta, body: { storage: { value: body, representation: "storage" } } });
+        }
+        return caseSensitiveServer(`${V2}/pages/${PAGE_ID}/attachments`, [
+          att(1, { id: "att801", title: "X.drawio", version: { number: 2 } }),
+          att(2, { id: "att802", title: "X.drawio.PNG" }),
+        ])(r);
+      };
+      const out = await call("update_drawio_diagram", {
+        page_id: PAGE_ID,
+        diagram_name: "X.drawio",
+        diagram_xml: '<mxfile><diagram id="d"><mxGraphModel><root><mxCell id="0"/></root></mxGraphModel></diagram></mxfile>',
+      });
+      expect(out.isError, out.text).toBe(true);
+      expect(out.text).toMatch(/saved in the draw\.io editor/);
+      expect(writes()).toEqual([]);
     });
   });
 });

@@ -40,6 +40,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The in-memory cache of historical bodies is keyed by source (v1 or v2), so a
   body from one API is never reused for, or compared against, the other.
 
+### Fixed
+- Attachment lists and name lookups ask for current attachments only
+  (`status=current`) and drop any archived or trashed item in the answer, so an
+  overwrite or a draw.io update can never add a version to an archived file,
+  and a current file next to an archived one of the same name is no longer
+  refused as ambiguous.
+- The attachment lookup no longer relies on the server's `filename=` filter: it
+  reads the page's whole current list and decides exact and case-only matches
+  itself. With a case-sensitive server filter, `add_attachment` overwrite of
+  `A.drawio` next to `a.drawio` still refuses, and the draw.io preview guard
+  still sees `X.drawio.PNG`.
+- v2 reads of an id of unknown type now read the page or blog post itself
+  first and route on that answer; a sub-collection (attachments, labels,
+  versions) answering 200 under `/pages/` no longer marks a blog post as a
+  page.
+- A missing version of an existing page or blog post is reported as such,
+  not as "No page or blog post with id ...".
+
 ## [7.5.0] - 2026-11-22 - security updates and agent hints
 
 ### Security

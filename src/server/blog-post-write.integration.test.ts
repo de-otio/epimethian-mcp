@@ -1060,19 +1060,20 @@ describe("drafts: attachments, status and comments", () => {
   it.each([
     ["a page", PAGE_ID],
     ["a published post", BLOG_ID],
-  ])("add_attachment and get_attachments on %s send no status (unchanged URLs)", async (_l, id) => {
+  ])("add_attachment and get_attachments on %s send no draft status", async (_l, id) => {
     const r = await call("add_attachment", { page_id: id, file_path: "/work/file.txt", overwrite: false });
     expect(r.isError, r.text).toBe(false);
     const list = await call("get_attachments", { page_id: id, limit: 25 });
     expect(list.isError, list.text).toBe(false);
     expect(list.text).toContain("file.txt");
-    // The upload is v1, the listing is v2; neither sends a status.
+    // The upload is v1 and sends no status; the v2 listing asks for current
+    // attachments only (never draft).
     expect(attachmentRequests().length).toBeGreaterThan(0);
     for (const x of attachmentRequests()) expect(x.query.has("status")).toBe(false);
     const segment = id === PAGE_ID ? "pages" : "blogposts";
     const listing = requests.filter((x) => x.method === "GET" && x.path === v2(`/${segment}/${id}/attachments`));
     expect(listing.length).toBeGreaterThan(0);
-    for (const x of listing) expect(x.query.has("status")).toBe(false);
+    for (const x of listing) expect(x.query.get("status")).toBe("current");
   });
 
   it("a failed status lookup uploads nothing", async () => {
