@@ -1,8 +1,7 @@
 # Plan: MCP SDK v2, protocol 2026-07-28, Confluence v2 API and new tools
 
 **Status:** proposed (2026-11-22). Nothing here is implemented.
-**Base:** `integration/check` after the release now in preparation (the CHANGELOG's
-`[Unreleased]` section; called **7.4.0** below — renumber if it ships under another number).
+**Base:** `master` after **7.5.0** (released 2026-11-22).
 That release already adds main-server `instructions`, `/pages/{id}/direct-children` in place
 of `/children`, a clear error for a 410 from v1, and the `anthropic/alwaysLoad` and
 `maxResultSizeChars` `_meta` keys. This plan builds on those and does not re-plan them.
@@ -17,7 +16,7 @@ Three releases, split by risk and by what can be verified on its own:
 
 | Release | Contents | Why grouped |
 |---|---|---|
-| **7.5.0** (minor, still on SDK 1.x) | v1 → v2 read swaps (W-V2READ, W-HIST), optional **gateway mode** for scoped API tokens, with a fixed capability map and stated degradations (W-GW), token-expiry reminder in `status` (W-GW) | Confluence-side only. No protocol change, so a regression is a Confluence API question and can be checked with read-only live calls. Users on Node 18 get one last minor with the v2 reads |
+| **7.6.0** (minor, still on SDK 1.x) | v1 → v2 read swaps (W-V2READ, W-HIST), optional **gateway mode** for scoped API tokens, with a fixed capability map and stated degradations (W-GW), token-expiry reminder in `status` (W-GW) | Confluence-side only. No protocol change, so a regression is a Confluence API question and can be checked with read-only live calls. Users on Node 18 get one last minor with the v2 reads |
 | **8.0.0** (major) | SDK `@modelcontextprotocol/server` 2.4.x, both protocol eras over stdio, confirmation gate redesigned for multi round-trip (MRTR), Node ≥ 20 floor, real stdio smoke test, raw zod shapes → `z.object` | Breaking (Node floor, SDK, `$schema` 2020-12 in `tools/list`). The confirmation gate is the security-critical change; it ships with no other behaviour change so a regression points at one thing |
 | **8.1.0** (minor) | New tools: `move_page` (same space), `delete_attachment` (trash only), `insert_section`, `rename_heading`, `get_page` `grep`, folder reads, `get_tasks` (read). R2 label memo | Additive. Built once on the v2 SDK and the new gate, instead of being built on 1.x and ported |
 
@@ -25,8 +24,8 @@ Why this order:
 
 - **SDK 1.x deadline.** v1.x gets fixes only until about 2027-01-27. 8.0.0 must be on npm by
   early January 2027, leaving three weeks for field reports. Count back from that date.
-- **7.5.0 before 8.0.0.** The API swaps touch `confluence-client.ts`, the CLI and the keychain;
-  the SDK migration touches `index.ts`, `elicitation.ts`, the build and CI. Shipping 7.5.0
+- **7.6.0 before 8.0.0.** The API swaps touch `confluence-client.ts`, the CLI and the keychain;
+  the SDK migration touches `index.ts`, `elicitation.ts`, the build and CI. Shipping 7.6.0
   first keeps the 8.0.0 diff to the protocol layer. The two can be **built** in parallel
   (§3); only the merges are ordered.
 - **New tools after 8.0.0.** Every new write tool needs the confirmation gate. Building them on
@@ -91,7 +90,7 @@ for every version kind (investigation open question 2); `serveStdio`'s factory l
 ## 3. Dependency DAG (all three releases)
 
 ```
-Phase 0 (orchestrator): 7.4.0 merged; branch release/7.5.0 off it; npm ci; full suite green
+Phase 0 (orchestrator): branch release/7.6.0 off master at 7.5.0; npm ci; full suite green
   │
   ├── Wave A (parallel, ≤4 test-running agents)
   │     lane 1: W-INV (live read-only probe matrix; no src edits)       ── Sonnet, medium
@@ -101,9 +100,9 @@ Phase 0 (orchestrator): 7.4.0 merged; branch release/7.5.0 off it; npm ci; full 
   │                └─► W-GATE-SPEC (design doc only)                    ── Opus, high
   ▼
 I-7.5 integration: merge W-V2READ+W-HIST, then W-GW; W-INV results gate W-HIST's revert switch
-  ▼ W-REVIEW-7.5 (Opus, read-only data-loss walk) → fixes → docs (Haiku) → 7.5.0 release checkpoint
+  ▼ W-REVIEW-7.5 (Opus, read-only data-loss walk) → fixes → docs (Haiku) → 7.6.0 release checkpoint
   ▼
-Branch release/8.0.0 off 7.5.0
+Branch release/8.0.0 off 7.6.0
   ├── Wave B
   │     lane 1: W-SDK (deps, codemod, serveStdio, ctx accessors, Node floor, build, CI)  ── Sonnet, high
   │     lane 2: W-GATE (era-aware gate + approval store), starts from W-GATE-SPEC          ── Opus, high
@@ -179,7 +178,7 @@ Why each edge exists:
   singletons export `_resetForTests()` (contract 6), every page body write goes through
   `safeSubmitPage` (`no-direct-raw-writer.test.ts`).
 
-## 5. Release 7.5.0 workstreams
+## 5. Release 7.6.0 workstreams
 
 ### 5.1 W-INV — live probe matrix · Sonnet, medium (lane 1)
 
@@ -275,7 +274,7 @@ shape changes (`get_page_versions` author field).
 
 **Live read-only verification:** `get_attachments`, `get_labels`, `get_page_versions`,
 `get_page_version`, `diff_page_versions` on the W-INV ids, through a local build connected to
-the designated test profile; outputs match the 7.4.0 build except the documented author field.
+the designated test profile; outputs match the 7.5.0 build except the documented author field.
 
 **Done:** all inventory rows owned here are on v2 or marked "stays v1, why"; scoped tests green;
 no new `tsc` errors in touched files.
@@ -336,7 +335,7 @@ rule only), new tests `gateway-mode.test.ts`, `api-capabilities.test.ts`.
 | Feature | Site mode | Gateway mode |
 |---|---|---|
 | Page/blog read, create, update, delete, children, comments | v2 | v2 |
-| Versions list, historical body, labels read, attachments list/metadata | v2 (7.5.0) | v2 |
+| Versions list, historical body, labels read, attachments list/metadata | v2 (7.6.0) | v2 |
 | Attachment upload / new version (`add_attachment`, draw.io tools) | v1 | **unavailable** |
 | Attachment download | site download path | gateway download path (W-INV verifies one exists; else unavailable) |
 | `add_label`, `remove_label`, attribution label | v1 | **unavailable** / skipped |
@@ -446,7 +445,7 @@ only, test-file imports, `src/shared/update-check.ts` and `src/cli/upgrade.ts` (
    When a 2026-era request carries no client info, the label is `undefined` and attribution
    falls back to "MCP client"; a test pins that the version comment never contains `undefined`.
 5. Keep `server.registerTool`'s wrapper semantics (profile filter, read-only gate) and the
-   `_meta` keys from 7.4.0; `tool-surface.test.ts` stays the golden check.
+   `_meta` keys from 7.5.0; `tool-surface.test.ts` stays the golden check.
 6. `engines.node` → `>=20` (or `>=22`, Q6); esbuild `target` to match; CI matrix 20/22/24 (or
    22/24).
 7. **Upgrade across the Node floor.** `upgrade` (tool and CLI) and the patch auto-upgrade
@@ -611,7 +610,7 @@ regenerated in the same commit and the diff goes in the PR body.
 ### 6.6 Wave D — reviews · test-critic, security-reviewer, Opus high
 
 - `test-critic` on `gate-eras`, `pending-approvals`, `gate-no-mutation`, `stdio-smoke`.
-- `security-reviewer` (omit `model`) on `git diff release/7.5.0...release/8.0.0` restricted to
+- `security-reviewer` (omit `model`) on `git diff release/7.6.0...release/8.0.0` restricted to
   `elicitation.ts`, `pending-approvals.ts`, `confirmation-tokens.ts`, `batch-tokens.ts` and the
   gate call sites.
 - Opus/high data-loss walk of every mutation path touched (house rule).
@@ -710,7 +709,7 @@ between CDATA-containing macros; rename of a heading containing a status macro k
 - `grep` (T2): literal, case-sensitive by default; returns each matching block element (p, li,
   tr, heading) with its heading path and storage, fenced, capped at 50 matches and the
   existing max-length cap (S-L4). Works for pages and blog posts.
-- Folder reads: `get_page_children` already lists folders through `/direct-children` (7.4.0);
+- Folder reads: `get_page_children` already lists folders through `/direct-children` (7.5.0);
   add `get_folder` (v2 `/folders/{id}`: title, parent, space) and make `get_page`/children
   output name folders as folders.
 - `get_tasks` (read only): v2 `/tasks` filtered by page id, space id, status or assignee; fenced
@@ -767,15 +766,15 @@ For each release: fast-forward the release branch into the default branch locall
 pushes and runs `gh release create` (the egress guard will ask); install from npm and check
 `epimethian-mcp --version` and `status`; re-check Dependabot and code-scanning alerts.
 
-8.0.0 extras: create a `release/7.x` maintenance branch at the 7.5.0 tag first. It receives
+8.0.0 extras: create a `release/7.x` maintenance branch at the 7.6.0 tag first. It receives
 security fixes until the SDK 1.x end of fixes (~2027-01-27). The CHANGELOG `Breaking` section
 lists: Node floor, SDK package rename (only relevant to people embedding the server), `$schema`
 2020-12 in `tools/list`, and any tool-surface change found by W-SHAPES.
 
 ## 11. Open questions for the user
 
-1. **Release split.** 7.5.0 (v2 API + gateway mode) → 8.0.0 (SDK v2 + MRTR gate) → 8.1.0 (new
-   tools). Agree, or fold 7.5.0 into 8.0.0?
+1. **Release split.** 7.6.0 (v2 API + gateway mode) → 8.0.0 (SDK v2 + MRTR gate) → 8.1.0 (new
+   tools). Agree, or fold 7.6.0 into 8.0.0?
 2. **Scoped test token.** Gateway mode can only be verified with a scoped, **read-only** API
    token for the designated test profile (short expiry). Will you create one? Without it,
    gateway mode ships marked "not live-verified".
@@ -806,7 +805,7 @@ lists: Node floor, SDK package rename (only relevant to people embedding the ser
 | Risk | Mitigation | Rollback |
 |---|---|---|
 | v2 historical read differs from v1 → `revert_page` writes the wrong body | Version assertion, 30-version parity gate, revert stays v1 in site mode until parity | Patch release putting reads back on v1 in site mode (the v1 functions stay in the tree for 7.5.x) |
-| v1 disappears on the site URL before 7.5.0 ships | 7.4.0's clear 410 error; inventory tells users which tools are affected | Ship W-V2READ alone as 7.4.x if needed |
+| v1 disappears on the site URL before 7.6.0 ships | 7.5.0's clear 410 error; inventory tells users which tools are affected | Ship W-V2READ alone as 7.5.x if needed |
 | Gateway mode sends a credential off-tenant | Prefix pinning on every request, cursor and redirect; sealed cloudId only | Gateway mode is opt-in; a patch can refuse to start in it |
 | A gate bypass in the MRTR rewrite | Spec reviewed before code; matrix + property tests; security review; C5 test | `release/7.x` stays on the 1.x gate; users pin `@7` |
 | Bundle crash from a second zod or SDK instance | Smoke test on the built bundle in CI and before publish | Do not publish; the publish workflow runs the smoke |
