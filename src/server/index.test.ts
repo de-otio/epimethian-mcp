@@ -4899,7 +4899,7 @@ describe("Track R — toolErrorWithContext remediation messages", () => {
     const result = toolErrorWithContext(err, { operation: "update_page", profile: null });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("API token is invalid or expired");
-    expect(result.content[0].text).toContain("epimethian-mcp login <profile>");
+    expect(result.content[0].text).toContain("epimethian-mcp setup --profile <profile>");
   });
 
   it("R1b: ConfluenceAuthError includes profile name when available", async () => {
@@ -4907,7 +4907,7 @@ describe("Track R — toolErrorWithContext remediation messages", () => {
     const err = new (ConfluenceAuthError as any)(401, "Unauthorized");
     const result = toolErrorWithContext(err, { operation: "update_page", profile: "my-profile" });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("epimethian-mcp login my-profile");
+    expect(result.content[0].text).toContain("epimethian-mcp setup --profile my-profile");
   });
 
   it("R2: ConfluencePermissionError yields permission message with operation + resource", async () => {
