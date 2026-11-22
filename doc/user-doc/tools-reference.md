@@ -269,7 +269,7 @@ Lists pages in a space.
 
 ### `get_page_children`
 
-Returns child pages of a given parent page.
+Returns the direct children of a page, in tree order (`GET /pages/{id}/direct-children`). Children can be pages, folders, whiteboards, databases or embeds; each line shows `Title (ID: 123)`, with the type added for anything that is not a page (`Specs (ID: 456, folder)`). Only page IDs work with the page tools.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|

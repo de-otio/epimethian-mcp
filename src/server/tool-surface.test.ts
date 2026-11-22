@@ -362,6 +362,23 @@ describe("tool surface: annotations and _meta", () => {
     }
   });
 
+  it("marks exactly get_page and search_pages alwaysLoad, and raises the result size only on the large page reads", async () => {
+    const { tools } = await bootServer("unlocked");
+    const alwaysLoad = tools.filter((t) => t._meta?.["anthropic/alwaysLoad"] === true).map((t) => t.name);
+    expect(alwaysLoad.sort()).toEqual(["get_page", "search_pages"]);
+    const bigResult = Object.fromEntries(
+      tools
+        .filter((t) => t._meta?.["anthropic/maxResultSizeChars"] !== undefined)
+        .map((t) => [t.name, t._meta?.["anthropic/maxResultSizeChars"]]),
+    );
+    expect(bigResult).toEqual({
+      get_page: 200_000,
+      get_page_by_title: 200_000,
+      get_page_version: 200_000,
+      diff_page_versions: 200_000,
+    });
+  });
+
   it("never combines readOnlyHint with destructiveHint", async () => {
     const { tools } = await bootServer("unlocked");
     for (const t of tools) {
@@ -606,8 +623,31 @@ describe("recovery server (setup_profile)", () => {
     expect(text).toContain("should not flow through this conversation");
   });
 
-  it("the main server sets no instructions", async () => {
+  it("the main server's instructions stay within the 1,800-char budget in both postures", async () => {
+    for (const state of ["unlocked", "read-only"] as const) {
+      const { instructions } = await bootServer(state);
+      expect((instructions ?? "").length, state).toBeLessThanOrEqual(MAX_DESCRIPTION);
+    }
+  });
+});
+
+describe("tool surface: server instructions", () => {
+  // Claude Code with tool search shows only tool names plus these
+  // instructions at session start, and cuts them at 4,096 chars.
+  it("sends instructions that fit Claude Code's limit and name the entry tools", async () => {
     const { instructions } = await bootServer("unlocked");
-    expect(instructions).toBeUndefined();
+    expect(instructions).toBeTruthy();
+    expect(instructions!.length).toBeLessThanOrEqual(4096);
+    expect(instructions).toContain("search_pages");
+    expect(instructions).toContain("get_page");
+    expect(instructions).toContain("untrusted");
+    expect(instructions).toContain("confirm");
+    expect(instructions).not.toContain("This profile is read-only");
+  });
+
+  it("says a read-only profile has no write tools, and drops the write guidance", async () => {
+    const { instructions } = await bootServer("read-only");
+    expect(instructions).toContain("This profile is read-only");
+    expect(instructions).not.toContain("update_page_section");
   });
 });

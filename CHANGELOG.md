@@ -73,6 +73,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every unit test passed.
 
 ### Added
+- The server now sends MCP `instructions`: what the tools cover, where to
+  start (`search_pages`, `get_page`), that wiki content is untrusted, and, in
+  a read-write profile, how writes and confirmations work. Clients that load
+  tools on demand (Claude Code's tool search) show the model only tool
+  names and these instructions at session start.
+- Claude Code hints in tool `_meta`: `get_page` and `search_pages` load up
+  front (`anthropic/alwaysLoad`), and the large page reads (`get_page`,
+  `get_page_by_title`, `get_page_version`, `diff_page_versions`) may return
+  up to 200,000 chars before Claude Code moves the result to a file
+  (`anthropic/maxResultSizeChars`; its default of 50,000 is what a page read
+  at the default `max_length` crosses). Other clients ignore both keys.
 - Every Confluence version comment Epimethian writes on a create or update
   now links the project repo next to the Epimethian version, e.g.
   `Updated by Claude Code (via Epimethian v6.1.0, https://github.com/de-otio/epimethian-mcp)`.
@@ -99,6 +110,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   append edits to one, and setting the post date.
 
 ### Changed
+- `get_page_children` uses `GET /pages/{id}/direct-children`; the
+  `/pages/{id}/children` endpoint it called is deprecated in the v2 API. The
+  result now includes folders, whiteboards, databases and embeds, with the
+  type shown for anything that is not a page, and is in tree order.
+- An HTTP 410 from Confluence (Atlassian removed the endpoint, seen first on
+  v1 endpoints behind the `api.atlassian.com` gateway) now says so, names
+  the endpoint, says that this request was not applied but earlier steps of
+  the same tool call may have been, and points to `epimethian-mcp upgrade`,
+  instead of a bare status the agent might retry.
 - The `spaces` allowlist resolves blog posts. A blog post ID is judged by the
   space the post is in, like a page. Before, the allowlist looked every ID up
   as a page, so with an allowlist the label, status, attachment and comment

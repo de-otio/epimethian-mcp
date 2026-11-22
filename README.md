@@ -278,7 +278,7 @@ Confluence pages are verbose — storage format HTML with macro markup can easil
 | `delete_page`         | Delete a page                                                          |
 | `authorise_destructive_writes` | Pre-authorise a batch of destructive writes (returns a `batch_token`) |
 | `list_pages`          | List pages in a space                                                  |
-| `get_page_children`   | Get child pages                                                        |
+| `get_page_children`   | Get direct children (pages, folders, …)                                |
 | `search_pages`        | Search via CQL (excerpts, last-modified time and editor; scoped by the profile's `read_spaces`) |
 | `get_spaces`          | List available spaces                                                  |
 | `add_attachment`      | Upload a file attachment to a page or blog post (`overwrite` uploads a new version) |

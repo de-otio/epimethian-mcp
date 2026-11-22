@@ -57,6 +57,7 @@ import {
   toMarkdownView,
   looksLikeMarkdown,
   ConfluenceApiError,
+  ConfluenceEndpointRemovedError,
   ConfluenceAuthError,
   ConfluencePermissionError,
   ConfluenceNotFoundError,
@@ -2013,6 +2014,26 @@ describe("getPageChildren", () => {
     const children = await getPageChildren("parent-1", 10);
     expect(children).toHaveLength(1);
     expect(children[0].id).toBe("c1");
+    expect(children[0].type).toBe("page");
+  });
+
+  it("calls direct-children, not the deprecated children endpoint", async () => {
+    global.fetch = mockFetchResponse({ results: [] });
+    await getPageChildren("parent-1", 10);
+    const url = (global.fetch as any).mock.calls[0][0] as string;
+    expect(url).toContain("/pages/parent-1/direct-children");
+    expect(url).toContain("limit=10");
+  });
+
+  it("keeps folders and other non-page children with their type", async () => {
+    global.fetch = mockFetchResponse({
+      results: [
+        { id: "c1", title: "Child", type: "page", status: "current", childPosition: 0 },
+        { id: "f1", title: "Specs", type: "folder", status: "current", childPosition: 1 },
+      ],
+    });
+    const children = await getPageChildren("parent-1", 10);
+    expect(children.map((c) => [c.id, c.type])).toEqual([["c1", "page"], ["f1", "folder"]]);
   });
 
   it("returns empty array when no children", async () => {
@@ -2699,6 +2720,42 @@ describe("downloadAttachmentBytes", () => {
 // =============================================================================
 
 describe("HTTP error handling", () => {
+  it("maps 410 Gone to ConfluenceEndpointRemovedError with the endpoint and no retry", async () => {
+    global.fetch = mockFetchResponse("This deprecated endpoint has been removed", 410);
+    const err = await getPageChildren("123", 5).catch((e) => e);
+    expect(err).toBeInstanceOf(ConfluenceEndpointRemovedError);
+    expect(err).toBeInstanceOf(ConfluenceApiError);
+    expect(err.status).toBe(410);
+    expect(err.message).toContain("HTTP 410 Gone");
+    expect(err.message).toContain("This request was not applied");
+    // Never claims the whole tool call changed nothing (multi-step writes).
+    expect(err.message).not.toMatch(/nothing was changed/i);
+    expect(err.message).toContain("read the current state");
+    expect(err.message).toContain("epimethian-mcp upgrade");
+    // Method and path only: no host, no query string.
+    expect(err.endpoint).toBe("GET /wiki/api/v2/pages/123/direct-children");
+    expect(err.message).not.toContain("limit=");
+    expect(err.message).toContain("This deprecated endpoint has been removed");
+    expect((global.fetch as any).mock.calls).toHaveLength(1);
+  });
+
+  it("keeps the guidance when Confluence's 410 body is long", async () => {
+    global.fetch = mockFetchResponse("x".repeat(5000), 410);
+    const err = await getPageChildren("123", 5).catch((e) => e);
+    expect(err.message.startsWith("Atlassian has removed")).toBe(true);
+    // toolError() passes messages through sanitizeError, which keeps 500
+    // chars: the guidance must survive that cut even with a long endpoint.
+    const long = new ConfluenceEndpointRemovedError(
+      410,
+      "x".repeat(2000),
+      "POST",
+      "https://site.example.net/wiki/rest/api/content/1234567890/child/attachment/att1234567890/data?x=1",
+    );
+    const shown = sanitizeError(long.message);
+    expect(shown).toContain("read the current state");
+    expect(shown).toContain("epimethian-mcp upgrade");
+  });
+
   it("throws ConfluenceApiError on 400 response", async () => {
     global.fetch = mockFetchResponse("Bad Request", 400);
     await expect(getPage("1", false)).rejects.toThrow(ConfluenceApiError);

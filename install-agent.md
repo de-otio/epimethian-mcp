@@ -862,7 +862,7 @@ newer upload by someone else is not replaced unseen.
 | `authorise_destructive_writes` | Pre-authorise a batch of destructive writes (returns `batch_token` consumed by subsequent update / delete calls) |
 | `revert_page` | Revert a page to a previous version |
 | `list_pages` | List pages in a space |
-| `get_page_children` | Get child pages of a page |
+| `get_page_children` | Get the direct children of a page (pages, folders, whiteboards, …) |
 | `search_pages` | Search pages using CQL (Confluence Query Language); shows last-modified time, version and last editor |
 | `get_spaces` | List available Confluence spaces |
 | `add_attachment` | Upload a file attachment to a page or blog post (`overwrite: true` uploads a new version of an existing one) |

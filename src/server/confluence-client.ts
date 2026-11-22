@@ -766,6 +766,41 @@ export class ConfluenceApiError extends Error {
 
 export class ConfluenceAuthError extends ConfluenceApiError {}        // 401
 
+/**
+ * 410 Gone: Atlassian has removed the endpoint. Seen first on v1 REST
+ * endpoints reached through the api.atlassian.com gateway. A definite
+ * answer for THIS request (not applied), and no retry will help, so the
+ * message says so instead of echoing a bare status the agent might keep
+ * retrying. It must not claim the whole tool call changed nothing: a
+ * multi-step write (create_page then its v1 label) can fail on a later step.
+ */
+export class ConfluenceEndpointRemovedError extends ConfluenceApiError {
+  endpoint: string | undefined;
+  constructor(status: number, body: string, method?: string, url?: string) {
+    super(status, body);
+    this.name = "ConfluenceEndpointRemovedError";
+    this.endpoint = url ? `${method ?? "GET"} ${endpointPath(url)}` : undefined;
+    this.message =
+      `Atlassian has removed the Confluence API endpoint this operation uses` +
+      (this.endpoint ? ` (${this.endpoint})` : "") +
+      ` — HTTP 410 Gone. This request was not applied, but earlier steps of the ` +
+      `same tool call may have been (for example a page created before its label), ` +
+      `so read the current state before trying again. Retrying will not help: run ` +
+      `\`epimethian-mcp upgrade\` for a version that uses the replacement endpoint, ` +
+      `or report it at https://github.com/de-otio/epimethian-mcp/issues. ` +
+      `Confluence said: ${sanitizeError(body)}`;
+  }
+}
+
+/** Path of a request URL without host or query (ids only, no credentials). */
+function endpointPath(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url.split("?")[0];
+  }
+}
+
 export class ConfluencePermissionError extends ConfluenceApiError {}  // 403
 
 export class ConfluenceNotFoundError extends ConfluenceApiError {}    // 404
@@ -1102,8 +1137,14 @@ export function _resetHttpStateForTests(
   );
 }
 
-function apiErrorFor(status: number, body: string): ConfluenceApiError {
+function apiErrorFor(
+  status: number,
+  body: string,
+  method?: string,
+  url?: string
+): ConfluenceApiError {
   if (status === 401) return new ConfluenceAuthError(status, body);
+  if (status === 410) return new ConfluenceEndpointRemovedError(status, body, method, url);
   if (status === 403) return new ConfluencePermissionError(status, body);
   if (status === 404) return new ConfluenceNotFoundError(status, body);
   return new ConfluenceApiError(status, body);
@@ -1173,7 +1214,7 @@ async function sendGuarded<T>(
       if (!isRead && (res.status === 502 || res.status === 504)) {
         throw new WriteOutcomeUnknownError(method, url, new Error(`HTTP ${res.status}`), "response");
       }
-      throw apiErrorFor(res.status, body);
+      throw apiErrorFor(res.status, body, method, url);
     });
     if (step.done) return step.value;
     await httpHooks.sleep(step.delayMs);
@@ -2086,12 +2127,33 @@ export async function listPages(
   return PagesResultSchema.parse(raw).results;
 }
 
+/**
+ * One item under a page. `direct-children` returns every content type that
+ * can sit in the page tree (page, folder, whiteboard, database, embed), not
+ * just pages, so callers must look at `type` before treating an id as a page.
+ */
+const ChildContentSchema = z.object({
+  id: z.string(),
+  title: z.string().default(""),
+  type: z.string().default("page"),
+});
+export type ChildContent = z.infer<typeof ChildContentSchema>;
+
+const ChildContentResultSchema = z.object({
+  results: z.array(ChildContentSchema).default([]),
+});
+
+/**
+ * Direct children of a page, in tree order. Uses
+ * `GET /pages/{id}/direct-children`; the older `/pages/{id}/children` is
+ * deprecated in the v2 spec and returns pages only, so folders went missing.
+ */
 export async function getPageChildren(
   pageId: string,
   limit: number
-): Promise<PageData[]> {
-  const raw = await v2Get(`/pages/${pageId}/children`, { limit });
-  return PagesResultSchema.parse(raw).results;
+): Promise<ChildContent[]> {
+  const raw = await v2Get(`/pages/${pageId}/direct-children`, { limit });
+  return ChildContentResultSchema.parse(raw).results;
 }
 
 export async function getSpaces(
