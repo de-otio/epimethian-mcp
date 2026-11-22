@@ -690,7 +690,7 @@ export function toolErrorWithContext(err: unknown, ctx: ErrCtx): ToolResult {
     return {
       content: [{
         type: "text",
-        text: `Error: Your Confluence API token is invalid or expired. Reauthenticate with 'epimethian-mcp login ${profileName}'.`,
+        text: `Error: Your Confluence API token is invalid or expired. Create a new token and store it with 'epimethian-mcp setup --profile ${profileName}'. Atlassian API tokens expire after at most one year.`,
       }],
       isError: true,
     };

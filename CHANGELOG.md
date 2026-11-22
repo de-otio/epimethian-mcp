@@ -112,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a new top-level inline comment still works on pages only.
 
 ### Fixed
+- An expired or invalid API token told the agent to run
+  `epimethian-mcp login <profile>`, a command that does not exist. It now
+  points to `epimethian-mcp setup --profile <profile>` and says that
+  Atlassian tokens expire after at most a year.
 - `add_drawio_diagram` uploaded the diagram attachment before reading the
   page, so an ID it could not read (missing, not visible, or a blog post) left
   an orphaned attachment behind. It now reads the page first and uploads

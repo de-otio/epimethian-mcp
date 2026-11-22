@@ -202,7 +202,7 @@ export class ConfluenceNotFoundError extends ConfluenceApiError {}    // 404
 
 | Error | Message |
 |---|---|
-| `ConfluenceAuthError` | `"Your Confluence API token is invalid or expired. Reauthenticate with `epimethian-mcp login <profile>`."` |
+| `ConfluenceAuthError` | `"Your Confluence API token is invalid or expired. Create a new token and store it with `epimethian-mcp setup --profile <profile>`. Atlassian API tokens expire after at most one year."` |
 | `ConfluencePermissionError` | `"Your token lacks permission for <operation> on <resource>. The operation was not performed."` |
 | `ConfluenceNotFoundError` | `"Resource not found. Confluence returns 'not found' when a token cannot see a resource due to restrictions — verify access."` |
 
