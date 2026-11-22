@@ -79,10 +79,10 @@ describe("D1: no automatic redirects on credentialed gateway requests", () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(
       redirectingFetch(new Response(null, { status: 307, headers: { location: `${OTHER}/wiki/api/v2/pages/999999999999` } })) as never
     );
-    const status = await probeGatewayWriteScope(GATEWAY, "u@example.com", "tok");
+    const probe = await probeGatewayWriteScope(GATEWAY, "u@example.com", "tok");
     expect(sent).toHaveLength(1);
     expect(sent[0].redirect).toBe("manual");
-    expect(classifyScopeProbe(status)).toBe("inconclusive");
+    expect(classifyScopeProbe(probe)).toBe("inconclusive");
   });
 
   it("site mode testConnection keeps the default redirect behaviour", async () => {

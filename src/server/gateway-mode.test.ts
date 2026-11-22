@@ -99,7 +99,13 @@ interface Req {
   readonly body: unknown;
 }
 const requests: Req[] = [];
-const net = { tenantCloudId: CLOUD_ID, tenantInfoOk: true, probeStatus: 403, pageVersion: 4 };
+const net = {
+  tenantCloudId: CLOUD_ID,
+  tenantInfoOk: true,
+  probeStatus: 403,
+  probeBody: { message: "probe" } as unknown,
+  pageVersion: 4,
+};
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -126,7 +132,7 @@ const defaultRoute: Route = (url, method, body) => {
 
   if (p === "/spaces") return json({ results: [{ id: "1001", key: "DOCS", name: "Docs", type: "global" }] });
   if (p === "/spaces/1001") return json({ id: "1001", key: "DOCS", name: "Docs", type: "global" });
-  if (p === "/pages/999999999999" && method === "PUT") return json({ message: "probe" }, net.probeStatus);
+  if (p === "/pages/999999999999" && method === "PUT") return json(net.probeBody, net.probeStatus);
   if (p === "/pages/5001" && method === "GET") return json(pageView(q.has("body-format")));
   if (p === "/pages/5001" && method === "PUT") {
     net.pageVersion = (body as { version: { number: number } }).version.number;
@@ -197,7 +203,13 @@ beforeEach(() => {
   keychain.saves.length = 0;
   keychain.record = gatewayRecord();
   settings.current = { posture: "read-write" };
-  Object.assign(net, { tenantCloudId: CLOUD_ID, tenantInfoOk: true, probeStatus: 403, pageVersion: 4 });
+  Object.assign(net, {
+    tenantCloudId: CLOUD_ID,
+    tenantInfoOk: true,
+    probeStatus: 403,
+    probeBody: { message: "probe" },
+    pageVersion: 4,
+  });
   fetchMock.mockClear();
   route = defaultRoute;
   queue.length = 0;
@@ -651,6 +663,44 @@ describe("validateStartup in gateway mode", () => {
     expect(errLines.join("\n")).toMatch(/inconclusive.*read-only/);
   });
 
+  // Live 2026-11-22: a scoped read-only token's dry-run PUT drew exactly this 401.
+  const LIVE_SCOPE_401 = { code: 401, message: "Unauthorized; scope does not match" };
+
+  it("posture 'detect': the gateway's 401 'scope does not match' is read-only, and startup succeeds", async () => {
+    settings.current = { posture: "detect" };
+    net.probeStatus = 401;
+    net.probeBody = LIVE_SCOPE_401;
+    const { getConfig, validateStartup, probeWriteCapability } = await loadClient();
+    await expect(validateStartup(await getConfig())).resolves.toBeUndefined();
+    const cfg = await getConfig();
+    expect(cfg.probedCapability).toBe("read-only");
+    expect(cfg.effectivePosture).toBe("read-only");
+    expect(await probeWriteCapability()).toBe("read-only");
+    expect(requests.some(rest)).toBe(false);
+    expect(errLines.join("\n")).not.toMatch(/probe threw unexpectedly/);
+  });
+
+  it("posture 'detect': any other 401 on the dry-run is still an authentication failure", async () => {
+    settings.current = { posture: "detect" };
+    net.probeStatus = 401;
+    net.probeBody = { code: 401, message: "Unauthorized" };
+    const { getConfig, probeWriteCapability, ConfluenceAuthError } = await loadClient();
+    await getConfig();
+    await expect(probeWriteCapability()).rejects.toBeInstanceOf(ConfluenceAuthError);
+  });
+
+  it("site mode: a dry-run 401 that says 'scope does not match' is still an authentication failure", async () => {
+    keychain.record = { url: SITE, email: "user@example.com", apiToken: SECRET, cloudId: CLOUD_ID };
+    route = (url, method) => {
+      if (method === "PUT") return json(LIVE_SCOPE_401, 401);
+      return json({ results: [] });
+    };
+    const { getConfig, probeWriteCapability, ConfluenceAuthError } = await loadClient();
+    await getConfig();
+    await expect(probeWriteCapability()).rejects.toBeInstanceOf(ConfluenceAuthError);
+    requests.length = 0; // site mode credentials the site origin by design
+  });
+
   it("the opportunistic seal re-save of a pre-seal profile keeps a recorded tokenExpiry (site mode)", async () => {
     // A record without a seal: startup seals it with `{ ...stored, cloudId }`.
     keychain.record = { url: SITE, email: "user@example.com", apiToken: SECRET, tokenExpiry: "2027-01-31" };
@@ -789,6 +839,20 @@ describe("tools/list in gateway mode", () => {
     }
     expect(names).toContain("get_page");
     expect(names).toContain("get_page_versions");
+  });
+
+  it("posture 'detect' with a read-only scoped token (live 401 'scope does not match') boots with the read set", async () => {
+    settings.current = { posture: "detect" };
+    net.probeStatus = 401;
+    net.probeBody = { code: 401, message: "Unauthorized; scope does not match" };
+    const s = await bootServer();
+    const names = s.tools.map((t) => t.name);
+    expect(names).toContain("get_page");
+    expect(names).not.toContain("update_page");
+    expect(names).toHaveLength(14);
+    // Read-only because the probe said so, not because it failed.
+    expect(errLines.join("\n")).not.toMatch(/probe threw unexpectedly|probe was inconclusive/);
+    expect(errLines.join("\n")).toMatch(/mode: read-only \(probe\)/);
   });
 
   it("the instructions name the mode and every missing tool, and are stable", async () => {

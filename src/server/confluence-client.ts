@@ -45,6 +45,7 @@ import {
 } from "./api-base.js";
 import { capabilitiesFor } from "./api-capabilities.js";
 import { tokenExpiryState, todayUtc } from "../shared/token-expiry.js";
+import { bodySaysScopeMismatch } from "../shared/gateway-scopes.js";
 
 // --- Client label (set once from index.ts after MCP initialize handshake) ---
 
@@ -338,7 +339,8 @@ export async function getConfig(): Promise<Config> {
  *     PUT /wiki/api/v2/pages/999999999999 with a trivially bad body.
  *     - 403 → "read-only" (permission denied)
  *     - 404 / 400 / 409 → "write" (token can write; hit a non-existent page, bad body or conflict)
- *     - 401 → rethrown (auth failure, not a capability question)
+ *     - 401 → rethrown (auth failure, not a capability question), except in
+ *       gateway mode when the body says "scope does not match" → "read-only"
  * 3. Any other answer or error (410, 429, other 4xx, 5xx, transport) →
  *    "inconclusive" (logs a warning); posture "detect" then resolves to read-only.
  *
@@ -404,7 +406,14 @@ export async function probeWriteCapability(): Promise<"write" | "read-only" | "i
     // 2xx would be very surprising, but if it happens the token can write
     return "write";
   } catch (err) {
-    if (err instanceof ConfluenceAuthError) throw err;
+    if (err instanceof ConfluenceAuthError) {
+      // Gateway mode: a scoped token without the page-write scope answers
+      // 401 "Unauthorized; scope does not match" (live, 2026-11-22), not 403.
+      // The token authenticated (the spaces read before this passed); it just
+      // cannot update pages. Any other 401 is still an auth failure.
+      if (cfg.apiMode === "gateway" && bodySaysScopeMismatch(err.rawBody)) return "read-only";
+      throw err;
+    }
     if (err instanceof ConfluencePermissionError) return "read-only";
     // Only the answers that show the write got past the scope check and failed on
     // the (missing) page or the empty body prove write capability:
@@ -902,8 +911,9 @@ export class ConfluenceApiError extends Error {
 export class ConfluenceAuthError extends ConfluenceApiError {}        // 401
 
 /**
- * 410 Gone: Atlassian has removed the endpoint. Seen first on v1 REST
- * endpoints reached through the api.atlassian.com gateway. A definite
+ * 410 Gone: Atlassian has removed the endpoint. Reported first for v1 REST
+ * endpoints reached through the api.atlassian.com gateway with classic
+ * tokens (a scoped token gets 401 from v1 there, live 2026-11-22). A definite
  * answer for THIS request (not applied), and no retry will help, so the
  * message says so instead of echoing a bare status the agent might keep
  * retrying. It must not claim the whole tool call changed nothing: a

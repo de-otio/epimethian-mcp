@@ -49,7 +49,7 @@ export function requestBaseFor(input: RequestBaseInput): string {
 export interface ApiBases {
   readonly apiMode: ApiMode;
   readonly apiV2: string;
-  /** `null` in gateway mode: v1 answers 410 there (plan §2). */
+  /** `null` in gateway mode: v1 is not served to scoped tokens there (live 2026-11-22: 401). */
   readonly apiV1: string | null;
 }
 

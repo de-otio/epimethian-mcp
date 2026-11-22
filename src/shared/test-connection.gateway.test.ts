@@ -4,7 +4,7 @@
  * the setup-time write probe reports only a status.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { classifyScopeProbe } from "./gateway-scopes.js";
+import { bodySaysScopeMismatch, classifyScopeProbe } from "./gateway-scopes.js";
 import { fetchTenantInfo, probeGatewayWriteScope, testConnection } from "./test-connection.js";
 
 const CLOUD_ID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
@@ -62,9 +62,15 @@ describe("testConnection through the gateway", () => {
 });
 
 describe("probeGatewayWriteScope + classifyScopeProbe", () => {
+  /** The exact body a scoped read-only token drew live (2026-11-22). */
+  const LIVE_SCOPE_BODY = '{"code":401,"message":"Unauthorized; scope does not match"}';
+
   it("sends the dry-run PUT to the gateway base and returns the status", async () => {
     fetchSpy.mockResolvedValue({ status: 403, body: null } as never);
-    expect(await probeGatewayWriteScope(GATEWAY, "u@example.com", "tok")).toBe(403);
+    expect(await probeGatewayWriteScope(GATEWAY, "u@example.com", "tok")).toEqual({
+      status: 403,
+      scopeMismatch: false,
+    });
     expect(fetchSpy.mock.calls[0][0]).toBe(`${GATEWAY}/wiki/api/v2/pages/999999999999`);
     expect((fetchSpy.mock.calls[0][1] as { method: string }).method).toBe("PUT");
   });
@@ -74,14 +80,47 @@ describe("probeGatewayWriteScope + classifyScopeProbe", () => {
     expect(await probeGatewayWriteScope(GATEWAY, "u@example.com", "tok")).toBeUndefined();
   });
 
+  it("the gateway's live 401 'scope does not match' answer is narrow", async () => {
+    fetchSpy.mockResolvedValue(new Response(LIVE_SCOPE_BODY, { status: 401 }));
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const probe = await probeGatewayWriteScope(GATEWAY, "u@example.com", "scoped-secret");
+    expect(probe).toEqual({ status: 401, scopeMismatch: true });
+    expect(classifyScopeProbe(probe)).toBe("narrow");
+    // Neither the body nor the credential is logged.
+    const logged = JSON.stringify([...errSpy.mock.calls, ...logSpy.mock.calls]);
+    expect(logged).not.toContain("scope does not match");
+    expect(logged).not.toContain("scoped-secret");
+  });
+
   it.each([
-    [403, "narrow"],
-    [404, "broad"],
-    [400, "broad"],
-    [401, "inconclusive"],
-    [500, "inconclusive"],
+    ['{"code":401,"message":"Unauthorized"}'],
+    ['{"code":401,"message":"Token expired"}'],
+    ["scope does not match"], // not JSON: only the JSON message counts
+    ['{"error":"scope does not match"}'], // not the message field
+    [""],
+  ])("a 401 with another body (%j) stays inconclusive", async (body) => {
+    fetchSpy.mockResolvedValue(new Response(body, { status: 401 }));
+    const probe = await probeGatewayWriteScope(GATEWAY, "u@example.com", "tok");
+    expect(probe).toEqual({ status: 401, scopeMismatch: false });
+    expect(classifyScopeProbe(probe)).toBe("inconclusive");
+  });
+
+  it("matches the message case-insensitively", () => {
+    expect(bodySaysScopeMismatch('{"message":"UNAUTHORIZED; Scope Does Not Match"}')).toBe(true);
+    expect(bodySaysScopeMismatch("null")).toBe(false);
+    expect(bodySaysScopeMismatch(undefined)).toBe(false);
+  });
+
+  it.each([
+    [{ status: 403, scopeMismatch: false }, "narrow"],
+    [{ status: 401, scopeMismatch: true }, "narrow"],
+    [{ status: 404, scopeMismatch: false }, "broad"],
+    [{ status: 400, scopeMismatch: false }, "broad"],
+    [{ status: 401, scopeMismatch: false }, "inconclusive"],
+    [{ status: 500, scopeMismatch: false }, "inconclusive"],
     [undefined, "inconclusive"],
-  ] as const)("status %s is %s", (status, verdict) => {
-    expect(classifyScopeProbe(status)).toBe(verdict);
+  ] as const)("probe %j is %s", (probe, verdict) => {
+    expect(classifyScopeProbe(probe)).toBe(verdict);
   });
 });

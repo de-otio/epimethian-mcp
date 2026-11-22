@@ -1,4 +1,5 @@
 import { sanitizeDisplayName } from './display-text.js';
+import { bodySaysScopeMismatch, type ScopeProbeResult } from './gateway-scopes.js';
 
 /**
  * Upper bound for each startup/setup check (tenant_info, the spaces check, the
@@ -232,8 +233,9 @@ export async function testConnection(
  * Setup-time scope probe (R4: one call must pass, one must fail). Sends the
  * same dry-run page update the server's capability probe uses,
  * `PUT /pages/999999999999` with an empty body, to the pinned gateway base,
- * and returns only the HTTP status (or undefined on a transport error or
- * timeout). The page does not exist, so a token that may update pages answers
+ * and returns the HTTP status plus whether a 401 body says the scope does not
+ * match (or undefined on a transport error or timeout). The body is read only
+ * for a 401, only its JSON `message` is inspected, and it is never logged. The page does not exist, so a token that may update pages answers
  * 400/404 and nothing is modified. It proves whether the token can update
  * pages, nothing about other write scopes. Classify with `classifyScopeProbe`
  * (gateway-scopes.ts).
@@ -242,7 +244,7 @@ export async function probeGatewayWriteScope(
   requestBase: string,
   email: string,
   apiToken: string
-): Promise<number | undefined> {
+): Promise<ScopeProbeResult | undefined> {
   const endpoint = `${requestBase.replace(/\/+$/, '')}/wiki/api/v2/pages/999999999999`;
   const auth = Buffer.from(`${email}:${apiToken}`).toString('base64');
   try {
@@ -260,8 +262,12 @@ export async function probeGatewayWriteScope(
         redirect: 'manual',
         signal,
       });
+      if (response.status === 401) {
+        const body = await response.text().catch(() => '');
+        return { status: 401, scopeMismatch: bodySaysScopeMismatch(body.slice(0, 4096)) };
+      }
       await Promise.resolve(response.body?.cancel?.()).catch(() => {});
-      return response.status;
+      return { status: response.status, scopeMismatch: false };
     });
   } catch {
     return undefined;

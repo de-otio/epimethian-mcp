@@ -238,7 +238,7 @@ async function runGatewaySetup(
   const scopes = GATEWAY_SCOPES[posture === "read-only" ? "read-only" : "read-write"];
   console.log(
     `\nScopes this token needs for ${posture === "read-only" ? "read-only" : "read-write"} use ` +
-      `(to be confirmed by the live probe):\n  ${scopes.join("\n  ")}\n`
+      `(the read scopes are confirmed for reads; the write scopes are not yet verified):\n  ${scopes.join("\n  ")}\n`
   );
 
   if (posture === "read-only") {

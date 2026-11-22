@@ -84,7 +84,7 @@ beforeEach(() => {
   mockFetchTenantInfo
     .mockReset()
     .mockResolvedValue({ ok: true, info: { cloudId: CLOUD_ID, displayName: "Example" } });
-  mockProbeWriteScope.mockReset().mockResolvedValue(403);
+  mockProbeWriteScope.mockReset().mockResolvedValue({ status: 403, scopeMismatch: false });
   mockReadFromKeychain.mockReset().mockResolvedValue(null);
   calls.length = 0;
   logs = [];
@@ -132,7 +132,7 @@ describe("gateway setup", () => {
     expect(mockSetProfileSettings).toHaveBeenCalledWith("gw-test", { posture: "read-only" });
     const out = logs.join("\n");
     expect(out).toContain("read:page:confluence");
-    expect(out).toContain("to be confirmed by the live probe");
+    expect(out).toContain("the write scopes are not yet verified");
     expect(out).not.toContain("write:page:confluence"); // read-only posture lists read scopes only
     expect(out).toContain("Not available in gateway mode:");
     expect(out).toContain("add_attachment");
@@ -147,7 +147,7 @@ describe("gateway setup", () => {
   });
 
   it("a read-only profile whose token can still write is warned, not blocked", async () => {
-    mockProbeWriteScope.mockResolvedValue(404);
+    mockProbeWriteScope.mockResolvedValue({ status: 404, scopeMismatch: false });
     answers("y", "y", "", "1");
     await runSetup("gw-test");
     expect(logs.join("\n")).toMatch(/broader than the read-only posture/);
@@ -198,13 +198,29 @@ describe("gateway setup", () => {
   });
 });
 
+describe("scope probe: the gateway's live 401 answer", () => {
+  it("401 'scope does not match' reads as a token that cannot update pages", async () => {
+    mockProbeWriteScope.mockResolvedValue({ status: 401, scopeMismatch: true });
+    answers("y", "y", "", "1");
+    await runSetup("gw-test");
+    expect(logs.join("\n")).toMatch(/this token cannot update pages/);
+  });
+
+  it("any other 401 stays inconclusive", async () => {
+    mockProbeWriteScope.mockResolvedValue({ status: 401, scopeMismatch: false });
+    answers("y", "y", "", "1");
+    await runSetup("gw-test");
+    expect(logs.join("\n")).toMatch(/Scope check inconclusive/);
+  });
+});
+
 describe("scope probe wording (review D5)", () => {
   it.each([
     [403, /this token cannot update pages/],
     [404, /this token can update pages/],
     [500, /inconclusive/],
   ])("status %i: says what was probed (page updates) and that other write scopes were not", async (status, said) => {
-    mockProbeWriteScope.mockResolvedValue(status);
+    mockProbeWriteScope.mockResolvedValue({ status, scopeMismatch: false });
     answers("y", "y", "", "1");
     await runSetup("gw-test");
     const out = logs.join("\n");

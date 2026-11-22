@@ -84,6 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   site; the docs recommend a separate Atlassian account per customer and state
   that gateway mode is not live-verified until the probe and the scoped-token
   check have run.
+- Gateway mode with a read-only scoped token: the gateway refuses the dry-run
+  page update with 401 `scope does not match`, not 403 (live check
+  2026-11-22). The setup scope check now reads that answer as "this token
+  cannot update pages" instead of "inconclusive", and posture `detect` resolves
+  it to read-only from the probe instead of logging "probe threw unexpectedly".
+  Any other 401 keeps its meaning; site mode is unchanged.
+- Docs: the 12 gateway read scopes are confirmed for reads (live check
+  2026-11-22); the write scopes are not yet verified. A scoped token gets 401,
+  not 410, from v1 through the gateway; the 410 reports concern classic tokens.
 
 ## [7.5.0] - 2026-11-22 - security updates and agent hints
 

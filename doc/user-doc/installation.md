@@ -99,7 +99,7 @@ Each project's `.mcp.json` specifies which profile to use. Profiles are fully is
 
 Atlassian can issue **scoped API tokens**: tokens limited to named permissions (scopes). A scoped token does not work against your site URL. It works only through the Atlassian API gateway, `https://api.atlassian.com/ex/confluence/{cloudId}`, and only against the Confluence v2 REST API. The site a request reaches is chosen by the `cloudId` in that path; Atlassian probably does **not** bind a scoped token to a single site, so the token may work for every site your Atlassian account can see. Epimethian supports this as an optional **gateway mode**. Ordinary (unscoped) tokens and every existing profile keep working exactly as before.
 
-> **Not yet live-verified.** Gateway mode is built and tested against stubs only. Until the live probe and the scoped-token check (see the parity investigation in `doc/design/investigations/investigate-v1-v2-parity-2026-11.md`) have run, treat the scope list, the scope check and the behaviour described here as unconfirmed.
+> **Partly live-verified.** Reads, the scope check and a read-only server start were checked live on 2026-11-22 with a scoped read-only token (see the parity investigation in `doc/design/investigations/investigate-v1-v2-parity-2026-11.md`). Writes through the gateway and the write scopes are not yet verified.
 
 ### Why use it
 
@@ -110,13 +110,13 @@ A scoped token can only do what its scopes allow, so a token created without wri
 1. Create the token at [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens) with **Create API token with scopes**, pick **Confluence**, and select the scopes below.
 2. Run `epimethian-mcp setup --profile <name>` and answer `y` to "Is this a scoped API token?". Gateway mode needs a named profile.
 3. Setup shows the tenant behind the URL (name and cloud ID) and asks you to confirm it **before** any credential is used. In gateway mode this question is always asked, even with `--yes`. The URL must be an Atlassian Cloud site (`https://<site>.atlassian.net`); pass `--allow-non-atlassian-host` only if your site really lives on another host. Setup then tests the token through the gateway, asks for the token's expiry date (optional, `YYYY-MM-DD`, as shown when you created the token), asks for the access mode, and prints the scope list.
-4. For a read-only profile, setup also checks that the token **cannot update pages** (a harmless page update against a page that does not exist must be refused with 403). If it is not refused, setup warns that the token can update pages, which is broader than the read-only mode. This check covers page updates only: the other write scopes (blog posts, comments, attachments, deletes) are not probed, so check the scopes you selected when you created the token.
+4. For a read-only profile, setup also checks that the token **cannot update pages** (a harmless page update against a page that does not exist must be refused: the gateway answers 401 "scope does not match" for a token without the page-write scope, and 403 also counts). If it is not refused, setup warns that the token can update pages, which is broader than the read-only mode. This check covers page updates only: the other write scopes (blog posts, comments, attachments, deletes) are not probed, so check the scopes you selected when you created the token.
 
 The mode, the tenant's cloud ID and the expiry are stored together in the OS keychain record. Gateway mode is only ever stored together with the cloud ID: it cannot be switched on for a profile without a tenant seal.
 
 ### Scopes
 
-These scopes are **to be confirmed by the live probe**. The list is the starting point and will be corrected against a live scoped token before it is final.
+The 12 read scopes are **confirmed for reads** (live check 2026-11-22): every read Epimethian makes in gateway mode answered with them. The write scopes are **not yet verified** against a live token.
 
 Read-only mode:
 

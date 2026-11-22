@@ -1,8 +1,8 @@
 /**
  * Granular scopes a scoped API token needs for gateway mode (plan
- * §5.3 item 7). TO BE CONFIRMED BY THE LIVE PROBE: the list below is the
- * plan's starting point and W-INV's live results correct it. Setup prints it
- * and `doc/user-doc/installation.md` repeats it from here.
+ * §5.3 item 7). The 12 read scopes are confirmed for reads by the live check
+ * of 2026-11-22; the write scopes are not yet verified live. Setup prints the
+ * list and `doc/user-doc/installation.md` repeats it from here.
  */
 export type GatewayPosture = "read-only" | "read-write";
 
@@ -36,22 +36,54 @@ export const GATEWAY_SCOPES: Readonly<Record<GatewayPosture, readonly string[]>>
 });
 
 /**
- * Classify the status of the setup-time dry-run `PUT /pages/999999999999`
- * for a token the user declared read-only (R4: one call must pass, one must
- * fail). The probe proves ONE thing: whether this token can update pages.
- * It says nothing about the other write scopes (blog posts, comments,
- * attachments, deletes), which are not probed; callers must say so.
- *
- * 403 means the token cannot update pages (narrow, as intended). Any other
- * 4xx that is not listed below means the update was allowed to proceed to
- * validation or lookup (broad). 3xx, 5xx and transport errors prove nothing.
+ * What the setup-time dry-run `PUT /pages/999999999999` answered: the HTTP
+ * status, and whether the body said the token's scopes do not cover the
+ * request. Nothing else from the body is kept (it is never logged).
  */
-export function classifyScopeProbe(status: number | undefined): "narrow" | "broad" | "inconclusive" {
-  if (status === undefined) return "inconclusive";
+export interface ScopeProbeResult {
+  status: number;
+  scopeMismatch: boolean;
+}
+
+/**
+ * True when an error body says the token's scopes do not cover the request.
+ * Live (2026-11-22), a scoped read-only token's dry-run page update through
+ * the gateway answered 401 with
+ * `{"code":401,"message":"Unauthorized; scope does not match"}`.
+ * Only the JSON `message` field is read; anything unparsable is false.
+ */
+export function bodySaysScopeMismatch(body: string | undefined): boolean {
+  if (!body) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  if (parsed === null || typeof parsed !== "object") return false;
+  const message = (parsed as { message?: unknown }).message;
+  return typeof message === "string" && /scope does not match/i.test(message);
+}
+
+/**
+ * Classify the setup-time dry-run `PUT /pages/999999999999` for a token the
+ * user declared read-only (R4: one call must pass, one must fail). The probe
+ * proves ONE thing: whether this token can update pages. It says nothing
+ * about the other write scopes (blog posts, comments, attachments, deletes),
+ * which are not probed; callers must say so.
+ *
+ * 403, and 401 whose body says "scope does not match" (what the gateway
+ * answers live), mean the token cannot update pages (narrow, as intended).
+ * Any other 4xx that is not listed below means the update was allowed to
+ * proceed to validation or lookup (broad). 3xx, 5xx and transport errors
+ * prove nothing.
+ */
+export function classifyScopeProbe(probe: ScopeProbeResult | undefined): "narrow" | "broad" | "inconclusive" {
+  if (probe === undefined) return "inconclusive";
+  const { status } = probe;
   if (status === 403) return "narrow";
-  // 401 is deliberately inconclusive: on the gateway it may mean a missing
-  // scope or a bad/expired token, and the probe cannot tell which. The live
-  // scoped-token check (doc/design/gateway-mode.md, open points) decides it.
+  if (status === 401 && probe.scopeMismatch) return "narrow";
+  // Any other 401 stays inconclusive: it may be a bad or expired token.
   if ([401, 405, 407, 410, 429].includes(status)) return "inconclusive";
   if (status >= 200 && status < 300) return "broad";
   if (status >= 400 && status < 500) return "broad";

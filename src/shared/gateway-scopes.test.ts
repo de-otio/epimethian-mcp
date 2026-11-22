@@ -14,9 +14,9 @@ describe("gateway scopes and the user documentation", () => {
     expect(GATEWAY_SCOPES["read-only"].some((s) => /^(write|delete):/.test(s))).toBe(false);
   });
 
-  it("installation.md lists every scope setup prints, and says they are unconfirmed", () => {
+  it("installation.md lists every scope setup prints, and says the write scopes are unverified", () => {
     for (const scope of GATEWAY_SCOPES["read-write"]) expect(DOC).toContain(`\`${scope}\``);
-    expect(DOC).toContain("to be confirmed by the live probe");
+    expect(DOC).toContain("The write scopes are **not yet verified**");
   });
 
   it("installation.md's degradation table names every tool the gateway profile does not register", () => {

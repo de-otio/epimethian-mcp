@@ -217,7 +217,8 @@ export function tokenExpiryState(expiry: string | undefined, today: string /* YY
    `fetchTenantInfo`, `testConnection` and the scope probe give up after
    `CONNECTION_CHECK_TIMEOUT_MS` (15 s).
 9. **Server-side posture probe.** Only a dry-run answer of 400, 404 or 409 counts as
-   write-capable, 403 as read-only; 410, 429, other 4xx, 5xx and transport errors are
+   write-capable, 403 (and, in gateway mode only, 401 "scope does not match") as read-only;
+   410, 429, other 4xx, 5xx and transport errors are
    inconclusive, and posture `detect` resolves an inconclusive probe to read-only with a
    stderr warning (both modes).
 
@@ -230,12 +231,16 @@ run.
   account can see)? Expected: yes, which is why the tenant guard does not rely on the
   token (§9 item 1).
 
-- The scope list in `src/shared/gateway-scopes.ts` and `doc/user-doc/installation.md` is
-  unconfirmed.
+- The scope list in `src/shared/gateway-scopes.ts` and `doc/user-doc/installation.md`: the
+  12 read scopes are confirmed for reads (live 2026-11-22); the write scopes are not yet
+  verified.
 - Whether `tenant_info` and the v2 `spaces` call behave as assumed with a scoped token,
   including the exact status for a missing scope (401 vs 403).
-- Whether the dry-run `PUT /pages/999999999999` answers 403 for a read-only token on the
-  gateway (the setup scope probe relies on it).
+- ~~Whether the dry-run `PUT /pages/999999999999` answers 403 for a read-only token on the
+  gateway.~~ Answered live 2026-11-22: it answers 401
+  `{"message":"Unauthorized; scope does not match"}`. The setup scope probe classifies that
+  body as narrow, and in gateway mode `probeWriteCapability` treats it as read-only; any
+  other 401 is unchanged.
 - Whether `_links.next` on v2 lists carries the `/ex/confluence/{cloudId}` prefix or not.
   Both forms are accepted: v2 list cursors go through `resolveV2NextLink`
   (`src/server/pagination-cursor.ts`), which takes `/wiki/api/v2/...` or

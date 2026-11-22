@@ -70,8 +70,10 @@ SDK migration: https://github.com/modelcontextprotocol/typescript-sdk/tree/main/
 Confluence:
 
 - v1 REST answers **410** on the `api.atlassian.com/ex/confluence/{cloudId}` gateway (reports
-  from about 2026-08 and 2026-11). Site-URL Basic auth still reaches v1. Deprecation notice
-  CHANGE-864.
+  from about 2026-08 and 2026-11, with classic tokens). Site-URL Basic auth still reaches v1.
+  Deprecation notice CHANGE-864. Live 2026-11-22: a **scoped** token gets **401**, not 410,
+  from v1 through the gateway (the v1 label read answered 200); see
+  `doc/design/investigations/investigate-v1-v2-parity-2026-11.md`, Findings.
 - v2 has: `GET /pages/{id}?version=N&body-format=storage`, `GET /pages/{id}/versions`,
   `GET /pages/{id}/labels` (read only), `GET`/`DELETE /attachments`, ancestors, descendants,
   content properties, folders, tasks, restriction-state/permissions (new 2026-10-14),
