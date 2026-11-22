@@ -137,3 +137,47 @@ describe("runStatus: installed copies", () => {
     spy.mockRestore();
   });
 });
+
+describe("runStatus --profile", () => {
+  const connected = () => {
+    mockReadFromKeychain.mockResolvedValue({ url: "https://example.atlassian.net", email: "u@example.com", apiToken: "tok" });
+    mockTestConnection.mockResolvedValue({ ok: true, message: "Connected." });
+  };
+
+  it("reads the profile named by --profile", async () => {
+    connected();
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runStatus(["--profile", "acme"]);
+    expect(mockReadFromKeychain).toHaveBeenCalledWith("acme");
+    expect(spy.mock.calls.map((c) => c[0]).join("\n")).toContain("profile: acme");
+    spy.mockRestore();
+  });
+
+  it("agrees with CONFLUENCE_PROFILE when both name the same profile", async () => {
+    connected();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await runStatus(["--profile", "acme"], { CONFLUENCE_PROFILE: "acme" });
+    expect(mockReadFromKeychain).toHaveBeenCalledWith("acme");
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    [["--profile", "globex"], { CONFLUENCE_PROFILE: "acme" }, /"globex".*CONFLUENCE_PROFILE="acme"/],
+    [["--profile", "bad name"], {}, /Invalid profile name "bad name"/],
+    [["--profile"], {}, /--profile needs a profile name/],
+  ] as const)("%j with %j fails before any keychain read or lookup", async (argv, env, said) => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("exit");
+    }) as never);
+    const errors: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => void errors.push(a.join(" ")));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await expect(runStatus(argv, env)).rejects.toThrow("exit");
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(errors.join("\n")).toMatch(said);
+    expect(mockReadFromKeychain).not.toHaveBeenCalled();
+    expect(mockTestConnection).not.toHaveBeenCalled();
+    expect(mockFind).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+});

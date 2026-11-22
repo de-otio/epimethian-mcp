@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockStartServer = vi.fn().mockResolvedValue(undefined);
 const mockRunSetup = vi.fn().mockResolvedValue(undefined);
@@ -138,5 +138,80 @@ describe("CLI entry point", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(mockRunUpgrade).toHaveBeenCalledOnce();
     expect(mockStartServer).not.toHaveBeenCalled();
+  });
+
+  describe("--profile for the server (setup's client snippets pass it)", () => {
+    const origEnv = process.env.CONFLUENCE_PROFILE;
+    let profileSeenByServer: string | undefined;
+    let errors: string[];
+
+    beforeEach(() => {
+      profileSeenByServer = "(not started)";
+      errors = [];
+      mockStartServer.mockImplementation(async () => {
+        profileSeenByServer = process.env.CONFLUENCE_PROFILE;
+      });
+      vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => void errors.push(a.join(" ")));
+      vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+      delete process.env.CONFLUENCE_PROFILE;
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      mockStartServer.mockReset().mockResolvedValue(undefined);
+      if (origEnv === undefined) delete process.env.CONFLUENCE_PROFILE;
+      else process.env.CONFLUENCE_PROFILE = origEnv;
+    });
+
+    async function run(argv: string[]): Promise<void> {
+      process.argv = ["node", "index.js", ...argv];
+      vi.resetModules();
+      vi.doMock("../server/index.js", () => ({ main: mockStartServer }));
+      vi.doMock("./status.js", () => ({ runStatus: mockRunStatus }));
+      await import("./index.js");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    it("starts the server with the profile named by --profile", async () => {
+      await run(["--profile", "acme"]);
+      expect(mockStartServer).toHaveBeenCalledOnce();
+      expect(profileSeenByServer).toBe("acme");
+    });
+
+    it("starts when --profile and CONFLUENCE_PROFILE agree", async () => {
+      process.env.CONFLUENCE_PROFILE = "acme";
+      await run(["--profile", "acme"]);
+      expect(profileSeenByServer).toBe("acme");
+    });
+
+    it("refuses to start when --profile and CONFLUENCE_PROFILE differ, naming both", async () => {
+      process.env.CONFLUENCE_PROFILE = "acme";
+      await run(["--profile", "globex"]);
+      expect(process.exit).toHaveBeenCalledWith(1);
+      expect(mockStartServer).not.toHaveBeenCalled();
+      expect(errors.join("\n")).toMatch(/"globex".*CONFLUENCE_PROFILE="acme"/);
+      expect(process.env.CONFLUENCE_PROFILE).toBe("acme"); // not overwritten
+    });
+
+    it.each([[["--profile"]], [["--profile", "--debug"]], [["--profile", "bad name"]]])(
+      "refuses %j before starting",
+      async (argv) => {
+        await run(argv);
+        expect(process.exit).toHaveBeenCalledWith(1);
+        expect(mockStartServer).not.toHaveBeenCalled();
+      },
+    );
+
+    it("without --profile the environment is left as it was", async () => {
+      process.env.CONFLUENCE_PROFILE = "globex";
+      await run([]);
+      expect(profileSeenByServer).toBe("globex");
+    });
+
+    it("passes the arguments after 'status' to runStatus", async () => {
+      await run(["status", "--profile", "acme"]);
+      expect(mockRunStatus).toHaveBeenCalledWith(["--profile", "acme"]);
+      expect(mockStartServer).not.toHaveBeenCalled();
+    });
   });
 });

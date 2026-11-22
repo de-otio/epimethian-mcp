@@ -3,6 +3,7 @@ import { readFromKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
 import { requestBaseFor } from "../server/api-base.js";
 import { tokenExpiryState, describeExpiry, todayUtc } from "../shared/token-expiry.js";
 import { describeCopies, findInstalledCopies } from "../shared/installed-copies.js";
+import { resolveProfileArg } from "./profile-arg.js";
 
 declare const __PKG_VERSION__: string;
 
@@ -22,13 +23,29 @@ async function printInstalledCopies(): Promise<void> {
   }
 }
 
-export async function runStatus(): Promise<void> {
+/**
+ * `epimethian-mcp status [--profile <name>]`. `argv` is the argument list
+ * after `status`. The profile is resolved first (flag against
+ * CONFLUENCE_PROFILE), so a bad or conflicting name fails before any keychain
+ * read or request.
+ */
+export async function runStatus(
+  argv: readonly string[] = [],
+  env: Readonly<Record<string, string | undefined>> = process.env
+): Promise<void> {
+  const resolved = resolveProfileArg(argv, env);
+  if (!resolved.ok) {
+    console.error(`Error: ${resolved.error}`);
+    process.exit(1);
+    return;
+  }
+
   await printInstalledCopies();
 
-  const profile = process.env.CONFLUENCE_PROFILE || "";
-  const urlEnv = process.env.CONFLUENCE_URL || "";
-  const emailEnv = process.env.CONFLUENCE_EMAIL || "";
-  const tokenEnv = process.env.CONFLUENCE_API_TOKEN || "";
+  const profile = resolved.profile ?? "";
+  const urlEnv = env.CONFLUENCE_URL || "";
+  const emailEnv = env.CONFLUENCE_EMAIL || "";
+  const tokenEnv = env.CONFLUENCE_API_TOKEN || "";
 
   let url: string;
   let email: string;

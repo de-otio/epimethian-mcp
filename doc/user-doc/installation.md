@@ -189,7 +189,7 @@ Atlassian does not expose a token's expiry through its API, so Epimethian stores
 
 | Variable | Description |
 |----------|-------------|
-| `CONFLUENCE_PROFILE` | **Recommended.** Name of the credential profile in the OS keychain. |
+| `CONFLUENCE_PROFILE` | **Recommended.** Name of the credential profile in the OS keychain. `--profile <name>` on the server's command line (what the snippets printed by setup use) does the same; if both are set they must name the same profile, or the server refuses to start. |
 | `CONFLUENCE_URL` | Atlassian instance URL (CI/CD only — requires all three env vars) |
 | `CONFLUENCE_EMAIL` | Atlassian account email (CI/CD only) |
 | `CONFLUENCE_API_TOKEN` | API token (CI/CD only — use OS keychain for interactive use) |
@@ -207,7 +207,7 @@ If configured correctly, your AI assistant will use the `get_spaces` tool and re
 You can also test from the terminal:
 
 ```bash
-CONFLUENCE_PROFILE=<name> epimethian-mcp status
+epimethian-mcp status --profile <name>    # or: CONFLUENCE_PROFILE=<name> epimethian-mcp status
 ```
 
 ## Troubleshooting

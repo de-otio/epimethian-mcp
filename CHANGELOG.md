@@ -84,6 +84,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   site; the docs recommend a separate Atlassian account per customer and state
   that gateway mode is not live-verified until the probe and the scoped-token
   check have run.
+- The server and `epimethian-mcp status` ignored `--profile <name>` and read
+  only `CONFLUENCE_PROFILE`, so every client snippet printed by setup (which
+  passes `"args": ["--profile", "<name>"]`) started with "Missing Confluence
+  credentials". Both now accept `--profile`. If `--profile` and
+  `CONFLUENCE_PROFILE` name different profiles they refuse to start and name
+  both, rather than pick one; a missing or invalid name is an error before any
+  keychain read.
 - Gateway mode with a read-only scoped token: the gateway refuses the dry-run
   page update with 401 `scope does not match`, not 403 (live check
   2026-11-22). The setup scope check now reads that answer as "this token

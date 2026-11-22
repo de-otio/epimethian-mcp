@@ -86,7 +86,7 @@ Manage profiles:
 ```bash
 epimethian-mcp profiles              # list all (shows read-only status)
 epimethian-mcp profiles --verbose    # show URLs, emails, and read-only status
-CONFLUENCE_PROFILE=globex epimethian-mcp status   # test connection
+epimethian-mcp status --profile globex           # test connection
 epimethian-mcp profiles --remove <name>           # delete profile and credentials
 ```
 
