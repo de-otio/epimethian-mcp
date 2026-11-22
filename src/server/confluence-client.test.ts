@@ -81,6 +81,7 @@ import {
   deleteInlineComment,
   type CommentData,
   getPageVersions,
+  _resetUserNameCacheForTests,
   getPageVersionBody,
   getVersionStorage,
   setClientLabel,
@@ -2104,27 +2105,29 @@ describe("getPageByTitle", () => {
 });
 
 describe("getAttachments", () => {
-  it("returns attachments with extensions", async () => {
+  it("maps v2 fields to the existing attachment shape", async () => {
     global.fetch = mockFetchResponse({
       results: [
         {
-          id: "att-1",
+          id: "att1",
           title: "file.png",
-          extensions: { fileSize: 1024, mediaType: "image/png" },
-          _links: { download: "/download/file.png" },
+          fileSize: 1024,
+          mediaType: "image/png",
+          downloadLink: "/download/file.png",
         },
       ],
     });
-    const atts = await getAttachments("page-1", 10);
+    const atts = await getAttachments("11", 10);
     expect(atts).toHaveLength(1);
     expect(atts[0].extensions?.mediaType).toBe("image/png");
+    expect(atts[0].extensions?.fileSize).toBe(1024);
     const url = (global.fetch as any).mock.calls[0][0] as string;
-    expect(url).toContain(`${API_V1}/content/page-1/child/attachment`);
+    expect(url).toContain(`${API_V2}/pages/11/attachments`);
   });
 
   it("returns empty array when no attachments", async () => {
     global.fetch = mockFetchResponse({ results: [] });
-    const atts = await getAttachments("page-1", 10);
+    const atts = await getAttachments("11", 10);
     expect(atts).toHaveLength(0);
   });
 });
@@ -2167,31 +2170,30 @@ describe("uploadAttachment", () => {
 });
 
 describe("getAttachments version", () => {
-  it("asks for the version and returns it", async () => {
+  it("returns the version from the v2 answer", async () => {
     global.fetch = mockFetchResponse({
       results: [{ id: "att1", title: "a.drawio", version: { number: 3 } }],
     });
     const atts = await getAttachments("123", 10);
     expect(atts[0].version?.number).toBe(3);
     const url = new URL((global.fetch as any).mock.calls[0][0] as string);
-    expect(url.searchParams.get("expand")).toBe("version");
+    expect(url.pathname).toBe("/wiki/api/v2/pages/123/attachments");
   });
 });
 
 describe("findAttachmentByName", () => {
-  it("encodes the filename and asks for the version", async () => {
+  it("encodes the filename in the v2 attachments request", async () => {
     global.fetch = mockFetchResponse({ results: [] });
     await findAttachmentByName("123", "my diagram ä&b.drawio");
     const url = new URL((global.fetch as any).mock.calls[0][0] as string);
-    expect(url.pathname).toBe("/wiki/rest/api/content/123/child/attachment");
+    expect(url.pathname).toBe("/wiki/api/v2/pages/123/attachments");
     expect(url.searchParams.get("filename")).toBe("my diagram ä&b.drawio");
-    expect(url.searchParams.get("expand")).toBe("version");
   });
 
   it("returns the exact title match with its version", async () => {
     global.fetch = mockFetchResponse({
       results: [
-        { id: "att9", title: "a.drawio", version: { number: 4 }, extensions: { fileSize: 10, mediaType: "application/vnd.jgraph.mxfile" } },
+        { id: "att9", title: "a.drawio", version: { number: 4 }, fileSize: 10, mediaType: "application/vnd.jgraph.mxfile" },
       ],
     });
     const r = await findAttachmentByName("123", "a.drawio");
@@ -2216,11 +2218,11 @@ describe("findAttachmentByName", () => {
     expect((await findAttachmentByName("123", "a.drawio")).exact).toBeNull();
   });
 
-  it("refuses to call the name absent when a full page of case-variants came back", async () => {
+  it("refuses to call the name absent when a full page of case-variants came back (draft, v1)", async () => {
     global.fetch = mockFetchResponse({
       results: Array.from({ length: 25 }, (_, i) => ({ id: `att${i}`, title: `A.DRAWIO${"".padEnd(i % 2)}` })),
     });
-    await expect(findAttachmentByName("123", "a.drawio")).rejects.toThrow(/refusing to decide/);
+    await expect(findAttachmentByName("123", "a.drawio", { draft: true })).rejects.toThrow(/refusing to decide/);
   });
 
   it("refuses two exact matches", async () => {
@@ -2869,7 +2871,7 @@ describe("getLabels", () => {
         { prefix: "global", name: "bar", id: "2", label: "bar" },
       ],
     });
-    const labels = await getLabels("page-42");
+    const labels = await getLabels("42");
     expect(labels).toHaveLength(2);
     expect(labels[0].name).toBe("foo");
     expect(labels[1].name).toBe("bar");
@@ -2877,21 +2879,21 @@ describe("getLabels", () => {
 
   it("returns empty array when page has no labels", async () => {
     global.fetch = mockFetchResponse({ results: [] });
-    const labels = await getLabels("page-42");
+    const labels = await getLabels("42");
     expect(labels).toHaveLength(0);
   });
 
-  it("constructs correct URL with pageId", async () => {
+  it("reads the v2 labels endpoint for the page", async () => {
     global.fetch = mockFetchResponse({ results: [] });
-    await getLabels("page-99");
-    const url = (global.fetch as any).mock.calls[0][0] as string;
-    expect(url).toBe(`${API_V1}/content/page-99/label`);
+    await getLabels("99");
+    const url = new URL((global.fetch as any).mock.calls[0][0] as string);
+    expect(url.origin + url.pathname).toBe(`${API_V2}/pages/99/labels`);
   });
 
   it("throws ConfluenceApiError on non-ok response", async () => {
-    global.fetch = mockFetchResponse("Not Found", 404);
-    await expect(getLabels("page-42")).rejects.toThrow(ConfluenceApiError);
-    await expect(getLabels("page-42")).rejects.toThrow("Confluence API error (404)");
+    global.fetch = mockFetchResponse("Server Error", 500);
+    await expect(getLabels("42")).rejects.toThrow(ConfluenceApiError);
+    await expect(getLabels("42")).rejects.toThrow("Confluence API error (500)");
   });
 });
 
@@ -3480,21 +3482,24 @@ describe("Comments", () => {
   describe("getPageVersions", () => {
     const sampleVersions = {
       results: [
-        { number: 3, by: { displayName: "Alice", accountId: "abc" }, when: "2025-01-03T00:00:00Z", message: "Fixed typo", minorEdit: true },
-        { number: 2, by: { displayName: "Bob", accountId: "def" }, when: "2025-01-02T00:00:00Z", message: "", minorEdit: false },
+        { number: 3, authorId: "abc", createdAt: "2025-01-03T00:00:00Z", message: "Fixed typo", minorEdit: true },
+        { number: 2, authorId: "def", createdAt: "2025-01-02T00:00:00Z", message: "", minorEdit: false },
       ],
     };
+    const usersBulk = { results: [{ accountId: "abc", displayName: "Alice" }, { accountId: "def", displayName: "Bob" }] };
 
-    it("constructs correct v1 URL with limit param", async () => {
-      global.fetch = mockFetchResponse(sampleVersions);
+    beforeEach(() => _resetUserNameCacheForTests());
+
+    it("constructs the v2 versions URL with a limit", async () => {
+      global.fetch = mockFetchSequence([{ body: sampleVersions }, { body: usersBulk }]);
       await getPageVersions("123", 50);
       const url = (global.fetch as any).mock.calls[0][0] as string;
-      expect(url).toContain(`${API_V1}/content/123/version`);
+      expect(url).toContain(`${API_V2}/pages/123/versions`);
       expect(url).toContain("limit=50");
     });
 
-    it("returns parsed version metadata array", async () => {
-      global.fetch = mockFetchResponse(sampleVersions);
+    it("returns parsed version metadata array with resolved names", async () => {
+      global.fetch = mockFetchSequence([{ body: sampleVersions }, { body: usersBulk }]);
       const result = await getPageVersions("123", 25);
       expect(result).toHaveLength(2);
       expect(result[0].number).toBe(3);
@@ -3505,18 +3510,20 @@ describe("Comments", () => {
 
     it("truncates messages longer than 500 chars", async () => {
       const longMsg = "x".repeat(600);
-      const versions = { results: [{ number: 1, by: { displayName: "A", accountId: "a" }, when: "2025-01-01T00:00:00Z", message: longMsg, minorEdit: false }] };
-      global.fetch = mockFetchResponse(versions);
+      const versions = { results: [{ number: 1, authorId: "a", createdAt: "2025-01-01T00:00:00Z", message: longMsg, minorEdit: false }] };
+      global.fetch = mockFetchSequence([{ body: versions }, { body: { results: [{ accountId: "a", displayName: "A" }] } }]);
       const result = await getPageVersions("1", 25);
       expect(result[0].message).toHaveLength(500);
     });
 
-    it("fills a missing author with the placeholder (zod 4: prefault, not default)", async () => {
-      const versions = { results: [{ number: 1, when: "2025-01-01T00:00:00Z", minorEdit: false }] };
+    it("fills a missing author with the placeholder", async () => {
+      const versions = { results: [{ number: 1, createdAt: "2025-01-01T00:00:00Z", minorEdit: false }] };
       global.fetch = mockFetchResponse(versions);
       const result = await getPageVersions("1", 25);
       expect(result[0].by).toEqual({ displayName: "unknown user", accountId: "" });
       expect(result[0].message).toBe("");
+      // no author id, so no name lookup at all
+      expect(global.fetch).toHaveBeenCalledOnce();
     });
 
     it("returns empty array for empty results", async () => {
@@ -3770,7 +3777,7 @@ describe("ensureAttributionLabel (Track G)", () => {
       { body: {}, status: 200 },                        // addLabels
       { body: { results: [{ prefix: "global", name: "epimethian-edited", id: "1", label: "epimethian-edited" }] }, status: 200 }, // getLabels
     ]);
-    const result = await ensureAttributionLabel("page-42");
+    const result = await ensureAttributionLabel("42");
     expect(result).toEqual({});
   });
 

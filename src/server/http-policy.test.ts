@@ -314,7 +314,7 @@ describe("R1 concurrency cap", () => {
     });
     let first = true;
     setFetch((url) => {
-      if (url.includes("/content/1/")) {
+      if (url.includes("/pages/1/labels")) {
         if (first) {
           first = false;
           return json({}, 429, { "Retry-After": "1" });

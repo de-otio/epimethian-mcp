@@ -5415,7 +5415,7 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
     {
       description: withUntrustedNote(
         "List version history for a Confluence page. Returns version numbers, " +
-        "authors, dates, and change messages. Costs 1 API call."
+        "authors, dates, and change messages. Costs 1-2 API calls (a second call resolves author names)."
       ),
       inputSchema: {
         page_id: pageIdSchema.describe("Confluence page ID"),
@@ -5438,7 +5438,13 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
           // displayName and version message are tenant-authored free text;
           // fence them so prompt injection via a crafted version note
           // cannot escape into the agent's instructions.
-          const authorFenced = fenceUntrusted(v.by.displayName, {
+          // v2 gives an account id, not a name: when the name lookup failed the
+          // id is shown, and said to be one.
+          const authorText =
+            v.by.nameResolved === false
+              ? `account ${v.by.accountId} (name unavailable)`
+              : v.by.displayName;
+          const authorFenced = fenceUntrusted(authorText, {
             field: "displayName",
           });
           lines.push(

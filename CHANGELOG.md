@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Attachment lists and lookups, version history and label reads now use the
+  Confluence v2 API (`get_attachments`, `get_page_versions`, `get_labels`, the
+  attachment lookup behind `add_attachment` with `overwrite` and the draw.io
+  tools). Blog posts keep working: every read is routed to `/pages/...` or
+  `/blogposts/...`. Output is unchanged except as noted below. Uploads, label
+  writes and content status stay on v1, which has no v2 equivalent.
+- Attachment lookup by name now reads every page of the answer, compares the
+  title exactly (case-sensitive), treats no match as "not found" and refuses
+  when two attachments have the same name, instead of picking one.
+- `get_page_versions` shows each version's author from a v2 account id. Names
+  come from one cached `users-bulk` lookup; if that fails the versions are
+  still listed with `account <id> (name unavailable)`.
+- A list cursor that points outside the Confluence API (another origin, another
+  tenant prefix, another endpoint) is refused instead of followed.
+- Reading a label list no longer fails a write that already succeeded when the
+  legacy-label cleanup cannot read the page's labels.
+
 ## [7.5.0] - 2026-11-22 - security updates and agent hints
 
 ### Security
