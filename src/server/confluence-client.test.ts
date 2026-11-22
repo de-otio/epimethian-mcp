@@ -30,6 +30,8 @@ import {
   getPage,
   _rawCreatePage,
   _rawUpdatePage,
+  buildVersionMessage,
+  EPIMETHIAN_REPO_URL,
   deletePage,
   searchPages,
   searchContent,
@@ -1333,6 +1335,10 @@ describe("_rawUpdatePage", () => {
     });
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message.length).toBeLessThanOrEqual(500);
+    // The caller's text is what gets shortened: attribution, link and
+    // destructive flags all survive.
+    expect(putBody.version.message).toContain(EPIMETHIAN_REPO_URL);
+    expect(putBody.version.message.endsWith("[destructive: replace_body]")).toBe(true);
   });
 });
 
@@ -1474,6 +1480,7 @@ describe("version messages with client label", () => {
     const body = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(body.version.message).toMatch(/^Created by Epimethian v/);
     expect(body.version.message).not.toContain("Claude");
+    expect(body.version.message).toContain(EPIMETHIAN_REPO_URL);
   });
 
   it("_rawUpdatePage includes client label without versionMessage", async () => {
@@ -1503,6 +1510,59 @@ describe("version messages with client label", () => {
     const putBody = JSON.parse((global.fetch as any).mock.calls[0][1].body as string);
     expect(putBody.version.message).toMatch(/^Updated by Epimethian v/);
     expect(putBody.version.message).not.toContain("Claude");
+    expect(putBody.version.message).toContain(EPIMETHIAN_REPO_URL);
+  });
+});
+
+describe("buildVersionMessage", () => {
+  const URL = "https://github.com/de-otio/epimethian-mcp";
+
+  it("names the version and links the repo in every shape", () => {
+    expect(buildVersionMessage({ action: "Created", version: "6.1.0" })).toBe(
+      `Created by Epimethian v6.1.0 (${URL})`
+    );
+    expect(buildVersionMessage({ action: "Updated", version: "6.1.0", clientLabel: "Claude Code" })).toBe(
+      `Updated by Claude Code (via Epimethian v6.1.0, ${URL})`
+    );
+    expect(buildVersionMessage({ action: "Updated", version: "6.1.0", message: "Fixed typo" })).toBe(
+      `Fixed typo (via Epimethian v6.1.0, ${URL})`
+    );
+    expect(
+      buildVersionMessage({ action: "Updated", version: "6.1.0", message: "Fixed typo", clientLabel: "Claude Code" })
+    ).toBe(`Fixed typo (Claude Code via Epimethian v6.1.0, ${URL})`);
+    expect(
+      buildVersionMessage({ action: "Updated", version: "6.1.0", message: "M", destructiveFlags: ["replace_body"] })
+    ).toBe(`M (via Epimethian v6.1.0, ${URL}) [destructive: replace_body]`);
+  });
+
+  it("leaves a message that fits exactly at 500 chars untouched", () => {
+    const tail = ` (via Epimethian v1.0.0, ${URL})`;
+    const msg = "a".repeat(500 - tail.length);
+    expect(buildVersionMessage({ action: "Updated", version: "1.0.0", message: msg })).toBe(msg + tail);
+  });
+
+  it("shortens the caller's message one char over the limit, keeping the tail", () => {
+    const tail = ` (via Epimethian v1.0.0, ${URL})`;
+    const msg = "a".repeat(501 - tail.length);
+    const out = buildVersionMessage({ action: "Updated", version: "1.0.0", message: msg });
+    expect(out.length).toBe(500);
+    expect(out.endsWith(`…${tail}`)).toBe(true);
+  });
+
+  it("never exceeds 500 chars and always keeps the link (property)", () => {
+    fc.assert(
+      fc.property(
+        fc.string({ maxLength: 1200 }),
+        fc.option(fc.string({ minLength: 1, maxLength: 80 }), { nil: undefined }),
+        fc.array(fc.constantFrom("replace_body", "confirm_shrinkage", "confirm_deletions"), { maxLength: 3 }),
+        (message, clientLabel, destructiveFlags) => {
+          const out = buildVersionMessage({ action: "Updated", version: "6.1.0", message, clientLabel, destructiveFlags });
+          expect(out.length).toBeLessThanOrEqual(500);
+          expect(out).toContain(URL);
+          expect(out).toContain("Epimethian v6.1.0");
+        }
+      )
+    );
   });
 });
 

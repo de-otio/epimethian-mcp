@@ -63,6 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extra request is made.
 
 ### Added
+- Every Confluence version comment Epimethian writes on a create or update
+  now links the project repo next to the Epimethian version, e.g.
+  `Updated by Claude Code (via Epimethian v6.1.0, https://github.com/de-otio/epimethian-mcp)`.
+  When a long `version_message` would push the comment past Confluence's
+  500-char limit, the caller's text is shortened instead of the attribution,
+  link and `[destructive: ...]` flags.
 - `create_blog_post` creates a blog post in a space's blog. It makes a
   **draft** by default: nobody is notified, and the result says how to
   publish it. `publish: true` publishes at once.

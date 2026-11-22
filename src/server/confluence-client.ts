@@ -1598,10 +1598,11 @@ export async function _rawCreateContent(
   const pageBody = normalizeBodyForSubmit(body);
   const segment = segmentFor(type);
 
-  const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
-  const versionMsg = cfg.attribution && opts.clientLabel
-    ? `Created by ${opts.clientLabel} (via ${epimethianTag})`
-    : `Created by ${epimethianTag}`;
+  const versionMsg = buildVersionMessage({
+    action: "Created",
+    version: __PKG_VERSION__,
+    clientLabel: cfg.attribution ? opts.clientLabel : undefined,
+  });
   const payload: Record<string, unknown> = {
     title,
     spaceId,
@@ -1629,6 +1630,60 @@ export async function _rawCreateContent(
   // caller chain so warnings can be surfaced. No call here.
 
   return page;
+}
+
+/** Project page linked from every Confluence version message we write. */
+export const EPIMETHIAN_REPO_URL = "https://github.com/de-otio/epimethian-mcp";
+
+/** Confluence rejects version messages longer than this. */
+const VERSION_MESSAGE_MAX = 500;
+
+/**
+ * Build the Confluence version message ("version comment") for a create or
+ * update. Every message names the Epimethian version and links the repo:
+ *
+ *   Created by Epimethian v6.1.0 (https://github.com/de-otio/epimethian-mcp)
+ *   Fixed typo (Claude Code via Epimethian v6.1.0, https://github.com/...)
+ *
+ * The result never exceeds Confluence's 500-char limit. When it would, the
+ * caller-supplied message is shortened (ending in "…") so the attribution,
+ * the link and any `[destructive: ...]` suffix survive intact.
+ */
+export function buildVersionMessage(opts: {
+  action: "Created" | "Updated";
+  version: string;
+  clientLabel?: string;
+  message?: string;
+  destructiveFlags?: string[];
+}): string {
+  const tag = `Epimethian v${opts.version}`;
+  const suffix =
+    opts.destructiveFlags && opts.destructiveFlags.length > 0
+      ? ` [destructive: ${opts.destructiveFlags.join(", ")}]`
+      : "";
+
+  let head: string;
+  let tail: string;
+  if (opts.message) {
+    head = opts.message;
+    tail = opts.clientLabel
+      ? ` (${opts.clientLabel} via ${tag}, ${EPIMETHIAN_REPO_URL})`
+      : ` (via ${tag}, ${EPIMETHIAN_REPO_URL})`;
+  } else {
+    head = "";
+    tail = opts.clientLabel
+      ? `${opts.action} by ${opts.clientLabel} (via ${tag}, ${EPIMETHIAN_REPO_URL})`
+      : `${opts.action} by ${tag} (${EPIMETHIAN_REPO_URL})`;
+  }
+  tail += suffix;
+
+  const room = VERSION_MESSAGE_MAX - tail.length;
+  if (head.length > room) {
+    head = room > 1 ? `${head.slice(0, room - 1)}…` : "";
+  }
+  const full = head + tail;
+  // Only reachable with an absurd flag list; hard cap as the last resort.
+  return full.length > VERSION_MESSAGE_MAX ? full.slice(0, VERSION_MESSAGE_MAX) : full;
 }
 
 export interface RawUpdateOptions {
@@ -1689,27 +1744,15 @@ export async function _rawUpdateContent(
   const keepsVersion = !isPage && opts.fromStatus === "draft";
   const newVersion = keepsVersion ? opts.version : opts.version + 1;
 
-  const epimethianTag = `Epimethian v${__PKG_VERSION__}`;
-  const effectiveClient = cfg.attribution ? opts.clientLabel : undefined;
-
-  let versionMessage: string;
-  if (opts.versionMessage && effectiveClient)
-    versionMessage = `${opts.versionMessage} (${effectiveClient} via ${epimethianTag})`;
-  else if (opts.versionMessage)
-    versionMessage = `${opts.versionMessage} (via ${epimethianTag})`;
-  else if (effectiveClient)
-    versionMessage = `Updated by ${effectiveClient} (via ${epimethianTag})`;
-  else
-    versionMessage = `Updated by ${epimethianTag}`;
-
-  // C3: append destructive-flag metadata so Confluence's version history
-  // records it too. Cap the combined length so we never exceed Confluence's
-  // 500-char version-message limit.
-  if (opts.destructiveFlags && opts.destructiveFlags.length > 0) {
-    const suffix = ` [destructive: ${opts.destructiveFlags.join(", ")}]`;
-    const combined = versionMessage + suffix;
-    versionMessage = combined.length > 500 ? combined.slice(0, 500) : combined;
-  }
+  // C3: destructive-flag metadata goes into the message so Confluence's
+  // version history records it too; the builder keeps it within 500 chars.
+  const versionMessage = buildVersionMessage({
+    action: "Updated",
+    version: __PKG_VERSION__,
+    clientLabel: cfg.attribution ? opts.clientLabel : undefined,
+    message: opts.versionMessage,
+    destructiveFlags: opts.destructiveFlags,
+  });
 
   // Compute the cleaned body ONCE — avoids double-execution of
   // stripAttributionFooter which could diverge if regex state drifts.
