@@ -813,6 +813,40 @@ describe("resolveV2NextLink", () => {
     ).toBeNull();
   });
 
+  describe("C1: the gateway's prefixed relative form", () => {
+    const CLOUD = "11111111-2222-3333-4444-555555555555";
+    const OTHER = "99999999-2222-3333-4444-555555555555";
+    const gw = `https://api.atlassian.com/ex/confluence/${CLOUD}/wiki/api/v2`;
+    const req = `${gw}/pages/11/attachments?limit=2`;
+
+    it("accepts /ex/confluence/{sealedCloudId}/wiki/api/v2/... in gateway mode", () => {
+      expect(resolveV2NextLink(`/ex/confluence/${CLOUD}/wiki/api/v2/pages/11/attachments?cursor=a`, gw, req)).toBe(
+        `${gw}/pages/11/attachments?cursor=a`
+      );
+    });
+
+    it("refuses another cloudId's prefix", () => {
+      expect(resolveV2NextLink(`/ex/confluence/${OTHER}/wiki/api/v2/pages/11/attachments?cursor=a`, gw, req)).toBeNull();
+    });
+
+    it("refuses the prefixed form for another endpoint", () => {
+      expect(resolveV2NextLink(`/ex/confluence/${CLOUD}/wiki/api/v2/pages/12/attachments?cursor=a`, gw, req)).toBeNull();
+    });
+
+    it("refuses a prefix that only starts with the sealed cloudId", () => {
+      expect(resolveV2NextLink(`/ex/confluence/${CLOUD}x/wiki/api/v2/pages/11/attachments?cursor=a`, gw, req)).toBeNull();
+    });
+
+    it("refuses traversal out of the prefix, plain or encoded", () => {
+      expect(resolveV2NextLink(`/ex/confluence/${CLOUD}/../${OTHER}/wiki/api/v2/pages/11/attachments`, gw, req)).toBeNull();
+      expect(resolveV2NextLink(`/ex/confluence/${CLOUD}/wiki/api/v2/%2e%2e/pages/11/attachments`, gw, req)).toBeNull();
+    });
+
+    it("in site mode a /ex/... cursor is refused", () => {
+      expect(resolveV2NextLink(`/ex/confluence/${CLOUD}/wiki/api/v2/pages/11/attachments?cursor=a`, API, REQ)).toBeNull();
+    });
+  });
+
   it.each([
     [undefined],
     [null],

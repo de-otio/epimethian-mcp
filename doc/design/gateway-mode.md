@@ -85,7 +85,9 @@ Add one pure predicate to `api-base.ts`: `isCredentialedUrl(url: string, request
   without sending, any URL that fails the predicate (belt and braces; all bases come from C1).
 - **Pagination cursors:** `resolveSearchNext` (`:2034`) keeps only the origin today and
   prefixes `/wiki`. Make it prefix-aware: resolve `next` against `requestBase`, then require
-  `isCredentialedUrl`. W-V2READ's attachment cursors use the same helper (plan §5.2 tests).
+  `isCredentialedUrl`. W-V2READ's list cursors use `resolveV2NextLink`
+  (`pagination-cursor.ts`), which is stricter (same request path) and also ends with
+  `isCredentialedUrl`; see the open points in §9.
 - **Download redirects:** `downloadAttachmentBytes` (`:2602`) latches `credentialed` on
   `next.origin === siteOrigin` (`:2650`). In gateway mode replace that comparison with
   `isCredentialedUrl(next, requestBase)`; `resolveDownloadUrl` (`:2571`) must refuse an
@@ -198,6 +200,10 @@ export function tokenExpiryState(expiry: string | undefined, today: string /* YY
   including the exact status for a missing scope (401 vs 403).
 - Whether the dry-run `PUT /pages/999999999999` answers 403 for a read-only token on the
   gateway (the setup scope probe relies on it).
-- Whether `_links.next` on v2 lists carries the `/ex/confluence/{cloudId}` prefix or not
-  (`resolveNextLink` accepts both).
+- Whether `_links.next` on v2 lists carries the `/ex/confluence/{cloudId}` prefix or not.
+  Both forms are accepted: v2 list cursors go through `resolveV2NextLink`
+  (`src/server/pagination-cursor.ts`), which takes `/wiki/api/v2/...` or
+  `/ex/confluence/{sealedCloudId}/wiki/api/v2/...` (the exact sealed prefix only) and
+  requires the same origin and the same request path; the v1 CQL search cursor goes
+  through `resolveNextLink` (`api-base.ts`). Both end with `isCredentialedUrl`.
 - A gateway download path for attachments (`attachments.download` stays `false`).

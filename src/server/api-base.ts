@@ -156,6 +156,10 @@ export function assertCredentialedUrl(url: string, requestBase: string): void {
  * path (and then refused unless it is under the sealed prefix); otherwise it
  * is resolved under the sealed prefix. The result must pass
  * `isCredentialedUrl`, so a cursor naming another cloudId is refused.
+ *
+ * Used by the v1 CQL search only. v2 list cursors go through the stricter
+ * `resolveV2NextLink` (pagination-cursor.ts), which also pins the cursor to the
+ * listing's own request path; both end with `isCredentialedUrl`.
  */
 export function resolveNextLink(next: unknown, requestBase: string): string | null {
   if (typeof next !== "string") return null;

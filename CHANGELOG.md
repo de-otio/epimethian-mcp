@@ -57,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page.
 - A missing version of an existing page or blog post is reported as such,
   not as "No page or blog post with id ...".
+- v2 list cursors in the gateway's prefixed form
+  (`/ex/confluence/{cloudId}/wiki/api/v2/...`) are followed when the prefix is
+  exactly the sealed one and the cursor continues the same listing; another
+  cloudId's prefix, and any `/ex/...` cursor in site mode, are refused.
 
 ## [7.5.0] - 2026-11-22 - security updates and agent hints
 
