@@ -90,8 +90,12 @@ export function requireV1(cfg: { readonly apiV1: string | null }, feature: Featu
 
 // --- Origin and prefix pinning (doc/design/gateway-mode.md §5) -------------
 
-/** Percent-encoded `.`, `/` and `\` could let a gateway path climb out of its prefix after decoding. */
-const ENCODED_TRAVERSAL_RE = /%2e|%2f|%5c/i;
+/**
+ * Percent-encoded `.`, `/`, `\` and `;` could let a gateway path climb out of
+ * its prefix after decoding; `;` also starts a path parameter, which some
+ * servers and proxies strip before routing (`/..;/` is read as `/../`).
+ */
+const ENCODED_TRAVERSAL_RE = /%2e|%2f|%5c|%3b/i;
 
 /**
  * May the credential be sent to `url`? Pure; the one predicate behind request
@@ -100,8 +104,9 @@ const ENCODED_TRAVERSAL_RE = /%2e|%2f|%5c/i;
  *   site (request base without a path): same origin as the base. Today's rule.
  *   gateway (request base `…/ex/confluence/{sealedCloudId}`): same origin AND the
  *     normalised path is below the base path, with the slash boundary
- *     (`…/{id}x/…` is not below `…/{id}`). Encoded dots, slashes and backslashes
- *     are refused, so no decoding step can climb out of the prefix.
+ *     (`…/{id}x/…` is not below `…/{id}`). Encoded dots, slashes, backslashes
+ *     and semicolons, and any `;` path parameter (`..;`), are refused, so no
+ *     decoding or parameter-stripping step can climb out of the prefix.
  *
  * Anything unparseable is refused.
  */
@@ -119,6 +124,9 @@ export function isCredentialedUrl(url: string, requestBase: string): boolean {
   const prefix = base.pathname.replace(/\/+$/, "");
   if (prefix === "") return true;
   if (ENCODED_TRAVERSAL_RE.test(target.pathname)) return false;
+  // Path parameters (`;x`, `..;`): the gateway prefix must be matched on the
+  // path the far side routes on, and a `;` makes that ambiguous. Refused.
+  if (target.pathname.includes(";")) return false;
   return target.pathname.startsWith(`${prefix}/`);
 }
 

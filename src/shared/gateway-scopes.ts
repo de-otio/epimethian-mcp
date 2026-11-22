@@ -38,14 +38,20 @@ export const GATEWAY_SCOPES: Readonly<Record<GatewayPosture, readonly string[]>>
 /**
  * Classify the status of the setup-time dry-run `PUT /pages/999999999999`
  * for a token the user declared read-only (R4: one call must pass, one must
- * fail). 403 means the token lacks write scope (narrow, as intended). Any
- * other 4xx that is not an auth failure means the write was permitted to
- * proceed to validation or lookup (broad). Auth failures, 5xx and transport
- * errors prove nothing.
+ * fail). The probe proves ONE thing: whether this token can update pages.
+ * It says nothing about the other write scopes (blog posts, comments,
+ * attachments, deletes), which are not probed; callers must say so.
+ *
+ * 403 means the token cannot update pages (narrow, as intended). Any other
+ * 4xx that is not listed below means the update was allowed to proceed to
+ * validation or lookup (broad). 3xx, 5xx and transport errors prove nothing.
  */
 export function classifyScopeProbe(status: number | undefined): "narrow" | "broad" | "inconclusive" {
   if (status === undefined) return "inconclusive";
   if (status === 403) return "narrow";
+  // 401 is deliberately inconclusive: on the gateway it may mean a missing
+  // scope or a bad/expired token, and the probe cannot tell which. The live
+  // scoped-token check (doc/design/gateway-mode.md, open points) decides it.
   if ([401, 405, 407, 410, 429].includes(status)) return "inconclusive";
   if (status >= 200 && status < 300) return "broad";
   if (status >= 400 && status < 500) return "broad";

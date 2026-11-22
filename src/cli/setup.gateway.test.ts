@@ -198,6 +198,79 @@ describe("gateway setup", () => {
   });
 });
 
+describe("scope probe wording (review D5)", () => {
+  it.each([
+    [403, /this token cannot update pages/],
+    [404, /this token can update pages/],
+    [500, /inconclusive/],
+  ])("status %i: says what was probed (page updates) and that other write scopes were not", async (status, said) => {
+    mockProbeWriteScope.mockResolvedValue(status);
+    answers("y", "y", "", "1");
+    await runSetup("gw-test");
+    const out = logs.join("\n");
+    expect(out).toMatch(said);
+    expect(out).toMatch(/other write scopes .*were not probed/i);
+    expect(out).not.toMatch(/the token cannot write/);
+  });
+});
+
+describe("gateway setup hardening (review D4)", () => {
+  const origArgv = process.argv;
+  afterEach(() => {
+    process.argv = origArgv;
+  });
+
+  it("--yes does not skip the tenant confirmation in gateway mode", async () => {
+    process.argv = [...origArgv.slice(0, 2), "setup", "--profile", "gw-test", "--yes"];
+    answers("y", "n"); // scoped, then the tenant question is asked and answered "no"
+    await expect(runSetup("gw-test")).rejects.toThrow("process.exit(1)");
+    expect(mockQuestion.mock.calls.map((c) => String(c[0]))).toContainEqual(
+      expect.stringMatching(/Is this the tenant you intended/),
+    );
+    expect(mockTestConnection).not.toHaveBeenCalled();
+    expect(mockSaveToKeychain).not.toHaveBeenCalled();
+  });
+
+  it("a gateway profile needs an *.atlassian.net site: refused before any request", async () => {
+    ["https://wiki.example.com", "user@example.com", "y"].forEach((a) => mockQuestion.mockResolvedValueOnce(a));
+    await expect(runSetup("gw-test")).rejects.toThrow("process.exit(1)");
+    expect(calls).toEqual([]);
+    expect(logs.join("\n")).toMatch(/--allow-non-atlassian-host/);
+  });
+
+  it("a lookalike host that only contains atlassian.net is refused too", async () => {
+    ["https://example.atlassian.net.evil.example", "user@example.com", "y"].forEach((a) => mockQuestion.mockResolvedValueOnce(a));
+    await expect(runSetup("gw-test")).rejects.toThrow("process.exit(1)");
+    expect(calls).toEqual([]);
+  });
+
+  it("--allow-non-atlassian-host lets a gateway profile use another host", async () => {
+    process.argv = [...origArgv.slice(0, 2), "setup", "--profile", "gw-test", "--allow-non-atlassian-host"];
+    ["https://wiki.example.com", "user@example.com", "y", "y", "", "2"].forEach((a) => mockQuestion.mockResolvedValueOnce(a));
+    await runSetup("gw-test");
+    expect(calls[0]).toBe("fetchTenantInfo");
+    expect(mockSaveToKeychain).toHaveBeenCalledTimes(1);
+  });
+
+  it("site mode with a non-atlassian host is still only a warning", async () => {
+    ["https://wiki.example.com", "user@example.com", "n", "y", "1"].forEach((a) => mockQuestion.mockResolvedValueOnce(a));
+    await runSetup("site-test");
+    expect(mockSaveToKeychain).toHaveBeenCalledTimes(1);
+  });
+
+  it("control characters in the tenant name are stripped before printing", async () => {
+    mockFetchTenantInfo.mockResolvedValue({
+      ok: true,
+      info: { cloudId: CLOUD_ID, displayName: "Exa\u001b[2Jmple\r\u202eKO\u0007" },
+    });
+    answers("y", "y", "", "2");
+    await runSetup("gw-test");
+    const out = logs.join("\n");
+    expect(out).toContain("Exa[2JmpleKO");
+    expect(out).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u202e]/);
+  });
+});
+
 describe("site setup is unchanged", () => {
   it("answering no to 'scoped?' never writes apiMode or tokenExpiry", async () => {
     mockFetchTenantInfo.mockResolvedValue({ ok: true, info: { cloudId: CLOUD_ID, displayName: "Example" } });

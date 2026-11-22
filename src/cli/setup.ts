@@ -19,6 +19,10 @@ import { requestBaseFor } from "../server/api-base.js";
 import { toolAvailableIn, unavailableToolsFor } from "../server/api-capabilities.js";
 import { GATEWAY_SCOPES, classifyScopeProbe } from "../shared/gateway-scopes.js";
 import { isValidExpiryDate } from "../shared/token-expiry.js";
+import { sanitizeDisplayName } from "../shared/display-text.js";
+
+/** Lets a gateway profile use a site host outside `*.atlassian.net`. */
+export const ALLOW_NON_ATLASSIAN_HOST_FLAG = "--allow-non-atlassian-host";
 
 /** Resolve the absolute path to the running epimethian-mcp binary. */
 function resolveBinPath(): string {
@@ -126,19 +130,29 @@ Your choice [default: 1]: `
   }
 }
 
-/** Show the tenant behind the URL and ask the user to confirm it (exits 1 on "no"). */
-async function confirmTenant(url: string, cloudId: string, displayName: string): Promise<void> {
+/**
+ * Show the tenant behind the URL and ask the user to confirm it (exits 1 on "no").
+ * `--yes` skips the question in site mode only: in gateway mode the confirmed
+ * cloudId becomes the tenant seal every request is pinned to, so a person
+ * always answers.
+ */
+async function confirmTenant(
+  url: string,
+  cloudId: string,
+  displayName: string,
+  opts: { alwaysAsk?: boolean } = {}
+): Promise<void> {
   console.log(
     `\nTenant identity:\n` +
-      `  Display name : ${displayName}\n` +
-      `  Cloud ID     : ${cloudId}\n` +
+      `  Display name : ${sanitizeDisplayName(displayName)}\n` +
+      `  Cloud ID     : ${sanitizeDisplayName(cloudId)}\n` +
       `  URL          : ${url}\n`
   );
 
   const rlConfirm = readline.createInterface({ input: stdin, output: stdout });
   try {
     const args = process.argv.slice(2);
-    const assumeYes = args.includes("--yes") || args.includes("-y");
+    const assumeYes = !opts.alwaysAsk && (args.includes("--yes") || args.includes("-y"));
     let answer = "y";
     if (!assumeYes) {
       answer = (
@@ -198,8 +212,9 @@ async function runGatewaySetup(
     );
     process.exit(1);
   }
-  const { cloudId, displayName } = tenantResult.info;
-  await confirmTenant(url, cloudId, displayName);
+  const { cloudId } = tenantResult.info;
+  const displayName = sanitizeDisplayName(tenantResult.info.displayName);
+  await confirmTenant(url, cloudId, displayName, { alwaysAsk: true });
 
   let requestBase: string;
   try {
@@ -227,16 +242,20 @@ async function runGatewaySetup(
   );
 
   if (posture === "read-only") {
+    // The probe is one dry-run page update; no other write is attempted.
+    const notProbed =
+      "Other write scopes (blog posts, comments, attachments, deletes) were not probed.";
     const verdict = classifyScopeProbe(await probeGatewayWriteScope(requestBase, email, apiToken));
     if (verdict === "narrow") {
-      console.log("Scope check: the token cannot write, as the read-only posture expects.");
+      console.log(`Scope check: this token cannot update pages, as the read-only posture expects. ${notProbed}`);
     } else if (verdict === "broad") {
       console.log(
-        "Warning: this token is broader than the read-only posture: a write attempt was not refused. " +
+        "Warning: this token can update pages, which is broader than the read-only posture " +
+          `(a dry-run page update was not refused). ${notProbed} ` +
           "Consider creating a token with only the read scopes above."
       );
     } else {
-      console.log("Scope check inconclusive: the write probe gave no clear answer.");
+      console.log(`Scope check inconclusive: the dry-run page update gave no clear answer. ${notProbed}`);
     }
   }
 
@@ -381,6 +400,20 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
       );
       process.exit(1);
     }
+    // Gateway mode seals the profile to the cloudId this host reports, unauthenticated.
+    // Only an Atlassian Cloud site is trusted to report it, unless the user says otherwise.
+    if (
+      gateway &&
+      !new URL(url).hostname.toLowerCase().endsWith(".atlassian.net") &&
+      !process.argv.slice(2).includes(ALLOW_NON_ATLASSIAN_HOST_FLAG)
+    ) {
+      console.error(
+        `Error: gateway mode needs an Atlassian Cloud site (https://<site>.atlassian.net); ${url} is not one. ` +
+          `If this host really is your Atlassian Cloud site, re-run with ${ALLOW_NON_ATLASSIAN_HOST_FLAG}. ` +
+          "No credentials were saved."
+      );
+      process.exit(1);
+    }
 
     // Close readline before raw mode password input
     rl.close();
@@ -418,7 +451,8 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
     let sealedDisplayName: string | undefined;
 
     if (tenantResult.ok) {
-      const { cloudId, displayName } = tenantResult.info;
+      const { cloudId } = tenantResult.info;
+      const displayName = sanitizeDisplayName(tenantResult.info.displayName);
       await confirmTenant(url, cloudId, displayName);
 
       sealedCloudId = cloudId;

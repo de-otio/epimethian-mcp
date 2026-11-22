@@ -3708,6 +3708,36 @@ describe("probeWriteCapability", () => {
     expect(result).toBe("write");
   });
 
+  // Review D6: only the expected "not found / bad request / conflict" answers
+  // prove the dry-run write got past the scope check.
+  it.each([
+    [400, "write"],
+    [404, "write"],
+    [409, "write"],
+    [403, "read-only"],
+    [410, "inconclusive"],
+    [429, "inconclusive"],
+    [422, "inconclusive"],
+    [500, "inconclusive"],
+  ])("dry-run answered %i → %s", async (status, expected) => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    global.fetch = mockFetchSequence([
+      { body: { results: [] } },
+      { body: { message: "x" }, status },
+      // in case the policy retries a 5xx/429: the same answer again
+      { body: { message: "x" }, status },
+      { body: { message: "x" }, status },
+      { body: { message: "x" }, status },
+    ]);
+    _resetHttpStateForTests({ sleep: async () => {} });
+    const result = await probeWriteCapability();
+    expect(result).toBe(expected);
+    if (expected === "inconclusive") {
+      expect(errSpy.mock.calls.map((c) => c.join(" ")).join("\n")).toMatch(/write-capability probe/);
+    }
+    _resetHttpStateForTests();
+  });
+
   // Test 6: all strategies fail with unexpected non-4xx error → "inconclusive"
   it("returns 'inconclusive' when all strategies fail with unexpected errors", async () => {
     // Simulate network error on dry-run PUT (after spaces returns empty)

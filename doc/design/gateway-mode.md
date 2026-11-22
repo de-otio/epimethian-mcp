@@ -83,6 +83,7 @@ Add one pure predicate to `api-base.ts`: `isCredentialedUrl(url: string, request
 `new URL(requestBase).pathname + "/"`). Apply it at three places:
 - **Requests:** `sendGuarded` (`confluence-client.ts:1177`) / `confluenceFetch` (`:1234`): refuse,
   without sending, any URL that fails the predicate (belt and braces; all bases come from C1).
+  In gateway mode they also never follow a redirect (§9 item 8).
 - **Pagination cursors:** `resolveSearchNext` (`:2034`) keeps only the origin today and
   prefixes `/wiki`. Make it prefix-aware: resolve `next` against `requestBase`, then require
   `isCredentialedUrl`. W-V2READ's list cursors use `resolveV2NextLink`
@@ -187,10 +188,29 @@ export function tokenExpiryState(expiry: string | undefined, today: string /* YY
    reads the seal unauthenticated, has the user confirm it, tests through the gateway,
    asks for expiry and posture, prints the scope list, runs the scope probe (read-only
    posture: the dry-run write must be refused), then saves mode, `cloudId` and expiry in
-   one `buildKeychainRecord` call. A gateway profile needs `--profile`.
+   one `buildKeychainRecord` call. A gateway profile needs `--profile`. In gateway mode
+   `--yes` does not skip the tenant confirmation (the confirmed cloudId becomes the seal),
+   the site host must end in `.atlassian.net` unless `--allow-non-atlassian-host` is given,
+   and control characters are stripped from the tenant name before it is printed or saved.
+   The scope probe is one dry-run page update: setup says "this token can / cannot update
+   pages" and that other write scopes were not probed. No other probe request is sent.
 7. **Keychain round-trip.** `parseKeychainRecord` (pure, in `keychain.ts`) copies every
    field a record can hold, so the opportunistic seal re-save cannot erase `apiMode` or
    `tokenExpiry`.
+
+8. **No automatic redirects, bounded checks.** In gateway mode every credentialed request
+   (`sendGuarded`, `testConnection`, the setup scope probe) is sent with
+   `redirect: "manual"`, and a 3xx is an error (`ConfluenceRedirectRefusedError`; for a
+   write, `WriteOutcomeUnknownError`): a same-origin hop keeps the `Authorization` header,
+   so following a redirect to another cloudId's prefix would carry the token there, and a
+   307/308 would replay a write body. Site mode keeps the default behaviour.
+   `isCredentialedUrl` also refuses `;` path parameters (`..;`) and `%3b`.
+   `fetchTenantInfo`, `testConnection` and the scope probe give up after
+   `CONNECTION_CHECK_TIMEOUT_MS` (15 s).
+9. **Server-side posture probe.** Only a dry-run answer of 400, 404 or 409 counts as
+   write-capable, 403 as read-only; 410, 429, other 4xx, 5xx and transport errors are
+   inconclusive, and posture `detect` resolves an inconclusive probe to read-only with a
+   stderr warning (both modes).
 
 ### Open points for the live scoped-token check
 

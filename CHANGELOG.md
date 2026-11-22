@@ -61,6 +61,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`/ex/confluence/{cloudId}/wiki/api/v2/...`) are followed when the prefix is
   exactly the sealed one and the cursor continues the same listing; another
   cloudId's prefix, and any `/ex/...` cursor in site mode, are refused.
+- Gateway mode: credentialed requests (API calls, the connection check and the
+  setup scope probe) never follow a redirect; a 3xx is an error, and a write
+  that drew one is reported as "outcome unknown". Path parameters (`;`, `..;`,
+  `%3b`) are refused under the gateway prefix. Site mode is unchanged.
+- The tenant check, the connection check and the setup scope probe time out
+  after 15 seconds instead of hanging.
+- Gateway setup always asks for the tenant confirmation (`--yes` no longer
+  skips it), requires an `*.atlassian.net` site unless
+  `--allow-non-atlassian-host` is given, and strips control characters from the
+  tenant name before printing or saving it.
+- The setup scope check now says what it actually tested: "this token can /
+  cannot update pages", and that other write scopes were not probed.
+- Posture `detect`: the startup write probe counts only a 400, 404 or 409
+  answer as write-capable. Any other answer (410, 429, 5xx, ...) is
+  inconclusive, and an inconclusive probe now runs the session read-only with a
+  warning (it used to default to read-write).
 
 ## [7.5.0] - 2026-11-22 - security updates and agent hints
 

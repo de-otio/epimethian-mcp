@@ -143,7 +143,7 @@ const queue: Response[] = [];
 const enqueue = (...r: Response[]) => void queue.push(...r);
 
 /** Every call is recorded first, so assertions see exactly what was attempted. */
-const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+const fetchMock = vi.fn(async (input: unknown, init?: RequestInit): Promise<Response> => {
   const url = String(input);
   const method = (init?.method ?? "GET").toUpperCase();
   const headers = new Headers(init?.headers as HeadersInit | undefined);
@@ -156,7 +156,15 @@ const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
     }
   }
   requests.push({ url, method, authorization: headers.get("authorization") ?? undefined, body });
-  return queue.shift() ?? route(url, method, body);
+  const res = queue.shift() ?? route(url, method, body);
+  // Like the real fetch: unless the caller asked for `redirect: "manual"`, a
+  // 3xx is followed, with the same init (credential and, for 307/308, the
+  // method and body). Callers that must not follow have to say so.
+  const location = res.headers.get("location");
+  if (res.status >= 300 && res.status < 400 && location && init?.redirect !== "manual") {
+    return fetchMock(new URL(location, url).toString(), init);
+  }
+  return res;
 });
 
 const authorisedRequests = () => requests.filter((r) => r.authorization !== undefined);
@@ -298,6 +306,17 @@ describe("origin and prefix pinning (pure predicate)", () => {
     expect(isCredentialedUrl(`${GATEWAY}/%2e%2e/${OTHER_CLOUD_ID}/wiki`, base)).toBe(false);
     expect(isCredentialedUrl(`${GATEWAY}/..%2f${OTHER_CLOUD_ID}/wiki`, base)).toBe(false);
     expect(isCredentialedUrl(`${GATEWAY}/wiki/a%5cb`, base)).toBe(false);
+  });
+
+  it("gateway: `;` path parameters and `..;` segments are refused (review D3)", () => {
+    const base = GATEWAY;
+    expect(isCredentialedUrl(`${GATEWAY}/..;/${OTHER_CLOUD_ID}/wiki/api/v2/pages/1`, base)).toBe(false);
+    expect(isCredentialedUrl(`${GATEWAY}/wiki/api/v2/pages/1;jsessionid=x`, base)).toBe(false);
+    expect(isCredentialedUrl(`${GATEWAY}/wiki;x/api/v2/pages/1`, base)).toBe(false);
+    expect(isCredentialedUrl(`${GATEWAY}/wiki/..%3b/api/v2/pages/1`, base)).toBe(false);
+    expect(isCredentialedUrl(`${GATEWAY}/wiki/x%3By/api`, base)).toBe(false);
+    // a semicolon in the query is not a path parameter
+    expect(isCredentialedUrl(`${GATEWAY}/wiki/api/v2/pages?cql=a;b`, base)).toBe(true);
   });
 
   it("site: same origin, as before; any other origin is refused", () => {
@@ -522,6 +541,51 @@ describe("download pinning in gateway mode", () => {
 });
 
 // ===========================================================================
+// Redirects on credentialed requests (review D1)
+// ===========================================================================
+
+describe("credentialed requests never follow a redirect in gateway mode", () => {
+  const elsewhere = `https://api.atlassian.com/ex/confluence/${OTHER_CLOUD_ID}/wiki/api/v2/pages/5001`;
+
+  it("a read answered 307 to another cloudId's prefix: an error, and no second credentialed request", async () => {
+    const client = await loadClient();
+    enqueue(new Response(null, { status: 307, headers: { location: elsewhere } }));
+    await expect(client.getPage("5001", false)).rejects.toThrow(/redirect/i);
+    expect(requests).toHaveLength(1);
+    expect(requests.some((r) => r.url.includes(OTHER_CLOUD_ID))).toBe(false);
+  });
+
+  it("a write answered 307 is not replayed: outcome unknown, one request", async () => {
+    const client = await loadClient();
+    enqueue(new Response(null, { status: 307, headers: { location: elsewhere } }));
+    await expect(client.deletePage("5001")).rejects.toMatchObject({ name: "WriteOutcomeUnknownError" });
+    expect(requests).toHaveLength(1);
+    expect(requests.some((r) => r.url.includes(OTHER_CLOUD_ID))).toBe(false);
+  });
+
+  it("even a redirect that stays under the sealed prefix is not followed", async () => {
+    const client = await loadClient();
+    enqueue(new Response(null, { status: 302, headers: { location: `${GATEWAY}/wiki/api/v2/pages/5001` } }));
+    await expect(client.getPage("5001", false)).rejects.toThrow(/redirect/i);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("site mode is unchanged: a same-site redirect is followed", async () => {
+    keychain.record = { url: SITE, email: "user@example.com", apiToken: SECRET, cloudId: CLOUD_ID };
+    const client = await loadClient();
+    enqueue(
+      new Response(null, { status: 302, headers: { location: `${SITE}/wiki/api/v2/pages/5001?moved=1` } }),
+      json({ id: "5001", title: "Runbook", spaceId: "1001", version: { number: 4 } }),
+    );
+    const page = await client.getPage("5001", false);
+    expect(page.title).toBe("Runbook");
+    expect(requests).toHaveLength(2);
+    // Site mode sends credentials to the site origin by design; opt out of the gateway invariant.
+    requests.length = 0;
+  });
+});
+
+// ===========================================================================
 // 3. Startup
 // ===========================================================================
 
@@ -573,6 +637,18 @@ describe("validateStartup in gateway mode", () => {
     const puts = requests.filter((r) => r.method === "PUT");
     expect(puts.map((r) => r.url)).toEqual([`${GATEWAY}/wiki/api/v2/pages/999999999999`]);
     expect(requests.some(rest)).toBe(false);
+  });
+
+  it.each([410, 429])("posture 'detect': a dry-run answered %i is inconclusive and resolves to read-only, with a note", async (status) => {
+    settings.current = { posture: "detect" };
+    net.probeStatus = status;
+    const { getConfig, validateStartup, _resetHttpStateForTests } = await loadClient();
+    _resetHttpStateForTests({ sleep: async () => {} });
+    await validateStartup(await getConfig());
+    const cfg = await getConfig();
+    expect(cfg.probedCapability).toBe("inconclusive");
+    expect(cfg.effectivePosture).toBe("read-only");
+    expect(errLines.join("\n")).toMatch(/inconclusive.*read-only/);
   });
 
   it("the opportunistic seal re-save of a pre-seal profile keeps a recorded tokenExpiry (site mode)", async () => {

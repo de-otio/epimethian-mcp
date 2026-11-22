@@ -106,7 +106,10 @@ export function resolveUnverifiedStatusFlag(
  * "read-write"  | other           | "read-write"| "profile" |
  * "detect"      | "write"         | "read-write"| "probe"   |
  * "detect"      | "read-only"     | "read-only" | "probe"   |
- * "detect"      | inconcl. / null | "read-write"| "default" | inconclusive warning
+ * "detect"      | inconcl. / null | "read-only" | "default" | inconclusive warning
+ *
+ * An inconclusive probe fails safe: without proof that the token may write,
+ * "detect" does not grant writes. Pin "read-write" in the profile to override.
  */
 export function resolveEffectivePosture(
   configured: "read-only" | "read-write" | "detect",
@@ -134,11 +137,13 @@ export function resolveEffectivePosture(
   if (probed === "read-only") {
     return { effective: "read-only", source: "probe" };
   }
-  // inconclusive or null
+  // inconclusive or null: fail safe
   return {
-    effective: "read-write",
+    effective: "read-only",
     source: "default",
-    warning: "capability probe was inconclusive — defaulting to read-write",
+    warning:
+      "capability probe was inconclusive — running read-only for this session " +
+      "(restart to probe again, or set the profile's posture to read-write)",
   };
 }
 

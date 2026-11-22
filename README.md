@@ -152,7 +152,7 @@ Probe outcomes:
 
 - Token can write → effective posture is `read-write`; all tools registered.
 - Token is read-only → effective posture is `read-only`; write tools not registered.
-- Probe inconclusive → effective posture defaults to `read-write` with a visible warning.
+- Probe inconclusive (an unexpected answer such as 410, 429 or 5xx, or a network error) → effective posture is `read-only` for the session, with a visible warning. Restart to probe again, or pin `read-write` in the profile.
 
 ### Checking permissions
 

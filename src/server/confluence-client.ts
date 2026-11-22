@@ -337,12 +337,16 @@ export async function getConfig(): Promise<Config> {
  *  2. Fallback (when primary returns 404 or no spaces are available):
  *     PUT /wiki/api/v2/pages/999999999999 with a trivially bad body.
  *     - 403 → "read-only" (permission denied)
- *     - 404 / 400 → "write" (token can write; hit a non-existent page or bad body)
+ *     - 404 / 400 / 409 → "write" (token can write; hit a non-existent page, bad body or conflict)
  *     - 401 → rethrown (auth failure, not a capability question)
- * 3. Any other unexpected error → "inconclusive" (logs a warning).
+ * 3. Any other answer or error (410, 429, other 4xx, 5xx, transport) →
+ *    "inconclusive" (logs a warning); posture "detect" then resolves to read-only.
  *
  * Returns one of: "write" | "read-only" | "inconclusive"
  */
+/** Dry-run `PUT /pages/999999999999` answers that prove the token may write (see probeWriteCapability). */
+const DRY_RUN_WRITE_CAPABLE_STATUSES: ReadonlySet<number> = new Set([400, 404, 409]);
+
 export async function probeWriteCapability(): Promise<"write" | "read-only" | "inconclusive"> {
   const cfg = await getConfig();
 
@@ -402,16 +406,18 @@ export async function probeWriteCapability(): Promise<"write" | "read-only" | "i
   } catch (err) {
     if (err instanceof ConfluenceAuthError) throw err;
     if (err instanceof ConfluencePermissionError) return "read-only";
-    // 404 (page not found) or any 400-class body-validation error = token can write
-    if (err instanceof ConfluenceNotFoundError) return "write";
-    if (err instanceof ConfluenceApiError && err.status >= 400 && err.status < 500) {
-      // 400 Bad Request = body rejected by schema, but token had permission to attempt the write
+    // Only the answers that show the write got past the scope check and failed on
+    // the (missing) page or the empty body prove write capability:
+    //   404 page not found, 400 body rejected, 409 version conflict.
+    // Anything else (410 gone, 429 throttled, 422, 5xx, a refused redirect,
+    // a transport error) proves nothing: inconclusive, which "detect" resolves
+    // to read-only (resolveEffectivePosture).
+    if (err instanceof ConfluenceApiError && DRY_RUN_WRITE_CAPABLE_STATUSES.has(err.status)) {
       return "write";
     }
-    // Unexpected / network error
     console.error(
-      `epimethian-mcp: warning — write-capability probe failed with unexpected error: ${
-        err instanceof Error ? err.message : String(err)
+      `epimethian-mcp: warning — write-capability probe was inconclusive: ${
+        err instanceof Error ? sanitizeError(err.message) : String(err)
       }`
     );
     return "inconclusive";
@@ -899,6 +905,22 @@ export class ConfluenceAuthError extends ConfluenceApiError {}        // 401
  * retrying. It must not claim the whole tool call changed nothing: a
  * multi-step write (create_page then its v1 label) can fail on a later step.
  */
+/**
+ * Gateway mode: Confluence (or the gateway) answered a credentialed request
+ * with a redirect. It is never followed: a hop on the same origin keeps the
+ * Authorization header and could name another tenant's cloudId, and a 307/308
+ * would replay a write body there.
+ */
+export class ConfluenceRedirectRefusedError extends ConfluenceApiError {
+  constructor(status: number, method: string, url: string) {
+    super(status, "");
+    this.name = "ConfluenceRedirectRefusedError";
+    this.message =
+      `Confluence ${method} ${endpointPath(url)} answered with a redirect (HTTP ${status}). ` +
+      `In gateway mode credentialed requests never follow redirects, so it was not followed.`;
+  }
+}
+
 export class ConfluenceEndpointRemovedError extends ConfluenceApiError {
   endpoint: string | undefined;
   constructor(status: number, body: string, method?: string, url?: string) {
@@ -1305,6 +1327,11 @@ async function sendGuarded<T>(
   // only fires if a URL was built some other way (belt and braces).
   // Synchronous on purpose: no await may sit between the caller and the permit.
   assertCredentialedUrl(url, requestBase);
+  // Gateway mode (a request base pinned to a path prefix): never follow a
+  // redirect automatically. Same-origin hops keep the credential, so a 3xx to
+  // another cloudId's prefix would carry it there. Site mode is unchanged.
+  const pinnedToPrefix = new URL(requestBase).pathname.replace(/\/+$/, "") !== "";
+  const sendInit: RequestInit = pinnedToPrefix ? { ...init, redirect: "manual" } : init;
 
   for (let attempt = 1; ; attempt++) {
     // The permit covers one attempt and is released before any Retry-After
@@ -1312,11 +1339,20 @@ async function sendGuarded<T>(
     const step = await httpSemaphore.run(async (): Promise<Step<T>> => {
       let res: Response;
       try {
-        res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+        res = await fetch(url, { ...sendInit, signal: AbortSignal.timeout(timeoutMs) });
       } catch (err) {
         if (!isRead) throw new WriteOutcomeUnknownError(method, url, err, "request");
         if (isAbortLike(err)) throw new ConfluenceTimeoutError(method, url, timeoutMs);
         throw err;
+      }
+
+      if (pinnedToPrefix && (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400))) {
+        await Promise.resolve(res.body?.cancel?.()).catch(() => {});
+        const refused = new ConfluenceRedirectRefusedError(res.status, method, url);
+        console.error(`epimethian-mcp: ${refused.message}`);
+        // A write that drew a redirect is not known to be unapplied: say so.
+        if (!isRead) throw new WriteOutcomeUnknownError(method, url, refused, "response");
+        throw refused;
       }
 
       if (res.ok) {
