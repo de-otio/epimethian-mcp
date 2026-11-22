@@ -1,7 +1,7 @@
 # Investigation: v1 / v2 Confluence REST parity (2026-11)
 
-**STATUS: NOT RUN YET.** The probe is built and tested against stubbed responses only. A person
-runs it by hand against the designated test profile, then pastes the output below.
+**STATUS: site mode run 2026-11-22 (results below); gateway mode not run yet.** A person runs
+the probe by hand against the designated test profile and pastes the output below.
 
 **Gateway mode is not live-verified** until both the gateway run of this probe and the
 scoped-token check (question 4) have run. Until then every gateway claim in the docs is a
@@ -83,39 +83,76 @@ What the script does not cover:
 
 ## Results
 
-Paste the Markdown printed on stdout under each heading. The table below is the template: the
-same header the script prints, with every row marked "not run yet".
-
 ### Site mode
 
-(Paste the run summary and both tables here. Template:)
+Run by hand on 2026-11-22 against the designated test profile, read-only. Items:
+5 pages (one with a draw.io diagram, two with 18 and 20 versions, two recently edited
+pages with tables and macros) and 2 blog posts. Not covered: a page with more than 25
+versions, a page converted from the legacy editor, and a page with a restore in its history.
 
-### Parity matrix
+#### Run summary
+
+- Mode: site
+- Date: 2026-11-22
+- Items: 5 page(s), 2 blog post(s)
+- Requests: 113 of a cap of 150 (GET/HEAD only)
+- Versions sampled: 27 (cap 30)
+- Run status: complete
+
+#### Parity matrix
 
 | # | Row | v1 call | v2 call | Site: v1 | Site: v2 | Site: parity | Gateway: v1 | Gateway: v2 | Gateway: parity | Expected v2 scope | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| R1 | Attachment list | GET content/{id}/child/attachment | GET /pages\|blogposts/{id}/attachments | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | read:attachment:confluence |  |
-| R2 | Attachment download | GET content/{id}/child/attachment/{attId}/data | GET downloadLink (v2 attachment) | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | read:attachment:confluence |  |
-| R3 | Attachment upload | POST content/{id}/child/attachment | none | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | n/a | write; never probed |
-| R4 | Attachment new version | POST content/{id}/child/attachment/{attId}/data | none | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | n/a | write; never probed |
-| R5 | Version list | GET content/{id}/version | GET /pages\|blogposts/{id}/versions | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | read:page:confluence (blog posts: read:blogpost:confluence) |  |
-| R6 | Version authors | inline in R5 | POST /users-bulk | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | read:user:confluence | POST read; not probed by the GET/HEAD-only rule |
-| R7 | Historical body | GET content/{id}?version=N&expand=body.storage | GET /pages\|blogposts/{id}?version=N&body-format=storage | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | read:page:confluence (blog posts: read:blogpost:confluence) |  |
-| R8 | Labels read | GET content/{id}/label | GET /pages\|blogposts/{id}/labels | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | read:label:confluence |  |
-| R9 | Labels write | POST/DELETE content/{id}/label | none | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | n/a | write; never probed |
-| R10 | Content state read | GET content/{id}/state | none | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | n/a |  |
-| R11 | Content state write | PUT/DELETE content/{id}/state | none | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | n/a | write; never probed |
-| R12 | CQL search | GET /search | none | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | n/a |  |
-| R13 | User search | GET /search/user | none (POST /users-bulk by id only) | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | n/a |  |
-| R14 | Write-capability probe | GET user/current/permission/space/{key} | GET /spaces/{id}/operations | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | read:space:confluence |  |
-| R15 | Site locale | GET settings/systemInfo | none | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | n/a |  |
-| R16 | Connection check | GET user/current | GET /spaces?limit=1 | not run yet | not run yet | not run yet | not run yet | not run yet | not run yet | read:space:confluence |  |
+| R1 | Attachment list | GET content/{id}/child/attachment | GET /pages\|blogposts/{id}/attachments | 200x7 | 200x7 | count 7/7; fields 7/7; order: samex3, reversedx1, different-orderx3; paging: single-pagex7 | not run in this mode | not run in this mode | - | read:attachment:confluence |  |
+| R2 | Attachment download | GET content/{id}/child/attachment/{attId}/data | GET downloadLink (v2 attachment) | 405x1 | 200x1 | - | not run in this mode | not run in this mode | - | read:attachment:confluence |  |
+| R3 | Attachment upload | POST content/{id}/child/attachment | none | not probed (write) | not probed (write) | - | not probed (write) | not probed (write) | - | n/a | write; never probed |
+| R4 | Attachment new version | POST content/{id}/child/attachment/{attId}/data | none | not probed (write) | not probed (write) | - | not probed (write) | not probed (write) | - | n/a | write; never probed |
+| R5 | Version list | GET content/{id}/version | GET /pages\|blogposts/{id}/versions | 200x7 | 200x7 | count 7/7; fields 7/7; order: samex7; paging: single-pagex7 | not run in this mode | not run in this mode | - | read:page:confluence (blog posts: read:blogpost:confluence) |  |
+| R6 | Version authors | inline in R5 | POST /users-bulk | - | not probed (POST) | - | - | not probed (POST) | - | read:user:confluence | POST read; not probed by the GET/HEAD-only rule |
+| R7 | Historical body | GET content/{id}?version=N&expand=body.storage | GET /pages\|blogposts/{id}?version=N&body-format=storage | 200x27 | 200x27 | hash 27/27; echo 27/27 | not run in this mode | not run in this mode | - | read:page:confluence (blog posts: read:blogpost:confluence) |  |
+| R8 | Labels read | GET content/{id}/label | GET /pages\|blogposts/{id}/labels | 200x7 | 200x7 | count 7/7; fields 7/7; order: samex7; paging: single-pagex7 | not run in this mode | not run in this mode | - | read:label:confluence |  |
+| R9 | Labels write | POST/DELETE content/{id}/label | none | not probed (write) | not probed (write) | - | not probed (write) | not probed (write) | - | n/a | write; never probed |
+| R10 | Content state read | GET content/{id}/state | none | 200x7 | n/a (no v2) | state: state-setx7 | not run in this mode | not run in this mode | - | n/a |  |
+| R11 | Content state write | PUT/DELETE content/{id}/state | none | not probed (write) | not probed (write) | - | not probed (write) | not probed (write) | - | n/a | write; never probed |
+| R12 | CQL search | GET /search | none | 200x1 | n/a (no v2) | - | not run in this mode | not run in this mode | - | n/a |  |
+| R13 | User search | GET /search/user | none (POST /users-bulk by id only) | 200x1 | n/a (no v2) | - | not run in this mode | not run in this mode | - | n/a |  |
+| R14 | Write-capability probe | GET user/current/permission/space/{key} | GET /spaces/{id}/operations | 404x1 | 200x1 | - | not run in this mode | not run in this mode | - | read:space:confluence |  |
+| R15 | Site locale | GET settings/systemInfo | none | 200x1 | n/a (no v2) | - | not run in this mode | not run in this mode | - | n/a |  |
+| R16 | Connection check | GET user/current | GET /spaces?limit=1 | 200x1 | 200x1 | - | not run in this mode | not run in this mode | - | read:space:confluence |  |
 
-### Historical bodies (R7)
+#### Historical bodies (R7)
 
 | Item | Version | v1 status | v2 status | v1 sha256 (first 12) | v2 sha256 (first 12) | Byte-identical | v2 echoes version |
 |---|---|---|---|---|---|---|---|
-| not run yet | | | | | | | |
+| p1 | 1 | 200 | 200 | 0e640c3dc7c8 | 0e640c3dc7c8 | yes | yes |
+| p1 | 2 | 200 | 200 | 0e640c3dc7c8 | 0e640c3dc7c8 | yes | yes |
+| p1 | 3 | 200 | 200 | c7dfe2de0e4a | c7dfe2de0e4a | yes | yes |
+| p2 | 1 | 200 | 200 | d50551c273a7 | d50551c273a7 | yes | yes |
+| p2 | 2 | 200 | 200 | d50551c273a7 | d50551c273a7 | yes | yes |
+| p2 | 3 | 200 | 200 | 9d49ec6cb912 | 9d49ec6cb912 | yes | yes |
+| p2 | 4 | 200 | 200 | 027f2b859f53 | 027f2b859f53 | yes | yes |
+| p2 | 5 | 200 | 200 | d1b8e01c26a7 | d1b8e01c26a7 | yes | yes |
+| p3 | 1 | 200 | 200 | 553532ed3298 | 553532ed3298 | yes | yes |
+| p3 | 7 | 200 | 200 | e0c83b4ded6a | e0c83b4ded6a | yes | yes |
+| p3 | 14 | 200 | 200 | 8c6d624d35cb | 8c6d624d35cb | yes | yes |
+| p3 | 20 | 200 | 200 | a50eac09bb86 | a50eac09bb86 | yes | yes |
+| p4 | 1 | 200 | 200 | 9042807ceb8c | 9042807ceb8c | yes | yes |
+| p4 | 7 | 200 | 200 | fb2b1f17b82e | fb2b1f17b82e | yes | yes |
+| p4 | 12 | 200 | 200 | 5b6d38b3d2d7 | 5b6d38b3d2d7 | yes | yes |
+| p4 | 18 | 200 | 200 | 1ce166d4282a | 1ce166d4282a | yes | yes |
+| p5 | 1 | 200 | 200 | badbeb2644d5 | badbeb2644d5 | yes | yes |
+| p5 | 2 | 200 | 200 | badbeb2644d5 | badbeb2644d5 | yes | yes |
+| p5 | 3 | 200 | 200 | e5b3ba84dfd3 | e5b3ba84dfd3 | yes | yes |
+| b1 | 1 | 200 | 200 | d0d1ce7eaf01 | d0d1ce7eaf01 | yes | yes |
+| b1 | 2 | 200 | 200 | ce82adde7c71 | ce82adde7c71 | yes | yes |
+| b1 | 4 | 200 | 200 | d742fed4b4ec | d742fed4b4ec | yes | yes |
+| b1 | 5 | 200 | 200 | 12a213677338 | 12a213677338 | yes | yes |
+| b2 | 1 | 200 | 200 | 245d8112c235 | 245d8112c235 | yes | yes |
+| b2 | 3 | 200 | 200 | 1d1d4f6785c5 | 1d1d4f6785c5 | yes | yes |
+| b2 | 4 | 200 | 200 | bb0d200e7c67 | bb0d200e7c67 | yes | yes |
+| b2 | 6 | 200 | 200 | 03c7def9f39b | 03c7def9f39b | yes | yes |
+
+Byte-identical: 27/27 compared. v2 echoed the requested version: 27/27.
 
 ### Gateway mode
 
@@ -124,16 +161,35 @@ shape is the same as above.)
 
 ## Findings
 
-Not run yet. Fill in after the runs:
+Site mode (2026-11-22):
 
-- Parity counts per row.
-- Historical bodies: byte-identical n/N; v2 echoed the version n/N.
-- Gateway: v1 GETs that answer 410, and v1 GETs that do not.
-- Scope list: the minimum granular scopes per v2 read, and corrections to the list in plan
-  section 5.3 item 7.
-- Decisions this unlocks: the `revert_page` switch (needs 30/30 byte-identical), the
-  `probeWriteCapability` swap, and each "to be confirmed" gateway-table row.
-- Scoped-token check (question 4): whether the token was accepted for a second cloudId.
+- **Historical bodies (R7):** byte-identical 27/27; v2 echoed the requested version 27/27,
+  across 5 pages and 2 blog posts, versions 1 to 20. No restored or legacy-converted version was
+  in the sample.
+- **Attachments (R1):** same count and fields 7/7. Order differs on 4 of 7 items (v1 and v2 sort
+  differently). No write depends on list order: lookups match by exact name over the whole
+  current list. `get_attachments` output order differs from 7.5.0.
+- **Versions (R5):** same count, fields and order 7/7 (v2's default order matches v1, so no
+  `sort` parameter is needed; plan finding F6 does not apply on this tenant).
+- **Labels (R8):** same count, fields and order 7/7.
+- **Download (R2):** v1 `child/attachment/{attId}/data` answers 405; the v2 `downloadLink`
+  answers 200.
+- **Write-capability probe (R14):** v1 `user/current/permission/space/{key}` answers 404, so
+  `probeWriteCapability` always uses its dry-run fallback today. v2 `/spaces/{id}/operations`
+  answers 200: a candidate for a later swap (not in 7.6.0).
+- **Not checked by this run:** `status=current` on attachment lists and the `status` field
+  (added after the probe was written), R6 `users-bulk` (POST).
+
+Decisions:
+
+- `revert_page` stays on the v1 historical read in site mode for 7.6.0. The sample is 27
+  versions, not the 30 the plan asks for, and has no restored or legacy-converted version; v1
+  still works in site mode, so there is no reason to switch yet. Gateway mode uses v2 with the
+  fail-closed checks.
+- `probeWriteCapability` keeps its current order (v1 permission call, then the dry-run).
+
+Gateway mode: not run (no scoped token yet). Question 4 (a scoped token against a second
+cloudId): not run.
 
 ## v2 response-shape assumptions to confirm (W-V2READ, W-HIST)
 
