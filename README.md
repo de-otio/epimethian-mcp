@@ -92,7 +92,7 @@ epimethian-mcp profiles --remove <name>           # delete profile and credentia
 
 The `--remove` command deletes the profile's keychain entry and registry record after interactive confirmation. For non-interactive environments (CI, agent shell sessions), pass `--force` to skip the prompt.
 
-If the profile registry (`~/.config/epimethian-mcp/profiles.json`) is unreadable (a JSON syntax error, group- or world-writable permissions, a symlink, or a file or directory owned by another user), `setup` and `profiles --remove` stop before touching the keychain and print the fix, and a running server starts in recovery mode with a single `setup_profile` tool that reports it. Fix a writable file with `chmod 600 ~/.config/epimethian-mcp/profiles.json`, then restart the MCP client. `profiles.json.bak` is the version before the last CLI change.
+If the profile registry (`~/.config/epimethian-mcp/profiles.json`) is unreadable (a JSON syntax error, group- or world-writable permissions, a symlink, or a file or directory owned by another user), `setup` and `profiles --remove` stop before touching the keychain and print the fix, and a running server starts in recovery mode with a single `setup_profile` tool that reports it. Fix a writable file with `chmod 600 ~/.config/epimethian-mcp/profiles.json`, then restart the MCP client. `profiles.json.bak` is the version before the last CLI change. Only problems with the file itself are refused so far; a mistyped value inside a profile (for example `"readOnly": "true"`) is not yet rejected.
 
 ### Per-Profile Read-Only Mode
 

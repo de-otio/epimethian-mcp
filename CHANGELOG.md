@@ -14,12 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the fix; it is no longer treated as empty, which silently dropped a profile's
   restrictions. A registry that is group- or world-writable must be fixed with
   `chmod 600 ~/.config/epimethian-mcp/profiles.json`; a symlinked registry must
-  be replaced with a regular file.
+  be replaced with a regular file. 7.6.1 fails closed on problems with the
+  file itself (unparseable, wrong shape, permissions, file type); a mistyped
+  value inside a profile, such as `"readOnly": "true"`, is not yet rejected.
 - CLI commands no longer overwrite an unreadable profile registry; `setup` and
   `profiles --remove` check it before touching the keychain. Writes are flushed
   to disk, take a lock so two commands cannot overwrite each other, keep the
-  version before the last CLI change in `profiles.json.bak`, and keep unknown
-  top-level keys.
+  version before the last CLI change in `profiles.json.bak` (replaced only by
+  a write that succeeds), and keep unknown top-level keys. A refused lock
+  names the lock file, which can be deleted when no other epimethian-mcp
+  command is running.
+- `setup` asks every question before it writes anything, then saves the
+  profile and its access mode in one registry write before the keychain, so
+  an interrupted setup no longer leaves a profile without its access mode
+  (which made the server detect the mode from the token). When a later step
+  fails, the error says what was already changed.
+- `fix-legacy-links` refuses to run when the profile registry is unreadable,
+  also with `--i-understand-multi-tenant`.
 - The write-allowlist refusal no longer names a CLI flag that does not exist.
 
 ## [7.6.0] - 2026-11-22 - gateway mode and v2 reads
