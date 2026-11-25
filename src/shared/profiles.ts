@@ -1,9 +1,14 @@
-import { writeFile, rename, mkdir, lstat } from "node:fs/promises";
-import type { BigIntStats } from "node:fs";
+import { mkdir, lstat, type FileHandle } from "node:fs/promises";
+import { promises as fsPromises, constants as fsConstants, type BigIntStats } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { homedir } from "node:os";
-import { randomBytes } from "node:crypto";
-import { safeOpenRead, safeOpenAppend, safeOpenReadWithStat, UnsafePathError } from "./safe-fs.js";
+import {
+  safeOpenAppend,
+  safeOpenReadWithStat,
+  safeAtomicWrite,
+  verifyDirChain,
+  UnsafePathError,
+} from "./safe-fs.js";
 
 /**
  * Track E1 — Symlink / TOCTOU audit memo (see `plans/security-audit-fixes.md`).
@@ -174,11 +179,6 @@ export interface ProfileSettings {
   redact_patterns?: string[];
 }
 
-interface ProfileRegistry {
-  profiles: string[];
-  settings?: Record<string, ProfileSettings>;
-}
-
 // --- Three-state registry read and the writer core (policy gate, step 0) ---
 // Contract PG-C1, doc/design/policy-gate/02-interfaces.md §1.1.
 
@@ -250,31 +250,44 @@ export interface BackupFacts {
 
 /** Never throws. Reads through safeOpenReadWithStat. */
 export async function readRegistry(): Promise<RegistryRead> {
+  return (await readRegistryWithText()).read;
+}
+
+/**
+ * readRegistry plus, for an `ok` read, the exact text that was parsed. The
+ * text was strictly decoded from valid UTF-8, so re-encoding it gives the
+ * file's bytes back unchanged (that is what `.bak` receives).
+ */
+async function readRegistryWithText(): Promise<{ readonly read: RegistryRead; readonly raw?: string }> {
   const path = getProfileRegistryPath();
   try {
-    let read: { readonly raw: string; readonly stat: BigIntStats };
+    let file: { readonly raw: string; readonly stat: BigIntStats };
     try {
-      read = await safeOpenReadWithStat(path);
+      file = await safeOpenReadWithStat(path);
     } catch (err) {
       const reason = classifyReadError(err);
       const observed = await registryFingerprint();
-      if (reason === "absent") return { state: "absent", observed };
-      return { state: "unreadable", reason, path, backup: await backupIfPresent(), observed };
+      if (reason === "absent") return { read: { state: "absent", observed } };
+      return { read: { state: "unreadable", reason, path, backup: await backupIfPresent(), observed } };
     }
-    const observed = fingerprintOf(read.stat);
-    const parsed = parseRegistryText(read.raw);
+    const observed = fingerprintOf(file.stat);
+    const parsed = parseRegistryText(file.raw);
     if (!parsed.ok) {
-      return { state: "unreadable", reason: parsed.reason, path, backup: await backupIfPresent(), observed };
+      return {
+        read: { state: "unreadable", reason: parsed.reason, path, backup: await backupIfPresent(), observed },
+      };
     }
-    return { state: "ok", registry: parsed.registry, observed };
+    return { read: { state: "ok", registry: parsed.registry, observed }, raw: file.raw };
   } catch {
     // Defensive: nothing above should throw; if it does, fail closed.
     return {
-      state: "unreadable",
-      reason: { kind: "io-error", errno: "EUNKNOWN" },
-      path,
-      backup: undefined,
-      observed: { errno: "EUNKNOWN" },
+      read: {
+        state: "unreadable",
+        reason: { kind: "io-error", errno: "EUNKNOWN" },
+        path,
+        backup: undefined,
+        observed: { errno: "EUNKNOWN" },
+      },
     };
   }
 }
@@ -477,106 +490,353 @@ export function describeUnreadable(
  */
 export type WriteKind = { readonly kind: "other" };
 
-/** The one writer core (D12). Every exported writer calls it. */
+/** Code of the refusal when another CLI command holds the registry lock. */
+export const REGISTRY_BUSY = "REGISTRY_BUSY";
+/** Code of the refusal when the file kept changing under a write. */
+export const REGISTRY_CHANGING = "REGISTRY_CHANGING";
+
+/** A CLI registry write was refused before anything was changed. */
+export class RegistryWriteRefusedError extends Error {
+  constructor(
+    readonly code: typeof REGISTRY_BUSY | typeof REGISTRY_CHANGING,
+    message: string,
+  ) {
+    super(message);
+    this.name = "RegistryWriteRefusedError";
+  }
+}
+
+/** Retry interval, wait limit and stale age of the writer lock (02 §1.1 step 1). */
+const LOCK_RETRY_MS = 50;
+const LOCK_WAIT_MS = 5_000;
+const LOCK_STALE_MS = 60_000;
+/** Temp files older than this were left by a crash (step 2). */
+const TEMP_STALE_MS = 60 * 60 * 1000;
+/** Re-applies after a detected concurrent change, on top of the first attempt (step 7). */
+const MAX_REAPPLIES = 3;
+
+/**
+ * Temp names this module (and 7.6.0) creates in the config directory; the
+ * sweep removes nothing else: `.profiles.json.<16 hex>.tmp` (registry),
+ * `.profiles.json.bak.<16 hex>.tmp` (backup), `.profiles.<8 hex>.tmp` (7.6.0).
+ */
+const SWEEPABLE_TEMP = /^\.profiles(?:\.json(?:\.bak)?\.[0-9a-f]{16}|\.[0-9a-f]{8})\.tmp$/;
+
+/** Clock, pid, liveness, sleep and stderr, injected so tests pin them. */
+interface RegistryWriterEnv {
+  readonly now: () => number;
+  readonly pid: number;
+  readonly isPidAlive: (pid: number) => boolean;
+  readonly sleep: (ms: number) => Promise<void>;
+  readonly warn: (message: string) => void;
+  /** Test seam: runs just before the pre-rename lstat compare; `attempt` is 0-based. */
+  readonly beforeCompare?: (attempt: number) => Promise<void>;
+}
+
+function defaultIsPidAlive(pid: number): boolean {
+  // pid 0 and negatives address process groups in kill(2): never probe them.
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the process exists but belongs to someone else.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+const DEFAULT_WRITER_ENV: RegistryWriterEnv = {
+  now: () => Date.now(),
+  pid: process.pid,
+  isPidAlive: defaultIsPidAlive,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  warn: (message) => console.error(message),
+};
+
+// Mutable on purpose: replaced only by tests (house contract _resetForTests).
+let writerEnv: RegistryWriterEnv = DEFAULT_WRITER_ENV;
+
+/** Test seam: override the writer's clock, pid, liveness, sleep, warning sink or hook. */
+export function _setRegistryWriterEnvForTests(overrides: Partial<RegistryWriterEnv>): void {
+  writerEnv = { ...writerEnv, ...overrides };
+}
+
+export function _resetForTests(): void {
+  writerEnv = DEFAULT_WRITER_ENV;
+}
+
+export function getProfileRegistryLockPath(): string {
+  return `${getProfileRegistryPath()}.lock`;
+}
+
+const EMPTY_REGISTRY: Registry = { profiles: [], extra: {} };
+
+/** Pure. The file text for a registry: profiles, settings, then unknown keys. */
+export function serializeRegistry(r: Registry): string {
+  const obj = Object.fromEntries([
+    ["profiles", r.profiles],
+    ...(r.settings !== undefined ? [["settings", r.settings] as const] : []),
+    ...Object.entries(r.extra).filter(([k]) => k !== "profiles" && k !== "settings"),
+  ]);
+  return JSON.stringify(obj, null, 2) + "\n";
+}
+
+/** Thrown inside the pre-rename hook when the file is not the one that was read. */
+class ChangedDuringWrite extends Error {}
+
+interface LockToken {
+  readonly ino: bigint;
+}
+
+/** Step 1: O_EXCL lock file holding pid and ISO time; 50 ms retries for up to 5 s. */
+async function acquireLock(lockPath: string): Promise<LockToken> {
+  const env = writerEnv;
+  const flags =
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
+  const start = env.now();
+  for (;;) {
+    let handle: FileHandle | undefined;
+    try {
+      handle = await fsPromises.open(lockPath, flags, 0o600);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    if (handle !== undefined) {
+      try {
+        await handle.writeFile(`${env.pid}\n${new Date(env.now()).toISOString()}\n`);
+        return { ino: (await handle.stat({ bigint: true })).ino };
+      } catch (err) {
+        await handle.close().catch(() => {});
+        handle = undefined;
+        await fsPromises.unlink(lockPath).catch(() => {});
+        throw err;
+      } finally {
+        await handle?.close();
+      }
+    }
+    if (await removeIfStale(lockPath)) continue;
+    if (env.now() - start >= LOCK_WAIT_MS) {
+      throw new RegistryWriteRefusedError(
+        REGISTRY_BUSY,
+        "Another epimethian-mcp command is changing the profile registry. Try again in a moment; nothing was changed.",
+      );
+    }
+    await env.sleep(LOCK_RETRY_MS);
+  }
+}
+
+/** The pid on the lock's first line, or undefined (unparseable, unreadable, not a file). */
+async function readLockPid(lockPath: string): Promise<number | undefined> {
+  try {
+    const handle = await fsPromises.open(
+      lockPath,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
+    );
+    try {
+      if (!(await handle.stat()).isFile()) return undefined;
+      const { buffer, bytesRead } = await handle.read(Buffer.alloc(64), 0, 64, 0);
+      const first = buffer.subarray(0, bytesRead).toString("latin1").split("\n")[0] ?? "";
+      return /^[1-9][0-9]{0,9}$/.test(first) ? Number(first) : undefined;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Removes a lock older than 60 s whose pid is not alive (an unparseable pid
+ * counts as not alive). A live pid, even a reused one, is never removed. The
+ * lock is re-lstat'ed just before the unlink and left alone if it changed.
+ * Returns true when the caller should retry at once (removed, or gone).
+ */
+async function removeIfStale(lockPath: string): Promise<boolean> {
+  const env = writerEnv;
+  let seen: BigIntStats;
+  try {
+    seen = await fsPromises.lstat(lockPath, { bigint: true });
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT";
+  }
+  const ageMs = env.now() - Number(seen.mtimeNs / 1_000_000n);
+  if (ageMs <= LOCK_STALE_MS) return false;
+  const pid = await readLockPid(lockPath);
+  if (pid !== undefined && env.isPidAlive(pid)) return false;
+  try {
+    const again = await fsPromises.lstat(lockPath, { bigint: true });
+    if (again.ino !== seen.ino || again.mtimeNs !== seen.mtimeNs) return false;
+    await fsPromises.unlink(lockPath);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT";
+  }
+  env.warn(
+    `epimethian-mcp: removed a stale lock ${displayPath(lockPath)} ` +
+      `(left by process ${pid ?? "unknown"}, which is no longer running).`,
+  );
+  return true;
+}
+
+/** Released in `finally`; only our own lock (same inode) is removed. */
+async function releaseLock(lockPath: string, token: LockToken): Promise<void> {
+  try {
+    const st = await fsPromises.lstat(lockPath, { bigint: true });
+    if (st.ino === token.ino) await fsPromises.unlink(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      writerEnv.warn(`epimethian-mcp: could not remove the lock ${displayPath(lockPath)} (${errnoOf(err)}).`);
+    }
+  }
+}
+
+/** Step 2: removes our own temp names older than one hour (left by a crash). */
+async function sweepStaleTemps(dir: string): Promise<void> {
+  let names: string[];
+  try {
+    names = await fsPromises.readdir(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!SWEEPABLE_TEMP.test(name)) continue;
+    const path = join(dir, name);
+    try {
+      const st = await fsPromises.lstat(path);
+      if (st.isFile() && writerEnv.now() - st.mtimeMs > TEMP_STALE_MS) await fsPromises.unlink(path);
+    } catch {
+      // Gone already, or not ours to touch: leave it.
+    }
+  }
+}
+
+/**
+ * The writer core. Steps (02 §1.1; the anchor steps 4, 5 and 8 are step A):
+ *   1. mkdir + verifyDirChain(config dir); take profiles.json.lock.
+ *   2. Sweep our temp files older than one hour.
+ *   3. Read. Unreadable → RegistryUnreadableError before any temp file;
+ *      absent → start from {profiles: []}, .bak untouched (D36).
+ *   4. next = change(prev). `undefined` (internal callers) or `prev` itself
+ *      means "no change": nothing is written.
+ *   6. ok read: its exact bytes → profiles.json.bak (safeAtomicWrite).
+ *   7. next → profiles.json (safeAtomicWrite); just before the rename one
+ *      lstat is compared with the step-3 observation. A difference (hand
+ *      edit, or a writer that ignored the lock) removes the temp and repeats
+ *      from step 3, at most three times, then refuses.
+ * The lock is released in `finally`.
+ */
+async function commitRegistryChange(
+  change: (prev: Registry | undefined) => Registry | undefined,
+): Promise<{ readonly before: Registry | undefined; readonly after: Registry | undefined; readonly written: boolean }> {
+  const dir = configDir();
+  const path = getProfileRegistryPath();
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  try {
+    await verifyDirChain(dir);
+  } catch (err) {
+    if (err instanceof UnsafePathError) {
+      throw new RegistryUnreadableError(
+        { kind: "unsafe-permissions", target: "directory", problem: err.problem === "mode" ? "mode" : "owner" },
+        path,
+        await backupIfPresent(),
+      );
+    }
+    throw err;
+  }
+  const lockPath = getProfileRegistryLockPath();
+  const token = await acquireLock(lockPath);
+  try {
+    await sweepStaleTemps(dir);
+    for (let attempt = 0; ; attempt++) {
+      const { read, raw } = await readRegistryWithText();
+      if (read.state === "unreadable") throw new RegistryUnreadableError(read.reason, read.path, read.backup);
+      const prev = read.state === "ok" ? read.registry : undefined;
+      const next = change(prev);
+      if (next === undefined || next === prev) return { before: prev, after: prev, written: false };
+      const text = serializeRegistry(next);
+      // A change function must produce a registry this module can read back.
+      if (!parseRegistryText(text).ok) throw new Error("internal error: the new profile registry would be unreadable");
+      if (read.state === "ok" && raw !== undefined) {
+        await safeAtomicWrite(getProfileRegistryBackupPath(), raw);
+      }
+      try {
+        await safeAtomicWrite(path, text, {
+          beforeRename: async () => {
+            await writerEnv.beforeCompare?.(attempt);
+            if (!sameObservation(await registryFingerprint(), read.observed)) throw new ChangedDuringWrite();
+          },
+        });
+        return { before: prev, after: next, written: true };
+      } catch (err) {
+        if (!(err instanceof ChangedDuringWrite)) throw err;
+        if (attempt >= MAX_REAPPLIES) {
+          throw new RegistryWriteRefusedError(
+            REGISTRY_CHANGING,
+            `The profile registry ${displayPath(path)} kept changing while saving; nothing was changed. ` +
+              "Try again when no editor is saving it.",
+          );
+        }
+      }
+    }
+  } finally {
+    await releaseLock(lockPath, token);
+  }
+}
+
+/** The one writer core (D12). Every exported writer calls it. Returning `prev` writes nothing. */
 export async function writeWithAnchor(
-  _change: (prev: Registry | undefined) => Registry,
+  change: (prev: Registry | undefined) => Registry,
   _how: WriteKind,
 ): Promise<{ readonly before: Registry | undefined; readonly after: Registry }> {
-  throw new Error("not implemented");
+  const { before, after } = await commitRegistryChange(change);
+  // after is undefined only when change(undefined) returned undefined, which its type forbids.
+  return { before, after: after ?? EMPTY_REGISTRY };
+}
+
+/** Pure. `settings` with `name` set to `value` (in place, keeping key order) or removed. */
+function withProfileSettings(
+  settings: Readonly<Record<string, ProfileSettings>> | undefined,
+  name: string,
+  value: ProfileSettings | undefined,
+): Readonly<Record<string, ProfileSettings>> | undefined {
+  const entries = Object.entries(settings ?? {});
+  const kept = entries
+    .filter(([k]) => !(k === name && value === undefined))
+    .map(([k, v]) => [k, k === name ? (value as ProfileSettings) : v] as const);
+  const present = entries.some(([k]) => k === name);
+  const all = present || value === undefined ? kept : [...kept, [name, value] as const];
+  // Object.fromEntries defines own properties, so a "__proto__" key stays a key.
+  return all.length === 0 ? undefined : Object.fromEntries(all);
+}
+
+function withSettings(r: Registry, settings: Readonly<Record<string, ProfileSettings>> | undefined): Registry {
+  return settings === undefined
+    ? { profiles: r.profiles, extra: r.extra }
+    : { profiles: r.profiles, settings, extra: r.extra };
 }
 
 /** Whole-value replacement; returning undefined removes the profile's settings entry. */
 export async function updateProfileSettings(
-  _name: string,
-  _fn: (prev: ProfileSettings | undefined) => ProfileSettings | undefined,
-  _how?: WriteKind,
+  name: string,
+  fn: (prev: ProfileSettings | undefined) => ProfileSettings | undefined,
+  _how: WriteKind = { kind: "other" },
 ): Promise<{ readonly before: ProfileSettings | undefined; readonly after: ProfileSettings | undefined }> {
-  throw new Error("not implemented");
+  // Reassigned on each attempt; the values of the attempt that committed are returned.
+  let before: ProfileSettings | undefined;
+  let after: ProfileSettings | undefined;
+  await commitRegistryChange((prev) => {
+    const base = prev ?? EMPTY_REGISTRY;
+    before = base.settings !== undefined && Object.hasOwn(base.settings, name) ? base.settings[name] : undefined;
+    after = fn(before);
+    if (after === before) return prev;
+    return withSettings(base, withProfileSettings(base.settings, name, after));
+  });
+  return { before, after };
 }
 
 /** Throws RegistryUnreadableError when unreadable; used by CLI preflights. */
 export async function assertRegistryWritable(): Promise<void> {
   const read = await readRegistry();
   if (read.state === "unreadable") throw new RegistryUnreadableError(read.reason, read.path, read.backup);
-}
-
-/**
- * Read the full registry object from disk.
- * Returns a default empty registry if the file is missing or corrupted.
- */
-async function readFullRegistry(): Promise<ProfileRegistry> {
-  try {
-    // E2 — TOCTOU-safe read: safeOpenRead opens with O_NOFOLLOW, fstats the
-    // resulting fd (so the mode check applies to the exact inode we will read),
-    // and rejects symlinks / non-regular files / group- or world-writable
-    // modes. Replaces the previous stat→readFile two-syscall pattern.
-    const raw = await safeOpenRead(getProfileRegistryPath());
-    const parsed = JSON.parse(raw);
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      Array.isArray(parsed.profiles) &&
-      parsed.profiles.every((p: unknown) => typeof p === "string")
-    ) {
-      return {
-        profiles: parsed.profiles as string[],
-        settings: parsed.settings ?? undefined,
-      };
-    }
-    console.error(
-      "Warning: Profile registry has unexpected format. Treating as empty."
-    );
-    return { profiles: [] };
-  } catch (err: unknown) {
-    if (
-      err instanceof Error &&
-      "code" in err &&
-      (err as NodeJS.ErrnoException).code === "ENOENT"
-    ) {
-      return { profiles: [] }; // File doesn't exist yet
-    }
-    // safeOpenRead reports these with string messages (no Node errno).
-    if (err instanceof Error && err.message === "unsafe-permissions") {
-      console.error(
-        "Error: Profile registry has unsafe permissions (group/world-writable). " +
-          `Run: chmod 600 ${getProfileRegistryPath()}`
-      );
-      return { profiles: [] };
-    }
-    if (err instanceof Error && err.message === "not-regular-file") {
-      console.error(
-        "Error: Profile registry is not a regular file (possible symlink or device). Refusing to read."
-      );
-      return { profiles: [] };
-    }
-    if (
-      err instanceof Error &&
-      "code" in err &&
-      (err as NodeJS.ErrnoException).code === "ELOOP"
-    ) {
-      console.error(
-        "Error: Profile registry appears to be a symlink. Refusing to follow; " +
-          "remove the symlink or restore the file with `chmod 600 " +
-          getProfileRegistryPath() +
-          "`."
-      );
-      return { profiles: [] };
-    }
-    console.error("Warning: Could not read profile registry. Treating as empty.");
-    return { profiles: [] };
-  }
-}
-
-/** Atomic write of the full registry to disk. */
-async function writeRegistry(registry: ProfileRegistry): Promise<void> {
-  await ensureConfigDir();
-  const data = JSON.stringify(registry, null, 2) + "\n";
-  const tmpFile = join(
-    configDir(),
-    `.profiles.${randomBytes(4).toString("hex")}.tmp`
-  );
-  await writeFile(tmpFile, data, { mode: 0o600 });
-  await rename(tmpFile, getProfileRegistryPath());
 }
 
 /**
@@ -602,49 +862,32 @@ export async function getProfileSettings(
   return profileSettingsOf(await readRegistry(), name);
 }
 
-/**
- * Set settings for a specific profile (merge with existing).
- */
+/** Shallow merge into the profile's settings, as in 7.6.0. Through the writer core. */
 export async function setProfileSettings(
   name: string,
   settings: ProfileSettings
 ): Promise<void> {
-  const registry = await readFullRegistry();
-  if (!registry.settings) {
-    registry.settings = {};
-  }
-  registry.settings[name] = { ...registry.settings[name], ...settings };
-  await writeRegistry(registry);
+  await updateProfileSettings(name, (prev) => ({ ...prev, ...settings }));
 }
 
-/**
- * Add a profile name to the registry (idempotent).
- * Uses atomic write (write to temp file, then rename).
- */
+/** Add a profile name to the registry (idempotent: no write when present). */
 export async function addToProfileRegistry(name: string): Promise<void> {
-  await ensureConfigDir();
-  const registry = await readFullRegistry();
-  if (registry.profiles.includes(name)) return; // Already registered
-  registry.profiles.push(name);
-  await writeRegistry(registry);
+  await commitRegistryChange((prev) => {
+    const base = prev ?? EMPTY_REGISTRY;
+    if (base.profiles.includes(name)) return prev;
+    return { ...base, profiles: [...base.profiles, name] };
+  });
 }
 
-/**
- * Remove a profile name from the registry.
- */
+/** Remove a profile name and its settings entry (no write when not listed). */
 export async function removeFromProfileRegistry(name: string): Promise<void> {
-  const registry = await readFullRegistry();
-  const filtered = registry.profiles.filter((p) => p !== name);
-  if (filtered.length === registry.profiles.length) return; // Wasn't in the list
-  registry.profiles = filtered;
-  // Clean up settings for removed profile
-  if (registry.settings) {
-    delete registry.settings[name];
-    if (Object.keys(registry.settings).length === 0) {
-      delete registry.settings;
-    }
-  }
-  await writeRegistry(registry);
+  await commitRegistryChange((prev) => {
+    if (prev === undefined || !prev.profiles.includes(name)) return prev;
+    return withSettings(
+      { ...prev, profiles: prev.profiles.filter((p) => p !== name) },
+      withProfileSettings(prev.settings, name, undefined),
+    );
+  });
 }
 
 /**
