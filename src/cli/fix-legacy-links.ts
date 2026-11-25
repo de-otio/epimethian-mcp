@@ -120,6 +120,8 @@ export function rewriteLegacyLinks(
  *   - A set of hostname strings.
  *   - `hasUnreadableProfile: true` if at least one profile's keychain entry
  *     could not be read — treated as an unknown distinct host (safe default).
+ * Throws RegistryUnreadableError when the profile registry itself cannot be
+ * used: that is refused outright, even with --i-understand-multi-tenant.
  */
 export async function detectTenantHosts(): Promise<{
   hosts: Set<string>;
@@ -138,14 +140,12 @@ export async function detectTenantHosts(): Promise<{
     }
   }
 
-  // Profile registry: read each profile's keychain entry.
-  let profiles: string[];
-  try {
-    profiles = await readProfileRegistry();
-  } catch {
-    profiles = [];
-    hasUnreadableProfile = true;
-  }
+  // Profile registry: read each profile's keychain entry. An unreadable
+  // registry is NOT turned into "no profiles": the host set would be
+  // incomplete and --i-understand-multi-tenant would let the migration run
+  // against an unknown tenant set. RegistryUnreadableError propagates; the
+  // CLI prints the fix and exits 1.
+  const profiles = await readProfileRegistry();
 
   for (const profile of profiles) {
     try {

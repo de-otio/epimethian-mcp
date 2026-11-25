@@ -348,6 +348,24 @@ describe("runFixLegacyLinks — multi-tenant refusal", () => {
   });
 });
 
+describe("runFixLegacyLinks — unreadable registry (W-REVIEW-0 finding 5)", () => {
+  it("refuses even with --i-understand-multi-tenant: no getConfig, no page read", async () => {
+    const { RegistryUnreadableError } = await vi.importActual<typeof import("../shared/profiles.js")>(
+      "../shared/profiles.js",
+    );
+    const err = new RegistryUnreadableError({ kind: "parse-error" }, "/x/profiles.json");
+    (readProfileRegistry as ReturnType<typeof vi.fn>).mockRejectedValueOnce(err);
+    vi.mocked(getConfig).mockClear();
+    vi.mocked(getPage).mockClear();
+    await expect(
+      runFixLegacyLinks(["--client-label", "test", "--page-ids", "p1", "--i-understand-multi-tenant", "--apply"]),
+    ).rejects.toBe(err);
+    expect(getConfig).not.toHaveBeenCalled();
+    expect(getPage).not.toHaveBeenCalled();
+    expect(safeSubmitPage).not.toHaveBeenCalled();
+  });
+});
+
 describe("runFixLegacyLinks — dry run", () => {
   it("reports affected pages without calling safeSubmitPage", async () => {
     (getPage as ReturnType<typeof vi.fn>).mockResolvedValue(
