@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockReadFromKeychain = vi.fn();
 const mockDeleteFromKeychain = vi.fn().mockResolvedValue(undefined);
@@ -22,13 +22,63 @@ vi.mock("../shared/profiles.js", () => ({
   appendAuditLog: (...args: unknown[]) => mockAppendAuditLog(...args),
   getProfileSettings: (...args: unknown[]) => mockGetProfileSettings(...args),
   setProfileSettings: (...args: unknown[]) => mockSetProfileSettings(...args),
+  assertRegistryWritable: (...args: unknown[]) => mockAssertRegistryWritable(...args),
 }));
+const mockAssertRegistryWritable = vi.fn().mockResolvedValue(undefined);
 
 import { runProfiles } from "./profiles.js";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockAssertRegistryWritable.mockReset().mockResolvedValue(undefined);
   process.argv = ["node", "index.js", "profiles"];
+});
+
+describe("profiles --remove registry preflight (0-T6)", () => {
+  const origTTY = process.stdin.isTTY;
+
+  beforeEach(() => {
+    Object.defineProperty(process.stdin, "isTTY", { value: false, writable: true });
+    process.argv = ["node", "index.js", "profiles", "--remove", "globex", "--force"];
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process.stdin, "isTTY", { value: origTTY, writable: true });
+  });
+
+  async function unreadable() {
+    const { RegistryUnreadableError } = await vi.importActual<typeof import("../shared/profiles.js")>(
+      "../shared/profiles.js",
+    );
+    return new RegistryUnreadableError({ kind: "unexpected-shape" }, "/x/profiles.json");
+  }
+
+  it("an unreadable registry: the credentials are never deleted and nothing is logged", async () => {
+    const err = await unreadable();
+    mockAssertRegistryWritable.mockRejectedValue(err);
+    await expect(runProfiles()).rejects.toBe(err);
+    expect(mockDeleteFromKeychain).not.toHaveBeenCalled();
+    expect(mockRemoveFromProfileRegistry).not.toHaveBeenCalled();
+    expect(mockAppendAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("checked again right before the keychain delete", async () => {
+    const err = await unreadable();
+    mockAssertRegistryWritable.mockResolvedValueOnce(undefined).mockRejectedValueOnce(err);
+    await expect(runProfiles()).rejects.toBe(err);
+    expect(mockAssertRegistryWritable).toHaveBeenCalledTimes(2);
+    expect(mockDeleteFromKeychain).not.toHaveBeenCalled();
+  });
+
+  it("a readable registry: keychain delete, registry remove, audit line, in that order", async () => {
+    const order: string[] = [];
+    mockDeleteFromKeychain.mockImplementationOnce(async () => void order.push("keychain"));
+    mockRemoveFromProfileRegistry.mockImplementationOnce(async () => void order.push("registry"));
+    mockAppendAuditLog.mockImplementationOnce(async () => void order.push("audit"));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await runProfiles();
+    expect(order).toEqual(["keychain", "registry", "audit"]);
+  });
 });
 
 describe("runProfiles", () => {

@@ -42,9 +42,11 @@ vi.mock("../shared/keychain.js", async (importOriginal) => {
 
 const mockAddToProfileRegistry = vi.fn().mockResolvedValue(undefined);
 const mockSetProfileSettings = vi.fn().mockResolvedValue(undefined);
+const mockAssertRegistryWritable = vi.fn().mockResolvedValue(undefined);
 vi.mock("../shared/profiles.js", () => ({
   addToProfileRegistry: (...a: unknown[]) => mockAddToProfileRegistry(...a),
   setProfileSettings: (...a: unknown[]) => mockSetProfileSettings(...a),
+  assertRegistryWritable: (...a: unknown[]) => mockAssertRegistryWritable(...a),
 }));
 
 const mockQuestion = vi.fn();
@@ -79,6 +81,7 @@ function answers(...rest: string[]): void {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockAssertRegistryWritable.mockReset().mockResolvedValue(undefined);
   mockQuestion.mockReset();
   mockTestConnection.mockReset().mockResolvedValue({ ok: true, message: "Connected successfully." });
   mockFetchTenantInfo
@@ -175,6 +178,32 @@ describe("gateway setup", () => {
     await expect(runSetup("gw-test")).rejects.toThrow("process.exit(1)");
     expect(mockTestConnection).not.toHaveBeenCalled();
     expect(mockSaveToKeychain).not.toHaveBeenCalled();
+  });
+
+  it("0-T6: an unreadable registry stops gateway setup before any prompt, request or keychain write", async () => {
+    const { RegistryUnreadableError } = await vi.importActual<typeof import("../shared/profiles.js")>(
+      "../shared/profiles.js",
+    );
+    const err = new RegistryUnreadableError({ kind: "not-regular-file" }, "/x/profiles.json");
+    mockAssertRegistryWritable.mockRejectedValueOnce(err);
+    answers("y", "y", "", "1");
+    await expect(runSetup("gw-test")).rejects.toBe(err);
+    expect(calls).toEqual([]);
+    expect(mockQuestion).not.toHaveBeenCalled();
+    expect(mockSaveToKeychain).not.toHaveBeenCalled();
+  });
+
+  it("0-T6: a registry broken during the gateway prompts stops before saveToKeychain", async () => {
+    const { RegistryUnreadableError } = await vi.importActual<typeof import("../shared/profiles.js")>(
+      "../shared/profiles.js",
+    );
+    const err = new RegistryUnreadableError({ kind: "parse-error" }, "/x/profiles.json");
+    mockAssertRegistryWritable.mockResolvedValueOnce(undefined).mockRejectedValueOnce(err);
+    answers("y", "y", "", "1");
+    await expect(runSetup("gw-test")).rejects.toBe(err);
+    expect(calls).toEqual(["fetchTenantInfo", "testConnection", "probeWriteScope"]);
+    expect(mockSaveToKeychain).not.toHaveBeenCalled();
+    expect(mockAddToProfileRegistry).not.toHaveBeenCalled();
   });
 
   it("a gateway connection failure saves nothing", async () => {

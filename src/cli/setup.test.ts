@@ -23,12 +23,14 @@ vi.mock("../shared/keychain.js", async (importOriginal) => {
 
 const mockAddToProfileRegistry = vi.fn().mockResolvedValue(undefined);
 const mockSetProfileSettings = vi.fn().mockResolvedValue(undefined);
+const mockAssertRegistryWritable = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("../shared/profiles.js", () => ({
   addToProfileRegistry: (...args: unknown[]) =>
     mockAddToProfileRegistry(...args),
   setProfileSettings: (...args: unknown[]) =>
     mockSetProfileSettings(...args),
+  assertRegistryWritable: (...args: unknown[]) => mockAssertRegistryWritable(...args),
 }));
 
 // Mock readline
@@ -52,6 +54,7 @@ describe("runSetup", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockAssertRegistryWritable.mockReset().mockResolvedValue(undefined);
     // mockClear / clearAllMocks does NOT drain the mockResolvedValueOnce queue
     // in vitest — stale "once" responses from earlier tests would otherwise be
     // consumed by the next test's first rl.question call. Explicitly reset.
@@ -371,6 +374,82 @@ describe("runSetup", () => {
     expect(mockAddToProfileRegistry).toHaveBeenCalledWith("globex");
 
     process.stdin.on = originalOn;
+  });
+
+  describe("registry preflight (0-T6)", () => {
+    async function unreadable() {
+      const { RegistryUnreadableError } = await vi.importActual<typeof import("../shared/profiles.js")>(
+        "../shared/profiles.js",
+      );
+      return new RegistryUnreadableError({ kind: "parse-error" }, "/x/profiles.json");
+    }
+
+    function typeTok(): () => void {
+      const originalOn = process.stdin.on;
+      process.stdin.on = vi.fn((event: string, cb: (key: string) => void) => {
+        if (event === "data") setTimeout(() => ["t", "o", "k", "\n"].forEach((c) => cb(c)), 0);
+        return process.stdin;
+      }) as any;
+      process.stdin.resume = vi.fn().mockReturnValue(process.stdin);
+      process.stdin.pause = vi.fn().mockReturnValue(process.stdin);
+      return () => {
+        process.stdin.on = originalOn;
+      };
+    }
+
+    it("an unreadable registry stops setup before any prompt or keychain access", async () => {
+      const err = await unreadable();
+      mockAssertRegistryWritable.mockRejectedValueOnce(err);
+      await expect(runSetup("globex")).rejects.toBe(err);
+      expect(mockQuestion).not.toHaveBeenCalled();
+      expect(mockReadFromKeychain).not.toHaveBeenCalled();
+      expect(mockSaveToKeychain).not.toHaveBeenCalled();
+      expect(mockAddToProfileRegistry).not.toHaveBeenCalled();
+      expect(mockSetProfileSettings).not.toHaveBeenCalled();
+    });
+
+    it("also without a profile name (setup checks the registry first in every mode)", async () => {
+      mockAssertRegistryWritable.mockRejectedValueOnce(await unreadable());
+      await expect(runSetup()).rejects.toMatchObject({ code: "REGISTRY_UNREADABLE" });
+      expect(mockSaveToKeychain).not.toHaveBeenCalled();
+    });
+
+    it("a registry broken during the prompts stops setup before saveToKeychain", async () => {
+      const err = await unreadable();
+      mockAssertRegistryWritable.mockResolvedValueOnce(undefined).mockRejectedValueOnce(err);
+      mockQuestion
+        .mockResolvedValueOnce("https://test.atlassian.net")
+        .mockResolvedValueOnce("user@test.com")
+        .mockResolvedValueOnce("n");
+      mockTestConnection.mockResolvedValueOnce({ ok: true, message: "Connected successfully." });
+      const restore = typeTok();
+      try {
+        await expect(runSetup("globex")).rejects.toBe(err);
+      } finally {
+        restore();
+      }
+      expect(mockAssertRegistryWritable).toHaveBeenCalledTimes(2);
+      expect(mockSaveToKeychain).not.toHaveBeenCalled();
+      expect(mockAddToProfileRegistry).not.toHaveBeenCalled();
+    });
+
+    it("without a profile the registry is not written, so the pre-save check is skipped", async () => {
+      mockQuestion
+        .mockResolvedValueOnce("https://test.atlassian.net")
+        .mockResolvedValueOnce("user@test.com")
+        .mockResolvedValueOnce("n");
+      mockTestConnection.mockResolvedValueOnce({ ok: true, message: "Connected successfully." });
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      const restore = typeTok();
+      try {
+        await runSetup(undefined, "claude-code");
+      } finally {
+        restore();
+      }
+      expect(mockAssertRegistryWritable).toHaveBeenCalledTimes(1);
+      expect(mockSaveToKeychain).toHaveBeenCalledTimes(1);
+      expect(mockAddToProfileRegistry).not.toHaveBeenCalled();
+    });
   });
 
   it("exits on invalid profile name", async () => {

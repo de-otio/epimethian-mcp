@@ -9,6 +9,7 @@ import {
   readProfileRegistry,
   removeFromProfileRegistry,
   appendAuditLog,
+  assertRegistryWritable,
   getProfileSettings,
   setProfileSettings,
 } from "../shared/profiles.js";
@@ -152,6 +153,11 @@ async function setAttributionFlag(name: string, attribution: boolean): Promise<v
 }
 
 async function removeProfile(name: string, force: boolean): Promise<void> {
+  // Preflight (0-D4): with an unreadable registry the credentials must not be
+  // deleted, because the registry entry could not be removed after them.
+  // Throws RegistryUnreadableError, printed by the CLI with the fix (exit 1).
+  await assertRegistryWritable();
+
   // --force only works when stdin is NOT a TTY (CI environments)
   if (!force || stdin.isTTY) {
     if (!stdin.isTTY) {
@@ -175,6 +181,8 @@ async function removeProfile(name: string, force: boolean): Promise<void> {
     }
   }
 
+  // Again after the confirmation, right before the keychain changes.
+  await assertRegistryWritable();
   await deleteFromKeychain(name);
   await removeFromProfileRegistry(name);
   await appendAuditLog(`Removed profile "${name}"`);

@@ -12,7 +12,7 @@ import {
   buildKeychainRecord,
   PROFILE_NAME_RE,
 } from "../shared/keychain.js";
-import { addToProfileRegistry, setProfileSettings } from "../shared/profiles.js";
+import { addToProfileRegistry, assertRegistryWritable, setProfileSettings } from "../shared/profiles.js";
 import { renderConfigSnippet, knownClientIds } from "./client-configs.js";
 import { KNOWN_TOOLS } from "../server/tool-allowlist.js";
 import { requestBaseFor } from "../server/api-base.js";
@@ -285,6 +285,9 @@ async function runGatewaySetup(
     }
   }
 
+  // Preflight again just before the keychain changes: the registry may have
+  // been broken while the prompts ran. Throws RegistryUnreadableError (0-D4).
+  await assertRegistryWritable();
   await saveToKeychain(
     buildKeychainRecord({
       url,
@@ -355,6 +358,11 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
     );
     process.exit(1);
   }
+
+  // Preflight (0-D4): an unreadable profile registry stops setup before any
+  // prompt, keychain read or keychain write. It throws
+  // RegistryUnreadableError, which the CLI prints with the fix (exit 1).
+  await assertRegistryWritable();
 
   const banner = profile
     ? `Epimethian MCP - Credential setup for profile "${profile}"`
@@ -488,6 +496,10 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
       );
     }
 
+    // A named profile is written to the registry after the keychain: check
+    // the registry again first, so a file broken during the prompts never
+    // leaves new credentials without their registry entry.
+    if (profile) await assertRegistryWritable();
     await saveToKeychain(
       buildKeychainRecord({
         url,
