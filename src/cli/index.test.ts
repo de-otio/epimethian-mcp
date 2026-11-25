@@ -214,4 +214,52 @@ describe("CLI entry point", () => {
       expect(mockStartServer).not.toHaveBeenCalled();
     });
   });
+
+  describe("errors the person can act on (0-D4)", () => {
+    let errors: string[];
+
+    beforeEach(() => {
+      errors = [];
+      vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => void errors.push(a.map(String).join(" ")));
+      vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    /** `make` builds the error from the fresh module graph (instanceof must match it). */
+    async function runRejecting(make: (p: typeof import("../shared/profiles.js")) => unknown): Promise<void> {
+      process.argv = ["node", "index.js", "profiles"];
+      vi.resetModules();
+      const err = make(await import("../shared/profiles.js"));
+      vi.doMock("./profiles.js", () => ({ runProfiles: vi.fn().mockRejectedValue(err) }));
+      await import("./index.js");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    it("prints RegistryUnreadableError as what + fix, without a stack, and exits 1", async () => {
+      await runRejecting(
+        (p) => new p.RegistryUnreadableError({ kind: "unsafe-permissions", target: "file", problem: "mode" }, "/x/profiles.json"),
+      );
+      expect(process.exit).toHaveBeenCalledWith(1);
+      const out = errors.join("\n");
+      expect(out).toContain("Fix: chmod 600 /x/profiles.json");
+      expect(out).toContain("nothing was changed");
+      expect(out).not.toContain("Fatal error");
+      expect(out).not.toMatch(/\n\s+at /);
+    });
+
+    it("prints a refused write (lock held) as its message and exits 1", async () => {
+      await runRejecting((p) => new p.RegistryWriteRefusedError(p.REGISTRY_BUSY, "Another epimethian-mcp command is busy."));
+      expect(process.exit).toHaveBeenCalledWith(1);
+      expect(errors).toEqual(["Error: Another epimethian-mcp command is busy."]);
+    });
+
+    it("still prints other errors as a fatal error", async () => {
+      await runRejecting(() => new Error("something else"));
+      expect(process.exit).toHaveBeenCalledWith(1);
+      expect(errors.join("\n")).toContain("Fatal error");
+    });
+  });
 });

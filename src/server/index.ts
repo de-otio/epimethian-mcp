@@ -175,7 +175,15 @@ import { planUpdate } from "./converter/update-orchestrator.js";
 import { tokeniseStorage } from "./converter/tokeniser.js";
 import { resolveToolFilter } from "./tool-allowlist.js";
 import { readOnlyTool, writeTool, destructiveTool, LARGE_READ_RESULT_CHARS } from "./tool-meta.js";
-import { getProfileSettings } from "../shared/profiles.js";
+import {
+  getProfileSettings,
+  profileSettingsOf,
+  readRegistry,
+  describeUnreadable,
+  RegistryUnreadableError,
+  REGISTRY_UNREADABLE,
+  type RegistryRead,
+} from "../shared/profiles.js";
 import { assertSpaceAllowed } from "./space-allowlist.js";
 import { resolveReadScope } from "./read-scope.js";
 import { scopeCql } from "./cql-scope.js";
@@ -1116,13 +1124,17 @@ export function buildServerInstructions(opts: {
   return lines.join("\n");
 }
 
-async function registerTools(server: McpServer, config: Config): Promise<void> {
+async function registerTools(server: McpServer, config: Config, registry?: RegistryRead): Promise<void> {
   const echo = tenantEcho(config);
 
-  // F2: resolve per-tool allowlist / denylist from profile registry.
-  const settings = config.profile
-    ? await getProfileSettings(config.profile)
-    : undefined;
+  // F2: resolve per-tool allowlist / denylist from profile registry. main()
+  // passes the one startup read (D13), so posture and tools cannot disagree;
+  // an unreadable registry never reaches here (recovery mode).
+  const settings = !config.profile
+    ? undefined
+    : registry !== undefined
+      ? profileSettingsOf(registry, config.profile)
+      : await getProfileSettings(config.profile);
   const isToolEnabled = resolveToolFilter(settings);
 
   // F3: closure that each write handler calls before dispatching. When
@@ -6270,64 +6282,40 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
 
 // --- Start ---
 
-/**
- * Recovery-mode server: started when CONFLUENCE_PROFILE names a profile with
- * no keychain entry. Rather than exiting (which leaves the MCP client showing
- * an opaque "connection failed"), we start a server that exposes a single
- * `setup_profile` tool. The agent calls it to retrieve the exact CLI command
- * the user should run in their terminal. API tokens never flow through the
- * model, and the existing interactive setup (tenant-seal confirmation, etc.)
- * is preserved.
- */
 /** Why the server started in recovery mode (contract PG-C2, 02 §4). */
 export type RecoveryReason =
   | { readonly kind: "profile-missing" }
   | { readonly kind: "registry-unreadable"; readonly what: string; readonly fix: string };
 
-/** Pure. The server name, instructions, tool description and tool text for a recovery server. */
+/**
+ * Pure. The server name, instructions, tool description and tool text for a
+ * recovery server. `registry-unreadable` uses the five-line refusal shape;
+ * `what` and `fix` come from `describeUnreadable` and carry no file content.
+ */
 export function recoveryText(
-  _profile: string,
-  _r: RecoveryReason,
+  profile: string,
+  r: RecoveryReason,
 ): {
   readonly serverName: string;
   readonly instructions: string;
   readonly description: string;
   readonly text: string;
 } {
-  throw new Error("not implemented");
-}
-
-export async function startRecoveryServer(
-  profile: string,
-  _reason: RecoveryReason = { kind: "profile-missing" },
-): Promise<void> {
-  const server = new McpServer(
-    {
-      name: `confluence-${profile}-setup-needed`,
-      version: __PKG_VERSION__,
-    },
-    {
-      instructions:
-        `The Confluence profile "${profile}" referenced by CONFLUENCE_PROFILE ` +
-        `has no keychain entry, so no Confluence tools are available. ` +
-        `Call the setup_profile tool for instructions to create it.`,
-    }
-  );
-
-  server.registerTool(
-    "setup_profile",
-    {
-      description:
-        `Return setup instructions for the missing Confluence profile "${profile}". ` +
-        `Invoke this first — no other Confluence tools are available until the ` +
-        `profile is configured.`,
-      inputSchema: {},
-      ...readOnlyTool("Get profile setup instructions"),
-    },
-    async () => {
+  switch (r.kind) {
+    case "profile-missing": {
       const cmd = `epimethian-mcp setup --profile ${profile}`;
-      return toolResult(
-        `Profile "${profile}" is not configured.\n\n` +
+      return {
+        serverName: `confluence-${profile}-setup-needed`,
+        instructions:
+          `The Confluence profile "${profile}" referenced by CONFLUENCE_PROFILE ` +
+          `has no keychain entry, so no Confluence tools are available. ` +
+          `Call the setup_profile tool for instructions to create it.`,
+        description:
+          `Return setup instructions for the missing Confluence profile "${profile}". ` +
+          `Invoke this first — no other Confluence tools are available until the ` +
+          `profile is configured.`,
+        text:
+          `Profile "${profile}" is not configured.\n\n` +
           `Ask the user whether they would like to create it. If yes, they must ` +
           `run this command in their terminal (the setup is interactive and ` +
           `requires a Confluence API token, which should not flow through this ` +
@@ -6335,9 +6323,57 @@ export async function startRecoveryServer(
           `    ${cmd}\n\n` +
           `After the command completes successfully, the user must reload the ` +
           `VS Code window (or restart their MCP client) for the new credentials ` +
-          `to take effect.`
-      );
+          `to take effect.`,
+      };
     }
+    case "registry-unreadable":
+      return {
+        serverName: `confluence-${profile}-config-error`,
+        instructions:
+          `No Confluence tool is available: ${r.what}. ` +
+          `The person must fix it: ${/[.!?]$/.test(r.fix) ? r.fix : `${r.fix}.`} ` +
+          `Call the setup_profile tool and tell the user what it returns; do not edit the file yourself.`,
+        description:
+          `Explain why no Confluence tools are available for profile "${profile}" ` +
+          `(the profile registry cannot be used). Invoke this first and tell the user the result.`,
+        text: [
+          `Withheld [${REGISTRY_UNREADABLE}]: no Confluence tool is available in this session. ` +
+            `This is final until the person fixes the file: do not retry, and do not edit the file yourself.`,
+          `Rule: ${r.what}; an unreadable registry is refused, never ignored.`,
+          `For the person: ${r.fix}`,
+          `Instead: tell the user this message.`,
+          `Restart: needed; restart the MCP client after the fix.`,
+        ].join("\n"),
+      };
+  }
+}
+
+/**
+ * Recovery-mode server: started when CONFLUENCE_PROFILE names a profile with
+ * no keychain entry (`profile-missing`), or when the profile registry cannot
+ * be used (`registry-unreadable`). Rather than exiting (which leaves the MCP
+ * client showing an opaque "connection failed"), it exposes a single
+ * `setup_profile` tool whose text names the problem and the fix the person
+ * runs in a terminal. API tokens never flow through the model.
+ */
+export async function startRecoveryServer(profile: string, reason: RecoveryReason): Promise<void> {
+  const t = recoveryText(profile, reason);
+  const server = new McpServer(
+    {
+      name: t.serverName,
+      version: __PKG_VERSION__,
+    },
+    { instructions: t.instructions }
+  );
+
+  server.registerTool(
+    "setup_profile",
+    {
+      description: t.description,
+      inputSchema: {},
+      ...readOnlyTool("Get profile setup instructions"),
+    },
+    async () => toolResult(t.text)
   );
 
   const transport = new StdioServerTransport();
@@ -6348,12 +6384,31 @@ export async function main() {
   // Resolve and validate credentials before accepting tool calls.
   // A missing named profile is recoverable — start a setup-needed server
   // instead of exiting, so the MCP client can surface the problem to the user.
+  //
+  // The profile registry is read once, here (D13): the same read decides
+  // posture (getConfig) and the tool set (registerTools). Env-var mode
+  // (no CONFLUENCE_PROFILE) does not consult the registry. An unreadable
+  // registry is never treated as empty: it starts recovery mode with the
+  // problem and the fix (fail closed, 0-D3).
+  const profileEnv = process.env.CONFLUENCE_PROFILE || "";
+  const registry = profileEnv ? await readRegistry() : undefined;
   let config: Config;
   try {
-    config = await getConfig();
+    config = await getConfig({ registry });
   } catch (err) {
     if (err instanceof ProfileNotConfiguredError) {
       await startRecoveryServer(err.profile, { kind: "profile-missing" });
+      return;
+    }
+    if (err instanceof RegistryUnreadableError) {
+      // profileEnv passed resolveCredentials' name check before this throw.
+      const { what, fix } = describeUnreadable(
+        err.reason,
+        err.path,
+        profileEnv,
+        err.backup !== undefined ? { path: err.backup, fitsAnchor: undefined } : undefined,
+      );
+      await startRecoveryServer(profileEnv, { kind: "registry-unreadable", what, fix });
       return;
     }
     throw err;
@@ -6403,7 +6458,7 @@ export async function main() {
     },
   );
 
-  await registerTools(server, config);
+  await registerTools(server, config, registry);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

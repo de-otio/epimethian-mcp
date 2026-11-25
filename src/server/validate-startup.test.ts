@@ -16,9 +16,13 @@ vi.mock("../shared/keychain.js", () => ({
   PROFILE_NAME_RE: /^[a-z0-9][a-z0-9-]{0,62}$/,
 }));
 
-vi.mock("../shared/profiles.js", () => ({
-  getProfileSettings: (...args: unknown[]) => mockGetProfileSettings(...args),
-}));
+vi.mock("../shared/profiles.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../shared/profiles.js")>();
+  return {
+    ...actual,
+    getProfileSettings: (...args: unknown[]) => mockGetProfileSettings(...args),
+  };
+});
 
 vi.mock("../shared/test-connection.js", () => ({
   testConnection: (...args: unknown[]) => mockTestConnection(...args),
@@ -232,5 +236,86 @@ describe("validateStartup — tenant seal", () => {
 
     expect(mockSaveToKeychain).toHaveBeenCalledTimes(1);
     expect(mockExit).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0-T8: an unreadable registry stops getConfig, so the posture-"detect" write
+// probe (a dry-run PUT) is never sent. 7.6.0 treated the file as empty and
+// went on to probe.
+// ---------------------------------------------------------------------------
+
+describe("getConfig with an unreadable registry (0-T8)", () => {
+  const creds = { url: "https://example.atlassian.net", email: "user@example.com", apiToken: "tok" };
+
+  it("throws RegistryUnreadableError from the passed startup read; no request is made", async () => {
+    process.env.CONFLUENCE_PROFILE = "work";
+    mockReadFromKeychain.mockResolvedValue(creds);
+    const fetchSpy = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      const { getConfig } = await loadModule();
+      const { RegistryUnreadableError } = await import("../shared/profiles.js");
+      const registry = {
+        state: "unreadable" as const,
+        reason: { kind: "parse-error" as const, line: 2, column: 5 },
+        path: "/home/u/.config/epimethian-mcp/profiles.json",
+        backup: undefined,
+        observed: "absent" as const,
+      };
+      const err = await getConfig({ registry }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(RegistryUnreadableError);
+      expect(err).toMatchObject({ reason: { kind: "parse-error", line: 2, column: 5 } });
+      // Not read again from disk: the passed read is the only source.
+      expect(mockGetProfileSettings).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(mockTestConnection).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("throws when it reads the registry itself (no posture fallback)", async () => {
+    process.env.CONFLUENCE_PROFILE = "work";
+    mockReadFromKeychain.mockResolvedValue(creds);
+    const { RegistryUnreadableError } = await import("../shared/profiles.js");
+    mockGetProfileSettings.mockRejectedValue(
+      new RegistryUnreadableError({ kind: "unexpected-shape" }, "/x/profiles.json"),
+    );
+    const { getConfig } = await loadModule();
+    await expect(getConfig()).rejects.toMatchObject({ code: "REGISTRY_UNREADABLE" });
+  });
+
+  it("uses the passed ok read for posture and does not read the file again", async () => {
+    process.env.CONFLUENCE_PROFILE = "work";
+    mockReadFromKeychain.mockResolvedValue(creds);
+    const { getConfig } = await loadModule();
+    const config = await getConfig({
+      registry: {
+        state: "ok",
+        registry: { profiles: ["work"], settings: { work: { posture: "read-only" } }, extra: {} },
+        observed: { ino: 1n, mtimeNs: 1n, ctimeNs: 1n, size: 1n },
+      },
+    });
+    expect(config.posture).toBe("read-only");
+    expect(mockGetProfileSettings).not.toHaveBeenCalled();
+  });
+
+  it("env-var mode ignores the registry entirely", async () => {
+    process.env.CONFLUENCE_URL = "https://example.atlassian.net";
+    process.env.CONFLUENCE_EMAIL = "user@example.com";
+    process.env.CONFLUENCE_API_TOKEN = "tok";
+    const { getConfig } = await loadModule();
+    const config = await getConfig({
+      registry: {
+        state: "unreadable",
+        reason: { kind: "not-regular-file" },
+        path: "/x",
+        backup: undefined,
+        observed: "absent",
+      },
+    });
+    expect(config.profile).toBeNull();
+    expect(mockGetProfileSettings).not.toHaveBeenCalled();
   });
 });

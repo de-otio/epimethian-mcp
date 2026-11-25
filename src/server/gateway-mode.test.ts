@@ -64,7 +64,25 @@ vi.mock("../shared/keychain.js", async (importOriginal) => {
 });
 vi.mock("../shared/profiles.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../shared/profiles.js")>();
-  return { ...actual, getProfileSettings: vi.fn(async () => settings.current) };
+  // main() reads the registry once (readRegistry) and derives the settings from
+  // that read; the stub serves settings.current for the profile being booted.
+  const read = (): import("../shared/profiles.js").RegistryRead => {
+    const profile = process.env.CONFLUENCE_PROFILE ?? "";
+    return {
+      state: "ok",
+      registry: {
+        profiles: [profile],
+        ...(settings.current ? { settings: { [profile]: settings.current } } : {}),
+        extra: {},
+      },
+      observed: { ino: 1n, mtimeNs: 1n, ctimeNs: 1n, size: 1n },
+    };
+  };
+  return {
+    ...actual,
+    getProfileSettings: vi.fn(async () => settings.current),
+    readRegistry: vi.fn(async () => read()),
+  };
 });
 vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
   StdioServerTransport: vi.fn().mockImplementation(function () {

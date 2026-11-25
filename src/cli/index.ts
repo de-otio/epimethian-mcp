@@ -1,5 +1,6 @@
 import { main as startServer } from "../server/index.js";
 import { resolveProfileArg } from "./profile-arg.js";
+import { describeCliError } from "./cli-errors.js";
 
 async function run(): Promise<void> {
   const command = process.argv[2];
@@ -55,6 +56,14 @@ async function run(): Promise<void> {
 }
 
 run().catch((err) => {
+  // A registry the CLI must not touch, or a write that was refused, is a
+  // message for the person, not a crash: no stack, exit 1, nothing changed.
+  const message = describeCliError(err);
+  if (message !== undefined) {
+    console.error(message);
+    process.exit(1);
+    return;
+  }
   console.error("Fatal error:", err);
   process.exit(1);
 });

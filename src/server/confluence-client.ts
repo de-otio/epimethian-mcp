@@ -1,7 +1,7 @@
 import { z } from "zod";
 import TurndownService from "turndown";
 import { readFromKeychain, saveToKeychain, PROFILE_NAME_RE } from "../shared/keychain.js";
-import { getProfileSettings } from "../shared/profiles.js";
+import { getProfileSettings, profileSettingsOf, type RegistryRead } from "../shared/profiles.js";
 import {
   testConnection,
   verifyTenantIdentity,
@@ -237,7 +237,15 @@ export async function resolveCredentials(): Promise<{
   process.exit(1);
 }
 
-export async function getConfig(): Promise<Config> {
+/**
+ * The resolved, frozen configuration (cached for the process).
+ *
+ * `opts.registry` is the one registry read `main()` made at startup (D13); it
+ * is used instead of reading the file again. Without it, the registry is read
+ * here. Either way an unreadable registry throws `RegistryUnreadableError`:
+ * there is no fallback to default settings or posture "detect".
+ */
+export async function getConfig(opts: { readonly registry?: RegistryRead } = {}): Promise<Config> {
   if (_config) return _config;
 
   const { url, email, apiToken, profile, sealedCloudId, sealedDisplayName, apiMode, tokenExpiry } =
@@ -256,7 +264,12 @@ export async function getConfig(): Promise<Config> {
   }
 
   // Resolve configuration from profile registry and environment.
-  const registrySettings = profile ? await getProfileSettings(profile) : undefined;
+  // Throws RegistryUnreadableError on an unreadable file (fail closed).
+  const registrySettings = !profile
+    ? undefined
+    : opts.registry !== undefined
+      ? profileSettingsOf(opts.registry, profile)
+      : await getProfileSettings(profile);
 
   // Posture (design doc #14): tri-state with legacy readOnly alias.
   // Until Track O1's startup probe ships, "detect" is treated as "read-write"
