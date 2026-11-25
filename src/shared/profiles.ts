@@ -7,6 +7,7 @@ import {
   safeOpenAppend,
   safeOpenReadWithStat,
   safeAtomicWrite,
+  prepareAtomicWrite,
   verifyDirChain,
   UnsafePathError,
 } from "./safe-fs.js";
@@ -811,11 +812,14 @@ async function sweepStaleTemps(dir: string): Promise<void> {
  *      absent → start from {profiles: []}, .bak untouched (D36).
  *   4. next = change(prev). `undefined` (internal callers) or `prev` itself
  *      means "no change": nothing is written.
- *   6. ok read: its exact bytes → profiles.json.bak (safeAtomicWrite).
+ *   6. ok read: its exact bytes → a fsynced .bak temp (prepareAtomicWrite).
  *   7. next → profiles.json (safeAtomicWrite); just before the rename one
  *      lstat is compared with the step-3 observation. A difference (hand
- *      edit, or a writer that ignored the lock) removes the temp and repeats
- *      from step 3, at most three times, then refuses.
+ *      edit, or a writer that ignored the lock) removes both temps and
+ *      repeats from step 3, at most three times, then refuses. Only when
+ *      the compare passed is the .bak temp renamed onto profiles.json.bak,
+ *      immediately before the registry rename, so a refused or failed
+ *      attempt never replaces the previous .bak.
  * The lock is released in `finally`.
  */
 async function commitRegistryChange(
@@ -849,18 +853,28 @@ async function commitRegistryChange(
       const text = serializeRegistry(next);
       // A change function must produce a registry this module can read back.
       if (!parseRegistryText(text).ok) throw new Error("internal error: the new profile registry would be unreadable");
-      if (read.state === "ok" && raw !== undefined) {
-        await safeAtomicWrite(getProfileRegistryBackupPath(), raw);
-      }
+      // The .bak temp is prepared now but renamed only after the compare
+      // passed, just before the registry rename: a refused or failed attempt
+      // never replaces the previous .bak.
+      const bak =
+        read.state === "ok" && raw !== undefined
+          ? await prepareAtomicWrite(getProfileRegistryBackupPath(), raw)
+          : undefined;
+      let bakCommitted = false; // set inside beforeRename, read in the catch below
       try {
         await safeAtomicWrite(path, text, {
           beforeRename: async () => {
             await writerEnv.beforeCompare?.(attempt);
             if (!sameObservation(await registryFingerprint(), read.observed)) throw new ChangedDuringWrite();
+            if (bak !== undefined) {
+              await bak.commit();
+              bakCommitted = true;
+            }
           },
         });
         return { before: prev, after: next, written: true };
       } catch (err) {
+        if (bak !== undefined && !bakCommitted) await bak.abort();
         if (!(err instanceof ChangedDuringWrite)) throw err;
         if (attempt >= MAX_REAPPLIES) {
           throw new RegistryWriteRefusedError(

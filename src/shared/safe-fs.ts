@@ -165,8 +165,35 @@ export async function safeAtomicWrite(
   bytes: string | Uint8Array,
   opts: SafeAtomicWriteOptions = {},
 ): Promise<void> {
-  const dir = dirname(path);
-  const { handle, tmp } = await openFreshTemp(dir, basename(path));
+  const prepared = await prepareAtomicWrite(path, bytes);
+  try {
+    if (opts.beforeRename) await opts.beforeRename();
+  } catch (err) {
+    await prepared.abort();
+    throw err;
+  }
+  await prepared.commit();
+  await syncDirBestEffort(dirname(path), path);
+}
+
+/** A complete, fsynced temp file waiting to be renamed onto its target. */
+export interface PreparedWrite {
+  /** rename(temp, target); on failure the temp is removed and the error propagates.
+   *  No directory fsync: the caller's next safeAtomicWrite in the same directory
+   *  (or its own syncDir) flushes the directory. */
+  readonly commit: () => Promise<void>;
+  /** Removes the temp; the target is untouched. Never throws. */
+  readonly abort: () => Promise<void>;
+}
+
+/**
+ * First half of safeAtomicWrite: temp `.<name>.<16 hex>.tmp` opened
+ * O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW 0600, written and fsynced. The target is
+ * not touched until `commit`. Used where one rename must happen only once
+ * another write is certain (the registry's .bak).
+ */
+export async function prepareAtomicWrite(path: string, bytes: string | Uint8Array): Promise<PreparedWrite> {
+  const { handle, tmp } = await openFreshTemp(dirname(path), basename(path));
   try {
     try {
       // writeFile loops until the buffer is drained (see safeWriteFile).
@@ -175,13 +202,24 @@ export async function safeAtomicWrite(
     } finally {
       await handle.close();
     }
-    if (opts.beforeRename) await opts.beforeRename();
-    await fsPromises.rename(tmp, path);
   } catch (err) {
     await fsPromises.unlink(tmp).catch(() => {});
     throw err;
   }
-  await syncDirBestEffort(dir, path);
+  const abort = async (): Promise<void> => {
+    await fsPromises.unlink(tmp).catch(() => {});
+  };
+  return {
+    abort,
+    commit: async () => {
+      try {
+        await fsPromises.rename(tmp, path);
+      } catch (err) {
+        await abort();
+        throw err;
+      }
+    },
+  };
 }
 
 async function openFreshTemp(

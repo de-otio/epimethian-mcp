@@ -387,7 +387,7 @@ posixOnly("0-T11 durability (writer core)", () => {
     expect(await readFile(bakPath, "utf-8")).toBe(afterFirst);
   });
 
-  it(".bak is fsynced and renamed before the registry's temp is written", async () => {
+  it(".bak is fsynced first and renamed only just before the registry rename", async () => {
     const proto = Object.getPrototypeOf(await (async () => {
       const fh = await open(join(home, "probe"), "w");
       await fh.close();
@@ -414,11 +414,12 @@ posixOnly("0-T11 durability (writer core)", () => {
     });
     await writeFile(registryPath, regText({ profiles: ["a"] }), { mode: 0o600 });
     await addToProfileRegistry("b");
+    // Both temps are complete and fsynced first; the .bak rename comes only
+    // after the compare, right before the registry rename; one directory fsync.
     expect(events).toEqual([
       "sync /.profiles.json.bak.X.tmp",
-      "rename /profiles.json.bak",
-      "sync ",
       "sync /.profiles.json.X.tmp",
+      "rename /profiles.json.bak",
       "rename /profiles.json",
       "sync ",
     ]);

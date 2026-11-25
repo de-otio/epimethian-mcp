@@ -270,6 +270,29 @@ posixOnly("0-T12 hand edit between read and rename", () => {
     expect((await readdir(configDir)).filter((n) => n.endsWith(".tmp") || n.endsWith(".lock"))).toEqual([]);
   });
 
+  it("a refused write (file keeps changing) keeps the previous .bak byte-identical", async () => {
+    await writeFile(`${registryPath}.bak`, "PREVIOUS-BAK", { mode: 0o600 });
+    _setRegistryWriterEnvForTests({
+      beforeCompare: async (attempt) => {
+        await writeFile(registryPath, regText({ profiles: [`edit-${attempt}`] }));
+      },
+    });
+    await expect(addToProfileRegistry("cli")).rejects.toMatchObject({ code: REGISTRY_CHANGING });
+    expect(await readFile(`${registryPath}.bak`, "utf-8")).toBe("PREVIOUS-BAK");
+    expect((await readdir(configDir)).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("an edit that makes the file unreadable mid-write keeps the previous .bak", async () => {
+    await writeFile(`${registryPath}.bak`, "PREVIOUS-BAK", { mode: 0o600 });
+    _setRegistryWriterEnvForTests({
+      beforeCompare: async (attempt) => {
+        if (attempt === 0) await writeFile(registryPath, `{"profiles": [`);
+      },
+    });
+    await expect(addToProfileRegistry("cli")).rejects.toMatchObject({ code: "REGISTRY_UNREADABLE" });
+    expect(await readFile(`${registryPath}.bak`, "utf-8")).toBe("PREVIOUS-BAK");
+  });
+
   it("a file that keeps changing is refused after three re-applies; the last edit stays", async () => {
     let attempts = 0;
     _setRegistryWriterEnvForTests({

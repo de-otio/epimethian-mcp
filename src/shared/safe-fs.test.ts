@@ -11,6 +11,7 @@ import {
   SAFE_FS_HAS_O_NOFOLLOW,
   safeOpenReadWithStat,
   safeAtomicWrite,
+  prepareAtomicWrite,
   UnsafePathError,
   _setSafeFsHooksForTests,
   _resetForTests,
@@ -653,5 +654,46 @@ posixOnly("safeAtomicWrite (0-T11, safe-fs half)", () => {
     expect(opened).not.toContain(dir);
     expect(opened.some((p) => p.endsWith(".tmp"))).toBe(true);
     expect(warnings).toEqual([]);
+  });
+});
+
+posixOnly("prepareAtomicWrite", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "safe-fs-prepare-"));
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("leaves the target untouched until commit; abort removes the temp", async () => {
+    const { readFile, readdir } = await import("node:fs/promises");
+    const path = join(dir, "t.json");
+    await writeFile(path, "OLD", { mode: 0o600 });
+    const p1 = await prepareAtomicWrite(path, "NEW");
+    expect(await readFile(path, "utf-8")).toBe("OLD");
+    expect((await readdir(dir)).length).toBe(2);
+    await p1.abort();
+    expect(await readdir(dir)).toEqual(["t.json"]);
+    expect(await readFile(path, "utf-8")).toBe("OLD");
+    const p2 = await prepareAtomicWrite(path, "NEW");
+    await p2.commit();
+    expect(await readFile(path, "utf-8")).toBe("NEW");
+    expect(await readdir(dir)).toEqual(["t.json"]);
+  });
+
+  it("a failed commit removes the temp and keeps the target", async () => {
+    const { readFile, readdir } = await import("node:fs/promises");
+    const fs = await import("node:fs");
+    const path = join(dir, "t.json");
+    await writeFile(path, "OLD", { mode: 0o600 });
+    const p = await prepareAtomicWrite(path, "NEW");
+    vi.spyOn(fs.promises, "rename").mockRejectedValueOnce(Object.assign(new Error("x"), { code: "EIO" }));
+    await expect(p.commit()).rejects.toThrow("x");
+    expect(await readFile(path, "utf-8")).toBe("OLD");
+    expect(await readdir(dir)).toEqual(["t.json"]);
   });
 });
