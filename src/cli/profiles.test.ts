@@ -15,7 +15,15 @@ const mockAppendAuditLog = vi.fn().mockResolvedValue(undefined);
 const mockGetProfileSettings = vi.fn().mockResolvedValue(undefined);
 const mockSetProfileSettings = vi.fn().mockResolvedValue(undefined);
 
-vi.mock("../shared/profiles.js", () => ({
+vi.mock("../shared/profiles.js", async (importOriginal) => ({
+  // The real error classes and describeUnreadable (used by cli-errors.ts).
+  ...(({ RegistryUnreadableError, RegistryWriteRefusedError, REGISTRY_BUSY, REGISTRY_CHANGING, describeUnreadable }) => ({
+    RegistryUnreadableError,
+    RegistryWriteRefusedError,
+    REGISTRY_BUSY,
+    REGISTRY_CHANGING,
+    describeUnreadable,
+  }))(await importOriginal<typeof import("../shared/profiles.js")>()),
   readProfileRegistry: () => mockReadProfileRegistry(),
   removeFromProfileRegistry: (...args: unknown[]) =>
     mockRemoveFromProfileRegistry(...args),
@@ -68,6 +76,31 @@ describe("profiles --remove registry preflight (0-T6)", () => {
     await expect(runProfiles()).rejects.toBe(err);
     expect(mockAssertRegistryWritable).toHaveBeenCalledTimes(2);
     expect(mockDeleteFromKeychain).not.toHaveBeenCalled();
+  });
+
+  it("a registry write that fails after the keychain delete reports what changed (not 'nothing was changed')", async () => {
+    const { RegistryWriteRefusedError, REGISTRY_BUSY } = await vi.importActual<typeof import("../shared/profiles.js")>(
+      "../shared/profiles.js",
+    );
+    mockRemoveFromProfileRegistry.mockRejectedValueOnce(
+      new RegistryWriteRefusedError(REGISTRY_BUSY, "busy; nothing was changed", "another command was changing it"),
+    );
+    const err = await runProfiles().catch((e: unknown) => e);
+    const { describeCliError } = await import("./cli-errors.js");
+    const text = describeCliError(err)!;
+    expect(mockDeleteFromKeychain).toHaveBeenCalledWith("globex");
+    expect(text).toContain('The credentials of profile "globex" were deleted from the OS keychain');
+    expect(text).toContain("another command was changing it");
+    expect(text).toContain("run: epimethian-mcp profiles --remove globex");
+    expect(text).not.toContain("nothing was changed");
+    expect(mockAppendAuditLog).not.toHaveBeenCalled();
+  });
+
+  it("an audit-log failure after a full removal says the profile was removed", async () => {
+    mockAppendAuditLog.mockRejectedValueOnce(Object.assign(new Error("x"), { code: "EIO" }));
+    const err = await runProfiles().catch((e: unknown) => e);
+    const { describeCliError } = await import("./cli-errors.js");
+    expect(describeCliError(err)).toContain('Profile "globex" was removed');
   });
 
   it("a readable registry: keychain delete, registry remove, audit line, in that order", async () => {

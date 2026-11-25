@@ -12,7 +12,8 @@ import {
   buildKeychainRecord,
   PROFILE_NAME_RE,
 } from "../shared/keychain.js";
-import { addToProfileRegistry, assertRegistryWritable, setProfileSettings } from "../shared/profiles.js";
+import { assertRegistryWritable, registerProfile } from "../shared/profiles.js";
+import { CliMessageError, PartialChangeError } from "./cli-errors.js";
 import { renderConfigSnippet, knownClientIds } from "./client-configs.js";
 import { KNOWN_TOOLS } from "../server/tool-allowlist.js";
 import { requestBaseFor } from "../server/api-base.js";
@@ -285,10 +286,11 @@ async function runGatewaySetup(
     }
   }
 
-  // Preflight again just before the keychain changes: the registry may have
-  // been broken while the prompts ran. Throws RegistryUnreadableError (0-D4).
-  await assertRegistryWritable();
-  await saveToKeychain(
+  // Every answer is in. Registry first, in one write (name + posture), then
+  // the keychain: a refused registry write leaves nothing changed, and a
+  // keychain failure afterwards is reported with what did change.
+  await registerProfile(profile, { posture });
+  await saveCredentials(
     buildKeychainRecord({
       url,
       email,
@@ -298,10 +300,9 @@ async function runGatewaySetup(
       apiMode: "gateway",
       ...(tokenExpiry ? { tokenExpiry } : {}),
     }),
-    profile
+    profile,
+    posture,
   );
-  await addToProfileRegistry(profile);
-  await setProfileSettings(profile, { posture });
   console.log(
     `Credentials saved to OS keychain (profile: ${profile}, mode: gateway, posture: ${posture}` +
       `${tokenExpiry ? `, token expires ${tokenExpiry}` : ""}).\n`
@@ -312,6 +313,32 @@ async function runGatewaySetup(
   console.log(
     "\nSetup complete. Restart your MCP client to use the new credentials."
   );
+}
+
+/**
+ * Save the keychain record after the registry entry was written. On failure
+ * the error says what did change (the registry entry) and never repeats the
+ * keychain tool's message, which can echo the command line and the token.
+ */
+async function saveCredentials(
+  record: Parameters<typeof saveToKeychain>[0],
+  profile: string | undefined,
+  posture: Posture | undefined,
+): Promise<void> {
+  try {
+    await saveToKeychain(record, profile);
+  } catch {
+    if (profile !== undefined) {
+      throw new PartialChangeError(
+        `The profile registry now lists "${profile}" (posture: ${posture ?? "detect"})`,
+        "saving the credentials to the OS keychain failed",
+        `The keychain may hold no credentials for "${profile}" now. Check that the keychain is unlocked, then run: epimethian-mcp setup --profile ${profile}`,
+      );
+    }
+    throw new CliMessageError(
+      "Saving the credentials to the OS keychain failed; the keychain may hold no credentials now. Check that the keychain is unlocked.",
+    );
+  }
 }
 
 /** Print config snippet(s) for the requested client (or all clients if omitted). */
@@ -496,11 +523,16 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
       );
     }
 
-    // A named profile is written to the registry after the keychain: check
-    // the registry again first, so a file broken during the prompts never
-    // leaves new credentials without their registry entry.
-    if (profile) await assertRegistryWritable();
-    await saveToKeychain(
+    // Collect every answer before anything is written: the posture prompt
+    // used to come after the keychain and registry writes, so a failure or
+    // Ctrl-C there left a profile with no posture ("detect").
+    // Without a profile there is no posture setting: the server resolves it
+    // at startup (CONFLUENCE_READ_ONLY or the probe), so the list is "detect".
+    const profilePosture: Posture = profile ? await promptPosture() : "detect";
+
+    // Registry first, in one write (name + posture), then the keychain.
+    if (profile) await registerProfile(profile, { posture: profilePosture });
+    await saveCredentials(
       buildKeychainRecord({
         url,
         email,
@@ -508,19 +540,11 @@ export async function runSetup(profile?: string, clientId?: string): Promise<voi
         ...(sealedCloudId ? { cloudId: sealedCloudId } : {}),
         ...(sealedDisplayName ? { tenantDisplayName: sealedDisplayName } : {}),
       }),
-      profile
+      profile,
+      profile ? profilePosture : undefined,
     );
-    // Without a profile there is no posture setting: the server resolves it
-    // at startup (CONFLUENCE_READ_ONLY or the probe), so the list is "detect".
-    let profilePosture: Posture = "detect";
     if (profile) {
-      await addToProfileRegistry(profile);
-
-      // Prompt for MCP access posture (replaces old read-only/write binary)
-      const posture = await promptPosture();
-      profilePosture = posture;
-      await setProfileSettings(profile, { posture });
-      console.log(`Credentials saved to OS keychain (profile: ${profile}, posture: ${posture}).\n`);
+      console.log(`Credentials saved to OS keychain (profile: ${profile}, posture: ${profilePosture}).\n`);
     } else {
       console.log("Credentials saved to OS keychain.\n");
       console.log(

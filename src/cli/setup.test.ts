@@ -15,7 +15,10 @@ vi.mock("../shared/keychain.js", async (importOriginal) => {
   return {
     // The pure record builder is the real one: setup's output is checked through it.
     buildKeychainRecord: actual.buildKeychainRecord,
-    saveToKeychain: (...args: unknown[]) => mockSaveToKeychain(...args),
+    saveToKeychain: (...args: unknown[]) => {
+      writes.push("keychain");
+      return mockSaveToKeychain(...args);
+    },
     readFromKeychain: (...args: unknown[]) => mockReadFromKeychain(...args),
     PROFILE_NAME_RE: /^[a-z0-9][a-z0-9-]{0,62}$/,
   };
@@ -24,13 +27,28 @@ vi.mock("../shared/keychain.js", async (importOriginal) => {
 const mockAddToProfileRegistry = vi.fn().mockResolvedValue(undefined);
 const mockSetProfileSettings = vi.fn().mockResolvedValue(undefined);
 const mockAssertRegistryWritable = vi.fn().mockResolvedValue(undefined);
+const mockRegisterProfile = vi.fn().mockResolvedValue(undefined);
+// Order of the registry and keychain writes, as setup makes them.
+const writes: string[] = [];
 
-vi.mock("../shared/profiles.js", () => ({
+vi.mock("../shared/profiles.js", async (importOriginal) => ({
+  // The real error classes and describeUnreadable (used by cli-errors.ts).
+  ...(({ RegistryUnreadableError, RegistryWriteRefusedError, REGISTRY_BUSY, REGISTRY_CHANGING, describeUnreadable }) => ({
+    RegistryUnreadableError,
+    RegistryWriteRefusedError,
+    REGISTRY_BUSY,
+    REGISTRY_CHANGING,
+    describeUnreadable,
+  }))(await importOriginal<typeof import("../shared/profiles.js")>()),
   addToProfileRegistry: (...args: unknown[]) =>
     mockAddToProfileRegistry(...args),
   setProfileSettings: (...args: unknown[]) =>
     mockSetProfileSettings(...args),
   assertRegistryWritable: (...args: unknown[]) => mockAssertRegistryWritable(...args),
+  registerProfile: (...args: unknown[]) => {
+    writes.push("registry");
+    return mockRegisterProfile(...args);
+  },
 }));
 
 // Mock readline
@@ -55,6 +73,9 @@ describe("runSetup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockAssertRegistryWritable.mockReset().mockResolvedValue(undefined);
+    mockRegisterProfile.mockReset().mockResolvedValue(undefined);
+    mockSaveToKeychain.mockReset().mockResolvedValue(undefined);
+    writes.length = 0;
     // mockClear / clearAllMocks does NOT drain the mockResolvedValueOnce queue
     // in vitest — stale "once" responses from earlier tests would otherwise be
     // consumed by the next test's first rl.question call. Explicitly reset.
@@ -371,7 +392,7 @@ describe("runSetup", () => {
       },
       "globex"
     );
-    expect(mockAddToProfileRegistry).toHaveBeenCalledWith("globex");
+    expect(mockRegisterProfile).toHaveBeenCalledWith("globex", { posture: "read-only" });
 
     process.stdin.on = originalOn;
   });
@@ -404,8 +425,7 @@ describe("runSetup", () => {
       expect(mockQuestion).not.toHaveBeenCalled();
       expect(mockReadFromKeychain).not.toHaveBeenCalled();
       expect(mockSaveToKeychain).not.toHaveBeenCalled();
-      expect(mockAddToProfileRegistry).not.toHaveBeenCalled();
-      expect(mockSetProfileSettings).not.toHaveBeenCalled();
+      expect(mockRegisterProfile).not.toHaveBeenCalled();
     });
 
     it("also without a profile name (setup checks the registry first in every mode)", async () => {
@@ -414,41 +434,89 @@ describe("runSetup", () => {
       expect(mockSaveToKeychain).not.toHaveBeenCalled();
     });
 
-    it("a registry broken during the prompts stops setup before saveToKeychain", async () => {
-      const err = await unreadable();
-      mockAssertRegistryWritable.mockResolvedValueOnce(undefined).mockRejectedValueOnce(err);
+    /** url, email, "scoped? n", the token, then posture "1"; connection ok. */
+    function siteAnswers(): () => void {
       mockQuestion
         .mockResolvedValueOnce("https://test.atlassian.net")
         .mockResolvedValueOnce("user@test.com")
-        .mockResolvedValueOnce("n");
+        .mockResolvedValueOnce("n")
+        .mockResolvedValueOnce("1");
       mockTestConnection.mockResolvedValueOnce({ ok: true, message: "Connected successfully." });
-      const restore = typeTok();
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      return typeTok();
+    }
+
+    it("writes the registry (name and posture, one write) before the keychain, after every prompt", async () => {
+      const restore = siteAnswers();
       try {
-        await expect(runSetup("globex")).rejects.toBe(err);
+        await runSetup("globex");
       } finally {
         restore();
       }
-      expect(mockAssertRegistryWritable).toHaveBeenCalledTimes(2);
-      expect(mockSaveToKeychain).not.toHaveBeenCalled();
+      expect(writes).toEqual(["registry", "keychain"]);
+      expect(mockRegisterProfile).toHaveBeenCalledTimes(1);
+      expect(mockRegisterProfile).toHaveBeenCalledWith("globex", { posture: "read-only" });
+      // The posture prompt (4th question) came before either write.
+      expect(mockQuestion).toHaveBeenCalledTimes(4);
       expect(mockAddToProfileRegistry).not.toHaveBeenCalled();
+      expect(mockSetProfileSettings).not.toHaveBeenCalled();
     });
 
-    it("without a profile the registry is not written, so the pre-save check is skipped", async () => {
+    it("a registry write that fails (broken during the prompts, lock held) leaves the keychain untouched", async () => {
+      const { RegistryWriteRefusedError, REGISTRY_BUSY } = await vi.importActual<
+        typeof import("../shared/profiles.js")
+      >("../shared/profiles.js");
+      for (const err of [await unreadable(), new RegistryWriteRefusedError(REGISTRY_BUSY, "busy; nothing was changed")]) {
+        mockRegisterProfile.mockRejectedValueOnce(err);
+        const restore = siteAnswers();
+        try {
+          await expect(runSetup("globex")).rejects.toBe(err);
+        } finally {
+          restore();
+        }
+      }
+      expect(mockSaveToKeychain).not.toHaveBeenCalled();
+    });
+
+    it("a keychain failure after the registry write says what changed, without the keychain tool's message", async () => {
+      mockSaveToKeychain.mockRejectedValueOnce(new Error("security: add-generic-password -w SECRET-TOKEN-JSON failed"));
+      const restore = siteAnswers();
+      let err: unknown;
+      try {
+        err = await runSetup("globex").catch((e: unknown) => e);
+      } finally {
+        restore();
+      }
+      const { describeCliError, PartialChangeError } = await import("./cli-errors.js");
+      expect(err).toBeInstanceOf(PartialChangeError);
+      const text = describeCliError(err)!;
+      expect(text).toContain('The profile registry now lists "globex" (posture: read-only)');
+      expect(text).toContain("saving the credentials to the OS keychain failed");
+      expect(text).toContain("run: epimethian-mcp setup --profile globex");
+      expect(text).not.toContain("nothing was changed");
+      expect(text).not.toContain("SECRET-TOKEN-JSON");
+    });
+
+    it("without a profile: no registry write, and a keychain failure names no token", async () => {
       mockQuestion
         .mockResolvedValueOnce("https://test.atlassian.net")
         .mockResolvedValueOnce("user@test.com")
         .mockResolvedValueOnce("n");
       mockTestConnection.mockResolvedValueOnce({ ok: true, message: "Connected successfully." });
       vi.spyOn(console, "log").mockImplementation(() => {});
+      mockSaveToKeychain.mockRejectedValueOnce(new Error("-w SECRET-TOKEN-JSON"));
       const restore = typeTok();
+      let err: unknown;
       try {
-        await runSetup(undefined, "claude-code");
+        err = await runSetup(undefined, "claude-code").catch((e: unknown) => e);
       } finally {
         restore();
       }
+      expect(mockRegisterProfile).not.toHaveBeenCalled();
       expect(mockAssertRegistryWritable).toHaveBeenCalledTimes(1);
-      expect(mockSaveToKeychain).toHaveBeenCalledTimes(1);
-      expect(mockAddToProfileRegistry).not.toHaveBeenCalled();
+      const { describeCliError } = await import("./cli-errors.js");
+      expect(describeCliError(err)).toMatch(/^Error: Saving the credentials to the OS keychain failed/);
+      expect(describeCliError(err)).not.toContain("SECRET-TOKEN-JSON");
     });
   });
 
@@ -485,7 +553,7 @@ describe("runSetup", () => {
     const logSpy = vi.spyOn(console, "log");
     await runSetup("acme");
 
-    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-only" });
+    expect(mockRegisterProfile).toHaveBeenCalledWith("acme", { posture: "read-only" });
     // The printed list is what a read-only site profile registers: no write tool.
     const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     const listLine = out.split("\n").find((l) => l.startsWith("Available tools"))!;
@@ -566,7 +634,7 @@ describe("runSetup", () => {
 
     await runSetup("acme");
 
-    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-write" });
+    expect(mockRegisterProfile).toHaveBeenCalledWith("acme", { posture: "read-write" });
 
     process.stdin.on = originalOn;
   });
@@ -597,7 +665,7 @@ describe("runSetup", () => {
     const logSpy = vi.spyOn(console, "log");
     await runSetup("acme");
 
-    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "detect" });
+    expect(mockRegisterProfile).toHaveBeenCalledWith("acme", { posture: "detect" });
     const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(out).toContain("Available tools depend on the startup probe (posture: detect).");
     expect(out).toMatch(/Only if the probe finds the token can write \(\d+ more\): .*create_page/);
@@ -633,7 +701,7 @@ describe("runSetup", () => {
     await runSetup("acme");
 
     // Verify setProfileSettings was called with the eventual valid choice
-    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-write" });
+    expect(mockRegisterProfile).toHaveBeenCalledWith("acme", { posture: "read-write" });
     // Verify rl.question was called 5 times (url, email, scoped?, invalid, retry)
     expect(mockQuestion).toHaveBeenCalledTimes(5);
 
@@ -666,7 +734,7 @@ describe("runSetup", () => {
 
     await runSetup("acme");
 
-    expect(mockSetProfileSettings).toHaveBeenCalledWith("acme", { posture: "read-only" });
+    expect(mockRegisterProfile).toHaveBeenCalledWith("acme", { posture: "read-only" });
 
     process.stdin.on = originalOn;
   });

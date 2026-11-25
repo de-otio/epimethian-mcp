@@ -501,12 +501,16 @@ export const REGISTRY_CHANGING = "REGISTRY_CHANGING";
 
 /** A CLI registry write was refused before anything was changed. */
 export class RegistryWriteRefusedError extends Error {
+  /** The reason as a clause without "nothing was changed", for callers that changed something earlier. */
+  readonly detail: string;
   constructor(
     readonly code: typeof REGISTRY_BUSY | typeof REGISTRY_CHANGING,
     message: string,
+    detail?: string,
   ) {
     super(message);
     this.name = "RegistryWriteRefusedError";
+    this.detail = detail ?? message;
   }
 }
 
@@ -623,6 +627,7 @@ async function acquireLock(lockPath: string): Promise<LockToken> {
       throw new RegistryWriteRefusedError(
         REGISTRY_BUSY,
         "Another epimethian-mcp command is changing the profile registry. Try again in a moment; nothing was changed.",
+        "another epimethian-mcp command was changing it",
       );
     }
     await env.sleep(LOCK_RETRY_MS);
@@ -777,6 +782,7 @@ async function commitRegistryChange(
             REGISTRY_CHANGING,
             `The profile registry ${displayPath(path)} kept changing while saving; nothing was changed. ` +
               "Try again when no editor is saving it.",
+            "it kept changing while saving (an editor may be saving it)",
           );
         }
       }
@@ -872,6 +878,21 @@ export async function setProfileSettings(
   settings: ProfileSettings
 ): Promise<void> {
   await updateProfileSettings(name, (prev) => ({ ...prev, ...settings }));
+}
+
+/**
+ * Add `name` (when not listed) and shallow-merge `settings` into its entry, in
+ * ONE registry write, so a profile is never listed without the settings setup
+ * chose for it (a missing posture would mean "detect"). Re-running setup on
+ * an existing profile keeps its other settings.
+ */
+export async function registerProfile(name: string, settings: ProfileSettings): Promise<void> {
+  await commitRegistryChange((prev) => {
+    const base = prev ?? EMPTY_REGISTRY;
+    const own = base.settings !== undefined && Object.hasOwn(base.settings, name) ? base.settings[name] : undefined;
+    const profiles = base.profiles.includes(name) ? base.profiles : [...base.profiles, name];
+    return withSettings({ ...base, profiles }, withProfileSettings(base.settings, name, { ...own, ...settings }));
+  });
 }
 
 /** Add a profile name to the registry (idempotent: no write when present). */

@@ -13,6 +13,7 @@ import {
   getProfileSettings,
   setProfileSettings,
 } from "../shared/profiles.js";
+import { PartialChangeError, registryFailureText } from "./cli-errors.js";
 
 export async function runProfiles(): Promise<void> {
   const args = process.argv.slice(3);
@@ -184,7 +185,24 @@ async function removeProfile(name: string, force: boolean): Promise<void> {
   // Again after the confirmation, right before the keychain changes.
   await assertRegistryWritable();
   await deleteFromKeychain(name);
-  await removeFromProfileRegistry(name);
-  await appendAuditLog(`Removed profile "${name}"`);
+  // From here on something has changed: report a failure with what did.
+  try {
+    await removeFromProfileRegistry(name);
+  } catch (err) {
+    throw new PartialChangeError(
+      `The credentials of profile "${name}" were deleted from the OS keychain`,
+      registryFailureText(err),
+      `The registry still lists "${name}". After the fix, run: epimethian-mcp profiles --remove ${name}`,
+    );
+  }
+  try {
+    await appendAuditLog(`Removed profile "${name}"`);
+  } catch {
+    throw new PartialChangeError(
+      `Profile "${name}" was removed (keychain entry and registry entry)`,
+      "the audit log line could not be written",
+      "Nothing else needs to be done.",
+    );
+  }
   console.log(`Profile "${name}" removed.`);
 }

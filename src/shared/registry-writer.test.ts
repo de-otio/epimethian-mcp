@@ -33,6 +33,7 @@ import {
   setProfileSettings,
   updateProfileSettings,
   writeWithAnchor,
+  registerProfile,
   readRegistry,
   serializeRegistry,
   RegistryUnreadableError,
@@ -160,6 +161,7 @@ const WRITERS: readonly (readonly [string, () => Promise<unknown>])[] = [
   ["setProfileSettings", () => setProfileSettings("work", { readOnly: true })],
   ["updateProfileSettings", () => updateProfileSettings("work", () => undefined)],
   ["writeWithAnchor", () => writeWithAnchor((r) => ({ ...(r ?? { profiles: [], extra: {} }), profiles: ["x"] }), { kind: "other" })],
+  ["registerProfile", () => registerProfile("added", { posture: "read-only" })],
 ];
 
 posixOnly("0-T2 every writer refuses on every unreadable kind; nothing changes", () => {
@@ -507,5 +509,44 @@ posixOnly("0-T11 durability (writer core)", () => {
     const text = serializeRegistry({ profiles: ["a"], settings: { a: { readOnly: true } }, extra: { z: 1, b: [2] } });
     expect(Object.keys(JSON.parse(text))).toEqual(["profiles", "settings", "z", "b"]);
     expect(text.endsWith("}\n")).toBe(true);
+  });
+});
+
+posixOnly("registerProfile (setup: name and settings in one write)", () => {
+  it("adds the name and its settings in a single write (one rename)", async () => {
+    await writeFile(registryPath, regText({ profiles: ["a"] }), { mode: 0o600 });
+    const renames: string[] = [];
+    const realRename = fs.promises.rename;
+    vi.spyOn(fs.promises, "rename").mockImplementation(async (a, b) => {
+      renames.push(String(b));
+      return realRename(a, b);
+    });
+    await registerProfile("b", { posture: "read-only" });
+    expect(renames.filter((r) => r === registryPath)).toHaveLength(1);
+    expect(JSON.parse(await readFile(registryPath, "utf-8"))).toEqual({
+      profiles: ["a", "b"],
+      settings: { b: { posture: "read-only" } },
+    });
+  });
+
+  it("re-running on an existing profile merges: other settings kept, name not duplicated", async () => {
+    await writeFile(
+      registryPath,
+      regText({ profiles: ["a"], settings: { a: { posture: "read-write", spaces: ["DEV"], attribution: false } } }),
+      { mode: 0o600 },
+    );
+    await registerProfile("a", { posture: "read-only" });
+    expect(JSON.parse(await readFile(registryPath, "utf-8"))).toEqual({
+      profiles: ["a"],
+      settings: { a: { posture: "read-only", spaces: ["DEV"], attribution: false } },
+    });
+  });
+
+  it("creates the registry when absent", async () => {
+    await registerProfile("first", { posture: "detect" });
+    expect(JSON.parse(await readFile(registryPath, "utf-8"))).toEqual({
+      profiles: ["first"],
+      settings: { first: { posture: "detect" } },
+    });
   });
 });

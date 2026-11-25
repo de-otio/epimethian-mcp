@@ -43,11 +43,24 @@ vi.mock("../shared/keychain.js", async (importOriginal) => {
 const mockAddToProfileRegistry = vi.fn().mockResolvedValue(undefined);
 const mockSetProfileSettings = vi.fn().mockResolvedValue(undefined);
 const mockAssertRegistryWritable = vi.fn().mockResolvedValue(undefined);
-vi.mock("../shared/profiles.js", () => ({
+vi.mock("../shared/profiles.js", async (importOriginal) => ({
+  // The real error classes and describeUnreadable (used by cli-errors.ts).
+  ...(({ RegistryUnreadableError, RegistryWriteRefusedError, REGISTRY_BUSY, REGISTRY_CHANGING, describeUnreadable }) => ({
+    RegistryUnreadableError,
+    RegistryWriteRefusedError,
+    REGISTRY_BUSY,
+    REGISTRY_CHANGING,
+    describeUnreadable,
+  }))(await importOriginal<typeof import("../shared/profiles.js")>()),
   addToProfileRegistry: (...a: unknown[]) => mockAddToProfileRegistry(...a),
   setProfileSettings: (...a: unknown[]) => mockSetProfileSettings(...a),
   assertRegistryWritable: (...a: unknown[]) => mockAssertRegistryWritable(...a),
+  registerProfile: (...a: unknown[]) => {
+    calls.push("registry");
+    return mockRegisterProfile(...a);
+  },
 }));
+const mockRegisterProfile = vi.fn().mockResolvedValue(undefined);
 
 const mockQuestion = vi.fn();
 vi.mock("node:readline/promises", () => ({
@@ -82,6 +95,8 @@ function answers(...rest: string[]): void {
 beforeEach(() => {
   vi.clearAllMocks();
   mockAssertRegistryWritable.mockReset().mockResolvedValue(undefined);
+  mockRegisterProfile.mockReset().mockResolvedValue(undefined);
+  mockSaveToKeychain.mockReset().mockResolvedValue(undefined);
   mockQuestion.mockReset();
   mockTestConnection.mockReset().mockResolvedValue({ ok: true, message: "Connected successfully." });
   mockFetchTenantInfo
@@ -114,7 +129,7 @@ describe("gateway setup", () => {
     await runSetup("gw-test");
 
     // No credentialed call before the tenant is confirmed; the probe comes before the save.
-    expect(calls).toEqual(["fetchTenantInfo", "testConnection", "probeWriteScope", "save"]);
+    expect(calls).toEqual(["fetchTenantInfo", "testConnection", "probeWriteScope", "registry", "save"]);
     expect(mockFetchTenantInfo).toHaveBeenCalledWith(URL_, "user@example.com", "scoped-token", {
       authenticated: false,
     });
@@ -132,7 +147,8 @@ describe("gateway setup", () => {
       },
       "gw-test",
     );
-    expect(mockSetProfileSettings).toHaveBeenCalledWith("gw-test", { posture: "read-only" });
+    expect(mockRegisterProfile).toHaveBeenCalledWith("gw-test", { posture: "read-only" });
+    expect(mockRegisterProfile).toHaveBeenCalledTimes(1);
     const out = logs.join("\n");
     expect(out).toContain("read:page:confluence");
     expect(out).toContain("the write scopes are not yet verified");
@@ -193,17 +209,29 @@ describe("gateway setup", () => {
     expect(mockSaveToKeychain).not.toHaveBeenCalled();
   });
 
-  it("0-T6: a registry broken during the gateway prompts stops before saveToKeychain", async () => {
+  it("a registry write that fails after the prompts leaves the keychain untouched", async () => {
     const { RegistryUnreadableError } = await vi.importActual<typeof import("../shared/profiles.js")>(
       "../shared/profiles.js",
     );
     const err = new RegistryUnreadableError({ kind: "parse-error" }, "/x/profiles.json");
-    mockAssertRegistryWritable.mockResolvedValueOnce(undefined).mockRejectedValueOnce(err);
+    mockRegisterProfile.mockRejectedValueOnce(err);
     answers("y", "y", "", "1");
     await expect(runSetup("gw-test")).rejects.toBe(err);
-    expect(calls).toEqual(["fetchTenantInfo", "testConnection", "probeWriteScope"]);
+    expect(calls).toEqual(["fetchTenantInfo", "testConnection", "probeWriteScope", "registry"]);
     expect(mockSaveToKeychain).not.toHaveBeenCalled();
-    expect(mockAddToProfileRegistry).not.toHaveBeenCalled();
+  });
+
+  it("a keychain failure after the registry write says what changed and names no token", async () => {
+    mockSaveToKeychain.mockRejectedValueOnce(new Error("add-generic-password -w scoped-token"));
+    answers("y", "y", "", "2");
+    const err = await runSetup("gw-test").catch((e: unknown) => e);
+    const { describeCliError, PartialChangeError } = await import("./cli-errors.js");
+    expect(err).toBeInstanceOf(PartialChangeError);
+    const text = describeCliError(err)!;
+    expect(text).toContain('The profile registry now lists "gw-test" (posture: read-write)');
+    expect(text).not.toContain("nothing was changed");
+    expect(text).not.toContain("scoped-token");
+    expect(calls).toEqual(["fetchTenantInfo", "testConnection", "registry", "save"]);
   });
 
   it("a gateway connection failure saves nothing", async () => {
