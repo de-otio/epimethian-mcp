@@ -32,6 +32,7 @@ import {
   getSpaceKeyById,
 } from "./confluence-client.js";
 import type { Config, ContentType, PageData } from "./confluence-client.js";
+import { getProfileRegistryPath, homeRelativePath } from "../shared/profiles.js";
 
 /** Error code thrown when a tool targets a space outside the allowlist. */
 export const SPACE_NOT_ALLOWED = "SPACE_NOT_ALLOWED";
@@ -41,12 +42,14 @@ export class SpaceNotAllowedError extends Error {
   readonly spaceKey: string;
   readonly allowed: readonly string[];
   constructor(spaceKey: string, allowed: readonly string[]) {
+    // No CLI command edits `spaces` in 7.6.1; name the setting and the file
+    // (0-D5). The space key is the resolved target, as before.
     super(
       `Space "${spaceKey}" is not in this profile's allowlist ` +
         `[${allowed.join(", ") || "(empty — no writes permitted)"}]. ` +
-        `Either configure this space into the profile's \`spaces\` list ` +
-        `(CLI: \`epimethian-mcp profiles --add-space ${spaceKey}\`) or ` +
-        `retarget the operation to an allowed space.`,
+        `Either retarget the operation to an allowed space, or ask the user to add ` +
+        `"${spaceKey}" to the profile's \`spaces\` setting in ${homeRelativePath(getProfileRegistryPath())} ` +
+        `and restart the MCP client.`,
     );
     this.name = "SpaceNotAllowedError";
     this.spaceKey = spaceKey;

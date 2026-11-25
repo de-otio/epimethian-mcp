@@ -415,6 +415,10 @@ export function profileSettingsOf(read: RegistryRead, name: string): ProfileSett
 }
 
 /** `~/…` for paths under the home directory, so agent-facing text names no user directory. */
+export function homeRelativePath(path: string): string {
+  return displayPath(path);
+}
+
 function displayPath(path: string): string {
   const home = homedir();
   return path.startsWith(home + sep) ? `~${path.slice(home.length)}` : path;

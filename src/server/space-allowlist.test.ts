@@ -251,3 +251,23 @@ describe("resolvePageSpace (F3)", () => {
     expect(await resolvePageSpace("1")).toBeUndefined();
   });
 });
+
+describe("SpaceNotAllowedError message (0-D5)", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("names the spaces setting and the registry file, and no CLI flag that does not exist", () => {
+    vi.stubEnv("HOME", "/home/u");
+    const msg = new SpaceNotAllowedError("HR", ["DEV", "DOCS"]).message;
+    expect(msg).toContain('Space "HR" is not in this profile\'s allowlist [DEV, DOCS]');
+    expect(msg).toContain("`spaces` setting in ~/.config/epimethian-mcp/profiles.json");
+    expect(msg).toContain("restart the MCP client");
+    expect(msg).not.toContain("--add-space");
+    expect(msg).not.toMatch(/epimethian-mcp \w/);
+  });
+
+  it("an empty allowlist still says no writes are permitted", () => {
+    expect(new SpaceNotAllowedError("HR", []).message).toContain("(empty — no writes permitted)");
+  });
+});
