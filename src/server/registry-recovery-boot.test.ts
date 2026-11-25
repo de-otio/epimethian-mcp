@@ -107,6 +107,10 @@ describe("0-T5 main() with a syntax-error registry", () => {
     expect(text.startsWith("Withheld [REGISTRY_UNREADABLE]: ")).toBe(true);
     expect(text).not.toContain(CANARY);
     expect(boot.fetches).toBe(0);
+    // Recovery mode starts no update check and reads no pending-update record.
+    const updates = await import("../shared/update-check.js");
+    expect(updates.checkForUpdates).not.toHaveBeenCalled();
+    expect(updates.getPendingUpdate).not.toHaveBeenCalled();
     await client.close();
   });
 });

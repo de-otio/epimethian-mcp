@@ -245,6 +245,18 @@ describe("parseRegistryText: parse-error position", () => {
     expect(r).toEqual({ ok: false, reason: { kind: "parse-error" } });
   });
 
+  it("position text inside the quoted file content is not taken as the position (anchored)", () => {
+    const spy = vi.spyOn(JSON, "parse");
+    spy.mockImplementationOnce(() => {
+      throw new SyntaxError(`Unexpected token 'x', ..."(line 9 column 9) x"... is not valid JSON`);
+    });
+    expect(parseRegistryText("x")).toEqual({ ok: false, reason: { kind: "parse-error" } });
+    spy.mockImplementationOnce(() => {
+      throw new SyntaxError(`Unexpected token 'x', ..."at position 3 x"... is not valid JSON`);
+    });
+    expect(parseRegistryText("x")).toEqual({ ok: false, reason: { kind: "parse-error" } });
+  });
+
   it("a non-Error throw is still a parse error without a position", () => {
     vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
       throw "weird";

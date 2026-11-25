@@ -20,6 +20,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const CANARY = "CANARY-c4n4ry-9f1e";
+/**
+ * Short enough that V8 quotes all of it in its SyntaxError message (Node 20+
+ * quotes about ten characters around the error), so forwarding err.message
+ * anywhere would make these tests fail.
+ */
+const SHORT_CANARY = "CNRY7q";
+const QUOTED_TEXT = `{"profiles": ["work"], "x": t${SHORT_CANARY}}`;
 
 vi.mock("./keychain.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./keychain.js")>();
@@ -83,6 +90,13 @@ const CASES: readonly Case[] = [
     },
     kind: "parse-error",
     extra: { line: 3, column: 1 },
+  },
+  {
+    name: "an unexpected token whose V8 message quotes the file content",
+    arrange: async () => {
+      await writeFile(registryPath, QUOTED_TEXT, { mode: 0o600 });
+    },
+    kind: "parse-error",
   },
   {
     name: "an empty file (syntax error without a position)",
@@ -167,7 +181,12 @@ function expectNoCanary(value: unknown): void {
       ? value
       : JSON.stringify(value, (_k, v: unknown) => (typeof v === "bigint" ? v.toString() : v));
   expect(text).not.toContain(CANARY);
+  expect(text).not.toContain(SHORT_CANARY);
 }
+
+it("precondition: V8's message for QUOTED_TEXT contains the short canary", () => {
+  expect(() => JSON.parse(QUOTED_TEXT)).toThrow(SHORT_CANARY);
+});
 
 posixOnly("0-T1 registry fails closed", () => {
   beforeEach(async () => {

@@ -404,9 +404,11 @@ export function parseRegistryText(
 
 function positionOf(err: unknown, raw: string): { line?: number; column?: number } {
   const message = err instanceof Error ? err.message : "";
-  const lc = /\(line (\d{1,9}) column (\d{1,9})\)/.exec(message);
+  // Anchored: V8 appends "(line N column M)" at the end; the same text earlier in
+  // the message could come from the quoted file content.
+  const lc = /\(line (\d{1,9}) column (\d{1,9})\)$/.exec(message);
   if (lc) return { line: Number(lc[1]), column: Number(lc[2]) };
-  const pos = /at position (\d{1,9})/.exec(message);
+  const pos = /at position (\d{1,9})(?: \(line \d{1,9} column \d{1,9}\))?$/.exec(message);
   if (pos) {
     const offset = Number(pos[1]);
     if (offset <= raw.length) {

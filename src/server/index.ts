@@ -175,6 +175,7 @@ import { planUpdate } from "./converter/update-orchestrator.js";
 import { tokeniseStorage } from "./converter/tokeniser.js";
 import { resolveToolFilter } from "./tool-allowlist.js";
 import { readOnlyTool, writeTool, destructiveTool, LARGE_READ_RESULT_CHARS } from "./tool-meta.js";
+import { PROFILE_NAME_RE } from "../shared/keychain.js";
 import {
   getProfileSettings,
   profileSettingsOf,
@@ -6392,6 +6393,21 @@ export async function main() {
   // problem and the fix (fail closed, 0-D3).
   const profileEnv = process.env.CONFLUENCE_PROFILE || "";
   const registry = profileEnv ? await readRegistry() : undefined;
+  const startRegistryRecovery = async (r: Extract<RegistryRead, { state: "unreadable" }>): Promise<void> => {
+    const { what, fix } = describeUnreadable(
+      r.reason,
+      r.path,
+      profileEnv,
+      r.backup !== undefined ? { path: r.backup, fitsAnchor: undefined } : undefined,
+    );
+    await startRecoveryServer(profileEnv, { kind: "registry-unreadable", what, fix });
+  };
+  // Before any keychain read: recovery mode never loads the token. An
+  // invalid profile name falls through to getConfig, which reports it.
+  if (registry?.state === "unreadable" && PROFILE_NAME_RE.test(profileEnv)) {
+    await startRegistryRecovery(registry);
+    return;
+  }
   let config: Config;
   try {
     config = await getConfig({ registry });
@@ -6401,14 +6417,14 @@ export async function main() {
       return;
     }
     if (err instanceof RegistryUnreadableError) {
-      // profileEnv passed resolveCredentials' name check before this throw.
-      const { what, fix } = describeUnreadable(
-        err.reason,
-        err.path,
-        profileEnv,
-        err.backup !== undefined ? { path: err.backup, fitsAnchor: undefined } : undefined,
-      );
-      await startRecoveryServer(profileEnv, { kind: "registry-unreadable", what, fix });
+      // Not reached with the startup read above; kept for a read made inside getConfig.
+      await startRegistryRecovery({
+        state: "unreadable",
+        reason: err.reason,
+        path: err.path,
+        backup: err.backup,
+        observed: "absent",
+      });
       return;
     }
     throw err;

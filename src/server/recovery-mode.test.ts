@@ -217,6 +217,30 @@ describe("main() with an unreadable registry (0-T4)", () => {
     expect(r.text).not.toContain(home);
   });
 
+  it("a syntax error whose V8 message quotes the file: the quoted text never appears", async () => {
+    const SHORT = "CNRY8w";
+    const text = `{"profiles": ["work"], "x": t${SHORT}}`;
+    expect(() => JSON.parse(text)).toThrow(SHORT); // precondition: V8 quotes it
+    const r = await bootWith(() => writeFile(registry(), text, { mode: 0o600 }));
+    expect(r.serverName).toBe("confluence-work-config-error");
+    for (const v of Object.values(r)) expect(v).not.toContain(SHORT);
+  });
+
+  it("recovery mode never reads the keychain (the token is not loaded)", async () => {
+    await bootWith(() => writeFile(registry(), "{", { mode: 0o600 }));
+    expect(mockReadFromKeychain).not.toHaveBeenCalled();
+  });
+
+  it("an unreadable registry wins over a missing keychain entry", async () => {
+    process.env.CONFLUENCE_PROFILE = "work";
+    mockReadFromKeychain.mockResolvedValue(null);
+    await writeFile(registry(), "{", { mode: 0o600 });
+    const { main } = await importIndex();
+    await main();
+    expect(mockMcpServer.mock.calls[0][0].name).toBe("confluence-work-config-error");
+    expect(mockReadFromKeychain).not.toHaveBeenCalled();
+  });
+
   it("with a .bak present: the .bak clause is appended to the fix line", async () => {
     const r = await bootWith(async () => {
       await writeFile(registry(), `{"profiles": "${CANARY}"}`, { mode: 0o600 });
