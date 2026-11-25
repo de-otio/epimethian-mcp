@@ -21,8 +21,10 @@ import {
 } from "./profiles.js";
 
 const posixOnly = process.platform === "win32" ? describe.skip : describe;
+// 02 §1.1's text plus the lock path and the way out (W-REVIEW-0; deliberate deviation).
 const LOCK_MESSAGE =
-  "Another epimethian-mcp command is changing the profile registry. Try again in a moment; nothing was changed.";
+  "Another epimethian-mcp command is changing the profile registry (lock file ~/.config/epimethian-mcp/profiles.json.lock). " +
+  "Try again in a moment; nothing was changed. If no other epimethian-mcp command is running, delete that file and try again.";
 
 let home: string;
 let configDir: string;
@@ -98,7 +100,7 @@ posixOnly("0-T12 lock", () => {
       },
     });
     await addToProfileRegistry("a");
-    expect(seen).toBe(`4242\n${new Date(clock).toISOString()}\n`);
+    expect(seen).toMatch(new RegExp(`^4242\\n${new Date(clock).toISOString().replace(/\./g, "\\.")}\\n[0-9a-f]{32}\\n$`));
     expect(mode).toBe(0o600);
   });
 
@@ -199,6 +201,17 @@ posixOnly("0-T12 lock", () => {
     await addToProfileRegistry("x");
     expect(await readFile(target, "utf-8")).toBe("TARGET");
     expect((await current()).profiles).toEqual(["start", "x"]);
+  });
+
+  it("only its own lock is released: a lock rewritten in place (same inode, other nonce) stays", async () => {
+    _setRegistryWriterEnvForTests({
+      beforeCompare: async () => {
+        // Same inode, other content: what inode reuse looks like to an inode-only check.
+        await writeFile(lockPath, `7777\n2026-01-01T00:00:00.000Z\n${"a".repeat(32)}\n`);
+      },
+    });
+    await addToProfileRegistry("x");
+    expect(await readFile(lockPath, "utf-8")).toContain("7777");
   });
 
   it("only its own lock is released: a lock replaced during the write stays", async () => {
@@ -360,5 +373,88 @@ posixOnly("0-T12 default pid liveness (process.kill(pid, 0))", () => {
     await writeFile(lockPath, "1\n", { mode: 0o600 });
     await age(lockPath, 10 * 60_000);
     await expect(addToProfileRegistry("x")).rejects.toMatchObject({ code: REGISTRY_BUSY });
+  });
+});
+
+posixOnly("0-T12 stale-lock breakers are serialised (W-REVIEW-0 finding 2)", () => {
+  function realtimeSleep(): void {
+    _setRegistryWriterEnvForTests({
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        await new Promise((r) => setTimeout(r, 5));
+      },
+    });
+  }
+
+  it("two breakers of one stale lock never both hold the lock", async () => {
+    realtimeSleep();
+    await writeFile(lockPath, `999\n2020-01-01T00:00:00.000Z\n`, { mode: 0o600 });
+    await age(lockPath, 61_000);
+
+    // Breaker A pauses just before it would remove the stale lock, until a
+    // writer is inside the critical section or 150 ms have passed.
+    let releaseA: () => void = () => {};
+    const gateA = new Promise<void>((r) => {
+      releaseA = r;
+      setTimeout(r, 150);
+    });
+    let aPaused: () => void = () => {};
+    const aIsPaused = new Promise<void>((r) => (aPaused = r));
+    let pauses = 0;
+    let inside = 0;
+    let maxInside = 0;
+    _setRegistryWriterEnvForTests({
+      beforeStaleUnlink: async () => {
+        if (pauses++ === 0) {
+          aPaused();
+          await gateA;
+        }
+      },
+      beforeCompare: async () => {
+        inside++;
+        maxInside = Math.max(maxInside, inside);
+        releaseA();
+        await new Promise((r) => setTimeout(r, 40));
+        inside--;
+      },
+    });
+
+    const a = addToProfileRegistry("a");
+    await aIsPaused;
+    const b = addToProfileRegistry("b");
+    await Promise.all([a, b]);
+
+    expect(maxInside).toBe(1);
+    expect([...(await current()).profiles].sort()).toEqual(["a", "b", "start"]);
+    expect(warnings.filter((w) => w.includes("stale lock"))).toHaveLength(1);
+    expect((await readdir(configDir)).filter((n) => n.includes(".lock"))).toEqual([]);
+  });
+
+  it("a break file left by a crashed breaker (older than 10 s, dead pid) is cleared", async () => {
+    await writeFile(lockPath, `999\n`, { mode: 0o600 });
+    await age(lockPath, 61_000);
+    await writeFile(`${lockPath}.break`, `998\n`, { mode: 0o600 });
+    await age(`${lockPath}.break`, 11_000);
+    await addToProfileRegistry("x");
+    expect((await current()).profiles).toEqual(["start", "x"]);
+    expect((await readdir(configDir)).filter((n) => n.includes(".lock"))).toEqual([]);
+  });
+
+  it("a live breaker's break file is respected: no takeover, refusal after 5 s", async () => {
+    await writeFile(lockPath, `999\n`, { mode: 0o600 });
+    await age(lockPath, 61_000);
+    await writeFile(`${lockPath}.break`, `4242\n`, { mode: 0o600 }); // pid alive
+    await age(`${lockPath}.break`, 60_000);
+    await expect(addToProfileRegistry("x")).rejects.toMatchObject({ code: REGISTRY_BUSY });
+    expect(await readFile(lockPath, "utf-8")).toBe("999\n");
+    expect(await readFile(`${lockPath}.break`, "utf-8")).toBe("4242\n");
+  });
+
+  it("the refusal names the lock file and the way out", async () => {
+    await writeFile(lockPath, `4242\n`, { mode: 0o600 });
+    const err = (await addToProfileRegistry("x").catch((e: unknown) => e)) as RegistryWriteRefusedError;
+    expect(err.message).toBe(LOCK_MESSAGE);
+    expect(err.detail).toContain("profiles.json.lock");
+    expect(err.detail).not.toContain("nothing was changed");
   });
 });

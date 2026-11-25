@@ -2,6 +2,7 @@ import { mkdir, lstat, type FileHandle } from "node:fs/promises";
 import { promises as fsPromises, constants as fsConstants, type BigIntStats } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
 import {
   safeOpenAppend,
   safeOpenReadWithStat,
@@ -537,8 +538,12 @@ interface RegistryWriterEnv {
   readonly isPidAlive: (pid: number) => boolean;
   readonly sleep: (ms: number) => Promise<void>;
   readonly warn: (message: string) => void;
+  /** Nonces for the lock and break files (32 hex characters). */
+  readonly randomHex: () => string;
   /** Test seam: runs just before the pre-rename lstat compare; `attempt` is 0-based. */
   readonly beforeCompare?: (attempt: number) => Promise<void>;
+  /** Test seam: runs while holding the break lock, just before the stale main lock is re-checked and removed. */
+  readonly beforeStaleUnlink?: () => Promise<void>;
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -559,6 +564,7 @@ const DEFAULT_WRITER_ENV: RegistryWriterEnv = {
   isPidAlive: defaultIsPidAlive,
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   warn: (message) => console.error(message),
+  randomHex: () => randomBytes(16).toString("hex"),
 };
 
 // Mutable on purpose: replaced only by tests (house contract _resetForTests).
@@ -592,110 +598,189 @@ export function serializeRegistry(r: Registry): string {
 /** Thrown inside the pre-rename hook when the file is not the one that was read. */
 class ChangedDuringWrite extends Error {}
 
+/** Identifies our own lock file by content, not inode (inodes are reused). */
 interface LockToken {
-  readonly ino: bigint;
+  readonly nonce: string;
 }
 
-/** Step 1: O_EXCL lock file holding pid and ISO time; 50 ms retries for up to 5 s. */
+/** A crashed stale-lock breaker's `.break` file is cleared after this long, once its pid is dead. */
+const BREAK_STALE_MS = 10_000;
+
+/** What a lock file looked like: identity (inode, mtime, content) and liveness facts. */
+interface LockFileView {
+  readonly ino: bigint;
+  readonly mtimeNs: bigint;
+  readonly content: string;
+}
+
+/** lstat plus up to 256 bytes of content (O_NOFOLLOW: a symlink reads as ""). undefined when absent. */
+async function inspectLock(path: string): Promise<LockFileView | undefined> {
+  let st: BigIntStats;
+  try {
+    st = await fsPromises.lstat(path, { bigint: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+  let content = "";
+  if (st.isFile()) {
+    try {
+      const handle = await fsPromises.open(
+        path,
+        fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
+      );
+      try {
+        const { buffer, bytesRead } = await handle.read(Buffer.alloc(256), 0, 256, 0);
+        content = buffer.subarray(0, bytesRead).toString("latin1");
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      content = "";
+    }
+  }
+  return { ino: st.ino, mtimeNs: st.mtimeNs, content };
+}
+
+/** Pid on the first line, or undefined (unparseable: counts as not alive). */
+function lockPid(content: string): number | undefined {
+  const first = content.split("\n")[0] ?? "";
+  return /^[1-9][0-9]{0,9}$/.test(first) ? Number(first) : undefined;
+}
+
+/** Nonce on the third line, or undefined. */
+function lockNonce(content: string): string | undefined {
+  const third = content.split("\n")[2] ?? "";
+  return /^[0-9a-f]{32}$/.test(third) ? third : undefined;
+}
+
+function sameLockFile(a: LockFileView, b: LockFileView): boolean {
+  return a.ino === b.ino && a.mtimeNs === b.mtimeNs && a.content === b.content;
+}
+
+/** Older than `maxAgeMs` by the injected clock and its pid not alive. */
+function isStale(view: LockFileView, maxAgeMs: number): boolean {
+  const ageMs = writerEnv.now() - Number(view.mtimeNs / 1_000_000n);
+  if (ageMs <= maxAgeMs) return false;
+  const pid = lockPid(view.content);
+  return pid === undefined || !writerEnv.isPidAlive(pid);
+}
+
+/**
+ * Creates `path` with O_CREAT|O_EXCL|O_NOFOLLOW 0600 holding
+ * "<pid>\n<ISO time>\n<nonce>\n". false when it already exists. A failure
+ * after the create removes the file again.
+ */
+async function createLockFile(path: string, nonce: string): Promise<boolean> {
+  const env = writerEnv;
+  let handle: FileHandle;
+  try {
+    handle = await fsPromises.open(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  }
+  try {
+    await handle.writeFile(`${env.pid}\n${new Date(env.now()).toISOString()}\n${nonce}\n`);
+  } catch (err) {
+    await handle.close().catch(() => {});
+    await fsPromises.unlink(path).catch(() => {});
+    throw err;
+  }
+  await handle.close();
+  return true;
+}
+
+/** Removes `path` only if it still holds `nonce` (never another process's file). */
+async function removeIfOurs(path: string, nonce: string): Promise<void> {
+  try {
+    const view = await inspectLock(path);
+    if (view !== undefined && lockNonce(view.content) === nonce) await fsPromises.unlink(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      writerEnv.warn(`epimethian-mcp: could not remove the lock ${displayPath(path)} (${errnoOf(err)}).`);
+    }
+  }
+}
+
+/** Step 1: O_EXCL lock file holding pid, ISO time and a nonce; 50 ms retries for up to 5 s. */
 async function acquireLock(lockPath: string): Promise<LockToken> {
   const env = writerEnv;
-  const flags =
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
+  const nonce = env.randomHex();
   const start = env.now();
   for (;;) {
-    let handle: FileHandle | undefined;
-    try {
-      handle = await fsPromises.open(lockPath, flags, 0o600);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    }
-    if (handle !== undefined) {
-      try {
-        await handle.writeFile(`${env.pid}\n${new Date(env.now()).toISOString()}\n`);
-        return { ino: (await handle.stat({ bigint: true })).ino };
-      } catch (err) {
-        await handle.close().catch(() => {});
-        handle = undefined;
-        await fsPromises.unlink(lockPath).catch(() => {});
-        throw err;
-      } finally {
-        await handle?.close();
-      }
-    }
-    if (await removeIfStale(lockPath)) continue;
+    if (await createLockFile(lockPath, nonce)) return { nonce };
+    if (await breakIfStale(lockPath)) continue;
     if (env.now() - start >= LOCK_WAIT_MS) {
+      const where = displayPath(lockPath);
       throw new RegistryWriteRefusedError(
         REGISTRY_BUSY,
-        "Another epimethian-mcp command is changing the profile registry. Try again in a moment; nothing was changed.",
-        "another epimethian-mcp command was changing it",
+        `Another epimethian-mcp command is changing the profile registry (lock file ${where}). ` +
+          "Try again in a moment; nothing was changed. " +
+          "If no other epimethian-mcp command is running, delete that file and try again.",
+        `another epimethian-mcp command holds its lock (${where}); if none is running, delete that file`,
       );
     }
     await env.sleep(LOCK_RETRY_MS);
   }
 }
 
-/** The pid on the lock's first line, or undefined (unparseable, unreadable, not a file). */
-async function readLockPid(lockPath: string): Promise<number | undefined> {
-  try {
-    const handle = await fsPromises.open(
-      lockPath,
-      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
-    );
-    try {
-      if (!(await handle.stat()).isFile()) return undefined;
-      const { buffer, bytesRead } = await handle.read(Buffer.alloc(64), 0, 64, 0);
-      const first = buffer.subarray(0, bytesRead).toString("latin1").split("\n")[0] ?? "";
-      return /^[1-9][0-9]{0,9}$/.test(first) ? Number(first) : undefined;
-    } finally {
-      await handle.close();
-    }
-  } catch {
-    return undefined;
-  }
-}
-
 /**
- * Removes a lock older than 60 s whose pid is not alive (an unparseable pid
- * counts as not alive). A live pid, even a reused one, is never removed. The
- * lock is re-lstat'ed just before the unlink and left alone if it changed.
- * Returns true when the caller should retry at once (removed, or gone).
+ * Removes the main lock when it is older than 60 s and its pid is not alive
+ * (an unparseable pid counts as not alive; a live pid, even a reused one, is
+ * never removed). Breakers are serialised by `profiles.json.lock.break`
+ * (O_EXCL, same format): only its holder may unlink the main lock, and it
+ * re-checks, under the break lock, that the main lock is still the same
+ * stale file (inode, mtime and content). So two breakers can never remove
+ * each other's fresh lock. A break file older than 10 s whose pid is dead
+ * (a breaker that crashed) is removed. Returns true when the caller should
+ * retry at once (removed, or gone).
  */
-async function removeIfStale(lockPath: string): Promise<boolean> {
+async function breakIfStale(lockPath: string): Promise<boolean> {
   const env = writerEnv;
-  let seen: BigIntStats;
-  try {
-    seen = await fsPromises.lstat(lockPath, { bigint: true });
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "ENOENT";
+  const seen = await inspectLock(lockPath);
+  if (seen === undefined) return true;
+  if (!isStale(seen, LOCK_STALE_MS)) return false;
+
+  const breakPath = `${lockPath}.break`;
+  const breakNonce = env.randomHex();
+  if (!(await createLockFile(breakPath, breakNonce))) {
+    const other = await inspectLock(breakPath);
+    if (other !== undefined && isStale(other, BREAK_STALE_MS)) {
+      const again = await inspectLock(breakPath);
+      if (again !== undefined && sameLockFile(again, other)) await fsPromises.unlink(breakPath).catch(() => {});
+    }
+    return false;
   }
-  const ageMs = env.now() - Number(seen.mtimeNs / 1_000_000n);
-  if (ageMs <= LOCK_STALE_MS) return false;
-  const pid = await readLockPid(lockPath);
-  if (pid !== undefined && env.isPidAlive(pid)) return false;
   try {
-    const again = await fsPromises.lstat(lockPath, { bigint: true });
-    if (again.ino !== seen.ino || again.mtimeNs !== seen.mtimeNs) return false;
-    await fsPromises.unlink(lockPath);
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "ENOENT";
+    await env.beforeStaleUnlink?.();
+    const now = await inspectLock(lockPath);
+    if (now === undefined) return true;
+    if (!sameLockFile(now, seen) || !isStale(now, LOCK_STALE_MS)) return false;
+    try {
+      await fsPromises.unlink(lockPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      return true;
+    }
+    const pid = lockPid(seen.content);
+    env.warn(
+      `epimethian-mcp: removed a stale lock ${displayPath(lockPath)} ` +
+        `(left by process ${pid ?? "unknown"}, which is no longer running).`,
+    );
+    return true;
+  } finally {
+    await removeIfOurs(breakPath, breakNonce);
   }
-  env.warn(
-    `epimethian-mcp: removed a stale lock ${displayPath(lockPath)} ` +
-      `(left by process ${pid ?? "unknown"}, which is no longer running).`,
-  );
-  return true;
 }
 
-/** Released in `finally`; only our own lock (same inode) is removed. */
+/** Released in `finally`; only our own lock (same nonce) is removed. */
 async function releaseLock(lockPath: string, token: LockToken): Promise<void> {
-  try {
-    const st = await fsPromises.lstat(lockPath, { bigint: true });
-    if (st.ino === token.ino) await fsPromises.unlink(lockPath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      writerEnv.warn(`epimethian-mcp: could not remove the lock ${displayPath(lockPath)} (${errnoOf(err)}).`);
-    }
-  }
+  await removeIfOurs(lockPath, token.nonce);
 }
 
 /** Step 2: removes our own temp names older than one hour (left by a crash). */
