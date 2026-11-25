@@ -21,13 +21,27 @@
  */
 
 import { promises as fsPromises, constants as fsConstants, type BigIntStats } from "node:fs";
-import { open as fsOpen } from "node:fs/promises";
+import { open as fsOpen, type FileHandle } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 // `O_NOFOLLOW` is POSIX. Fall back to 0 on Windows so the open call still
 // succeeds — we accept that symlink protection is POSIX-only.
 const O_NOFOLLOW: number = fsConstants.O_NOFOLLOW ?? 0;
+const O_NONBLOCK: number = fsConstants.O_NONBLOCK ?? 0;
+
+/** A directory in the chain is a symlink, owned by someone else, or group/world-writable. */
+export class UnsafePathError extends Error {
+  constructor(
+    readonly problem: "symlink" | "owner" | "mode",
+    readonly dir: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "UnsafePathError";
+  }
+}
 
 /**
  * Read a file whose contents must not be mutated behind our back between
@@ -74,10 +88,66 @@ export async function safeOpenRead(path: string): Promise<string> {
  * Error("not-regular-file"), ELOOP, ENOENT, others by errno.
  */
 export async function safeOpenReadWithStat(
-  _path: string,
+  path: string,
 ): Promise<{ readonly raw: string; readonly stat: BigIntStats }> {
-  throw new Error("not implemented");
+  await verifyDirChain(dirname(path));
+  // O_NONBLOCK: a FIFO planted at `path` must not hang the open; it is then
+  // rejected by the isFile() check. No effect on regular files.
+  const handle = await fsPromises.open(path, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  try {
+    const st = await handle.stat({ bigint: true });
+    if (!st.isFile()) throw new Error("not-regular-file");
+    if ((st.mode & 0o022n) !== 0n) throw new Error("unsafe-permissions");
+    const euid = currentEuid();
+    if (euid !== undefined && st.uid !== BigInt(euid)) throw new Error("unsafe-owner");
+    const bytes = await handle.readFile();
+    let raw: string;
+    try {
+      // Strict: a lenient decode would turn a bad byte into U+FFFD, the text
+      // would parse, and the next write would silently replace the user's
+      // bytes. ignoreBOM keeps a BOM in the text, as readFile("utf-8") does.
+      raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch {
+      throw new Error("invalid-utf8");
+    }
+    return { raw, stat: st };
+  } finally {
+    await handle.close();
+  }
 }
+
+/** euid, or undefined where there is none (Windows, worker threads). */
+function currentEuid(): number | undefined {
+  if (process.platform === "win32") return undefined;
+  const geteuid = (process as { geteuid?: () => number }).geteuid;
+  return typeof geteuid === "function" ? geteuid.call(process) : undefined;
+}
+
+/** Injectable for tests: temp-name randomness and the stderr warning. */
+interface SafeFsHooks {
+  readonly randomHex: () => string;
+  readonly warn: (message: string) => void;
+}
+
+const DEFAULT_HOOKS: SafeFsHooks = {
+  randomHex: () => randomBytes(8).toString("hex"),
+  warn: (message) => console.error(message),
+};
+
+// Mutable on purpose: the only module state, replaced only by tests.
+let hooks: SafeFsHooks = DEFAULT_HOOKS;
+
+/** Test seam: override temp-name randomness and/or the warning sink. */
+export function _setSafeFsHooksForTests(overrides: Partial<SafeFsHooks>): void {
+  hooks = { ...hooks, ...overrides };
+}
+
+export function _resetForTests(): void {
+  hooks = DEFAULT_HOOKS;
+}
+
+/** At most this many temp names are tried when one already exists. */
+const TEMP_NAME_TRIES = 3;
 
 /**
  * Atomic, durable write: temp file `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` 0600
@@ -85,13 +155,68 @@ export async function safeOpenReadWithStat(
  * (skipped on Windows; elsewhere a failure after a successful rename is a
  * warning on stderr, not a write failure, D30). Removes the temp on any
  * failure.
+ *
+ * The temp is `.<basename>.<16 hex>.tmp`. An existing file or symlink at a
+ * temp name is never opened (O_EXCL): another random name is tried, at most
+ * three in all. The caller verifies the directory chain.
  */
 export async function safeAtomicWrite(
-  _path: string,
-  _bytes: string | Uint8Array,
-  _opts: SafeAtomicWriteOptions = {},
+  path: string,
+  bytes: string | Uint8Array,
+  opts: SafeAtomicWriteOptions = {},
 ): Promise<void> {
-  throw new Error("not implemented");
+  const dir = dirname(path);
+  const { handle, tmp } = await openFreshTemp(dir, basename(path));
+  try {
+    try {
+      // writeFile loops until the buffer is drained (see safeWriteFile).
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    if (opts.beforeRename) await opts.beforeRename();
+    await fsPromises.rename(tmp, path);
+  } catch (err) {
+    await fsPromises.unlink(tmp).catch(() => {});
+    throw err;
+  }
+  await syncDirBestEffort(dir, path);
+}
+
+async function openFreshTemp(
+  dir: string,
+  base: string,
+): Promise<{ readonly handle: FileHandle; readonly tmp: string }> {
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | O_NOFOLLOW;
+  for (let attempt = 1; ; attempt++) {
+    const tmp = join(dir, `.${base}.${hooks.randomHex()}.tmp`);
+    try {
+      return { handle: await fsPromises.open(tmp, flags, 0o600), tmp };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST" && attempt < TEMP_NAME_TRIES) continue;
+      throw err;
+    }
+  }
+}
+
+/** D30: after a successful rename a directory fsync failure only warns. */
+async function syncDirBestEffort(dir: string, path: string): Promise<void> {
+  if (process.platform === "win32") return;
+  try {
+    const dh = await fsPromises.open(dir, fsConstants.O_RDONLY);
+    try {
+      await dh.sync();
+    } finally {
+      await dh.close();
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "unknown error";
+    hooks.warn(
+      `epimethian-mcp: warning: ${path} was saved, but flushing its directory failed (${code}); ` +
+        "the change may not survive a power loss.",
+    );
+  }
 }
 
 export interface SafeAtomicWriteOptions {
@@ -249,15 +374,19 @@ export async function verifyDirChain(
     }
 
     if (st.isSymbolicLink()) {
-      throw new Error(`unsafe-path: symlink at ${current}`);
+      throw new UnsafePathError("symlink", current, `unsafe-path: symlink at ${current}`);
     }
     if (st.uid !== euid) {
-      throw new Error(
+      throw new UnsafePathError(
+        "owner",
+        current,
         `unsafe-path: ${current} is not owned by the current user (uid ${st.uid} vs euid ${euid})`
       );
     }
     if ((st.mode & 0o022) !== 0) {
-      throw new Error(
+      throw new UnsafePathError(
+        "mode",
+        current,
         `unsafe-path: ${current} is group- or world-writable (mode ${(st.mode & 0o777).toString(8)})`
       );
     }

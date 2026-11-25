@@ -13,6 +13,7 @@ vi.mock("node:fs/promises", () => ({
 vi.mock("./safe-fs.js", () => ({
   safeOpenRead: vi.fn(),
   safeOpenAppend: vi.fn().mockResolvedValue(undefined),
+  safeAtomicWrite: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("node:crypto", () => ({
@@ -33,8 +34,8 @@ vi.mock("node:util", async (importOriginal) => {
   };
 });
 
-import { readFile, writeFile, rename } from "node:fs/promises";
-import { safeOpenRead } from "./safe-fs.js";
+import { readFile } from "node:fs/promises";
+import { safeAtomicWrite, safeOpenRead } from "./safe-fs.js";
 import {
   parseSemVer,
   classifyUpdate,
@@ -47,8 +48,8 @@ import {
 } from "./update-check.js";
 
 const mockReadFile = vi.mocked(readFile);
-const mockWriteFile = vi.mocked(writeFile);
-const mockRename = vi.mocked(rename);
+// The state file is written through safeAtomicWrite(path, data): calls[i][1] is the data.
+const mockWriteFile = vi.mocked(safeAtomicWrite);
 const mockSafeOpenRead = vi.mocked(safeOpenRead);
 
 // Mock global fetch
@@ -305,7 +306,7 @@ describe("checkForUpdates", () => {
     expect(result).toBeNull();
   });
 
-  it("writes state atomically (tmp + rename)", async () => {
+  it("writes state atomically (through safeAtomicWrite)", async () => {
     mockReadFile.mockResolvedValue(
       JSON.stringify({ lastCheck: "2020-01-01T00:00:00.000Z" })
     );
@@ -316,12 +317,11 @@ describe("checkForUpdates", () => {
 
     await checkForUpdates("5.2.1");
 
+    // safeAtomicWrite owns the temp file, fsync and rename (safe-fs.test.ts).
     expect(mockWriteFile).toHaveBeenCalledWith(
-      expect.stringContaining(".update-check.abcd1234.tmp"),
-      expect.any(String),
-      { mode: 0o600 }
+      expect.stringMatching(/\.config\/epimethian-mcp\/update-check\.json$/),
+      expect.any(String)
     );
-    expect(mockRename).toHaveBeenCalled();
   });
 });
 

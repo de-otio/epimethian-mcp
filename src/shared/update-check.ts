@@ -48,13 +48,12 @@
  * See `plans/security-audit-fixes.md` Track A for the full plan.
  */
 
-import { readFile, writeFile, rename, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { safeOpenRead } from "./safe-fs.js";
+import { safeAtomicWrite, safeOpenRead } from "./safe-fs.js";
 import { globalInstallPrefix, packageDirUnder } from "./install-location.js";
 
 const execFileAsync = promisify(execFile);
@@ -132,12 +131,8 @@ async function readCheckState(): Promise<UpdateCheckState | null> {
 async function writeCheckState(state: UpdateCheckState): Promise<void> {
   await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
   const data = JSON.stringify(state, null, 2) + "\n";
-  const tmpFile = join(
-    CONFIG_DIR,
-    `.update-check.${randomBytes(4).toString("hex")}.tmp`
-  );
-  await writeFile(tmpFile, data, { mode: 0o600 });
-  await rename(tmpFile, UPDATE_CHECK_FILE);
+  // Temp O_EXCL|O_NOFOLLOW 0600, fsync, rename, directory fsync (D12, D30).
+  await safeAtomicWrite(UPDATE_CHECK_FILE, data);
 }
 
 type LatestLookup = { ok: true; version: string } | { ok: false; reason: string };

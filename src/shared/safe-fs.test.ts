@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, writeFile, symlink, chmod, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,11 @@ import {
   verifyDirChain,
   findDotSegment,
   SAFE_FS_HAS_O_NOFOLLOW,
+  safeOpenReadWithStat,
+  safeAtomicWrite,
+  UnsafePathError,
+  _setSafeFsHooksForTests,
+  _resetForTests,
 } from "./safe-fs.js";
 
 /**
@@ -357,5 +362,296 @@ posixOnly("safeWriteFile never produces executable files (H5)", () => {
     await safeWriteFile(path, new TextEncoder().encode("y"), { overwrite: true });
 
     expect((await stat(path)).mode & 0o777).toBe(0o640);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Policy gate step 0: safeOpenReadWithStat and safeAtomicWrite (0-D1, 0-D2,
+// the safe-fs half of 0-T11).
+// ---------------------------------------------------------------------------
+
+/** FileHandle.prototype, reached through a real handle (the class is not exported). */
+async function fileHandleProto(dir: string): Promise<Record<string, (...a: unknown[]) => Promise<unknown>>> {
+  const { open } = await import("node:fs/promises");
+  const probe = join(dir, ".probe");
+  await writeFile(probe, "", { mode: 0o600 });
+  const fh = await open(probe, "r");
+  const proto = Object.getPrototypeOf(fh);
+  await fh.close();
+  await rm(probe);
+  return proto;
+}
+
+posixOnly("safeOpenReadWithStat", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "safe-fs-readstat-"));
+    await chmod(dir, 0o700);
+    // The directory chain is checked up to HOME; the tempdir is HOME here.
+    vi.stubEnv("HOME", dir);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    await chmod(dir, 0o700).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("returns the text and the bigint fstat of the fd it read", async () => {
+    const { stat } = await import("node:fs/promises");
+    const path = join(dir, "ok.json");
+    await writeFile(path, `{"a":1}`, { mode: 0o600 });
+    const { raw, stat: st } = await safeOpenReadWithStat(path);
+    expect(raw).toBe(`{"a":1}`);
+    expect(typeof st.ino).toBe("bigint");
+    expect(typeof st.mtimeNs).toBe("bigint");
+    expect(st.ino).toBe((await stat(path, { bigint: true })).ino);
+    expect(st.size).toBe(7n);
+  });
+
+  it("rejects group- and world-writable modes with 'unsafe-permissions'", async () => {
+    const path = join(dir, "bad.json");
+    await writeFile(path, "{}", { mode: 0o600 });
+    for (const mode of [0o620, 0o602, 0o666]) {
+      await chmod(path, mode);
+      await expect(safeOpenReadWithStat(path)).rejects.toThrow("unsafe-permissions");
+    }
+    await chmod(path, 0o644);
+    await expect(safeOpenReadWithStat(path)).resolves.toMatchObject({ raw: "{}" });
+  });
+
+  it("rejects a file owned by another uid with 'unsafe-owner'", async () => {
+    const path = join(dir, "owned.json");
+    await writeFile(path, "{}", { mode: 0o600 });
+    const proto = await fileHandleProto(dir);
+    const original = proto.stat;
+    vi.spyOn(proto, "stat").mockImplementation(async function (this: unknown, ...args: unknown[]) {
+      const st = (await original.apply(this, args)) as { uid: bigint };
+      return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { uid: st.uid + 1n });
+    });
+    await expect(safeOpenReadWithStat(path)).rejects.toThrow("unsafe-owner");
+  });
+
+  it("rejects an unsafe directory chain with UnsafePathError before opening", async () => {
+    const sub = join(dir, "cfg");
+    await mkdir(sub, { mode: 0o700 });
+    const path = join(sub, "p.json");
+    await writeFile(path, "{}", { mode: 0o600 });
+    await chmod(sub, 0o770);
+    const err = await safeOpenReadWithStat(path).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UnsafePathError);
+    expect((err as UnsafePathError).problem).toBe("mode");
+    expect((err as Error).message).toMatch(/^unsafe-path/);
+  });
+
+  it("rejects a symlink with ELOOP and a directory or FIFO with 'not-regular-file'", async () => {
+    const real = join(dir, "real.json");
+    await writeFile(real, "{}", { mode: 0o600 });
+    const link = join(dir, "link.json");
+    await symlink(real, link);
+    await expect(safeOpenReadWithStat(link)).rejects.toMatchObject({ code: "ELOOP" });
+
+    const sub = join(dir, "adir");
+    await mkdir(sub, { mode: 0o700 });
+    await expect(safeOpenReadWithStat(sub)).rejects.toThrow("not-regular-file");
+
+    const { execFileSync } = await import("node:child_process");
+    const fifo = join(dir, "fifo");
+    execFileSync("mkfifo", ["-m", "600", fifo]);
+    // Without O_NONBLOCK this open would block forever (no writer).
+    await expect(safeOpenReadWithStat(fifo)).rejects.toThrow("not-regular-file");
+  });
+
+  it("rejects bytes that are not UTF-8 with 'invalid-utf8' and keeps a BOM", async () => {
+    const bad = join(dir, "bad.json");
+    await writeFile(bad, new Uint8Array([0x7b, 0x22, 0xff, 0x22, 0x7d]), { mode: 0o600 });
+    await expect(safeOpenReadWithStat(bad)).rejects.toThrow("invalid-utf8");
+    const bom = join(dir, "bom.json");
+    await writeFile(bom, new Uint8Array([0xef, 0xbb, 0xbf, 0x7b, 0x7d]), { mode: 0o600 });
+    expect((await safeOpenReadWithStat(bom)).raw).toBe("﻿{}");
+  });
+
+  it("propagates ENOENT", async () => {
+    await expect(safeOpenReadWithStat(join(dir, "missing.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+posixOnly("safeAtomicWrite (0-T11, safe-fs half)", () => {
+  let dir: string;
+  let warnings: string[];
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "safe-fs-atomic-"));
+    warnings = [];
+    _setSafeFsHooksForTests({ warn: (m) => warnings.push(m) });
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    _resetForTests();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function entries(): Promise<string[]> {
+    const { readdir } = await import("node:fs/promises");
+    return (await readdir(dir)).sort();
+  }
+
+  it("creates the file 0600 with the exact bytes and leaves no temp", async () => {
+    const { readFile, stat } = await import("node:fs/promises");
+    const path = join(dir, "state.json");
+    await safeAtomicWrite(path, "hello\n");
+    expect(await readFile(path, "utf-8")).toBe("hello\n");
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect(await entries()).toEqual(["state.json"]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("replaces an existing file with a new inode (rename, not truncate)", async () => {
+    const { readFile, stat } = await import("node:fs/promises");
+    const path = join(dir, "state.json");
+    await writeFile(path, "OLD-LONGER-CONTENT", { mode: 0o600 });
+    const before = (await stat(path)).ino;
+    await safeAtomicWrite(path, new TextEncoder().encode("new"));
+    expect(await readFile(path, "utf-8")).toBe("new");
+    expect((await stat(path)).ino).not.toBe(before);
+  });
+
+  it("a failed rename leaves the old file intact and removes the temp", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const fs = await import("node:fs");
+    const path = join(dir, "state.json");
+    await writeFile(path, "OLD", { mode: 0o600 });
+    vi.spyOn(fs.promises, "rename").mockRejectedValueOnce(
+      Object.assign(new Error("injected"), { code: "EIO" }),
+    );
+    await expect(safeAtomicWrite(path, "NEW")).rejects.toThrow("injected");
+    expect(await readFile(path, "utf-8")).toBe("OLD");
+    expect(await entries()).toEqual(["state.json"]);
+  });
+
+  it("a beforeRename that throws aborts: old file intact, temp removed", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const path = join(dir, "state.json");
+    await writeFile(path, "OLD", { mode: 0o600 });
+    let tempSeen: string[] = [];
+    await expect(
+      safeAtomicWrite(path, "NEW", {
+        beforeRename: async () => {
+          tempSeen = (await entries()).filter((n) => n.endsWith(".tmp"));
+          throw new Error("changed underneath");
+        },
+      }),
+    ).rejects.toThrow("changed underneath");
+    expect(tempSeen).toHaveLength(1);
+    expect(tempSeen[0]).toMatch(/^\.state\.json\.[0-9a-f]{16}\.tmp$/);
+    expect(await readFile(path, "utf-8")).toBe("OLD");
+    expect(await entries()).toEqual(["state.json"]);
+  });
+
+  it("never follows or reuses a pre-existing temp name (O_EXCL)", async () => {
+    const { readFile, lstat } = await import("node:fs/promises");
+    const names = ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"];
+    _setSafeFsHooksForTests({ randomHex: () => names.shift() ?? "cccccccccccccccc" });
+    const victim = join(dir, "victim.txt");
+    await writeFile(victim, "VICTIM", { mode: 0o600 });
+    const planted = join(dir, ".state.json.aaaaaaaaaaaaaaaa.tmp");
+    await symlink(victim, planted);
+    const path = join(dir, "state.json");
+
+    await safeAtomicWrite(path, "NEW");
+
+    expect(await readFile(path, "utf-8")).toBe("NEW");
+    expect(await readFile(victim, "utf-8")).toBe("VICTIM");
+    expect((await lstat(planted)).isSymbolicLink()).toBe(true);
+  });
+
+  it("gives up after three taken temp names without writing anything", async () => {
+    const { readFile } = await import("node:fs/promises");
+    _setSafeFsHooksForTests({ randomHex: () => "dddddddddddddddd" });
+    await writeFile(join(dir, ".state.json.dddddddddddddddd.tmp"), "PLANTED", { mode: 0o600 });
+    const path = join(dir, "state.json");
+    await writeFile(path, "OLD", { mode: 0o600 });
+    await expect(safeAtomicWrite(path, "NEW")).rejects.toMatchObject({ code: "EEXIST" });
+    expect(await readFile(path, "utf-8")).toBe("OLD");
+    expect(await readFile(join(dir, ".state.json.dddddddddddddddd.tmp"), "utf-8")).toBe("PLANTED");
+  });
+
+  it("replaces a symlink at the target instead of writing through it", async () => {
+    const { readFile, lstat } = await import("node:fs/promises");
+    const victim = join(dir, "victim.txt");
+    await writeFile(victim, "VICTIM", { mode: 0o600 });
+    const path = join(dir, "state.json");
+    await symlink(victim, path);
+    await safeAtomicWrite(path, "NEW");
+    expect((await lstat(path)).isFile()).toBe(true);
+    expect(await readFile(path, "utf-8")).toBe("NEW");
+    expect(await readFile(victim, "utf-8")).toBe("VICTIM");
+  });
+
+  it("fsyncs the temp before the rename and the directory after it, in that order", async () => {
+    const fs = await import("node:fs");
+    const proto = await fileHandleProto(dir);
+    const fdPaths = new Map<number, string>();
+    const realOpen = fs.promises.open;
+    vi.spyOn(fs.promises, "open").mockImplementation(async (...args: Parameters<typeof realOpen>) => {
+      const fh = await realOpen(...args);
+      fdPaths.set(fh.fd, String(args[0]));
+      return fh;
+    });
+    const order: string[] = [];
+    const realSync = proto.sync;
+    vi.spyOn(proto, "sync").mockImplementation(async function (this: { fd: number }) {
+      const p = fdPaths.get(this.fd) ?? "?";
+      order.push(p === dir ? "sync:dir" : p.endsWith(".tmp") ? "sync:temp" : `sync:${p}`);
+      return realSync.call(this);
+    });
+    const realRename = fs.promises.rename;
+    vi.spyOn(fs.promises, "rename").mockImplementation(async (a, b) => {
+      order.push("rename");
+      return realRename(a, b);
+    });
+
+    await safeAtomicWrite(join(dir, "state.json"), "x");
+
+    expect(order).toEqual(["sync:temp", "rename", "sync:dir"]);
+  });
+
+  it("a directory fsync failure after the rename is a stderr warning; the write resolves", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const fs = await import("node:fs");
+    const realOpen = fs.promises.open;
+    vi.spyOn(fs.promises, "open").mockImplementation(async (...args: Parameters<typeof realOpen>) => {
+      if (String(args[0]) === dir) throw Object.assign(new Error("no dir fsync"), { code: "EINVAL" });
+      return realOpen(...args);
+    });
+    const path = join(dir, "state.json");
+    await expect(safeAtomicWrite(path, "NEW")).resolves.toBeUndefined();
+    expect(await readFile(path, "utf-8")).toBe("NEW");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("EINVAL");
+    expect(warnings[0]).toContain(path);
+  });
+
+  it("on win32 the directory fsync is not attempted", async () => {
+    const fs = await import("node:fs");
+    const realOpen = fs.promises.open;
+    const opened: string[] = [];
+    vi.spyOn(fs.promises, "open").mockImplementation(async (...args: Parameters<typeof realOpen>) => {
+      opened.push(String(args[0]));
+      return realOpen(...args);
+    });
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      await safeAtomicWrite(join(dir, "state.json"), "x");
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+    expect(opened).not.toContain(dir);
+    expect(opened.some((p) => p.endsWith(".tmp"))).toBe(true);
+    expect(warnings).toEqual([]);
   });
 });
