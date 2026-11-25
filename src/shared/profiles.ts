@@ -1,8 +1,9 @@
-import { readFile, writeFile, rename, mkdir, chmod, stat } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { writeFile, rename, mkdir, lstat } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
+import { join, dirname, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { safeOpenRead, safeOpenAppend } from "./safe-fs.js";
+import { safeOpenRead, safeOpenAppend, safeOpenReadWithStat, UnsafePathError } from "./safe-fs.js";
 
 /**
  * Track E1 — Symlink / TOCTOU audit memo (see `plans/security-audit-fixes.md`).
@@ -65,20 +66,28 @@ import { safeOpenRead, safeOpenAppend } from "./safe-fs.js";
  *      Do NOT attempt `renameat2` (not available from Node).
  */
 
-const CONFIG_DIR = join(homedir(), ".config", "epimethian-mcp");
-const REGISTRY_FILE = join(CONFIG_DIR, "profiles.json");
-const AUDIT_LOG = join(CONFIG_DIR, "audit.log");
+// Paths are derived from homedir() on each call (not frozen at import), so a
+// test can point HOME at a temp directory. In a server or CLI process HOME
+// does not change, so this is the same path every time.
+function configDir(): string {
+  return join(homedir(), ".config", "epimethian-mcp");
+}
 
 export function getProfileRegistryPath(): string {
-  return REGISTRY_FILE;
+  return join(configDir(), "profiles.json");
+}
+
+/** profiles.json.bak: the version before the last CLI change (D36). */
+export function getProfileRegistryBackupPath(): string {
+  return `${getProfileRegistryPath()}.bak`;
 }
 
 export function getAuditLogPath(): string {
-  return AUDIT_LOG;
+  return join(configDir(), "audit.log");
 }
 
 async function ensureConfigDir(): Promise<void> {
-  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  await mkdir(configDir(), { recursive: true, mode: 0o700 });
 }
 
 // --- Registry types ---
@@ -241,22 +250,225 @@ export interface BackupFacts {
 
 /** Never throws. Reads through safeOpenReadWithStat. */
 export async function readRegistry(): Promise<RegistryRead> {
-  throw new Error("not implemented");
+  const path = getProfileRegistryPath();
+  try {
+    let read: { readonly raw: string; readonly stat: BigIntStats };
+    try {
+      read = await safeOpenReadWithStat(path);
+    } catch (err) {
+      const reason = classifyReadError(err);
+      const observed = await registryFingerprint();
+      if (reason === "absent") return { state: "absent", observed };
+      return { state: "unreadable", reason, path, backup: await backupIfPresent(), observed };
+    }
+    const observed = fingerprintOf(read.stat);
+    const parsed = parseRegistryText(read.raw);
+    if (!parsed.ok) {
+      return { state: "unreadable", reason: parsed.reason, path, backup: await backupIfPresent(), observed };
+    }
+    return { state: "ok", registry: parsed.registry, observed };
+  } catch {
+    // Defensive: nothing above should throw; if it does, fail closed.
+    return {
+      state: "unreadable",
+      reason: { kind: "io-error", errno: "EUNKNOWN" },
+      path,
+      backup: undefined,
+      observed: { errno: "EUNKNOWN" },
+    };
+  }
 }
 
-/** One lstat (a symlink is reported, not followed). */
+/** One lstat (a symlink is reported, not followed). Never throws. */
 export async function registryFingerprint(): Promise<Observation> {
-  throw new Error("not implemented");
+  try {
+    return fingerprintOf(await lstat(getProfileRegistryPath(), { bigint: true }));
+  } catch (err) {
+    const code = errnoOf(err);
+    return code === "ENOENT" ? "absent" : { errno: code };
+  }
+}
+
+function fingerprintOf(st: BigIntStats): FileFingerprint {
+  return { ino: st.ino, mtimeNs: st.mtimeNs, ctimeNs: st.ctimeNs, size: st.size };
+}
+
+/** True when two observations describe the same file state. */
+export function sameObservation(a: Observation, b: Observation): boolean {
+  if (a === "absent" || b === "absent") return a === b;
+  if ("errno" in a || "errno" in b) {
+    return "errno" in a && "errno" in b && a.errno === b.errno;
+  }
+  return a.ino === b.ino && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.size === b.size;
+}
+
+/** An errno-shaped code (EACCES, EIO, ...) or EUNKNOWN; never free text. */
+function errnoOf(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && /^E[A-Z0-9]{1,20}$/.test(code) ? code : "EUNKNOWN";
+}
+
+/** Maps a safeOpenReadWithStat failure to a reason; "absent" for ENOENT only. */
+function classifyReadError(err: unknown): UnreadableReason | "absent" {
+  if (err instanceof UnsafePathError) {
+    // A symlinked directory has no kind of its own; the directory fix line
+    // covers ownership and symlinks of the whole chain.
+    return { kind: "unsafe-permissions", target: "directory", problem: err.problem === "mode" ? "mode" : "owner" };
+  }
+  const message = err instanceof Error ? err.message : "";
+  if (message === "unsafe-permissions") return { kind: "unsafe-permissions", target: "file", problem: "mode" };
+  if (message === "unsafe-owner") return { kind: "unsafe-permissions", target: "file", problem: "owner" };
+  if (message === "not-regular-file") return { kind: "not-regular-file" };
+  if (message === "invalid-utf8") return { kind: "parse-error" };
+  const code = errnoOf(err);
+  if (code === "ENOENT") return "absent";
+  if (code === "ELOOP" || code === "EISDIR") return { kind: "not-regular-file" };
+  return { kind: "io-error", errno: code };
+}
+
+async function backupIfPresent(): Promise<string | undefined> {
+  const path = getProfileRegistryBackupPath();
+  try {
+    return (await lstat(path)).isFile() ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Pure. Parses and shape-checks the registry text. A parse error keeps only a
+ * line and column computed from the digits in the error message (and, for
+ * "at position N", from counting newlines in `raw`); the message itself and
+ * every byte of the text are dropped (S5).
+ */
+export function parseRegistryText(
+  raw: string,
+): { readonly ok: true; readonly registry: Registry } | { readonly ok: false; readonly reason: UnreadableReason } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return { ok: false, reason: { kind: "parse-error", ...positionOf(err, raw) } };
+  }
+  if (!isPlainObject(parsed)) return { ok: false, reason: { kind: "unexpected-shape" } };
+  const profiles = parsed.profiles;
+  if (!Array.isArray(profiles) || !profiles.every((p) => typeof p === "string")) {
+    return { ok: false, reason: { kind: "unexpected-shape" } };
+  }
+  const hasSettings = Object.hasOwn(parsed, "settings");
+  const settings = parsed.settings;
+  if (hasSettings && (!isPlainObject(settings) || !Object.values(settings).every(isPlainObject))) {
+    return { ok: false, reason: { kind: "unexpected-shape" } };
+  }
+  const extra = Object.fromEntries(
+    Object.entries(parsed).filter(([k]) => k !== "profiles" && k !== "settings"),
+  );
+  return {
+    ok: true,
+    registry: {
+      profiles: [...(profiles as string[])],
+      ...(hasSettings ? { settings: settings as Record<string, ProfileSettings> } : {}),
+      extra,
+    },
+  };
+}
+
+function positionOf(err: unknown, raw: string): { line?: number; column?: number } {
+  const message = err instanceof Error ? err.message : "";
+  const lc = /\(line (\d{1,9}) column (\d{1,9})\)/.exec(message);
+  if (lc) return { line: Number(lc[1]), column: Number(lc[2]) };
+  const pos = /at position (\d{1,9})/.exec(message);
+  if (pos) {
+    const offset = Number(pos[1]);
+    if (offset <= raw.length) {
+      const before = raw.slice(0, offset);
+      const lastNl = before.lastIndexOf("\n");
+      return { line: before.split("\n").length, column: offset - lastNl };
+    }
+  }
+  return {};
+}
+
+/** The settings of `name` from a read; throws on unreadable. Own keys only. */
+export function profileSettingsOf(read: RegistryRead, name: string): ProfileSettings | undefined {
+  if (read.state === "unreadable") throw new RegistryUnreadableError(read.reason, read.path, read.backup);
+  if (read.state === "absent") return undefined;
+  const settings = read.registry.settings;
+  return settings !== undefined && Object.hasOwn(settings, name) ? settings[name] : undefined;
+}
+
+/** `~/…` for paths under the home directory, so agent-facing text names no user directory. */
+function displayPath(path: string): string {
+  const home = homedir();
+  return path.startsWith(home + sep) ? `~${path.slice(home.length)}` : path;
 }
 
 /** Pure. One sentence of what is wrong, one fix line; no file content. */
 export function describeUnreadable(
-  _r: UnreadableReason,
-  _path: string,
+  r: UnreadableReason,
+  path: string,
   _profile: string | null,
-  _backup?: BackupFacts,
+  backup?: BackupFacts,
 ): { readonly what: string; readonly fix: string } {
-  throw new Error("not implemented");
+  const p = displayPath(path);
+  const check = "then run: epimethian-mcp profiles";
+  const base = ((): { what: string; fix: string } => {
+    switch (r.kind) {
+      case "parse-error":
+        return r.line !== undefined && r.column !== undefined
+          ? {
+              what: `the profile registry ${p} has a JSON syntax error near line ${r.line}, column ${r.column}`,
+              fix: `Fix the JSON near line ${r.line}, column ${r.column} of ${p}, ${check}`,
+            }
+          : { what: `the profile registry ${p} is not valid JSON`, fix: `Fix the JSON in ${p}, ${check}` };
+      case "unexpected-shape":
+        return {
+          what: `the profile registry ${p} does not have the expected top level`,
+          fix: `Fix the top level of ${p} ({"profiles": [...], "settings": {...}}), ${check}`,
+        };
+      case "unsafe-permissions":
+        if (r.target === "directory") {
+          const dir = displayPath(dirname(path));
+          return {
+            what:
+              r.problem === "mode"
+                ? `a directory holding the profile registry ${p} is group- or world-writable`
+                : `a directory holding the profile registry ${p} is a symlink or owned by another user`,
+            fix: `chmod 700 ${dir} and make sure you own it and every directory above it (none of them may be a symlink)`,
+          };
+        }
+        return r.problem === "mode"
+          ? { what: `the profile registry ${p} is group- or world-writable`, fix: `chmod 600 ${p}` }
+          : {
+              what: `the profile registry ${p} is owned by another user`,
+              fix: `Replace ${p} with a copy you own (cp, then chmod 600); it is owned by another user`,
+            };
+      case "not-regular-file":
+        return {
+          what: `the profile registry ${p} is a symlink or not a regular file`,
+          fix: `Replace ${p} with a regular file (it is a symlink or not a file)`,
+        };
+      case "io-error":
+        return {
+          what: `the profile registry ${p} could not be read (error ${r.errno})`,
+          fix: `Check that you can read ${p} (error ${r.errno})`,
+        };
+    }
+  })();
+  if (backup === undefined) return base;
+  // D36: .bak is one CLI write behind; it is not "the last good file".
+  // (The step-A anchor clause, for fitsAnchor === false, is not in 7.6.1.)
+  const bak = displayPath(backup.path);
+  return {
+    what: base.what,
+    fix:
+      `${base.fix}. The version before the last CLI change is ${bak}; ` +
+      `it may not hold the last change, so compare it with ${p} before restoring it.`,
+  };
 }
 
 /**
@@ -284,7 +496,8 @@ export async function updateProfileSettings(
 
 /** Throws RegistryUnreadableError when unreadable; used by CLI preflights. */
 export async function assertRegistryWritable(): Promise<void> {
-  throw new Error("not implemented");
+  const read = await readRegistry();
+  if (read.state === "unreadable") throw new RegistryUnreadableError(read.reason, read.path, read.backup);
 }
 
 /**
@@ -297,7 +510,7 @@ async function readFullRegistry(): Promise<ProfileRegistry> {
     // resulting fd (so the mode check applies to the exact inode we will read),
     // and rejects symlinks / non-regular files / group- or world-writable
     // modes. Replaces the previous stat→readFile two-syscall pattern.
-    const raw = await safeOpenRead(REGISTRY_FILE);
+    const raw = await safeOpenRead(getProfileRegistryPath());
     const parsed = JSON.parse(raw);
     if (
       parsed &&
@@ -326,7 +539,7 @@ async function readFullRegistry(): Promise<ProfileRegistry> {
     if (err instanceof Error && err.message === "unsafe-permissions") {
       console.error(
         "Error: Profile registry has unsafe permissions (group/world-writable). " +
-          `Run: chmod 600 ${REGISTRY_FILE}`
+          `Run: chmod 600 ${getProfileRegistryPath()}`
       );
       return { profiles: [] };
     }
@@ -344,7 +557,7 @@ async function readFullRegistry(): Promise<ProfileRegistry> {
       console.error(
         "Error: Profile registry appears to be a symlink. Refusing to follow; " +
           "remove the symlink or restore the file with `chmod 600 " +
-          REGISTRY_FILE +
+          getProfileRegistryPath() +
           "`."
       );
       return { profiles: [] };
@@ -359,31 +572,34 @@ async function writeRegistry(registry: ProfileRegistry): Promise<void> {
   await ensureConfigDir();
   const data = JSON.stringify(registry, null, 2) + "\n";
   const tmpFile = join(
-    CONFIG_DIR,
+    configDir(),
     `.profiles.${randomBytes(4).toString("hex")}.tmp`
   );
   await writeFile(tmpFile, data, { mode: 0o600 });
-  await rename(tmpFile, REGISTRY_FILE);
+  await rename(tmpFile, getProfileRegistryPath());
 }
 
 /**
  * Read the list of known profile names from the registry.
- * Returns [] if the file is missing or corrupted (with a warning to stderr).
+ * Returns [] if the file is absent; throws RegistryUnreadableError if it
+ * cannot be used (never treats a broken file as empty).
  */
 export async function readProfileRegistry(): Promise<string[]> {
-  const registry = await readFullRegistry();
-  return registry.profiles;
+  const read = await readRegistry();
+  if (read.state === "unreadable") throw new RegistryUnreadableError(read.reason, read.path, read.backup);
+  return read.state === "ok" ? [...read.registry.profiles] : [];
 }
 
 /**
- * Get settings for a specific profile.
- * Returns undefined if the profile has no settings or is unknown.
+ * Get settings for a specific profile (own keys only: a profile named
+ * "constructor" is not found through Object.prototype).
+ * Returns undefined if the profile has no settings, is unknown, or the file
+ * is absent; throws RegistryUnreadableError if it cannot be used.
  */
 export async function getProfileSettings(
   name: string
 ): Promise<ProfileSettings | undefined> {
-  const registry = await readFullRegistry();
-  return registry.settings?.[name];
+  return profileSettingsOf(await readRegistry(), name);
 }
 
 /**
@@ -440,5 +656,5 @@ export async function appendAuditLog(message: string): Promise<void> {
   // E2: use safeOpenAppend so the file is opened with O_NOFOLLOW. Refuses to
   // follow a symlink planted at AUDIT_LOG that would otherwise redirect
   // audit-log entries to an attacker-controlled file.
-  await safeOpenAppend(AUDIT_LOG, entry);
+  await safeOpenAppend(getAuditLogPath(), entry);
 }

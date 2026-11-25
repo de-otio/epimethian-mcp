@@ -162,7 +162,10 @@ async function mockFstatUidOffset(path: string): Promise<void> {
 }
 
 function expectNoCanary(value: unknown): void {
-  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const text =
+    typeof value === "string"
+      ? value
+      : JSON.stringify(value, (_k, v: unknown) => (typeof v === "bigint" ? v.toString() : v));
   expect(text).not.toContain(CANARY);
 }
 
@@ -192,7 +195,7 @@ posixOnly("0-T1 registry fails closed", () => {
 
   for (const c of CASES) {
     describe(c.name, () => {
-      it.fails("readRegistry reports unreadable with the right kind, and no canary", async () => {
+      it("readRegistry reports unreadable with the right kind, and no canary", async () => {
         await c.arrange();
         const { readRegistry, describeUnreadable } = await importProfiles();
         const read = await readRegistry();
@@ -212,7 +215,7 @@ posixOnly("0-T1 registry fails closed", () => {
         expectNoCanary(logged);
       });
 
-      it.fails("getProfileSettings throws RegistryUnreadableError (7.6.0: undefined)", async () => {
+      it("getProfileSettings throws RegistryUnreadableError (7.6.0: undefined)", async () => {
         await c.arrange();
         const { getProfileSettings, RegistryUnreadableError } = await importProfiles();
         const err = await getProfileSettings("work").then(
@@ -225,7 +228,7 @@ posixOnly("0-T1 registry fails closed", () => {
         expectNoCanary(logged);
       });
 
-      it.fails("getConfig throws instead of starting with posture detect (7.6.0: detect)", async () => {
+      it("getConfig throws instead of starting with posture detect (7.6.0: detect)", async () => {
         await c.arrange();
         const { getConfig } = await importClient();
         const { RegistryUnreadableError } = await import("./profiles.js");
@@ -240,7 +243,7 @@ posixOnly("0-T1 registry fails closed", () => {
     });
   }
 
-  it.fails("absent stays absent: no settings, no throw", async () => {
+  it("absent stays absent: no settings, no throw", async () => {
     const { readRegistry, getProfileSettings, readProfileRegistry } = await importProfiles();
     const read = await readRegistry();
     expect(read.state).toBe("absent");
