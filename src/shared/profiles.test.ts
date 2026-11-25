@@ -226,6 +226,32 @@ describe("parseRegistryText: parse-error position", () => {
     });
   });
 
+  it("older Node messages: 'at position N' is converted against the text, digits only", () => {
+    const spy = vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
+      throw new SyntaxError("Unexpected token } in JSON at position 9");
+    });
+    expect(parseRegistryText(`{\n  "a":1,\n}`)).toEqual({ ok: false, reason: { kind: "parse-error", line: 2, column: 8 } });
+    spy.mockImplementationOnce(() => {
+      throw new SyntaxError("Unexpected end of JSON input at position 999");
+    });
+    expect(parseRegistryText("{")).toEqual({ ok: false, reason: { kind: "parse-error" } });
+  });
+
+  it("Node 20 messages quote the input; nothing of it is kept and there is no position", () => {
+    vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
+      throw new SyntaxError(`Unexpected token '}', "{"secret":1,}" is not valid JSON`);
+    });
+    const r = parseRegistryText(`{"secret":1,}`);
+    expect(r).toEqual({ ok: false, reason: { kind: "parse-error" } });
+  });
+
+  it("a non-Error throw is still a parse error without a position", () => {
+    vi.spyOn(JSON, "parse").mockImplementationOnce(() => {
+      throw "weird";
+    });
+    expect(parseRegistryText("x")).toEqual({ ok: false, reason: { kind: "parse-error" } });
+  });
+
   it("no position for an empty text", () => {
     expect(parseRegistryText("")).toEqual({ ok: false, reason: { kind: "parse-error" } });
   });

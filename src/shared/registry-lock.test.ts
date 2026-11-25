@@ -323,3 +323,42 @@ posixOnly("0-T12 stale-temp sweep", () => {
     expect(await readdir(configDir)).toContain(old16);
   });
 });
+
+posixOnly("0-T12 default pid liveness (process.kill(pid, 0))", () => {
+  beforeEach(() => {
+    // Keep the real isPidAlive and pid; pin only the clock and the sleep.
+    _resetForTests();
+    _setRegistryWriterEnvForTests({
+      now: () => clock,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      warn: (m) => warnings.push(m),
+    });
+  });
+
+  it("a stale lock held by this (live) process is not removed", async () => {
+    await writeFile(lockPath, `${process.pid}\n`, { mode: 0o600 });
+    await age(lockPath, 10 * 60_000);
+    await expect(addToProfileRegistry("x")).rejects.toMatchObject({ code: REGISTRY_BUSY });
+    expect(warnings).toEqual([]);
+  });
+
+  it("a stale lock whose process has exited is removed", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const child = spawnSync(process.execPath, ["-e", "0"]);
+    expect(child.pid).toBeGreaterThan(0);
+    await writeFile(lockPath, `${child.pid}\n`, { mode: 0o600 });
+    await age(lockPath, 10 * 60_000);
+    await addToProfileRegistry("x");
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("a live process of another user (EPERM, e.g. pid 1) counts as alive", async () => {
+    if (process.getuid?.() === 0) return; // root may signal pid 1
+    await writeFile(lockPath, "1\n", { mode: 0o600 });
+    await age(lockPath, 10 * 60_000);
+    await expect(addToProfileRegistry("x")).rejects.toMatchObject({ code: REGISTRY_BUSY });
+  });
+});
