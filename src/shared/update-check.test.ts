@@ -14,6 +14,7 @@ vi.mock("./safe-fs.js", () => ({
   safeOpenRead: vi.fn(),
   safeOpenAppend: vi.fn().mockResolvedValue(undefined),
   safeAtomicWrite: vi.fn().mockResolvedValue(undefined),
+  verifyDirChain: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("node:crypto", () => ({
@@ -35,7 +36,8 @@ vi.mock("node:util", async (importOriginal) => {
 });
 
 import { readFile } from "node:fs/promises";
-import { safeAtomicWrite, safeOpenRead } from "./safe-fs.js";
+import { safeAtomicWrite, safeOpenRead, verifyDirChain } from "./safe-fs.js";
+import { mkdir } from "node:fs/promises";
 import {
   parseSemVer,
   classifyUpdate,
@@ -588,5 +590,27 @@ describe("checkLatestNow (manual upgrade)", () => {
     if (a.status === "unreachable") expect(a.reason).toContain("503");
     mockFetch.mockResolvedValue({ ok: true, json: async () => ({}) });
     expect((await checkLatestNow("7.2.0")).status).toBe("unreachable");
+  });
+});
+
+describe("writeCheckState directory chain (W-REVIEW-0 finding 4)", () => {
+  it("an unsafe directory chain skips the state write silently, before mkdir", async () => {
+    vi.mocked(verifyDirChain).mockRejectedValueOnce(new Error("unsafe-path: symlink at ~/.config"));
+    mockReadFile.mockResolvedValue(JSON.stringify({ lastCheck: "2020-01-01T00:00:00.000Z" }));
+    mockFetch.mockResolvedValue({ ok: true, json: async () => ({ version: "5.2.1" }) });
+    await expect(checkForUpdates("5.2.1")).resolves.toBeNull();
+    expect(vi.mocked(mkdir)).not.toHaveBeenCalled();
+    expect(mockWriteFile).not.toHaveBeenCalled();
+  });
+
+  it("verifies before and after mkdir, then writes", async () => {
+    const order: string[] = [];
+    vi.mocked(verifyDirChain).mockImplementation(async () => void order.push("verify"));
+    vi.mocked(mkdir).mockImplementation((async () => void order.push("mkdir")) as never);
+    mockWriteFile.mockImplementation(async () => void order.push("write"));
+    mockReadFile.mockResolvedValue(JSON.stringify({ lastCheck: "2020-01-01T00:00:00.000Z" }));
+    mockFetch.mockResolvedValue({ ok: true, json: async () => ({ version: "5.2.1" }) });
+    await checkForUpdates("5.2.1");
+    expect(order).toEqual(["verify", "mkdir", "verify", "write"]);
   });
 });

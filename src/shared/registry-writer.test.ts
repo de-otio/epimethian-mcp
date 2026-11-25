@@ -551,3 +551,22 @@ posixOnly("registerProfile (setup: name and settings in one write)", () => {
     });
   });
 });
+
+posixOnly("config directory creation (W-REVIEW-0 finding 4)", () => {
+  it("never creates directories through a symlinked ~/.config", async () => {
+    const elsewhere = join(home, "elsewhere");
+    await mkdir(elsewhere, { mode: 0o700 });
+    await rm(join(home, ".config"), { recursive: true });
+    await symlink(elsewhere, join(home, ".config"));
+    const err = await addToProfileRegistry("x").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RegistryUnreadableError);
+    expect((err as RegistryUnreadableError).reason).toMatchObject({ kind: "unsafe-permissions", target: "directory" });
+    expect(await readdir(elsewhere)).toEqual([]);
+  });
+
+  it("creates a missing config directory 0700 when the chain is safe", async () => {
+    await rm(join(home, ".config"), { recursive: true });
+    await addToProfileRegistry("x");
+    expect((await stat(configDir)).mode & 0o777).toBe(0o700);
+  });
+});

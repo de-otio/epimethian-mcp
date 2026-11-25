@@ -53,7 +53,7 @@ import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { safeAtomicWrite, safeOpenRead } from "./safe-fs.js";
+import { safeAtomicWrite, safeOpenRead, verifyDirChain } from "./safe-fs.js";
 import { globalInstallPrefix, packageDirUnder } from "./install-location.js";
 
 const execFileAsync = promisify(execFile);
@@ -129,7 +129,16 @@ async function readCheckState(): Promise<UpdateCheckState | null> {
 }
 
 async function writeCheckState(state: UpdateCheckState): Promise<void> {
-  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  // Best effort: an unsafe directory chain (a symlinked or shared ~/.config)
+  // skips the write silently. Verify before mkdir so mkdir -p cannot create
+  // directories through a symlink, and again after it.
+  try {
+    await verifyDirChain(CONFIG_DIR);
+    await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    await verifyDirChain(CONFIG_DIR);
+  } catch {
+    return;
+  }
   const data = JSON.stringify(state, null, 2) + "\n";
   // Temp O_EXCL|O_NOFOLLOW 0600, fsync, rename, directory fsync (D12, D30).
   await safeAtomicWrite(UPDATE_CHECK_FILE, data);

@@ -93,8 +93,18 @@ export function getAuditLogPath(): string {
   return join(configDir(), "audit.log");
 }
 
+/**
+ * Creates the config directory 0700 when missing, without ever creating
+ * directories through an unsafe chain: verifyDirChain first (missing rungs
+ * are skipped), so `mkdir -p` cannot follow a symlinked ~/.config; then
+ * mkdir; then verifyDirChain again over the rungs mkdir created. Throws
+ * UnsafePathError.
+ */
 async function ensureConfigDir(): Promise<void> {
-  await mkdir(configDir(), { recursive: true, mode: 0o700 });
+  const dir = configDir();
+  await verifyDirChain(dir);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await verifyDirChain(dir);
 }
 
 // --- Registry types ---
@@ -806,7 +816,8 @@ async function sweepStaleTemps(dir: string): Promise<void> {
 
 /**
  * The writer core. Steps (02 §1.1; the anchor steps 4, 5 and 8 are step A):
- *   1. mkdir + verifyDirChain(config dir); take profiles.json.lock.
+ *   1. verifyDirChain, mkdir 0700, verifyDirChain (config dir); take
+ *      profiles.json.lock.
  *   2. Sweep our temp files older than one hour.
  *   3. Read. Unreadable → RegistryUnreadableError before any temp file;
  *      absent → start from {profiles: []}, .bak untouched (D36).
@@ -827,9 +838,8 @@ async function commitRegistryChange(
 ): Promise<{ readonly before: Registry | undefined; readonly after: Registry | undefined; readonly written: boolean }> {
   const dir = configDir();
   const path = getProfileRegistryPath();
-  await mkdir(dir, { recursive: true, mode: 0o700 });
   try {
-    await verifyDirChain(dir);
+    await ensureConfigDir();
   } catch (err) {
     if (err instanceof UnsafePathError) {
       throw new RegistryUnreadableError(
