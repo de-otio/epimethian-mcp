@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- An unreadable profile registry (syntax error, unexpected shape, group- or
+  world-writable permissions, a file or directory owned by another user,
+  symlink) starts the server in recovery mode, whose tool names the problem and
+  the fix; it is no longer treated as empty, which silently dropped a profile's
+  restrictions. A registry that is group- or world-writable must be fixed with
+  `chmod 600 ~/.config/epimethian-mcp/profiles.json`; a symlinked registry must
+  be replaced with a regular file.
+- CLI commands no longer overwrite an unreadable profile registry; `setup` and
+  `profiles --remove` check it before touching the keychain. Writes are flushed
+  to disk, take a lock so two commands cannot overwrite each other, keep the
+  version before the last CLI change in `profiles.json.bak`, and keep unknown
+  top-level keys.
+- The write-allowlist refusal no longer names a CLI flag that does not exist.
+
 ## [7.6.0] - 2026-11-22 - gateway mode and v2 reads
 
 ### Added

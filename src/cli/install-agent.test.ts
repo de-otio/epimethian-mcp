@@ -211,3 +211,17 @@ describe("MCP server config correctness", () => {
     expect(constructorCall.name).toBe("confluence");
   });
 });
+
+describe("install-agent.md registry recovery mode", () => {
+  it("covers REGISTRY_UNREADABLE from setup_profile", () => {
+    expect(guideContent).toContain("REGISTRY_UNREADABLE");
+    expect(guideContent).toContain("Recovery mode: `REGISTRY_UNREADABLE`");
+    expect(guideContent).toContain("setup_profile");
+  });
+
+  it("tells the agent to relay the message and not to edit the registry", () => {
+    expect(guideContent).toContain("For the person");
+    expect(guideContent).toMatch(/Do not edit, delete, replace, `chmod` or restore `profiles\.json`/);
+    expect(guideContent).toContain("final until the person has fixed the file");
+  });
+});

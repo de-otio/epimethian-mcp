@@ -265,6 +265,18 @@ If **the server doesn't appear after restart**:
 - Verify the `command` value is an absolute path (run `which epimethian-mcp` to confirm)
 - Check that `.mcp.json` contains valid JSON (no trailing commas, correct quoting)
 
+## Recovery mode: `REGISTRY_UNREADABLE`
+
+If the only tool the server offers is `setup_profile` and its result begins with `Withheld [REGISTRY_UNREADABLE]`, the profile registry (`~/.config/epimethian-mcp/profiles.json`) cannot be read safely: a JSON syntax error, an unexpected top-level shape, a file or directory that is group- or world-writable or owned by another user, or a symlink. The server refuses to guess, because treating the file as empty would drop the profile's restrictions.
+
+What you (the agent) do:
+
+1. **Tell the user the message**, including the "For the person" line, verbatim. Do not paraphrase the fix.
+2. **Do not edit, delete, replace, `chmod` or restore `profiles.json` or `profiles.json.bak` yourself**, and do not retry the tool or look for another way around it. The result is final until the person has fixed the file.
+3. After the person has fixed the file, tell them to restart the MCP client. The server reads the registry at startup.
+
+Typical fixes the person runs: `chmod 600 ~/.config/epimethian-mcp/profiles.json` for a group- or world-writable file, replacing a symlink with a regular file, or correcting the JSON at the reported line and column. `profiles.json.bak` holds the version before the last CLI change; the message names it only when it exists.
+
 ## Write budget (safety cap on writes)
 
 epimethian-mcp enforces two write-rate caps per server process:

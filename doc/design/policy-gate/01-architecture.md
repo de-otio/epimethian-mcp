@@ -1,6 +1,6 @@
 # 1. Architecture
 
-Status: design, reviewed 2026-11-25. Not built. Line numbers are 7.6.0 (`15d5ebe`); step A
+Status: design, reviewed 2026-11-25. Step 0 (7.6.1) built; steps A and B not built. Line numbers are 7.6.0 (`15d5ebe`); step A
 re-anchors them against the 8.0.0 tag.
 
 ## 1.1 Components

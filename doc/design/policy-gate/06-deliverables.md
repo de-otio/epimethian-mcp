@@ -1,6 +1,6 @@
 # 6. Deliverables and acceptance criteria
 
-Status: design, reviewed 2026-11-25. Not built. Implementation plan:
+Status: design, reviewed 2026-11-25. Step 0 (7.6.1) built; steps A and B not built. Implementation plan:
 [plans/policy-gate.md](../../../plans/policy-gate.md).
 
 Releases (D22): step 0 as the 7.6.1 patch now, on SDK 1.x; P1 this week; step A after 8.0.0,

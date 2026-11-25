@@ -1,6 +1,6 @@
 # 2. Interfaces
 
-Status: design, reviewed 2026-11-25. Not built.
+Status: design, reviewed 2026-11-25. Step 0 (7.6.1) built; steps A and B not built.
 
 All types are `readonly`; functions in `src/shared/policy.ts` and `src/server/gate-core.ts` are
 pure (no I/O, no clock, no randomness). The clock enters as `now: number` (epoch ms). Record and

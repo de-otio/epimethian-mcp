@@ -1,6 +1,6 @@
 # 5. Risks, assumptions, open questions, rollback
 
-Status: design, reviewed 2026-11-25. Not built.
+Status: design, reviewed 2026-11-25. Step 0 (7.6.1) built; steps A and B not built.
 
 ## 1. Risks
 

@@ -1,6 +1,6 @@
 # 4. Design decisions
 
-Status: design, reviewed 2026-11-25. Not built. D1–D37 are design decisions within analysis
+Status: design, reviewed 2026-11-25. Step 0 (7.6.1) built; steps A and B not built. D1–D37 are design decisions within analysis
 decisions 1–14 ("A1"…"A14" below). D15, D18 and D20 go beyond them and were decided on
 2026-11-25, with D22, D23 and D26–D33, from the resolutions of the design review's open
 questions. D34–D37 settle review blockers and should-fix items. "Raised by" names the review

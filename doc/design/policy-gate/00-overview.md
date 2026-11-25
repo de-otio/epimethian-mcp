@@ -1,6 +1,6 @@
 # Policy gate: design overview (steps 0, A, B)
 
-Status: design, reviewed 2026-11-25. Not built. The design review (nine reviewers) found no
+Status: design, reviewed 2026-11-25. Step 0 (7.6.1) built; steps A and B not built. The design review (nine reviewers) found no
 redesign; its blockers X1–X7 and should-fix items S1–S38 are folded in, and the resolutions of
 its open questions and blockers are decisions D15, D18, D20, D22, D23 and D26–D37
 ([04-decisions.md](04-decisions.md)).
