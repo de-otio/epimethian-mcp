@@ -170,6 +170,123 @@ interface ProfileRegistry {
   settings?: Record<string, ProfileSettings>;
 }
 
+// --- Three-state registry read and the writer core (policy gate, step 0) ---
+// Contract PG-C1, doc/design/policy-gate/02-interfaces.md §1.1.
+
+/** From lstat/fstat with { bigint: true }: nanosecond times. */
+export interface FileFingerprint {
+  readonly ino: bigint;
+  readonly mtimeNs: bigint;
+  readonly ctimeNs: bigint;
+  readonly size: bigint;
+}
+
+/** What the last lstat saw, kept whatever the read outcome. */
+export type Observation = FileFingerprint | "absent" | { readonly errno: string };
+
+/**
+ * Why the registry could not be used. Never carries file content or a
+ * JSON.parse message: a parse error keeps only a line and column derived from
+ * the digits of the error position. Step A adds `invalid-settings`, `removed`
+ * and `anchor-unreadable`.
+ */
+export type UnreadableReason =
+  | { readonly kind: "parse-error"; readonly line?: number; readonly column?: number }
+  | { readonly kind: "unexpected-shape" }
+  | {
+      readonly kind: "unsafe-permissions";
+      readonly target: "file" | "directory";
+      readonly problem: "mode" | "owner";
+    }
+  | { readonly kind: "not-regular-file" }
+  | { readonly kind: "io-error"; readonly errno: string };
+
+export interface Registry {
+  readonly profiles: readonly string[];
+  readonly settings?: Readonly<Record<string, ProfileSettings>>;
+  /** Unknown top-level keys, written back unchanged. */
+  readonly extra: Readonly<Record<string, unknown>>;
+}
+
+export type RegistryRead =
+  | { readonly state: "absent"; readonly observed: Observation }
+  | { readonly state: "ok"; readonly registry: Registry; readonly observed: FileFingerprint }
+  | {
+      readonly state: "unreadable";
+      readonly reason: UnreadableReason;
+      readonly path: string;
+      readonly backup: string | undefined;
+      readonly observed: Observation;
+    };
+
+export const REGISTRY_UNREADABLE = "REGISTRY_UNREADABLE";
+
+export class RegistryUnreadableError extends Error {
+  readonly code: typeof REGISTRY_UNREADABLE = REGISTRY_UNREADABLE;
+  constructor(
+    readonly reason: UnreadableReason,
+    readonly path: string,
+    readonly backup?: string,
+  ) {
+    super(`The profile registry ${path} cannot be used (${reason.kind}).`);
+    this.name = "RegistryUnreadableError";
+  }
+}
+
+/** `fitsAnchor` is step A; step 0 always passes `undefined`. */
+export interface BackupFacts {
+  readonly path: string;
+  readonly fitsAnchor: boolean | undefined;
+}
+
+/** Never throws. Reads through safeOpenReadWithStat. */
+export async function readRegistry(): Promise<RegistryRead> {
+  throw new Error("not implemented");
+}
+
+/** One lstat (a symlink is reported, not followed). */
+export async function registryFingerprint(): Promise<Observation> {
+  throw new Error("not implemented");
+}
+
+/** Pure. One sentence of what is wrong, one fix line; no file content. */
+export function describeUnreadable(
+  _r: UnreadableReason,
+  _path: string,
+  _profile: string | null,
+  _backup?: BackupFacts,
+): { readonly what: string; readonly fix: string } {
+  throw new Error("not implemented");
+}
+
+/**
+ * Step 0 has only kind "other" (setup, profiles flags). Step A adds
+ * `{ kind: "policy"; profile }` with the keychain anchor steps.
+ */
+export type WriteKind = { readonly kind: "other" };
+
+/** The one writer core (D12). Every exported writer calls it. */
+export async function writeWithAnchor(
+  _change: (prev: Registry | undefined) => Registry,
+  _how: WriteKind,
+): Promise<{ readonly before: Registry | undefined; readonly after: Registry }> {
+  throw new Error("not implemented");
+}
+
+/** Whole-value replacement; returning undefined removes the profile's settings entry. */
+export async function updateProfileSettings(
+  _name: string,
+  _fn: (prev: ProfileSettings | undefined) => ProfileSettings | undefined,
+  _how?: WriteKind,
+): Promise<{ readonly before: ProfileSettings | undefined; readonly after: ProfileSettings | undefined }> {
+  throw new Error("not implemented");
+}
+
+/** Throws RegistryUnreadableError when unreadable; used by CLI preflights. */
+export async function assertRegistryWritable(): Promise<void> {
+  throw new Error("not implemented");
+}
+
 /**
  * Read the full registry object from disk.
  * Returns a default empty registry if the file is missing or corrupted.

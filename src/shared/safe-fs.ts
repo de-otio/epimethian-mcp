@@ -20,7 +20,7 @@
  * primary concern on that platform. The helpers no-op or degrade gracefully.
  */
 
-import { promises as fsPromises, constants as fsConstants } from "node:fs";
+import { promises as fsPromises, constants as fsConstants, type BigIntStats } from "node:fs";
 import { open as fsOpen } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
@@ -62,6 +62,43 @@ export async function safeOpenRead(path: string): Promise<string> {
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * Like `safeOpenRead`, plus: the file's owner uid equals the euid, and
+ * `verifyDirChain(dirname(path))` passes. Returns the raw text and the fstat
+ * of the fd that was read (`{ bigint: true }`, nanosecond times).
+ *
+ * Errors: Error("unsafe-permissions") (mode), Error("unsafe-owner"),
+ * UnsafePathError (directory chain, message starts "unsafe-path"),
+ * Error("not-regular-file"), ELOOP, ENOENT, others by errno.
+ */
+export async function safeOpenReadWithStat(
+  _path: string,
+): Promise<{ readonly raw: string; readonly stat: BigIntStats }> {
+  throw new Error("not implemented");
+}
+
+/**
+ * Atomic, durable write: temp file `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` 0600
+ * in the same directory; write; fsync(fd); rename; fsync(dir) best effort
+ * (skipped on Windows; elsewhere a failure after a successful rename is a
+ * warning on stderr, not a write failure, D30). Removes the temp on any
+ * failure.
+ */
+export async function safeAtomicWrite(
+  _path: string,
+  _bytes: string | Uint8Array,
+  _opts: SafeAtomicWriteOptions = {},
+): Promise<void> {
+  throw new Error("not implemented");
+}
+
+export interface SafeAtomicWriteOptions {
+  /** Runs after the temp file is complete and fsynced, just before the
+   *  rename. A throw aborts the write: the temp is removed, the target is
+   *  untouched, and the error propagates. */
+  readonly beforeRename?: () => Promise<void>;
 }
 
 /**

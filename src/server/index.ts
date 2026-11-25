@@ -6279,7 +6279,28 @@ async function registerTools(server: McpServer, config: Config): Promise<void> {
  * model, and the existing interactive setup (tenant-seal confirmation, etc.)
  * is preserved.
  */
-export async function startRecoveryServer(profile: string): Promise<void> {
+/** Why the server started in recovery mode (contract PG-C2, 02 §4). */
+export type RecoveryReason =
+  | { readonly kind: "profile-missing" }
+  | { readonly kind: "registry-unreadable"; readonly what: string; readonly fix: string };
+
+/** Pure. The server name, instructions, tool description and tool text for a recovery server. */
+export function recoveryText(
+  _profile: string,
+  _r: RecoveryReason,
+): {
+  readonly serverName: string;
+  readonly instructions: string;
+  readonly description: string;
+  readonly text: string;
+} {
+  throw new Error("not implemented");
+}
+
+export async function startRecoveryServer(
+  profile: string,
+  _reason: RecoveryReason = { kind: "profile-missing" },
+): Promise<void> {
   const server = new McpServer(
     {
       name: `confluence-${profile}-setup-needed`,
@@ -6332,7 +6353,7 @@ export async function main() {
     config = await getConfig();
   } catch (err) {
     if (err instanceof ProfileNotConfiguredError) {
-      await startRecoveryServer(err.profile);
+      await startRecoveryServer(err.profile, { kind: "profile-missing" });
       return;
     }
     throw err;
