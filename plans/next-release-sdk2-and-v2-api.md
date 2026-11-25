@@ -172,7 +172,10 @@ Why each edge exists:
 - **C6. New tool modules (8.1.0).** Each new tool's handler lives in
   `src/server/tools/<tool>.ts` exporting `register<Tool>(server, deps)`. `deps` carries the
   shared guards (`checkSpaceAllowed`, `gate`, `writeBudget`, `logMutation`, attribution).
-  Tests go in new files named after the workstream (house contract 5). New
+  `deps` carries no read gate: the read gate wraps every handler in the `registerTool` shim.
+  Each tool module also exports its read-gate `GateSpec` row (policy-gate plan PG-C11,
+  `plans/policy-gate.md`); if the policy gate has not landed yet, the module exports nothing
+  extra and the policy-gate step-A lane adds the row. Tests go in new files named after the workstream (house contract 5). New
   `confluence-client.ts` exports are added to the hand-written mock block in `index.test.ts`;
   the integrator resolves those conflicts.
 - **C7. House contracts carry over** from the field-session plan §3: results with
@@ -768,7 +771,8 @@ For each release: fast-forward the release branch into the default branch locall
 pushes and runs `gh release create` (the egress guard will ask); install from npm and check
 `epimethian-mcp --version` and `status`; re-check Dependabot and code-scanning alerts.
 
-8.0.0 extras: create a `release/7.x` maintenance branch at the 7.6.0 tag first. It receives
+8.0.0 extras: create a `release/7.x` maintenance branch at the 7.6.1 tag first (7.6.1 is policy-gate step 0,
+`plans/policy-gate.md`; use the 7.6.0 tag only if 7.6.1 has not shipped). It receives
 security fixes until the SDK 1.x end of fixes (~2027-01-27). The CHANGELOG `Breaking` section
 lists: Node floor, SDK package rename (only relevant to people embedding the server), `$schema`
 2020-12 in `tools/list`, and any tool-surface change found by W-SHAPES.
