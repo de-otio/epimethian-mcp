@@ -100,7 +100,7 @@ posixOnly("0-T12 lock", () => {
       },
     });
     await addToProfileRegistry("a");
-    expect(seen).toMatch(new RegExp(`^4242\\n${new Date(clock).toISOString().replace(/\./g, "\\.")}\\n[0-9a-f]{32}\\n$`));
+    expect(seen).toMatch(new RegExp(`^4242\\n${new Date(clock).toISOString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n[0-9a-f]{32}\\n$`));
     expect(mode).toBe(0o600);
   });
 

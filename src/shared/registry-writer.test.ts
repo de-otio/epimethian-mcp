@@ -236,7 +236,8 @@ type Mutation = (text: string) => Uint8Array;
 const enc = (s: string) => new TextEncoder().encode(s);
 
 const mutationArb: fc.Arbitrary<Mutation> = fc.oneof(
-  fc.constant<Mutation>((t) => enc(t.replace("{", ""))),
+  // Drop the opening brace (JSON.stringify output always starts with it).
+  fc.constant<Mutation>((t) => enc(t.slice(1))),
   fc.constant<Mutation>((t) => enc(t.slice(0, t.lastIndexOf("}")))),
   fc.constantFrom<unknown>("x", 5, {}, null, [1]).map<Mutation>((bad) => (t) =>
     enc(JSON.stringify({ ...JSON.parse(t), profiles: bad }))),
