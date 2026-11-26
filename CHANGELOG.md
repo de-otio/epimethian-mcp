@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.6.1] - 2026-11-26 - fail-closed profile registry
+
 ### Fixed
 - An unreadable profile registry (syntax error, unexpected shape, group- or
   world-writable permissions, a file or directory owned by another user,
