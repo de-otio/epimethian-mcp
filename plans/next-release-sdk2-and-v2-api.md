@@ -104,7 +104,7 @@ Phase 0 (orchestrator): branch release/7.6.0 off master at 7.5.0; npm ci; full s
 I-7.5 integration: merge W-V2READ+W-HIST, then W-GW; W-INV results gate W-HIST's revert switch
   ▼ W-REVIEW-7.5 (Opus, read-only data-loss walk) → fixes → docs (Haiku) → 7.6.0 release checkpoint
   ▼
-Branch release/8.0.0 off 7.6.0
+Branch release/8.0.0 off master at or after the 7.6.1 tag (7.6.1 shipped 2026-11-26; no forward-merge needed)
   ├── Wave B
   │     lane 1: W-SDK (deps, codemod, serveStdio, ctx accessors, Node floor, build, CI)  ── Sonnet, high
   │     lane 2: W-GATE (era-aware gate + approval store), starts from W-GATE-SPEC          ── Opus, high
@@ -771,8 +771,8 @@ For each release: fast-forward the release branch into the default branch locall
 pushes and runs `gh release create` (the egress guard will ask); install from npm and check
 `epimethian-mcp --version` and `status`; re-check Dependabot and code-scanning alerts.
 
-8.0.0 extras: create a `release/7.x` maintenance branch at the 7.6.1 tag first (7.6.1 is policy-gate step 0,
-`plans/policy-gate.md`; use the 7.6.0 tag only if 7.6.1 has not shipped). It receives
+8.0.0 extras: the `release/7.x` maintenance branch exists at the 7.6.1 tag (created 2026-11-26;
+7.6.1 is policy-gate step 0, `plans/policy-gate.md`). It receives
 security fixes until the SDK 1.x end of fixes (~2027-01-27). The CHANGELOG `Breaking` section
 lists: Node floor, SDK package rename (only relevant to people embedding the server), `$schema`
 2020-12 in `tools/list`, and any tool-surface change found by W-SHAPES.

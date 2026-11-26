@@ -630,10 +630,9 @@ macOS (`security find-generic-password`, expected 44) and Linux (`secret-tool lo
 which must all differ from the not-found result. Do not print any secret. If Linux is not at
 hand, W-CONTRACT-A item 5 runs it; A-T12 pins the codes with mocks either way.
 
-**7.6.1:** after W-REVIEW-0; then forward-merge `master` into `release/8.0.0`. For the 8.0.0
-extras, create the `release/7.x` maintenance branch at the **7.6.1** tag, not 7.6.0 (the 8.0.0
-plan §10 now says so), so the maintenance line has the
-fail-closed registry.
+**7.6.1:** shipped 2026-11-26. `release/8.0.0` did not exist yet, so it branches off `master` at
+or after the 7.6.1 tag and needs no forward-merge. The `release/7.x` maintenance branch was created
+at the **7.6.1** tag, so the maintenance line has the fail-closed registry.
 **A-release (provisionally 8.2.0):** after W-REVIEW-A; the number is set here (§1). The
 CHANGELOG `[Unreleased]` entries become that heading.
 **B-release (provisionally 8.3.0):** after W-REVIEW-B, same procedure.
